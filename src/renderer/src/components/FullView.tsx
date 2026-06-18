@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { DocEntry } from '../types'
-import { PageCanvas } from './PageCanvas'
+import { PageView } from './PageView'
 
 interface FullViewProps {
   doc: DocEntry
@@ -9,10 +9,20 @@ interface FullViewProps {
 }
 
 const isMac = window.api.platform === 'darwin'
+const MAX_ZOOM = 8
+const WHEEL_ZOOM_SPEED = 0.036 // ~3x faster pinch zoom
+const ZOOM_STEP = 1.4
+const DOUBLE_CLICK_ZOOM = 2.5
 
+/**
+ * Full-screen single-page viewer. The page fills 100% of the viewport height;
+ * pinch / ⌘-wheel zooms toward the center (keeping the page centered, like
+ * macOS Preview), and panning kicks in once the page overflows the viewport.
+ */
 export function FullView({ doc, startPageId, onClose }: FullViewProps): React.JSX.Element {
-  const stripRef = useRef<HTMLDivElement>(null)
+  const stageRef = useRef<HTMLDivElement>(null)
   const wheelLock = useRef(0)
+  const drag = useRef<{ x: number; y: number; panX: number; panY: number } | null>(null)
   const [current, setCurrent] = useState(() =>
     Math.max(
       0,
@@ -20,6 +30,19 @@ export function FullView({ doc, startPageId, onClose }: FullViewProps): React.JS
     )
   )
   const [viewport, setViewport] = useState({ w: window.innerWidth, h: window.innerHeight })
+  const [zoom, setZoom] = useState(1)
+  const [pan, setPan] = useState({ x: 0, y: 0 })
+  // Bumped ~once the view settles, so the page re-renders crisp (see PageView).
+  const [renderVersion, setRenderVersion] = useState(0)
+
+  const index = Math.min(current, doc.pages.length - 1)
+  const page = doc.pages[index]
+  // Fit to 100% viewport height; width follows the aspect ratio.
+  const baseH = viewport.h
+  const baseW = (page.width / page.height) * baseH
+  const dispW = baseW * zoom
+  const dispH = baseH * zoom
+  const canPan = dispW > viewport.w + 1 || dispH > viewport.h + 1
 
   useEffect(() => {
     const onResize = (): void => setViewport({ w: window.innerWidth, h: window.innerHeight })
@@ -27,61 +50,118 @@ export function FullView({ doc, startPageId, onClose }: FullViewProps): React.JS
     return () => window.removeEventListener('resize', onResize)
   }, [])
 
-  // Open on the double-clicked page, and hold position through resizes.
-  useLayoutEffect(() => {
-    const strip = stripRef.current
-    if (strip) strip.scrollLeft = current * strip.clientWidth
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- only on mount/resize
-  }, [viewport])
+  // Keep the page from being dragged fully off-screen.
+  const clampPan = useCallback(
+    (p: { x: number; y: number }, z: number) => {
+      const maxX = Math.max(0, (baseW * z - viewport.w) / 2)
+      const maxY = Math.max(0, (baseH * z - viewport.h) / 2)
+      return {
+        x: Math.min(maxX, Math.max(-maxX, p.x)),
+        y: Math.min(maxY, Math.max(-maxY, p.y))
+      }
+    },
+    [baseW, baseH, viewport.w, viewport.h]
+  )
+
+  const resetView = useCallback(() => {
+    setZoom(1)
+    setPan({ x: 0, y: 0 })
+  }, [])
 
   const goTo = useCallback(
-    (index: number) => {
-      const strip = stripRef.current
-      if (!strip) return
-      const clamped = Math.max(0, Math.min(doc.pages.length - 1, index))
-      strip.scrollTo({ left: clamped * strip.clientWidth, behavior: 'smooth' })
+    (next: number) => {
+      setCurrent(Math.max(0, Math.min(doc.pages.length - 1, next)))
+      resetView()
     },
-    [doc.pages.length]
+    [doc.pages.length, resetView]
   )
+
+  // Zoom toward a focal point (the cursor) so the point under it stays fixed —
+  // consistent with the canvas and macOS Preview. Defaults to viewport center.
+  const zoomTo = useCallback(
+    (next: number, focal?: { x: number; y: number }) => {
+      const cx = focal ? focal.x : viewport.w / 2
+      const cy = focal ? focal.y : viewport.h / 2
+      setZoom((z) => {
+        const nz = Math.max(1, Math.min(MAX_ZOOM, next))
+        const r = nz / z
+        const dx = cx - viewport.w / 2
+        const dy = cy - viewport.h / 2
+        setPan((p) => clampPan({ x: dx * (1 - r) + r * p.x, y: dy * (1 - r) + r * p.y }, nz))
+        return nz
+      })
+    },
+    [clampPan, viewport.w, viewport.h]
+  )
+
+  // Re-render the page crisply once a zoom/pan gesture settles.
+  useEffect(() => {
+    const timer = setTimeout(() => setRenderVersion((v) => v + 1), 180)
+    return () => clearTimeout(timer)
+  }, [zoom, pan])
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent): void => {
       if (event.key === 'Escape') onClose()
-      else if (event.key === 'ArrowRight') goTo(current + 1)
-      else if (event.key === 'ArrowLeft') goTo(current - 1)
+      else if (event.key === 'ArrowRight') goTo(index + 1)
+      else if (event.key === 'ArrowLeft') goTo(index - 1)
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [current, goTo, onClose])
+  }, [index, goTo, onClose])
 
-  // Vertical mouse wheel flips one page at a time; horizontal swipes use
-  // native scrolling, where snap points settle on a page.
+  // Menu zoom (⌘ +/-/0) is routed here while the viewer is open (App skips the
+  // canvas zoom when a full view is showing).
   useEffect(() => {
-    const strip = stripRef.current
-    if (!strip) return
+    return window.api.onZoom((action) => {
+      if (action === 'in') zoomTo(zoom * ZOOM_STEP)
+      else if (action === 'out') zoomTo(zoom / ZOOM_STEP)
+      else resetView()
+    })
+  }, [zoom, zoomTo, resetView])
+
+  // Wheel: pinch/⌘ zooms; plain wheel pans when zoomed, else flips pages.
+  useEffect(() => {
+    const stage = stageRef.current
+    if (!stage) return
     const onWheel = (event: WheelEvent): void => {
-      if (event.ctrlKey || event.metaKey) return
+      if (event.ctrlKey || event.metaKey) {
+        event.preventDefault()
+        const dy = Math.max(-50, Math.min(50, event.deltaY))
+        zoomTo(zoom * Math.pow(2, -dy * WHEEL_ZOOM_SPEED), { x: event.clientX, y: event.clientY })
+        return
+      }
+      if (canPan) {
+        event.preventDefault()
+        setPan((p) => clampPan({ x: p.x - event.deltaX, y: p.y - event.deltaY }, zoom))
+        return
+      }
       if (Math.abs(event.deltaY) <= Math.abs(event.deltaX)) return
       event.preventDefault()
       const now = Date.now()
       if (now - wheelLock.current < 250) return
       wheelLock.current = now
-      goTo(Math.round(strip.scrollLeft / strip.clientWidth) + (event.deltaY > 0 ? 1 : -1))
+      goTo(index + (event.deltaY > 0 ? 1 : -1))
     }
-    strip.addEventListener('wheel', onWheel, { passive: false })
-    return () => strip.removeEventListener('wheel', onWheel)
-  }, [goTo])
+    stage.addEventListener('wheel', onWheel, { passive: false })
+    return () => stage.removeEventListener('wheel', onWheel)
+  }, [zoom, canPan, index, zoomTo, clampPan, goTo])
 
-  const onScroll = (): void => {
-    const strip = stripRef.current
-    if (!strip) return
-    setCurrent(
-      Math.max(0, Math.min(doc.pages.length - 1, Math.round(strip.scrollLeft / strip.clientWidth)))
-    )
+  const onPointerDown = (event: React.PointerEvent): void => {
+    if (!canPan) return
+    drag.current = { x: event.clientX, y: event.clientY, panX: pan.x, panY: pan.y }
+    event.currentTarget.setPointerCapture(event.pointerId)
   }
-
-  const availW = viewport.w - 120
-  const availH = viewport.h - 120
+  const onPointerMove = (event: React.PointerEvent): void => {
+    const d = drag.current
+    if (!d) return
+    setPan(clampPan({ x: d.panX + (event.clientX - d.x), y: d.panY + (event.clientY - d.y) }, zoom))
+  }
+  const endDrag = (event: React.PointerEvent): void => {
+    if (!drag.current) return
+    drag.current = null
+    event.currentTarget.releasePointerCapture?.(event.pointerId)
+  }
 
   return (
     <div className="full-view">
@@ -103,31 +183,39 @@ export function FullView({ doc, startPageId, onClose }: FullViewProps): React.JS
         </button>
       </header>
 
-      <div className="full-strip" ref={stripRef} onScroll={onScroll}>
-        {doc.pages.map((page) => {
-          const scale = Math.min(availH / page.height, availW / page.width)
-          const width = Math.max(1, Math.round(page.width * scale))
-          const height = Math.max(1, Math.round(page.height * scale))
-          return (
-            <div
-              key={page.id}
-              className="full-slide"
-              onClick={(e) => {
-                if (e.target === e.currentTarget) onClose()
-              }}
-            >
-              <div className="full-page" style={{ width, height }} onDoubleClick={onClose}>
-                <PageCanvas pdf={page.source.pdf} pageNumber={page.pageIndex + 1} height={height} />
-              </div>
-            </div>
-          )
-        })}
+      <div
+        className={`full-stage${canPan ? ' pannable' : ''}`}
+        ref={stageRef}
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={endDrag}
+        onPointerCancel={endDrag}
+        onClick={(e) => {
+          if (e.target === e.currentTarget) onClose()
+        }}
+      >
+        <div
+          key={page.id}
+          className="full-page"
+          style={{ width: dispW, height: dispH, transform: `translate(${pan.x}px, ${pan.y}px)` }}
+          onDoubleClick={(e) =>
+            zoom > 1 ? resetView() : zoomTo(DOUBLE_CLICK_ZOOM, { x: e.clientX, y: e.clientY })
+          }
+        >
+          <PageView
+            pdf={page.source.pdf}
+            pageNumber={page.pageIndex + 1}
+            naturalWidth={page.width}
+            naturalHeight={page.height}
+            version={renderVersion}
+          />
+        </div>
       </div>
 
       <button
         className="full-nav prev"
-        disabled={current === 0}
-        onClick={() => goTo(current - 1)}
+        disabled={index === 0}
+        onClick={() => goTo(index - 1)}
         title="Previous page (←)"
       >
         <svg
@@ -145,8 +233,8 @@ export function FullView({ doc, startPageId, onClose }: FullViewProps): React.JS
       </button>
       <button
         className="full-nav next"
-        disabled={current === doc.pages.length - 1}
-        onClick={() => goTo(current + 1)}
+        disabled={index === doc.pages.length - 1}
+        onClick={() => goTo(index + 1)}
         title="Next page (→)"
       >
         <svg
@@ -164,7 +252,7 @@ export function FullView({ doc, startPageId, onClose }: FullViewProps): React.JS
       </button>
 
       <div className="full-count">
-        {current + 1} / {doc.pages.length}
+        {index + 1} / {doc.pages.length}
       </div>
     </div>
   )

@@ -1,12 +1,15 @@
 import { useLayoutEffect, useRef } from 'react'
 import type { DocEntry } from '../types'
-import { PageCanvas } from './PageCanvas'
+import { PageView } from './PageView'
 
 interface DocumentRowProps {
   doc: DocEntry
   index: number
   total: number
+  /** Page height in world units (fixed; the canvas transform does the zoom). */
   pageHeight: number
+  /** Bumped when the view settles, so pages re-render the crisp visible region. */
+  renderVersion: number
   selectedPageId: string | null
   /** Page being dragged, when the drag started in THIS document. */
   draggingPageId: string | null
@@ -35,6 +38,7 @@ export function DocumentRow({
   index,
   total,
   pageHeight,
+  renderVersion,
   selectedPageId,
   draggingPageId,
   foreignDragActive,
@@ -236,10 +240,12 @@ export function DocumentRow({
               }}
               onDragEnd={onPageDragEnd}
             >
-              <PageCanvas
+              <PageView
                 pdf={page.source.pdf}
                 pageNumber={page.pageIndex + 1}
-                height={pageHeight}
+                naturalWidth={page.width}
+                naturalHeight={page.height}
+                version={renderVersion}
               />
               <span className="page-number">{pageIndex + 1}</span>
             </div>

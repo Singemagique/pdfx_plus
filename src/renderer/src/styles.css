@@ -18,7 +18,7 @@
   --group-bg: rgba(255, 255, 255, 0.05); /* subtle per-document card */
   --control: rgba(255, 255, 255, 0.12); /* floating controls over full view */
   --overlay: rgba(18, 18, 20, 0.72);
-  --overlay-strong: rgba(18, 18, 20, 0.92);
+  --overlay-strong: #131316; /* opaque focused-viewer backdrop */
   --scrollbar-thumb: rgba(255, 255, 255, 0.18);
   --scrollbar-thumb-hover: rgba(255, 255, 255, 0.3);
   --radius: 10px;
@@ -40,7 +40,7 @@
     --group-bg: rgba(20, 20, 24, 0.045);
     --control: rgba(255, 255, 255, 0.92);
     --overlay: rgba(247, 247, 245, 0.7);
-    --overlay-strong: rgba(247, 247, 245, 0.98);
+    --overlay-strong: #f4f4f2;
     --scrollbar-thumb: rgba(22, 22, 26, 0.16);
     --scrollbar-thumb-hover: rgba(22, 22, 26, 0.32);
     --page-shadow: 0 1px 2px rgba(20, 20, 24, 0.07), 0 6px 20px rgba(20, 20, 24, 0.06);
@@ -226,45 +226,57 @@ body {
 
 /* ---------- Content / document grid ---------- */
 
-.content {
+/* The free-floating canvas: a clipping viewport over a pan/zoom world. */
+.canvas-viewport {
+  position: relative;
   flex: 1;
-  overflow-y: auto;
-  /* Held transparent across the toolbar zone, then fading in below it, so
-     content stays clear of the floating toolbar and dissolves into the glass
-     as it scrolls up rather than clipping at a hard edge. */
-  mask-image: linear-gradient(to bottom, transparent 0, transparent 32px, #000 80px);
-  -webkit-mask-image: linear-gradient(to bottom, transparent 0, transparent 32px, #000 80px);
+  overflow: hidden;
+  cursor: grab;
+  /* Content dissolves into the floating toolbar at the very top. */
+  mask-image: linear-gradient(to bottom, transparent 0, transparent 28px, #000 76px);
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0, transparent 28px, #000 76px);
 }
 
-.doc-list {
-  display: flex;
-  flex-direction: column;
-  gap: 20px;
-  /* Top padding clears the floating toolbar + fade so the first row starts in
-     the fully-visible zone. */
-  padding: 80px 0 48px;
+.canvas-viewport.panning {
+  cursor: grabbing;
+}
+
+.canvas-world {
+  position: absolute;
+  top: 0;
+  left: 0;
+  transform-origin: 0 0;
+  /* will-change is toggled on only while moving (see Canvas.tsx) so the layer
+     re-rasterizes crisply at rest instead of being GPU-upscaled. */
+}
+
+/* One document, placed at its world coordinates by the layout. */
+.canvas-doc {
+  position: absolute;
 }
 
 /* Each document reads as a simple, roomy group/card. */
 .doc-row {
-  margin: 0 28px;
+  width: 100%;
   padding: 10px 16px 14px;
   background: var(--group-bg);
   border-radius: 24px;
 }
 
-/* Headers stay pinned while their document is in view, so the controls
-   and the document name are always at hand. */
-/* A plain label that's simply part of the card — no sticky, no own color. */
+/* A plain label that's part of the card. Its metrics are counter-scaled by
+   1/zoom (when zoomed in) so the title stays a constant, crisp size instead of
+   growing pixelated with the canvas; --label cascades to the children below.
+   At zoom < 1 it scales down with the world (--label clamps to 1). */
 .doc-header {
+  --label: calc(1 / max(var(--zoom, 1), 1));
   display: flex;
   align-items: baseline;
-  gap: 10px;
-  padding: 4px 6px 12px;
+  gap: calc(10px * var(--label));
+  padding: calc(4px * var(--label)) calc(6px * var(--label)) calc(12px * var(--label));
 }
 
 .doc-index {
-  font-size: 11px;
+  font-size: calc(11px * var(--label));
   font-weight: 600;
   color: var(--ink-faint);
   font-variant-numeric: tabular-nums;
@@ -272,7 +284,7 @@ body {
 }
 
 .doc-name {
-  font-size: 13.5px;
+  font-size: calc(13.5px * var(--label));
   font-weight: 600;
   color: var(--ink);
   white-space: nowrap;
@@ -282,7 +294,7 @@ body {
 }
 
 .doc-pages {
-  font-size: 12px;
+  font-size: calc(12px * var(--label));
   color: var(--ink-faint);
   font-variant-numeric: tabular-nums;
 }
@@ -290,29 +302,38 @@ body {
 .doc-actions {
   display: flex;
   align-items: center;
-  gap: 2px;
+  gap: calc(2px * var(--label));
   margin-left: auto;
   align-self: center;
   opacity: 0;
   transition: opacity 0.15s ease;
 }
 
+/* Keep the header's action buttons the same constant size as its text. */
+.doc-header .icon-btn {
+  width: calc(26px * var(--label));
+  height: calc(26px * var(--label));
+  border-radius: calc(6px * var(--label));
+}
+
+.doc-header .icon-btn svg {
+  width: calc(14px * var(--label));
+  height: calc(14px * var(--label));
+}
+
 .doc-row:hover .doc-actions {
   opacity: 1;
 }
 
+/* No scroll — the canvas pans/zooms the whole world; let shadows/outlines show. */
 .page-strip {
-  overflow-x: auto;
-  scroll-padding: 28px;
+  overflow: visible;
 }
 
-/* When a strip's content fits the viewport there is no scroll range, so the
-   zoom anchor translates this inner wrapper instead (it can go negative,
-   scrollLeft can't); once content overflows, the offset folds into scroll. */
 .page-strip-inner {
   display: flex;
   gap: 18px;
-  padding: 4px 8px 16px;
+  padding: 0 6px;
   width: max-content;
 }
 
@@ -349,6 +370,32 @@ body {
 
 .page-canvas.visible {
   opacity: 1;
+}
+
+/* Two-layer page rendering: a low-res full-page base + a crisp visible-region
+   detail layer on top (see PageView). */
+.pageview {
+  position: absolute;
+  inset: 0;
+}
+
+.pageview-base {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  transition: opacity 0.2s ease;
+}
+
+.pageview-base.ready {
+  opacity: 1;
+}
+
+.pageview-detail {
+  position: absolute;
+  top: 0;
+  left: 0;
 }
 
 .page-number {
@@ -593,36 +640,38 @@ body {
   height: 30px;
 }
 
-.full-strip {
+/* The page viewport: clips the (possibly zoomed) page, which it centers. */
+.full-stage {
   position: absolute;
   inset: 0;
   display: flex;
-  overflow-x: auto;
-  overflow-y: hidden;
-  scroll-snap-type: x mandatory;
-}
-
-.full-strip::-webkit-scrollbar {
-  display: none;
-}
-
-.full-slide {
-  flex: 0 0 100%;
-  display: flex;
   align-items: center;
   justify-content: center;
-  scroll-snap-align: center;
-  scroll-snap-stop: always;
+  overflow: hidden;
+  touch-action: none;
+}
+
+.full-stage.pannable {
+  cursor: grab;
 }
 
 .full-page {
   position: relative;
+  flex: none; /* keep the inline width/height; never shrink to fit */
   background: var(--surface);
-  border-radius: 10px;
+  border-radius: 4px;
   overflow: hidden;
-  box-shadow:
-    0 2px 6px rgba(20, 20, 24, 0.08),
-    0 18px 60px rgba(20, 20, 24, 0.16);
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.35);
+  animation: full-page-in 0.18s ease;
+}
+
+@keyframes full-page-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
 }
 
 .full-nav {
