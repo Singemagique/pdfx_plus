@@ -1,5 +1,5 @@
 appId: com.pdfx.app
-productName: PDFX
+productName: PDFx
 directories:
   buildResources: build
 files:

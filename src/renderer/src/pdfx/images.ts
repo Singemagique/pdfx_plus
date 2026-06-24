@@ -18,35 +18,37 @@ function isJpeg(data: Uint8Array): boolean {
   return data[0] === 0xff && data[1] === 0xd8
 }
 
-/** Sniff PNG/JPEG by magic bytes, for files without a telling extension. */
 export function isImageBytes(data: Uint8Array): boolean {
   return isPng(data) || isJpeg(data)
 }
 
-// Copy into a fresh ArrayBuffer-backed array: Uint8Array<ArrayBufferLike>
-// (e.g. straight off IPC) isn't assignable to BlobPart under TS 5.8.
 function toBlob(data: Uint8Array): Blob {
   return new Blob([new Uint8Array(data)])
 }
 
+// Guard against image decompression bombs: a small, highly-compressed file can
+// decode to enormous pixel dimensions and exhaust renderer memory.
+const MAX_IMAGE_PIXELS = 100 * 1024 * 1024 // 100 MP cap on a directly-embedded image
+const MAX_RASTER_DIM = 8192 // px on the longest edge when re-encoding through a canvas
+
+// PNG IHDR stores width/height as big-endian uint32 at byte offsets 16 and 20.
+function pngSize(data: Uint8Array): { width: number; height: number } | null {
+  if (data.length < 24 || !isPng(data)) return null
+  const dv = new DataView(data.buffer, data.byteOffset, data.byteLength)
+  return { width: dv.getUint32(16), height: dv.getUint32(20) }
+}
+
 async function rasterToPng(bitmap: ImageBitmap): Promise<Uint8Array> {
+  const scale = Math.min(1, MAX_RASTER_DIM / Math.max(bitmap.width, bitmap.height))
   const canvas = document.createElement('canvas')
-  canvas.width = bitmap.width
-  canvas.height = bitmap.height
-  canvas.getContext('2d')!.drawImage(bitmap, 0, 0)
+  canvas.width = Math.max(1, Math.round(bitmap.width * scale))
+  canvas.height = Math.max(1, Math.round(bitmap.height * scale))
+  canvas.getContext('2d')!.drawImage(bitmap, 0, 0, canvas.width, canvas.height)
   const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, 'image/png'))
   if (!blob) throw new Error('PNG encoding failed')
   return new Uint8Array(await blob.arrayBuffer())
 }
 
-/**
- * Wrap an image in a one-page PDF. PNG/JPEG bytes embed as-is; everything
- * else the browser can decode (webp, gif, …) is rasterized to PNG first.
- *
- * Without `pageSize` the page takes the image's natural dimensions (1px =
- * 1pt). With `pageSize` the image is fit-contain, centered — used when
- * pasting into an existing document to match the neighboring page.
- */
 export async function imageToPdf(
   data: Uint8Array,
   pageSize?: { width: number; height: number }
@@ -54,10 +56,12 @@ export async function imageToPdf(
   const doc = await PDFDocument.create()
   let image
   if (isPng(data)) {
+    const dim = pngSize(data)
+    if (dim && dim.width * dim.height > MAX_IMAGE_PIXELS) {
+      throw new Error('Image is too large to import')
+    }
     image = await doc.embedPng(data)
   } else if (isJpeg(data)) {
-    // pdf-lib ignores EXIF orientation; if the browser's oriented decode has
-    // different dimensions, the JPEG is rotated — rasterize it instead.
     const oriented = await createImageBitmap(toBlob(data))
     const raw = await createImageBitmap(toBlob(data), { imageOrientation: 'none' })
     const rotated = oriented.width !== raw.width

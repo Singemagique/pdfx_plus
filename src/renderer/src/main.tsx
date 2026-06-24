@@ -5,8 +5,6 @@ import workerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
 import App from './App'
 import './styles.css'
 
-// pdf.js 5.5 uses Map.prototype.getOrInsert(Computed), which Electron's
-// Chromium doesn't ship yet — polyfill both before any pdf.js call.
 const mapProto = Map.prototype as unknown as Record<string, unknown>
 if (typeof mapProto.getOrInsertComputed !== 'function') {
   mapProto.getOrInsertComputed = function (

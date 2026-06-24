@@ -5,3 +5,17 @@ out
 .DS_Store
 *.tsbuildinfo
 .smoke
+
+# Generated native build tree (node-gyp output; rebuilt by `yarn build:native` on postinstall).
+# Keeping it untracked avoids committing compiled binaries and leaking local absolute paths.
+native/build/
+
+# Secrets / credentials — never commit these.
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+*.mobileprovision

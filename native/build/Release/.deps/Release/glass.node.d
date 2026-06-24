@@ -1,1 +1,0 @@
-cmd_Release/glass.node := c++ -bundle -framework AppKit -framework QuartzCore -undefined dynamic_lookup -Wl,-search_paths_first -mmacosx-version-min=10.15 -arch x86_64 -L./Release -stdlib=libc++  -o Release/glass.node Release/obj.target/glass/src/glass.o Release/nothing.a 

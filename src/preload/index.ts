@@ -1,8 +1,9 @@
-import { contextBridge, ipcRenderer } from 'electron'
+import { contextBridge, ipcRenderer, webUtils } from 'electron'
 
 export interface OpenedFile {
   name: string
   data: Uint8Array
+  path?: string
 }
 
 export type ZoomAction = 'in' | 'out' | 'reset'
@@ -23,6 +24,16 @@ const api = {
     ipcRenderer.invoke('pdfx:read-clipboard-image'),
   readClipboardFiles: (): Promise<OpenedFile[]> => ipcRenderer.invoke('pdfx:read-clipboard-files'),
   clearClipboard: (): Promise<void> => ipcRenderer.invoke('pdfx:clipboard-clear'),
+  getPathForFile: (file: File): string => webUtils.getPathForFile(file),
+  expandDropPaths: (paths: string[]): Promise<OpenedFile[]> =>
+    ipcRenderer.invoke('pdfx:expand-drop-paths', paths),
+  readResource: (
+    htmlPath: string,
+    ref: string
+  ): Promise<{ data: Uint8Array; mime: string } | null> =>
+    ipcRenderer.invoke('pdfx:read-resource', htmlPath, ref),
+  markupToPdf: (html: string, fitPageHeightPx?: number): Promise<Uint8Array> =>
+    ipcRenderer.invoke('pdfx:markup-to-pdf', html, fitPageHeightPx),
   writeFile: (path: string, data: Uint8Array): Promise<string> =>
     ipcRenderer.invoke('pdfx:write-file', path, data),
   openFiles: (): Promise<OpenedFile[]> => ipcRenderer.invoke('pdfx:open-files'),
@@ -55,6 +66,6 @@ if (process.contextIsolated) {
     console.error(error)
   }
 } else {
-  // @ts-ignore (define in d.ts)
+  // @ts-ignore
   window.api = api
 }

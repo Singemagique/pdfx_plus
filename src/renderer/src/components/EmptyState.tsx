@@ -1,12 +1,13 @@
 interface EmptyStateProps {
   busy: boolean
+  dragging?: boolean
   onOpen: () => void
 }
 
-export function EmptyState({ busy, onOpen }: EmptyStateProps): React.JSX.Element {
+export function EmptyState({ busy, dragging, onOpen }: EmptyStateProps): React.JSX.Element {
   return (
     <div className="empty-state">
-      <div className="empty-card">
+      <div className={'empty-card' + (dragging ? ' drag-active' : '')}>
         <div className="empty-glyph" aria-hidden="true">
           <svg
             width="40"
@@ -23,14 +24,9 @@ export function EmptyState({ busy, onOpen }: EmptyStateProps): React.JSX.Element
             <path d="M5 21h14" />
           </svg>
         </div>
-        <h1>{busy ? 'Loading…' : 'Drop PDFs here'}</h1>
-        <p>
-          Each document flows horizontally, the collection stacks vertically.
-          <br />
-          Export everything as a single <code>.pdfx</code> file — still a valid PDF.
-        </p>
+        <h1>{busy ? 'Loading…' : 'Drop files here'}</h1>
         <button className="btn ghost" onClick={onOpen} disabled={busy}>
-          Browse files
+          Browse…
         </button>
       </div>
     </div>

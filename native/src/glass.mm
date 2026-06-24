@@ -19,6 +19,18 @@
 #import <napi.h>
 #include <cstring>
 
+// A backdrop container that never intercepts mouse events. Returning nil from
+// -hitTest: keeps the glass (and this container) out of the event path, so
+// toggling DevTools — which can momentarily reorder the window's subviews —
+// can never leave the backdrop on top swallowing clicks or inspector targeting.
+@interface PDFXBackdropView : NSView
+@end
+@implementation PDFXBackdropView
+- (NSView *)hitTest:(NSPoint)point {
+    return nil;
+}
+@end
+
 // NSGlassEffectView only exists on macOS 26 (Tahoe) and later.
 static Class glassEffectViewClass() {
     return NSClassFromString(@"NSGlassEffectView");
@@ -102,11 +114,19 @@ static Napi::Value ApplyGlass(const Napi::CallbackInfo &info) {
     configureWindowStyle(window);
 
     NSView *contentView = [window contentView];
-    NSView *glass = createGlassView(contentView.bounds);
-    // Track the content view's size so the backdrop always fills the window.
+
+    // Wrap the glass in a non-interactive container so the backdrop stays out of
+    // the mouse event path even if DevTools toggling reorders the subviews.
+    PDFXBackdropView *backdrop = [[PDFXBackdropView alloc] initWithFrame:contentView.bounds];
+    [backdrop setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
+
+    NSView *glass = createGlassView(backdrop.bounds);
+    // Track the container's size so the backdrop always fills the window.
     [glass setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
+    [backdrop addSubview:glass];
+
     // Positioned below the web contents view so the page renders on top.
-    [contentView addSubview:glass positioned:NSWindowBelow relativeTo:nil];
+    [contentView addSubview:backdrop positioned:NSWindowBelow relativeTo:nil];
 
     return env.Undefined();
 }

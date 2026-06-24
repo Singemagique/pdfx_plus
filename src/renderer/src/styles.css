@@ -1,11 +1,7 @@
 :root {
-  /* Dark is the default. The prefers-color-scheme: light block below restores
-     the light palette when the system is set to light, so the whole UI — and
-     the native macOS glass backdrop behind it — tracks the system appearance
-     live. */
   color-scheme: dark light;
 
-  --surface: #ffffff; /* PDF pages are white in both themes */
+  --surface: #ffffff;
   --ink: rgba(255, 255, 245, 0.92);
   --ink-soft: rgba(255, 255, 245, 0.6);
   --ink-faint: rgba(255, 255, 245, 0.4);
@@ -15,10 +11,10 @@
   --accent-hover: #ffffff;
   --select: #74a9ff;
   --hover: rgba(255, 255, 255, 0.08);
-  --group-bg: rgba(255, 255, 255, 0.05); /* subtle per-document card */
-  --control: rgba(255, 255, 255, 0.12); /* floating controls over full view */
+  --group-bg: rgba(255, 255, 255, 0.05);
+  --control: rgba(255, 255, 255, 0.12);
   --overlay: rgba(18, 18, 20, 0.72);
-  --overlay-strong: #131316; /* opaque focused-viewer backdrop */
+  --overlay-strong: #131316;
   --scrollbar-thumb: rgba(255, 255, 255, 0.18);
   --scrollbar-thumb-hover: rgba(255, 255, 255, 0.3);
   --radius: 10px;
@@ -62,9 +58,6 @@ body,
 body {
   font-family:
     -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Inter', 'Helvetica Neue', Arial, sans-serif;
-  /* Transparent so the native macOS liquid-glass backdrop shows through. On
-     other platforms the BrowserWindow's solid backgroundColor (--bg) paints
-     behind this instead. */
   background: transparent;
   color: var(--ink);
   -webkit-font-smoothing: antialiased;
@@ -79,12 +72,7 @@ body {
   height: 100%;
 }
 
-/* ---------- Toolbar ---------- */
-
 .toolbar {
-  /* Floats over the content so the scroll area spans the full window height
-     and content scrolls underneath, dissolving into the toolbar (see .content
-     mask). Stays a drag handle; the native window is also movable-by-background. */
   position: absolute;
   top: 0;
   left: 0;
@@ -95,7 +83,6 @@ body {
   gap: 14px;
   height: 56px;
   padding: 0 20px;
-  /* No background or divider — the toolbar reads end-to-end over the glass. */
   -webkit-app-region: drag;
 }
 
@@ -107,13 +94,8 @@ body {
   -webkit-app-region: no-drag;
 }
 
-.brand {
-  font-size: 14px;
-  font-weight: 700;
-  letter-spacing: 0.22em;
-}
-
 .toolbar-meta {
+  margin-left: 16px;
   font-size: 12.5px;
   color: var(--ink-faint);
   font-variant-numeric: tabular-nums;
@@ -153,8 +135,6 @@ body {
 .zoom-value:hover {
   background: var(--hover);
 }
-
-/* ---------- Buttons ---------- */
 
 .btn {
   font-family: inherit;
@@ -198,6 +178,53 @@ body {
   background: var(--hover);
 }
 
+/* Pill buttons with a liquid-glass gradient bezel (the masked ::before). The
+   fill is transparent; only a faint background appears on hover, instantly.
+   No backdrop-filter: on the transparent macOS window it would break the
+   -webkit-app-region drag regions. */
+.btn.glass {
+  position: relative;
+  border-radius: 999px;
+  color: var(--ink);
+  background: transparent;
+  transition: none;
+  -webkit-app-region: no-drag;
+}
+
+.btn.glass:hover:not(:disabled) {
+  background: var(--hover);
+}
+
+.btn.glass::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 1px;
+  background: linear-gradient(
+    to bottom left,
+    rgba(255, 255, 255, 0.3),
+    rgba(255, 255, 255, 0.05),
+    rgba(255, 255, 255, 0.2)
+  );
+  -webkit-mask:
+    linear-gradient(#fff 0 0) content-box,
+    linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  pointer-events: none;
+}
+
+/* In light mode the white bezel all but vanishes, so lift the glass pills off the
+   page with a soft, oversized shadow to give them depth. */
+@media (prefers-color-scheme: light) {
+  .btn.glass {
+    box-shadow:
+      0 10px 28px rgba(20, 20, 24, 0.16),
+      0 2px 6px rgba(20, 20, 24, 0.08);
+  }
+}
+
 .icon-btn {
   display: inline-flex;
   align-items: center;
@@ -224,17 +251,18 @@ body {
   cursor: default;
 }
 
-/* ---------- Content / document grid ---------- */
-
-/* The free-floating canvas: a clipping viewport over a pan/zoom world. */
 .canvas-viewport {
   position: relative;
   flex: 1;
   overflow: hidden;
   cursor: grab;
-  /* Content dissolves into the floating toolbar at the very top. */
-  mask-image: linear-gradient(to bottom, transparent 0, transparent 28px, #000 76px);
-  -webkit-mask-image: linear-gradient(to bottom, transparent 0, transparent 28px, #000 76px);
+  mask-image: linear-gradient(to bottom, rgba(0, 0, 0, 0.1) 0, rgba(0, 0, 0, 0.1) 28px, #000 76px);
+  -webkit-mask-image: linear-gradient(
+    to bottom,
+    rgba(0, 0, 0, 0.1) 0,
+    rgba(0, 0, 0, 0.1) 28px,
+    #000 76px
+  );
 }
 
 .canvas-viewport.panning {
@@ -246,37 +274,50 @@ body {
   top: 0;
   left: 0;
   transform-origin: 0 0;
-  /* will-change is toggled on only while moving (see Canvas.tsx) so the layer
-     re-rasterizes crisply at rest instead of being GPU-upscaled. */
 }
 
-/* One document, placed at its world coordinates by the layout. */
 .canvas-doc {
   position: absolute;
+  transition: transform 0.2s cubic-bezier(0.2, 0, 0, 1);
 }
 
-/* Each document reads as a simple, roomy group/card. */
+.app.committing .canvas-doc {
+  transition: none;
+}
+
 .doc-row {
   width: 100%;
-  padding: 10px 16px 14px;
+  padding: 52px 16px 14px;
   background: var(--group-bg);
   border-radius: 24px;
 }
 
-/* A plain label that's part of the card. Its metrics are counter-scaled by
-   1/zoom (when zoomed in) so the title stays a constant, crisp size instead of
-   growing pixelated with the canvas; --label cascades to the children below.
-   At zoom < 1 it scales down with the world (--label clamps to 1). */
+.canvas-overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  transform-origin: 0 0;
+  pointer-events: none;
+}
+
+.overlay-header-slot {
+  position: absolute;
+  transition: transform 0.2s cubic-bezier(0.2, 0, 0, 1);
+}
+
 .doc-header {
-  --label: calc(1 / max(var(--zoom, 1), 1));
   display: flex;
-  align-items: baseline;
-  gap: calc(10px * var(--label));
-  padding: calc(4px * var(--label)) calc(6px * var(--label)) calc(12px * var(--label));
+  align-items: center;
+  gap: 10px;
+  padding: 4px 6px;
+  pointer-events: auto;
+  transform: scale(calc(1 / max(var(--k, 1), 1)));
+  transform-origin: bottom left;
+  white-space: nowrap;
 }
 
 .doc-index {
-  font-size: calc(11px * var(--label));
+  font-size: 17px;
   font-weight: 600;
   color: var(--ink-faint);
   font-variant-numeric: tabular-nums;
@@ -284,48 +325,72 @@ body {
 }
 
 .doc-name {
-  font-size: calc(13.5px * var(--label));
+  font-size: 17px;
   font-weight: 600;
   color: var(--ink);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  max-width: 50%;
+  max-width: 320px;
+  padding: 2px 6px;
+  border-radius: 6px;
+  cursor: text;
+}
+
+.doc-name:hover {
+  background: var(--hover);
+}
+
+/* The rename field reuses .doc-name so it stays visually identical. */
+.doc-name-input {
+  font-family: inherit;
+  background: var(--hover);
+  border: none;
+  outline: none;
+  min-width: 80px;
 }
 
 .doc-pages {
-  font-size: calc(12px * var(--label));
+  font-size: 12px;
   color: var(--ink-faint);
   font-variant-numeric: tabular-nums;
+}
+
+/* In light mode --ink-faint (#8e8e94) is too washed-out against the page, so the
+   index and page-count labels barely register. Lift them to --ink-soft so the
+   header reads clearly. */
+@media (prefers-color-scheme: light) {
+  .doc-index,
+  .doc-pages {
+    color: var(--ink-soft);
+  }
 }
 
 .doc-actions {
   display: flex;
   align-items: center;
-  gap: calc(2px * var(--label));
+  gap: 2px;
   margin-left: auto;
   align-self: center;
   opacity: 0;
   transition: opacity 0.15s ease;
 }
 
-/* Keep the header's action buttons the same constant size as its text. */
 .doc-header .icon-btn {
-  width: calc(26px * var(--label));
-  height: calc(26px * var(--label));
-  border-radius: calc(6px * var(--label));
+  width: 26px;
+  height: 26px;
+  border-radius: 6px;
 }
 
 .doc-header .icon-btn svg {
-  width: calc(14px * var(--label));
-  height: calc(14px * var(--label));
+  width: 14px;
+  height: 14px;
 }
 
-.doc-row:hover .doc-actions {
+.doc-header:hover .doc-actions {
   opacity: 1;
 }
 
-/* No scroll — the canvas pans/zooms the whole world; let shadows/outlines show. */
 .page-strip {
   overflow: visible;
 }
@@ -345,10 +410,6 @@ body {
   box-shadow: var(--page-shadow);
   overflow: hidden;
   cursor: pointer;
-  /* Animates the insertion gap that opens while a foreign page hovers. */
-  transition:
-    margin-left 0.18s ease,
-    margin-right 0.18s ease;
 }
 
 .page.selected {
@@ -356,8 +417,147 @@ body {
   outline-offset: 2px;
 }
 
-.page.dragging {
-  opacity: 0.35;
+.page.collapsing {
+  box-shadow: none;
+}
+
+.page.ghost {
+  background: var(--hover);
+  border: 1.5px dashed var(--ink-faint);
+  box-shadow: none;
+  cursor: default;
+  pointer-events: none;
+}
+
+.page.ghost.grow {
+  animation: ghost-grow 0.18s cubic-bezier(0.2, 0, 0, 1);
+}
+
+@keyframes ghost-grow {
+  from {
+    width: 0;
+    opacity: 0;
+  }
+}
+
+/* Inline-SVG dashed border with a wider dash gap than CSS `border: dashed` allows;
+   sized to its host by the DashedBorder component. Shared by both add affordances. */
+.dashed-border {
+  position: absolute;
+  top: 0;
+  left: 0;
+  pointer-events: none;
+  overflow: visible;
+}
+
+.dashed-border rect {
+  stroke: var(--ink-faint);
+  transition: stroke 0.15s ease;
+}
+
+/* Shared interior of both "add" ghosts: the dashed page-like target holding the
+   centered + and label, over a subtle fill matching the drop ghosts. */
+.add-ghost {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  flex-shrink: 0;
+  font-family: inherit;
+  color: var(--ink-faint);
+  background: var(--hover);
+  border: none;
+  border-radius: 10px;
+  overflow: hidden;
+  cursor: pointer;
+}
+
+.add-label {
+  font-size: 13px;
+  font-weight: 500;
+}
+
+/* The "Add page" ghost lives in every row's reserved trailing slot, revealed on hover. */
+.page.add-page {
+  box-shadow: none;
+  pointer-events: auto;
+  opacity: 0;
+  transition:
+    opacity 0.15s ease,
+    color 0.15s ease;
+}
+
+.doc-row:hover .page.add-page {
+  opacity: 1;
+}
+
+.add-ghost:hover {
+  color: var(--ink);
+}
+
+.add-ghost:hover .dashed-border rect {
+  stroke: var(--ink-soft);
+}
+
+/* Hidden while a drag is in flight so it never competes with the drop ghosts. */
+.app.dragging .page.add-page {
+  display: none;
+}
+
+/* Persistent, transparent "Add document" row after the last document: a dashed
+   outline (drawn by DashedBorder) holding one always-visible ghost page. The padding
+   places that page where a real first page sits — keep in sync with ROW_PAD_Y. */
+.add-doc-row {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  justify-content: flex-start;
+  padding: 52px 22px 14px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+}
+
+.add-doc-row:hover .dashed-border rect {
+  stroke: var(--ink-soft);
+}
+
+.add-doc-page {
+  transition: color 0.15s ease;
+}
+
+.add-doc-row:hover .add-doc-page {
+  color: var(--ink);
+}
+
+/* Suppressed mid-drag so it never collides with the between-document drop ghost. */
+.app.dragging .add-doc-row {
+  display: none;
+}
+
+.ghost-doc {
+  pointer-events: none;
+  animation: ghost-row-in 0.2s ease;
+  transition: top 0.2s cubic-bezier(0.2, 0, 0, 1);
+}
+
+.doc-row.ghost {
+  padding: 42px 16px 14px;
+}
+
+.ghost-strip {
+  display: flex;
+  gap: 18px;
+  padding: 0 6px;
+  width: max-content;
+}
+
+@keyframes ghost-row-in {
+  from {
+    opacity: 0;
+  }
 }
 
 .page-canvas {
@@ -372,8 +572,6 @@ body {
   opacity: 1;
 }
 
-/* Two-layer page rendering: a low-res full-page base + a crisp visible-region
-   detail layer on top (see PageView). */
 .pageview {
   position: absolute;
   inset: 0;
@@ -417,8 +615,6 @@ body {
   opacity: 1;
 }
 
-/* ---------- Compact mode (zoomed-out overview) ---------- */
-
 .doc-list.compact {
   gap: 10px;
   padding-top: 80px;
@@ -460,8 +656,6 @@ body {
   display: none;
 }
 
-/* Thin scrollbars */
-
 .page-strip::-webkit-scrollbar {
   height: 8px;
 }
@@ -487,8 +681,6 @@ body {
 .content::-webkit-scrollbar-track {
   background: transparent;
 }
-
-/* ---------- Add row ---------- */
 
 .add-row {
   margin: 4px 14px 0;
@@ -518,8 +710,6 @@ body {
   cursor: default;
 }
 
-/* ---------- Empty state ---------- */
-
 .empty-state {
   height: 100%;
   display: flex;
@@ -545,72 +735,65 @@ body {
 }
 
 .empty-card h1 {
-  font-size: 17px;
+  font-size: 30px;
   font-weight: 600;
-  letter-spacing: -0.01em;
-}
-
-.empty-card p {
-  font-size: 13px;
-  line-height: 1.65;
-  color: var(--ink-soft);
-}
-
-.empty-card code {
-  font-family: ui-monospace, 'SF Mono', Menlo, monospace;
-  font-size: 12px;
-  background: var(--hover);
-  border-radius: 4px;
-  padding: 1px 5px;
+  letter-spacing: -0.02em;
 }
 
 .empty-card .btn {
   margin-top: 6px;
 }
 
-/* ---------- Drag overlay ---------- */
-
-.drop-overlay {
-  position: fixed;
-  inset: 10px;
-  z-index: 10;
+.empty-drop-stage {
+  position: absolute;
+  inset: 56px 0 0;
   display: flex;
   align-items: center;
   justify-content: center;
-  background: var(--overlay);
-  backdrop-filter: blur(2px);
-  border: 2px dashed var(--ink);
-  border-radius: 16px;
   pointer-events: none;
 }
 
-.drop-overlay-card {
-  font-size: 15px;
-  font-weight: 600;
-  background: var(--accent);
-  color: var(--accent-ink);
-  padding: 10px 22px;
-  border-radius: 999px;
-  box-shadow: 0 8px 28px rgba(20, 20, 24, 0.25);
+.empty-card {
+  transition: opacity 0.15s ease;
 }
 
-/* ---------- Full view ---------- */
+.empty-card.drag-active {
+  opacity: 0;
+}
 
 .full-view {
   position: fixed;
   inset: 0;
   z-index: 30;
-  background: var(--overlay-strong);
-  animation: full-view-in 0.16s ease;
+  /* The slice view stays dark in both themes so the focused page pops off the
+     backdrop. Pin the foreground + backdrop tokens to their dark-mode values
+     locally, so the chrome (title, close, nav, counter) reads light regardless
+     of the system light/dark setting. */
+  --ink: rgba(255, 255, 245, 0.92);
+  --ink-soft: rgba(255, 255, 245, 0.6);
+  --ink-faint: rgba(255, 255, 245, 0.4);
+  --hover: rgba(255, 255, 255, 0.08);
+  --control: rgba(255, 255, 255, 0.12);
+  --overlay-strong: #131316;
 }
 
-@keyframes full-view-in {
-  from {
-    opacity: 0;
-  }
-  to {
-    opacity: 1;
-  }
+.full-backdrop {
+  position: absolute;
+  inset: 0;
+  background: var(--overlay-strong);
+  transition: opacity 0.3s ease;
+}
+
+.full-chrome {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  transition: opacity 0.3s ease;
+}
+
+.full-chrome .icon-btn,
+.full-chrome .full-nav {
+  pointer-events: auto;
 }
 
 .full-bar {
@@ -640,38 +823,78 @@ body {
   height: 30px;
 }
 
-/* The page viewport: clips the (possibly zoomed) page, which it centers. */
-.full-stage {
+/* Native scroll-snap drives navigation: the outer scroller pages through documents
+   (vertical), each .full-doc is an inner scroller paging through its pages
+   (horizontal). The browser owns momentum, axis routing, and snapping, so direction
+   changes and re-scrolls are instant. Scrollbars are hidden. */
+.full-scroll {
   position: absolute;
   inset: 0;
+  overflow-x: hidden;
+  overflow-y: scroll;
+  scroll-snap-type: y mandatory;
+  overscroll-behavior: contain;
+  scrollbar-width: none;
+}
+
+.full-scroll::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
+
+/* Zoomed: freeze the scrollers so the page can be panned via transform instead. */
+.full-scroll.locked,
+.full-scroll.locked .full-doc {
+  overflow: hidden;
+  scroll-snap-type: none;
+}
+
+.full-scroll.pannable {
+  cursor: grab;
+}
+
+.full-doc {
+  position: relative;
+  height: 100%;
+  display: flex;
+  gap: 24px;
+  overflow-x: scroll;
+  overflow-y: hidden;
+  scroll-snap-type: x mandatory;
+  scroll-snap-align: start;
+  /* Contain horizontal overscroll (no back-swipe) but let vertical wheel deltas
+     pass up to the outer scroller so up/down still moves between documents. */
+  overscroll-behavior-x: contain;
+  scrollbar-width: none;
+}
+
+.full-doc::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
+
+/* The 24px breathing room that makes a move to a different document visible. */
+.full-doc:not(:last-child) {
+  margin-bottom: 24px;
+}
+
+.full-slide {
+  flex: 0 0 100%;
+  width: 100%;
+  height: 100%;
   display: flex;
   align-items: center;
   justify-content: center;
-  overflow: hidden;
-  touch-action: none;
-}
-
-.full-stage.pannable {
-  cursor: grab;
+  scroll-snap-align: start;
 }
 
 .full-page {
   position: relative;
-  flex: none; /* keep the inline width/height; never shrink to fit */
+  flex: none;
   background: var(--surface);
   border-radius: 4px;
   overflow: hidden;
   box-shadow: 0 10px 40px rgba(0, 0, 0, 0.35);
-  animation: full-page-in 0.18s ease;
-}
-
-@keyframes full-page-in {
-  from {
-    opacity: 0;
-  }
-  to {
-    opacity: 1;
-  }
 }
 
 .full-nav {
@@ -732,8 +955,6 @@ body {
   padding: 4px 12px;
   box-shadow: 0 1px 6px rgba(20, 20, 24, 0.1);
 }
-
-/* ---------- Toast ---------- */
 
 .toast {
   position: fixed;
