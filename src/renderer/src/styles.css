@@ -928,6 +928,33 @@ body {
   user-select: none;
 }
 
+.ov-text {
+  position: absolute;
+  pointer-events: none;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow: hidden;
+}
+
+.ov-textedit {
+  position: absolute;
+  z-index: 3;
+  pointer-events: auto;
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--select);
+  outline: none;
+  background: rgba(255, 255, 255, 0.92);
+  resize: none;
+  overflow: hidden;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.overlay-layer.placing {
+  cursor: text;
+}
+
 .ov-draft-rect {
   position: absolute;
   pointer-events: none;

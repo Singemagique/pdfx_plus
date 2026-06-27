@@ -30,6 +30,14 @@ function ToolIcon({ kind }: { kind: ToolKind }): React.JSX.Element {
         <rect x="6" y="4" width="12" height="9" rx="2" />
       </svg>
     )
+  if (kind === 'text')
+    return (
+      <svg {...common}>
+        <path d="M5 6V5h14v1" />
+        <path d="M12 5v14" />
+        <path d="M9.5 19h5" />
+      </svg>
+    )
   return (
     <svg {...common}>
       <path d="M3 21l4-1 11-11a2.8 2.8 0 0 0-4-4L3 16z" />
@@ -41,7 +49,8 @@ function ToolIcon({ kind }: { kind: ToolKind }): React.JSX.Element {
 const TOOLS: { kind: ToolKind; label: string }[] = [
   { kind: 'browse', label: 'Browse' },
   { kind: 'highlight', label: 'Highlight' },
-  { kind: 'ink', label: 'Draw' }
+  { kind: 'ink', label: 'Draw' },
+  { kind: 'text', label: 'Text' }
 ]
 
 export function EditTools(): React.JSX.Element {
@@ -96,6 +105,8 @@ export function EditTools(): React.JSX.Element {
   // Undo/redo keyboard shortcuts while the editor surface (full view) is mounted.
   useEffect(() => {
     const onKey = (e: KeyboardEvent): void => {
+      const t = e.target as HTMLElement | null
+      if (t && (t.tagName === 'TEXTAREA' || t.tagName === 'INPUT' || t.isContentEditable)) return
       if (!(e.metaKey || e.ctrlKey) || e.key.toLowerCase() !== 'z') return
       e.preventDefault()
       if (e.shiftKey) redo()
