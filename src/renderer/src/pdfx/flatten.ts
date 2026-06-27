@@ -2,9 +2,10 @@
 // shows them (PRD §4.4). Geometry is already in PDF points (origin bottom-left), so it
 // maps straight onto pdf-lib's draw API.
 //
-// `redaction` and `formValue` overlays are NOT handled here: redaction is applied by the
-// external PDFium pre-pass before re-assembly (§4.5) and form values go through pdf-lib's
-// AcroForm API + form.flatten(). flattenPageOverlays skips them.
+// `redaction` is NOT handled here: it is applied by the external PDFium pre-pass before
+// re-assembly (§4.5). `formValue` IS handled — the filled value is painted over its AcroForm
+// field rectangle (text, or an X for a checked box); the original interactive widget is left in
+// place underneath. flattenPageOverlays skips only redaction.
 
 import {
   PDFDocument,
@@ -196,6 +197,40 @@ function drawShape(page: PDFPage, o: Extract<Overlay, { type: 'shape' }>): void 
   }
 }
 
+/**
+ * Paint a filled form value over its field rectangle. Booleans render as an X (a checked box);
+ * strings render as left-aligned text vertically centred in the field, auto-sized to its height
+ * and wrapped across lines on explicit newlines.
+ */
+async function drawFormValue(
+  page: PDFPage,
+  o: Extract<Overlay, { type: 'formValue' }>,
+  res: FlattenResources
+): Promise<void> {
+  const { x, y, w, h } = o.geom
+  if (typeof o.value === 'boolean') {
+    if (!o.value) return
+    const pad = Math.min(w, h) * 0.22
+    const t = Math.max(1, Math.min(w, h) * 0.12)
+    const c = rgb(0.1, 0.1, 0.12)
+    page.drawLine({ start: { x: x + pad, y: y + pad }, end: { x: x + w - pad, y: y + h - pad }, thickness: t, color: c }) // prettier-ignore
+    page.drawLine({ start: { x: x + pad, y: y + h - pad }, end: { x: x + w - pad, y: y + pad }, thickness: t, color: c }) // prettier-ignore
+    return
+  }
+  if (!o.value) return
+  const font = await res.getFont('Helvetica')
+  const lines = String(o.value).split('\n')
+  const size = Math.min(12, Math.max(6, (h / Math.max(lines.length, 1)) * 0.7))
+  const lineHeight = size * 1.18
+  const color = rgb(0.1, 0.1, 0.12)
+  // Top baseline so the block sits centred-ish in the field; clamp into the box.
+  let baseline = y + h - (h - lines.length * lineHeight) / 2 - size
+  for (const line of lines) {
+    page.drawText(line, { x: x + 2, y: Math.max(y + 2, baseline), size, font, color })
+    baseline -= lineHeight
+  }
+}
+
 /** Bake every drawable overlay for one page, in z-order. Overlays must be pre-sorted. */
 export async function flattenPageOverlays(
   page: PDFPage,
@@ -237,9 +272,11 @@ export async function flattenPageOverlays(
           drawInk(page, o.paths, 1.5, { r: 0, g: 0, b: 0 }, opacity || 1)
         }
         break
-      case 'redaction':
       case 'formValue':
-        // Handled outside the draw pass (see file header).
+        await drawFormValue(page, o, res)
+        break
+      case 'redaction':
+        // Applied by the external PDFium pre-pass, not the draw pass (see file header).
         break
     }
   }

@@ -282,6 +282,45 @@ describe('buildPdf', () => {
   })
 })
 
+describe('formValue flatten', () => {
+  const formValue = (pageKey: string, field: string, value: string | boolean): Overlay => ({
+    id: `fv-${field}`,
+    pageKey,
+    z: 0,
+    createdAt: 0,
+    geom: { x: 20, y: 20, w: 120, h: 16, rotation: 0, opacity: 1 },
+    type: 'formValue',
+    field,
+    value
+  })
+  const flattenWith = async (overlay: Overlay): Promise<string> => {
+    const bytes = await makeSourcePdf()
+    const editLayer: EditLayer = {
+      overlays: new Map([[makePageKey('a', 0), [overlay]]]),
+      attachments: new Map()
+    }
+    const out = await buildPdf([{ bytes, sourceKey: 'a', pageIndex: 0 }], editLayer)
+    return pageContent(await PDFDocument.load(out), 0)
+  }
+
+  it('paints a text form value over its field', async () => {
+    // pdf-lib writes show-text as a hex string, e.g. "Ada" -> <416461> Tj.
+    const hex = [...'Ada'].map((c) => c.charCodeAt(0).toString(16).padStart(2, '0')).join('')
+    const content = await flattenWith(formValue(makePageKey('a', 0), 'name', 'Ada'))
+    expect(content).toContain(`<${hex}> Tj`)
+  })
+
+  it('draws nothing for an empty text value', async () => {
+    expect(await flattenWith(formValue(makePageKey('a', 0), 'name', ''))).not.toContain('Tj')
+  })
+
+  it('paints a checkbox mark only when checked', async () => {
+    const checked = await flattenWith(formValue(makePageKey('a', 0), 'agree', true))
+    const unchecked = await flattenWith(formValue(makePageKey('a', 0), 'agree', false))
+    expect(checked.length).toBeGreaterThan(unchecked.length) // the X adds stroke operators
+  })
+})
+
 describe('format helpers', () => {
   it('stripExtension removes only .pdf/.pdfx (case-insensitive)', () => {
     expect(stripExtension('Contract.pdf')).toBe('Contract')

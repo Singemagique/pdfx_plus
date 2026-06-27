@@ -80,6 +80,33 @@ export function clientToPdfRotated(
   return { x: (lx / box.w) * page.width, y: (1 - ly / box.h) * page.height }
 }
 
+/**
+ * Map a rectangle from a page's UNROTATED user space (e.g. a pdf.js annotation `/Rect`) into the
+ * rotation-baked "visual" space the overlay model lives in, given the visual page dims (`vw`,`vh`)
+ * and the page's intrinsic `/Rotate`. This is the inverse of the export-side unrotateCrop /
+ * intrinsicMatrix, so a form-field geom built from an annotation rect lines up with geomToCss in
+ * the editor and with the flatten rotation transform on export. A no-op for unrotated pages.
+ */
+export function rectToVisual(
+  g: { x: number; y: number; w: number; h: number },
+  rotate: number,
+  vw: number,
+  vh: number
+): { x: number; y: number; w: number; h: number } {
+  const wu = rotate === 90 || rotate === 270 ? vh : vw // unrotated width
+  const hu = rotate === 90 || rotate === 270 ? vw : vh // unrotated height
+  switch (((rotate % 360) + 360) % 360) {
+    case 90:
+      return { x: g.y, y: wu - g.x - g.w, w: g.h, h: g.w }
+    case 180:
+      return { x: wu - g.x - g.w, y: hu - g.y - g.h, w: g.w, h: g.h }
+    case 270:
+      return { x: hu - g.y - g.h, y: g.x, w: g.h, h: g.w }
+    default:
+      return { x: g.x, y: g.y, w: g.w, h: g.h }
+  }
+}
+
 /** Normalized geom (PDF) spanning two corner points — used for drag-rectangle tools. */
 export function rectGeom(a: Pt, b: Pt, opacity = 1): Geom {
   return {

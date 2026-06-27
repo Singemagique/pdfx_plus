@@ -89,6 +89,13 @@ function ToolIcon({ kind }: { kind: ToolKind }): React.JSX.Element {
         <path d="M2 6h14a2 2 0 0 1 2 2v14" />
       </svg>
     )
+  if (kind === 'form')
+    return (
+      <svg {...common}>
+        <rect x="4" y="3" width="16" height="18" rx="2" />
+        <path d="M8 8h8M8 12h8M8 16h4" />
+      </svg>
+    )
   return (
     <svg {...common}>
       <path d="M3 21l4-1 11-11a2.8 2.8 0 0 0-4-4L3 16z" />
@@ -103,7 +110,8 @@ const TOOLS: { kind: ToolKind; label: string }[] = [
   { kind: 'ink', label: 'Draw' },
   { kind: 'text', label: 'Text' },
   { kind: 'shape', label: 'Shape' },
-  { kind: 'crop', label: 'Crop' }
+  { kind: 'crop', label: 'Crop' },
+  { kind: 'form', label: 'Form' }
 ]
 
 export function EditTools(): React.JSX.Element {

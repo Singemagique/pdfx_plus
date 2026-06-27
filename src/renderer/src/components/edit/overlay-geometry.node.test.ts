@@ -9,6 +9,7 @@ import {
   pageScale,
   pointToCss,
   rectGeom,
+  rectToVisual,
   resizeGeom,
   scalePath
 } from './overlay-geometry'
@@ -19,6 +20,39 @@ const fit = { w: 100, h: 200 } // CSS px → scale 0.5
 describe('pageScale', () => {
   it('is CSS px per PDF point', () => {
     expect(pageScale(page, fit)).toBe(0.5)
+  })
+})
+
+describe('rectToVisual', () => {
+  // Source page is unrotated 400x200 (landscape); pdf.js reports the visual page swapped per /Rotate.
+  it('is a no-op for an unrotated page', () => {
+    const r = { x: 10, y: 20, w: 100, h: 50 }
+    expect(rectToVisual(r, 0, 200, 400)).toEqual(r)
+  })
+  it('maps an unrotated /Rect into 90° visual space (axes swap)', () => {
+    // visual 200x400 ⇒ unrotated 400x200; rect {10,20,100,50} in unrotated space.
+    expect(rectToVisual({ x: 10, y: 20, w: 100, h: 50 }, 90, 200, 400)).toEqual({
+      x: 20,
+      y: 290,
+      w: 50,
+      h: 100
+    })
+  })
+  it('maps 180° (both axes flipped, dims preserved)', () => {
+    expect(rectToVisual({ x: 10, y: 20, w: 100, h: 50 }, 180, 200, 400)).toEqual({
+      x: 90,
+      y: 330,
+      w: 100,
+      h: 50
+    })
+  })
+  it('maps 270° visual space', () => {
+    expect(rectToVisual({ x: 10, y: 20, w: 100, h: 50 }, 270, 200, 400)).toEqual({
+      x: 130,
+      y: 10,
+      w: 50,
+      h: 100
+    })
   })
 })
 
