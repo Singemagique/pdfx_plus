@@ -28,6 +28,7 @@ export interface Geom {
 
 export type StandardFontName = 'Helvetica' | 'Times' | 'Courier'
 export type TextAlign = 'left' | 'center' | 'right'
+export type ShapeKind = 'rect' | 'ellipse' | 'line' | 'arrow' | 'underline' | 'strike'
 
 interface BaseOverlay {
   id: string
@@ -59,6 +60,14 @@ export type Overlay =
       align: TextAlign
     })
   | (BaseOverlay & { type: 'highlight'; color: RGB })
+  | (BaseOverlay & {
+      type: 'shape'
+      shape: ShapeKind
+      color: RGB
+      strokeWidth: number
+      /** Endpoints [x1,y1,x2,y2] in page points for `line`/`arrow`; absent otherwise. */
+      points?: number[]
+    })
   | (BaseOverlay & { type: 'redaction'; fill: RGB })
   | (BaseOverlay & { type: 'formValue'; field: string; value: string | boolean })
   | (BaseOverlay & {
@@ -71,7 +80,14 @@ export type Overlay =
 export type OverlayType = Overlay['type']
 
 /** Overlay types that ./pdfx/flatten.ts bakes by drawing onto the page. */
-export const DRAWABLE_TYPES = ['image', 'ink', 'text', 'highlight', 'signatureVisual'] as const
+export const DRAWABLE_TYPES = [
+  'image',
+  'ink',
+  'text',
+  'highlight',
+  'shape',
+  'signatureVisual'
+] as const
 
 /**
  * Overlay types NOT drawn by the pdf-lib flatten pass:

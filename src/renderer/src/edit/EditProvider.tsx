@@ -6,11 +6,11 @@
 
 import { createContext, useCallback, useContext, useMemo, useState } from 'react'
 import { apply, canRedo, canUndo, initHistory, redo, undo, type History } from './history'
-import { groupByPage, type Overlay, type RGB } from './model'
+import { groupByPage, type Overlay, type RGB, type ShapeKind } from './model'
 import type { Attachment } from '../pdfx/flatten'
 import type { EditLayer } from '../pdfx/build'
 
-export type ToolKind = 'browse' | 'highlight' | 'ink' | 'text'
+export type ToolKind = 'browse' | 'highlight' | 'ink' | 'text' | 'shape'
 
 /** The page currently focused in full view, so palette actions know where to place things. */
 export interface CurrentPage {
@@ -28,6 +28,10 @@ export interface EditStore {
   setHighlightColor: (rgb: RGB) => void
   inkColor: RGB
   inkWidth: number
+  shapeKind: ShapeKind
+  setShapeKind: (s: ShapeKind) => void
+  shapeColor: RGB
+  shapeWidth: number
   selectedId: string | null
   select: (id: string | null) => void
   addOverlay: (o: Overlay) => void
@@ -61,11 +65,14 @@ const HIGHLIGHT_PALETTE: NamedColor[] = [
 ]
 const INK_COLOR: RGB = { r: 0.1, g: 0.1, b: 0.12 }
 const INK_WIDTH = 2
+const SHAPE_COLOR: RGB = { r: 0.85, g: 0.15, b: 0.18 }
+const SHAPE_WIDTH = 2
 
 export function useEditStore(): EditStore {
   const [history, setHistory] = useState<History<EditState>>(() => initHistory({ overlays: [] }))
   const [tool, setToolState] = useState<ToolKind>('browse')
   const [highlightColor, setHighlightColor] = useState<RGB>(HIGHLIGHT_PALETTE[0].rgb)
+  const [shapeKind, setShapeKind] = useState<ShapeKind>('rect')
   const [selectedId, setSelectedId] = useState<string | null>(null)
   // Image/stamp bytes, embedded as PDF file streams on export and referenced by overlays.
   const [attachments, setAttachments] = useState<Map<string, Attachment>>(() => new Map())
@@ -127,6 +134,10 @@ export function useEditStore(): EditStore {
     setHighlightColor,
     inkColor: INK_COLOR,
     inkWidth: INK_WIDTH,
+    shapeKind,
+    setShapeKind,
+    shapeColor: SHAPE_COLOR,
+    shapeWidth: SHAPE_WIDTH,
     selectedId,
     select: setSelectedId,
     addOverlay,

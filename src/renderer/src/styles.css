@@ -1117,6 +1117,33 @@ body {
     0 0 0 4px var(--ink);
 }
 
+.shape-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: none;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--ink-soft);
+  cursor: pointer;
+  transition:
+    background-color 0.12s ease,
+    color 0.12s ease;
+}
+
+.shape-btn:hover {
+  background: var(--hover);
+  color: var(--ink);
+}
+
+.shape-btn.active {
+  background: var(--accent);
+  color: var(--accent-ink);
+}
+
 .full-nav {
   position: absolute;
   top: 50%;

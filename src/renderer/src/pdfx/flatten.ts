@@ -132,6 +132,70 @@ async function drawTextOverlay(
   }
 }
 
+function drawShape(page: PDFPage, o: Extract<Overlay, { type: 'shape' }>): void {
+  const { x, y, w, h } = o.geom
+  const color = toColor(o.color)
+  const thickness = o.strokeWidth
+  const opacity = o.geom.opacity
+  switch (o.shape) {
+    case 'rect':
+      page.drawRectangle({
+        x,
+        y,
+        width: w,
+        height: h,
+        borderColor: color,
+        borderWidth: thickness,
+        opacity: 0,
+        borderOpacity: opacity
+      })
+      break
+    case 'ellipse':
+      page.drawEllipse({
+        x: x + w / 2,
+        y: y + h / 2,
+        xScale: w / 2,
+        yScale: h / 2,
+        borderColor: color,
+        borderWidth: thickness,
+        opacity: 0,
+        borderOpacity: opacity
+      })
+      break
+    case 'underline':
+      page.drawLine({ start: { x, y }, end: { x: x + w, y }, thickness, color, opacity })
+      break
+    case 'strike':
+      page.drawLine({
+        start: { x, y: y + h / 2 },
+        end: { x: x + w, y: y + h / 2 },
+        thickness,
+        color,
+        opacity
+      })
+      break
+    case 'line':
+    case 'arrow': {
+      const [x1, y1, x2, y2] = o.points ?? [x, y + h, x + w, y]
+      page.drawLine({ start: { x: x1, y: y1 }, end: { x: x2, y: y2 }, thickness, color, opacity })
+      if (o.shape === 'arrow') {
+        const ang = Math.atan2(y2 - y1, x2 - x1)
+        const head = Math.max(8, thickness * 3.5)
+        for (const da of [2.5, -2.5]) {
+          page.drawLine({
+            start: { x: x2, y: y2 },
+            end: { x: x2 + head * Math.cos(ang + da), y: y2 + head * Math.sin(ang + da) },
+            thickness,
+            color,
+            opacity
+          })
+        }
+      }
+      break
+    }
+  }
+}
+
 /** Bake every drawable overlay for one page, in z-order. Overlays must be pre-sorted. */
 export async function flattenPageOverlays(
   page: PDFPage,
@@ -158,6 +222,9 @@ export async function flattenPageOverlays(
         break
       case 'ink':
         drawInk(page, o.paths, o.strokeWidth, o.color, opacity)
+        break
+      case 'shape':
+        drawShape(page, o)
         break
       case 'text':
         await drawTextOverlay(page, o, res)
