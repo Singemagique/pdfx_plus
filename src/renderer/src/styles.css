@@ -13,6 +13,10 @@
   --hover: rgba(255, 255, 255, 0.08);
   --group-bg: rgba(255, 255, 255, 0.05);
   --control: rgba(255, 255, 255, 0.12);
+  /* Glass pill fill — gives the toolbar buttons a visible surface on solid
+     (non-vibrancy) windows where a transparent fill makes them disappear. */
+  --btn-glass-bg: rgba(255, 255, 255, 0.14);
+  --btn-glass-bg-hover: rgba(255, 255, 255, 0.24);
   --overlay: rgba(18, 18, 20, 0.72);
   --overlay-strong: #131316;
   --scrollbar-thumb: rgba(255, 255, 255, 0.18);
@@ -35,6 +39,8 @@
     --hover: rgba(22, 22, 26, 0.06);
     --group-bg: rgba(20, 20, 24, 0.045);
     --control: rgba(255, 255, 255, 0.92);
+    --btn-glass-bg: #ffffff;
+    --btn-glass-bg-hover: #f1f1ef;
     --overlay: rgba(247, 247, 245, 0.7);
     --overlay-strong: #f4f4f2;
     --scrollbar-thumb: rgba(22, 22, 26, 0.16);
@@ -186,13 +192,13 @@ body {
   position: relative;
   border-radius: 999px;
   color: var(--ink);
-  background: transparent;
-  transition: none;
+  background: var(--btn-glass-bg);
+  transition: background-color 0.15s ease;
   -webkit-app-region: no-drag;
 }
 
 .btn.glass:hover:not(:disabled) {
-  background: var(--hover);
+  background: var(--btn-glass-bg-hover);
 }
 
 .btn.glass::before {
