@@ -21,6 +21,7 @@ import {
   rectGeom,
   resizeGeom,
   scalePath,
+  type CssRect,
   type FitSize,
   type HandleId,
   type Pt
@@ -40,6 +41,7 @@ type Draft =
   | { kind: 'highlight'; start: Pt; current: Pt }
   | { kind: 'ink'; pts: number[] }
   | { kind: 'shape'; start: Pt; current: Pt }
+  | { kind: 'crop'; start: Pt; current: Pt }
 type Drag = {
   kind: 'move' | 'resize'
   handle?: HandleId
@@ -122,9 +124,11 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
   const pageOverlays = overlaysForPage(edits.overlays, pageKey)
   const drawing =
     active && (edits.tool === 'highlight' || edits.tool === 'ink' || edits.tool === 'shape')
+  const cropping = active && edits.tool === 'crop'
   const placing = active && edits.tool === 'text'
   const selecting = active && edits.tool === 'browse'
-  const capturing = drawing || placing
+  const capturing = drawing || placing || cropping
+  const cropBox = edits.crops.get(pageKey)
   const scale = pageScale(page, fit)
 
   const toPdf = (clientX: number, clientY: number): Pt => {
@@ -173,16 +177,18 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
 
   // ---- Drawing (highlight / ink) ----
   const onDrawDown = (e: React.PointerEvent): void => {
-    if (!drawing || e.button !== 0) return
+    if (!(drawing || cropping) || e.button !== 0) return
     e.stopPropagation()
     e.preventDefault()
     const p = toPdf(e.clientX, e.clientY)
     setDraft(
-      edits.tool === 'highlight'
-        ? { kind: 'highlight', start: p, current: p }
-        : edits.tool === 'shape'
-          ? { kind: 'shape', start: p, current: p }
-          : { kind: 'ink', pts: [p.x, p.y] }
+      cropping
+        ? { kind: 'crop', start: p, current: p }
+        : edits.tool === 'highlight'
+          ? { kind: 'highlight', start: p, current: p }
+          : edits.tool === 'shape'
+            ? { kind: 'shape', start: p, current: p }
+            : { kind: 'ink', pts: [p.x, p.y] }
     )
     layerRef.current?.setPointerCapture(e.pointerId)
   }
@@ -200,6 +206,17 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
     if (!draft) return
     e.stopPropagation()
     layerRef.current?.releasePointerCapture(e.pointerId)
+    if (draft.kind === 'crop') {
+      const g = rectGeom(draft.start, draft.current, 1)
+      // Clamp to the page; ignore an accidental tiny drag.
+      const x = Math.max(0, g.x)
+      const y = Math.max(0, g.y)
+      const w = Math.min(page.width, g.x + g.w) - x
+      const h = Math.min(page.height, g.y + g.h) - y
+      if (w > 8 && h > 8) edits.setCrop(pageKey, { x, y, w, h })
+      setDraft(null)
+      return
+    }
     const base = { id: newOverlayId(), pageKey, z: pageOverlays.length, createdAt: Date.now() }
     if (draft.kind === 'highlight') {
       const geom = rectGeom(draft.start, draft.current, 0.4)
@@ -236,7 +253,7 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
 
   // ---- Text ----
   const onLayerDown = (e: React.PointerEvent): void => {
-    if (drawing) return onDrawDown(e)
+    if (drawing || cropping) return onDrawDown(e)
     if (placing && !textEdit && e.button === 0) {
       e.stopPropagation()
       e.preventDefault()
@@ -542,10 +559,27 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
     )
   }
 
+  // Dim everything outside the crop rectangle (even-odd hole), with a dashed outline.
+  const cropMask = (r: CssRect, live: boolean): React.JSX.Element => (
+    <svg className="ov-crop-mask" width={fit.w} height={fit.h}>
+      <path
+        d={`M0 0H${fit.w}V${fit.h}H0Z M${r.left} ${r.top}H${r.left + r.width}V${r.top + r.height}H${r.left}Z`}
+        fillRule="evenodd"
+      />
+      <rect
+        className={`ov-crop-rect${live ? ' live' : ''}`}
+        x={r.left}
+        y={r.top}
+        width={r.width}
+        height={r.height}
+      />
+    </svg>
+  )
+
   return (
     <div
       ref={layerRef}
-      className={`overlay-layer${drawing ? ' drawing' : ''}${placing ? ' placing' : ''}`}
+      className={`overlay-layer${drawing ? ' drawing' : ''}${placing ? ' placing' : ''}${cropping ? ' cropping' : ''}`}
       style={{ pointerEvents: capturing ? 'auto' : 'none' }}
       onPointerDown={onLayerDown}
       onPointerMove={onDrawMove}
@@ -636,6 +670,11 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
           }
           return renderVisual(preview)
         })()}
+      {draft?.kind === 'crop'
+        ? cropMask(geomToCss(rectGeom(draft.start, draft.current, 1), page, fit), true)
+        : cropBox
+          ? cropMask(geomToCss({ ...cropBox, rotation: 0, opacity: 1 }, page, fit), false)
+          : null}
     </div>
   )
 }

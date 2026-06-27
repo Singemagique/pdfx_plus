@@ -31,12 +31,15 @@ describe('mirror round-trip', () => {
     const editLayer: EditLayer = {
       overlays: new Map([[makePageKey('s1', 0), [highlight(makePageKey('s1', 0))]]]),
       attachments: new Map(),
-      rotations: new Map([[makePageKey('s1', 0), 90]])
+      rotations: new Map([[makePageKey('s1', 0), 90]]),
+      crops: new Map([[makePageKey('s1', 0), { x: 5, y: 6, w: 70, h: 80 }]])
     }
 
     const mirror = serializeMirror(exportDocs, editLayer)
     expect(mirror).not.toBeNull()
-    expect(mirror!.edits).toEqual([expect.objectContaining({ doc: 0, page: 0, rotation: 90 })])
+    expect(mirror!.edits).toEqual([
+      expect.objectContaining({ doc: 0, page: 0, rotation: 90, crop: { x: 5, y: 6, w: 70, h: 80 } })
+    ])
 
     // Rebuild the manifest as it would be embedded, then import into a fresh source.
     const manifest: PdfxManifest = {
@@ -60,6 +63,7 @@ describe('mirror round-trip', () => {
     expect(imported!.overlays[0].pageKey).toBe(newKey) // rebound to the new page identity
     expect(imported!.overlays[0].type).toBe('highlight')
     expect(imported!.rotations).toEqual([[newKey, 90]])
+    expect(imported!.crops).toEqual([[newKey, { x: 5, y: 6, w: 70, h: 80 }]]) // crop rebinds too
   })
 
   it('returns null when there are no edits', () => {

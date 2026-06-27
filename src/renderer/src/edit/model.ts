@@ -26,6 +26,14 @@ export interface Geom {
   opacity: number
 }
 
+/** A page crop rectangle in PDF points (origin bottom-left), applied via /CropBox on export. */
+export interface CropBox {
+  x: number
+  y: number
+  w: number
+  h: number
+}
+
 export type StandardFontName = 'Helvetica' | 'Times' | 'Courier'
 export type TextAlign = 'left' | 'center' | 'right'
 export type ShapeKind = 'rect' | 'ellipse' | 'line' | 'arrow' | 'underline' | 'strike'
