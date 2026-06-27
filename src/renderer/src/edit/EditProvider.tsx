@@ -31,6 +31,8 @@ export interface EditStore {
   shapeKind: ShapeKind
   setShapeKind: (s: ShapeKind) => void
   shapeColor: RGB
+  shapePalette: NamedColor[]
+  setShapeColor: (rgb: RGB) => void
   shapeWidth: number
   selectedId: string | null
   select: (id: string | null) => void
@@ -65,7 +67,12 @@ const HIGHLIGHT_PALETTE: NamedColor[] = [
 ]
 const INK_COLOR: RGB = { r: 0.1, g: 0.1, b: 0.12 }
 const INK_WIDTH = 2
-const SHAPE_COLOR: RGB = { r: 0.85, g: 0.15, b: 0.18 }
+const SHAPE_PALETTE: NamedColor[] = [
+  { name: 'Red', rgb: { r: 0.85, g: 0.15, b: 0.18 } },
+  { name: 'Black', rgb: { r: 0.1, g: 0.1, b: 0.12 } },
+  { name: 'Blue', rgb: { r: 0.13, g: 0.42, b: 0.9 } },
+  { name: 'Green', rgb: { r: 0.13, g: 0.6, b: 0.25 } }
+]
 const SHAPE_WIDTH = 2
 
 export function useEditStore(): EditStore {
@@ -73,6 +80,7 @@ export function useEditStore(): EditStore {
   const [tool, setToolState] = useState<ToolKind>('browse')
   const [highlightColor, setHighlightColor] = useState<RGB>(HIGHLIGHT_PALETTE[0].rgb)
   const [shapeKind, setShapeKind] = useState<ShapeKind>('rect')
+  const [shapeColor, setShapeColor] = useState<RGB>(SHAPE_PALETTE[0].rgb)
   const [selectedId, setSelectedId] = useState<string | null>(null)
   // Image/stamp bytes, embedded as PDF file streams on export and referenced by overlays.
   const [attachments, setAttachments] = useState<Map<string, Attachment>>(() => new Map())
@@ -136,7 +144,9 @@ export function useEditStore(): EditStore {
     inkWidth: INK_WIDTH,
     shapeKind,
     setShapeKind,
-    shapeColor: SHAPE_COLOR,
+    shapeColor,
+    shapePalette: SHAPE_PALETTE,
+    setShapeColor,
     shapeWidth: SHAPE_WIDTH,
     selectedId,
     select: setSelectedId,
