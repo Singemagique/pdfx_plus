@@ -86,7 +86,7 @@ export function Toolbar({
         className="btn glass"
         onClick={onExport}
         disabled={busy || documentCount === 0}
-        title="A valid PDF that also remembers the separate documents, so PDFx can re-split it"
+        title="PDFx editable project — keeps documents separate and reopens fully editable (annotations stay editable). Use Export PDF for a flattened, shareable file."
       >
         Export .pdfx
       </button>

@@ -10,6 +10,7 @@ import {
   type Attachment,
   type FlattenResources
 } from './flatten'
+import { serializeMirror } from './mirror'
 
 /**
  * The optional edit layer baked into pages on export (PRD §4.4). Overlays are keyed by
@@ -67,10 +68,12 @@ export async function buildPdfx(
   edits?: EditLayer
 ): Promise<Uint8Array> {
   const output = await PDFDocument.create()
-  const res = edits ? createFlattenResources(output, edits.attachments) : undefined
   const manifest: PdfxManifest = { pdfx: PDFX_VERSION, title, documents: [] }
   const sources = new Map<string, PDFDocument>()
 
+  // .pdfx keeps pages CLEAN — overlays/rotation are stored in the manifest mirror instead of
+  // baked in, so the file reopens fully editable. Export PDF produces the flattened, shareable
+  // copy (any viewer sees the annotations there).
   for (const doc of documents) {
     if (doc.pages.length === 0) continue
     for (const page of doc.pages) {
@@ -81,9 +84,17 @@ export async function buildPdfx(
       }
       const [copied] = await output.copyPages(source, [page.pageIndex])
       output.addPage(copied)
-      await bakePage(copied, page, edits, res)
     }
     manifest.documents.push({ name: doc.name, pages: doc.pages.length })
+  }
+
+  if (edits) {
+    const mirror = serializeMirror(documents, edits)
+    if (mirror) {
+      manifest.pdfx = '1.1'
+      manifest.edits = mirror.edits
+      manifest.attachments = mirror.attachments
+    }
   }
 
   await output.attach(new TextEncoder().encode(JSON.stringify(manifest, null, 2)), MANIFEST_NAME, {
@@ -94,7 +105,7 @@ export async function buildPdfx(
   })
 
   output.setTitle(title)
-  output.setProducer(`PDFX ${PDFX_VERSION}`)
+  output.setProducer(`PDFX ${manifest.pdfx}`)
   output.setKeywords(['PDFX'])
 
   return output.save()

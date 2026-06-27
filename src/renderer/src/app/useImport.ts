@@ -1,6 +1,7 @@
 import { useCallback, useEffect } from 'react'
 import { findConverter } from '../pdfx/convert'
 import { importIntoDocs, loadIncomingPages } from '../pdfx/source'
+import type { ImportedMirror } from '../pdfx/mirror'
 import { dedupeNames } from './names'
 import { applyExternalDrop } from './external-drop'
 import type { Collection } from './useCollection'
@@ -9,6 +10,7 @@ import type { IncomingFile } from './types'
 
 export function useImport(
   collection: Collection,
+  loadEditState: (s: ImportedMirror) => void,
   setBusy: (busy: boolean) => void,
   flash: (message: string) => void
 ) {
@@ -26,8 +28,9 @@ export function useImport(
           const data = conv
             ? await conv.toPdf(file.name, file.data, undefined, file.path)
             : file.data
-          const entries = await importIntoDocs(name, data)
+          const { docs: entries, mirror } = await importIntoDocs(name, data)
           setDocs((prev) => [...prev, ...dedupeNames(prev, entries)])
+          if (mirror) loadEditState(mirror)
         } catch (error) {
           console.error(`Failed to import ${file.name}`, error)
           failed.push(file.name)
@@ -36,7 +39,7 @@ export function useImport(
       setBusy(false)
       if (failed.length > 0) flash(`Could not open ${failed.join(', ')}`)
     },
-    [flash, setBusy, setDocs]
+    [flash, setBusy, setDocs, loadEditState]
   )
 
   useEffect(() => {

@@ -49,7 +49,7 @@ export function usePaste(
           const { source, sizes } = await loadSource(bytes)
           insertPagesAfter(target, pagesFromSource(source, sizes, [0]))
         } else {
-          const entries = await importIntoDocs('Pasted image', await imageToPdf(png))
+          const { docs: entries } = await importIntoDocs('Pasted image', await imageToPdf(png))
           setDocs((prev) => [...prev, ...dedupeNames(prev, entries)])
         }
       } catch (error) {

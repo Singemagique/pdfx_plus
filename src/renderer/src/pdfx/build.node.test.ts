@@ -11,9 +11,11 @@ import {
   PDFString
 } from 'pdf-lib'
 
-import { buildPdf, buildPdfx } from './build'
+import { buildPdf, buildPdfx, type EditLayer } from './build'
 import { MANIFEST_NAME, partitionPages, stripExtension } from './format'
 import type { ExportDocument, ExportPage, PdfxManifest } from './format'
+import { deserializeMirror } from './mirror'
+import { makePageKey, type Overlay } from '../edit/model'
 
 // Build a tiny standalone single-page PDF we can use as an import source.
 async function makeSourcePdf(): Promise<Uint8Array> {
@@ -103,6 +105,55 @@ describe('buildPdfx', () => {
       new TextDecoder().decode(extractEmbeddedFile(reloaded, MANIFEST_NAME)!)
     ) as PdfxManifest
     expect(manifest.documents).toEqual([{ name: 'Real', pages: 1 }])
+  })
+})
+
+describe('buildPdfx v1.1 mirror', () => {
+  it('embeds an editable mirror that deserializes back to the overlays + rotation', async () => {
+    const bytes = await makeSourcePdf()
+    const pageKey = makePageKey('a', 0)
+    const overlay: Overlay = {
+      id: 'o1',
+      pageKey,
+      z: 0,
+      createdAt: 0,
+      geom: { x: 10, y: 20, w: 30, h: 40, rotation: 0, opacity: 0.4 },
+      type: 'highlight',
+      color: { r: 1, g: 0.9, b: 0.2 }
+    }
+    const editLayer: EditLayer = {
+      overlays: new Map([[pageKey, [overlay]]]),
+      attachments: new Map(),
+      rotations: new Map([[pageKey, 90]])
+    }
+    const documents: ExportDocument[] = [
+      { name: 'A', pages: [{ bytes, sourceKey: 'a', pageIndex: 0 }] }
+    ]
+
+    const out = await buildPdfx(documents, 'Project', editLayer)
+    const reloaded = await PDFDocument.load(out)
+    const manifest = JSON.parse(
+      new TextDecoder().decode(extractEmbeddedFile(reloaded, MANIFEST_NAME)!)
+    ) as PdfxManifest
+
+    expect(manifest.pdfx).toBe('1.1')
+    expect(manifest.edits).toHaveLength(1)
+    // Pages stay clean (no baked overlay image): the mirror is the source of truth.
+    expect(reloaded.getPageCount()).toBe(1)
+
+    // Reimport into a fresh source identity → overlays rebind to the new page key.
+    const page = {
+      id: 'p',
+      source: { id: 'newsrc', bytes: new Uint8Array(), pdf: null as never },
+      pageIndex: 0,
+      width: 200,
+      height: 200
+    }
+    const imported = deserializeMirror(manifest, [{ id: 'd', name: 'A', pages: [page] }])
+    expect(imported!.overlays).toHaveLength(1)
+    expect(imported!.overlays[0].type).toBe('highlight')
+    expect(imported!.overlays[0].pageKey).toBe(makePageKey('newsrc', 0))
+    expect(imported!.rotations).toEqual([[makePageKey('newsrc', 0), 90]])
   })
 })
 

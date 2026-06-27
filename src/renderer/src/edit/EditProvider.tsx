@@ -55,6 +55,12 @@ export interface EditStore {
   rotatePage: (pageKey: string, delta: number) => void
   savedSignature: Uint8Array | null
   setSavedSignature: (bytes: Uint8Array | null) => void
+  /** Merge a loaded PDFX v1.1 mirror (overlays/rotations/attachments) into the store. */
+  loadEditState: (s: {
+    overlays: Overlay[]
+    rotations: Array<[string, number]>
+    attachments: Array<[string, Attachment]>
+  }) => void
   /** Overlays + attachments shaped for the flatten-on-export pipeline. */
   editLayer: EditLayer
 }
@@ -112,6 +118,37 @@ export function useEditStore(): EditStore {
       return n
     })
   }, [])
+
+  const loadEditState = useCallback(
+    (s: {
+      overlays: Overlay[]
+      rotations: Array<[string, number]>
+      attachments: Array<[string, Attachment]>
+    }) => {
+      if (s.overlays.length) {
+        setHistory((h) =>
+          apply(h, (d) => {
+            for (const o of s.overlays) d.overlays.push(o)
+          })
+        )
+      }
+      if (s.rotations.length) {
+        setRotations((m) => {
+          const n = new Map(m)
+          for (const [k, v] of s.rotations) n.set(k, v)
+          return n
+        })
+      }
+      if (s.attachments.length) {
+        setAttachments((m) => {
+          const n = new Map(m)
+          for (const [k, v] of s.attachments) n.set(k, v)
+          return n
+        })
+      }
+    },
+    []
+  )
 
   const overlays = history.present.overlays
 
@@ -192,6 +229,7 @@ export function useEditStore(): EditStore {
     rotatePage,
     savedSignature,
     setSavedSignature,
+    loadEditState,
     editLayer
   }
 }
