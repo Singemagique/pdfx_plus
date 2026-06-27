@@ -101,7 +101,7 @@ export function EditTools(): React.JSX.Element {
   const { tool, setTool, undo, redo, canUndo, canRedo } = useEdits()
   const { highlightPalette, highlightColor, setHighlightColor } = useEdits()
   const { overlays, addOverlay, addAttachment, currentPage, select } = useEdits()
-  const { shapeKind, setShapeKind } = useEdits()
+  const { shapeKind, setShapeKind, shapeColor, shapePalette, setShapeColor } = useEdits()
   const fileRef = useRef<HTMLInputElement>(null)
 
   const onFile = async (e: React.ChangeEvent<HTMLInputElement>): Promise<void> => {
@@ -239,6 +239,17 @@ export function EditTools(): React.JSX.Element {
                 {s.icon}
               </svg>
             </button>
+          ))}
+          <span className="tool-sep" />
+          {shapePalette.map((c) => (
+            <button
+              key={c.name}
+              className={`swatch${rgbEq(c.rgb, shapeColor) ? ' active' : ''}`}
+              style={{ background: cssColor(c.rgb) }}
+              onClick={() => setShapeColor(c.rgb)}
+              title={c.name}
+              aria-label={`Shape ${c.name}`}
+            />
           ))}
         </span>
       )}
