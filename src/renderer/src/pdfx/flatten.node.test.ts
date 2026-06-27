@@ -118,6 +118,19 @@ describe('flatten on export', () => {
     expect(withEdits.length).toBeGreaterThan(plain.length)
   })
 
+  it('applies per-page rotation from the edit layer on export', async () => {
+    const src = await makeSourcePdf(2)
+    const pages = [
+      { bytes: src, sourceKey: 'a', pageIndex: 0 },
+      { bytes: src, sourceKey: 'a', pageIndex: 1 }
+    ]
+    const rotations = new Map([[makePageKey('a', 0), 90]])
+    const out = await buildPdf(pages, { overlays: new Map(), attachments: new Map(), rotations })
+    const reloaded = await PDFDocument.load(out)
+    expect(reloaded.getPage(0).getRotation().angle).toBe(90)
+    expect(reloaded.getPage(1).getRotation().angle).toBe(0)
+  })
+
   it('export without an edit layer is unchanged (no overlays, no throw)', async () => {
     const src = await makeSourcePdf(1)
     const out = await buildPdf([{ bytes: src, sourceKey: 'a', pageIndex: 0 }])

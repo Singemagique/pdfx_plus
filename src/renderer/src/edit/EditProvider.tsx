@@ -51,6 +51,8 @@ export interface EditStore {
   addAttachment: (id: string, bytes: Uint8Array, mime: string) => void
   currentPage: CurrentPage | null
   setCurrentPage: (p: CurrentPage | null) => void
+  rotations: Map<string, number>
+  rotatePage: (pageKey: string, delta: number) => void
   /** Overlays + attachments shaped for the flatten-on-export pipeline. */
   editLayer: EditLayer
 }
@@ -92,8 +94,20 @@ export function useEditStore(): EditStore {
   const [attachments, setAttachments] = useState<Map<string, Attachment>>(() => new Map())
   const [currentPage, setCurrentPage] = useState<CurrentPage | null>(null)
 
+  const [rotations, setRotations] = useState<Map<string, number>>(() => new Map())
+
   const addAttachment = useCallback((id: string, bytes: Uint8Array, mime: string) => {
     setAttachments((m) => new Map(m).set(id, { bytes, mime }))
+  }, [])
+
+  const rotatePage = useCallback((pageKey: string, delta: number) => {
+    setRotations((m) => {
+      const next = ((((m.get(pageKey) ?? 0) + delta) % 360) + 360) % 360
+      const n = new Map(m)
+      if (next === 0) n.delete(pageKey)
+      else n.set(pageKey, next)
+      return n
+    })
   }, [])
 
   const overlays = history.present.overlays
@@ -135,8 +149,8 @@ export function useEditStore(): EditStore {
   const doRedo = useCallback(() => setHistory((h) => redo(h)), [])
 
   const editLayer = useMemo<EditLayer>(
-    () => ({ overlays: groupByPage(overlays), attachments }),
-    [overlays, attachments]
+    () => ({ overlays: groupByPage(overlays), attachments, rotations }),
+    [overlays, attachments, rotations]
   )
 
   return {
@@ -171,6 +185,8 @@ export function useEditStore(): EditStore {
     addAttachment,
     currentPage,
     setCurrentPage,
+    rotations,
+    rotatePage,
     editLayer
   }
 }

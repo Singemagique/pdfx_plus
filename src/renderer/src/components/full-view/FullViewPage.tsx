@@ -1,6 +1,8 @@
 import type { PageEntry } from '../../types'
 import { PageView } from '../PageView'
 import { OverlayLayer } from '../edit/OverlayLayer'
+import { useEdits } from '../../edit/EditProvider'
+import { makePageKey } from '../../edit/model'
 import type { View } from './geometry'
 import { DOUBLE_CLICK_ZOOM, fitInto, TRANSITION_MS } from './geometry'
 
@@ -22,9 +24,17 @@ interface FullViewPageProps {
 export function FullViewPage(props: FullViewPageProps): React.JSX.Element {
   const { page: p, viewport, isCurrent, view, zoomed, interactive, animating } = props
   const { flip, flipTransition, renderVersion, resetView, applyZoom } = props
+  const { rotations } = useEdits()
 
-  const size = fitInto(p.width, p.height, viewport)
-  let style: React.CSSProperties = { width: size.w, height: size.h }
+  const rot = rotations.get(makePageKey(p.source.id, p.pageIndex)) ?? 0
+  const rotated = rot === 90 || rot === 270
+  // Box holds the upright canvas; CSS-rotating it yields the displayed (rotated) page that
+  // fits the viewport. The box's aspect therefore matches the upright page.
+  const dfit = fitInto(rotated ? p.height : p.width, rotated ? p.width : p.height, viewport)
+  const box = rotated ? { w: dfit.h, h: dfit.w } : { w: dfit.w, h: dfit.h }
+  const rotateT = rot ? ` rotate(${rot}deg)` : ''
+
+  let style: React.CSSProperties = { width: box.w, height: box.h }
   if (isCurrent && animating) {
     style = {
       ...style,
@@ -38,10 +48,12 @@ export function FullViewPage(props: FullViewPageProps): React.JSX.Element {
   } else if (isCurrent && zoomed) {
     style = {
       ...style,
-      transform: `translate(${view.x}px, ${view.y}px) scale(${view.zoom})`,
+      transform: `translate(${view.x}px, ${view.y}px) scale(${view.zoom})${rotateT}`,
       transformOrigin: 'center center',
       willChange: 'transform'
     }
+  } else if (rotateT) {
+    style = { ...style, transform: rotateT.trim(), transformOrigin: 'center center' }
   }
   return (
     <div className="full-slide">
@@ -65,7 +77,9 @@ export function FullViewPage(props: FullViewPageProps): React.JSX.Element {
           version={isCurrent ? renderVersion : 0}
           eager={isCurrent}
         />
-        {isCurrent && <OverlayLayer page={p} fit={size} active={interactive && !animating} />}
+        {isCurrent && (
+          <OverlayLayer page={p} fit={box} rot={rot} active={interactive && !animating} />
+        )}
       </div>
     </div>
   )
