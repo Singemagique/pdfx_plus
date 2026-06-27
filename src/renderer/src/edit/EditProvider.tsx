@@ -12,6 +12,13 @@ import type { EditLayer } from '../pdfx/build'
 
 export type ToolKind = 'browse' | 'highlight' | 'ink'
 
+/** The page currently focused in full view, so palette actions know where to place things. */
+export interface CurrentPage {
+  pageKey: string
+  width: number
+  height: number
+}
+
 export interface EditStore {
   overlays: Overlay[]
   tool: ToolKind
@@ -31,6 +38,9 @@ export interface EditStore {
   canUndo: boolean
   canRedo: boolean
   attachments: Map<string, Attachment>
+  addAttachment: (id: string, bytes: Uint8Array, mime: string) => void
+  currentPage: CurrentPage | null
+  setCurrentPage: (p: CurrentPage | null) => void
   /** Overlays + attachments shaped for the flatten-on-export pipeline. */
   editLayer: EditLayer
 }
@@ -57,8 +67,13 @@ export function useEditStore(): EditStore {
   const [tool, setToolState] = useState<ToolKind>('browse')
   const [highlightColor, setHighlightColor] = useState<RGB>(HIGHLIGHT_PALETTE[0].rgb)
   const [selectedId, setSelectedId] = useState<string | null>(null)
-  // Image overlays will register bytes here once the PNG-stamp tool lands; empty for now.
-  const [attachments] = useState<Map<string, Attachment>>(() => new Map())
+  // Image/stamp bytes, embedded as PDF file streams on export and referenced by overlays.
+  const [attachments, setAttachments] = useState<Map<string, Attachment>>(() => new Map())
+  const [currentPage, setCurrentPage] = useState<CurrentPage | null>(null)
+
+  const addAttachment = useCallback((id: string, bytes: Uint8Array, mime: string) => {
+    setAttachments((m) => new Map(m).set(id, { bytes, mime }))
+  }, [])
 
   const overlays = history.present.overlays
 
@@ -122,6 +137,9 @@ export function useEditStore(): EditStore {
     canUndo: canUndo(history),
     canRedo: canRedo(history),
     attachments,
+    addAttachment,
+    currentPage,
+    setCurrentPage,
     editLayer
   }
 }

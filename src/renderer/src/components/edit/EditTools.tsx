@@ -1,6 +1,6 @@
-import { useEffect } from 'react'
+import { useEffect, useRef } from 'react'
 import { useEdits, type ToolKind } from '../../edit/EditProvider'
-import type { RGB } from '../../edit/model'
+import { newOverlayId, type RGB } from '../../edit/model'
 
 const cssColor = (c: RGB): string =>
   `rgb(${Math.round(c.r * 255)}, ${Math.round(c.g * 255)}, ${Math.round(c.b * 255)})`
@@ -47,6 +47,51 @@ const TOOLS: { kind: ToolKind; label: string }[] = [
 export function EditTools(): React.JSX.Element {
   const { tool, setTool, undo, redo, canUndo, canRedo } = useEdits()
   const { highlightPalette, highlightColor, setHighlightColor } = useEdits()
+  const { overlays, addOverlay, addAttachment, currentPage, select } = useEdits()
+  const fileRef = useRef<HTMLInputElement>(null)
+
+  const onFile = async (e: React.ChangeEvent<HTMLInputElement>): Promise<void> => {
+    const file = e.target.files?.[0]
+    e.target.value = '' // allow re-picking the same file
+    if (!file || !currentPage) return
+    const bytes = new Uint8Array(await file.arrayBuffer())
+    const mime = file.type === 'image/jpeg' ? 'image/jpeg' : 'image/png'
+    let natW = 1
+    let natH = 1
+    try {
+      const bmp = await createImageBitmap(new Blob([bytes], { type: mime }))
+      natW = bmp.width
+      natH = bmp.height
+      bmp.close()
+    } catch {
+      /* keep 1:1 fallback */
+    }
+    const targetW = Math.min(currentPage.width * 0.4, natW)
+    const targetH = (targetW * natH) / natW
+    const attachmentId = newOverlayId()
+    addAttachment(attachmentId, bytes, mime)
+    const id = newOverlayId()
+    const z = overlays.filter((o) => o.pageKey === currentPage.pageKey).length
+    addOverlay({
+      id,
+      pageKey: currentPage.pageKey,
+      z,
+      createdAt: Date.now(),
+      geom: {
+        x: (currentPage.width - targetW) / 2,
+        y: (currentPage.height - targetH) / 2,
+        w: targetW,
+        h: targetH,
+        rotation: 0,
+        opacity: 1
+      },
+      type: 'image',
+      attachmentId,
+      mime
+    })
+    setTool('browse')
+    select(id)
+  }
 
   // Undo/redo keyboard shortcuts while the editor surface (full view) is mounted.
   useEffect(() => {
@@ -73,6 +118,34 @@ export function EditTools(): React.JSX.Element {
           <span>{t.label}</span>
         </button>
       ))}
+      <button
+        className="tool-btn"
+        onClick={() => fileRef.current?.click()}
+        title="Place an image or signature (PNG / JPEG)"
+      >
+        <svg
+          width="16"
+          height="16"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        >
+          <rect x="3" y="4" width="18" height="16" rx="2" />
+          <circle cx="8.5" cy="9.5" r="1.5" />
+          <path d="M21 16l-5-5-9 9" />
+        </svg>
+        <span>Image</span>
+      </button>
+      <input
+        ref={fileRef}
+        type="file"
+        accept="image/png,image/jpeg"
+        style={{ display: 'none' }}
+        onChange={(e) => void onFile(e)}
+      />
       {tool === 'highlight' && (
         <span className="tool-swatches">
           {highlightPalette.map((c) => (

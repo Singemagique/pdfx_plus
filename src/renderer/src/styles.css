@@ -921,6 +921,13 @@ body {
   mix-blend-mode: multiply;
 }
 
+.ov-image {
+  position: absolute;
+  pointer-events: none;
+  object-fit: fill;
+  user-select: none;
+}
+
 .ov-draft-rect {
   position: absolute;
   pointer-events: none;

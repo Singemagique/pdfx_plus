@@ -72,8 +72,9 @@ const geomEq = (a: Overlay['geom'], b: Overlay['geom']): boolean =>
 
 export function OverlayLayer({ page, fit, active }: OverlayLayerProps): React.JSX.Element {
   const edits = useEdits()
-  const { selectedId, select } = edits
+  const { selectedId, select, setCurrentPage } = edits
   const layerRef = useRef<HTMLDivElement>(null)
+  const urlCache = useRef<Map<string, string>>(new Map())
   const [draft, setDraft] = useState<Draft | null>(null)
   const [drag, setDrag] = useState<Drag | null>(null)
 
@@ -86,6 +87,29 @@ export function OverlayLayer({ page, fit, active }: OverlayLayerProps): React.JS
   const toPdf = (clientX: number, clientY: number): Pt => {
     const rect = layerRef.current!.getBoundingClientRect()
     return clientToPdf(clientX, clientY, rect, page)
+  }
+
+  // Report this page as the placement target for palette actions (e.g. stamping).
+  useEffect(() => {
+    if (active) setCurrentPage({ pageKey, width: page.width, height: page.height })
+  }, [active, pageKey, page.width, page.height, setCurrentPage])
+
+  // Object URLs for image overlays, revoked on unmount.
+  useEffect(() => {
+    const cache = urlCache.current
+    return () => {
+      for (const url of cache.values()) URL.revokeObjectURL(url)
+      cache.clear()
+    }
+  }, [])
+  const imageUrl = (attachmentId: string): string | null => {
+    const cached = urlCache.current.get(attachmentId)
+    if (cached) return cached
+    const att = edits.attachments.get(attachmentId)
+    if (!att) return null
+    const url = URL.createObjectURL(new Blob([new Uint8Array(att.bytes)], { type: att.mime }))
+    urlCache.current.set(attachmentId, url)
+    return url
   }
 
   // Delete / deselect via keyboard while this page is focused.
@@ -213,6 +237,26 @@ export function OverlayLayer({ page, fit, active }: OverlayLayerProps): React.JS
             />
           ))}
         </svg>
+      )
+    }
+    if (o.type === 'image') {
+      const r = geomToCss(o.geom, page, fit)
+      const url = imageUrl(o.attachmentId)
+      if (!url) return null
+      return (
+        <img
+          key={o.id}
+          className="ov-image"
+          src={url}
+          draggable={false}
+          style={{
+            left: r.left,
+            top: r.top,
+            width: r.width,
+            height: r.height,
+            opacity: o.geom.opacity
+          }}
+        />
       )
     }
     return null
