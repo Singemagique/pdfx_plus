@@ -28,13 +28,19 @@
   "dependencies": {
     "@electron-toolkit/preload": "3.0.2",
     "@electron-toolkit/utils": "4.0.0",
-    "@embedpdf/pdfium": "^2.14.4"
+    "@embedpdf/pdfium": "^2.14.4",
+    "@signpdf/placeholder-plain": "^3.3.0",
+    "@signpdf/signer-p12": "^3.3.0",
+    "@signpdf/signpdf": "^3.3.0",
+    "@signpdf/utils": "^3.3.0",
+    "node-forge": "^1.4.0"
   },
   "devDependencies": {
     "@electron-toolkit/tsconfig": "1.0.1",
     "@types/d3-selection": "3.0.11",
     "@types/d3-zoom": "3.0.8",
     "@types/node": "22.19.21",
+    "@types/node-forge": "^1.3.14",
     "@types/react": "19.2.17",
     "@types/react-dom": "19.2.3",
     "@vitejs/plugin-react": "4.7.0",

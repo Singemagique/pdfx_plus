@@ -1068,6 +1068,40 @@
   resolved "https://registry.yarnpkg.com/@rollup/rollup-win32-x64-msvc/-/rollup-win32-x64-msvc-4.61.1.tgz#cb98a579ab6eec9940bda7a736df5e2b94eb0a27"
   integrity sha512-X+zaP2x+j4RXGfbp/seSoRHWnPxzApilDszisZxbYH5C/jTxFhCtDNdPGZb9lJyYPs24wGxruPF7Y+sIXt9Gzw==
 
+"@signpdf/placeholder-pdfkit010@^3.3.0":
+  version "3.3.0"
+  resolved "https://registry.yarnpkg.com/@signpdf/placeholder-pdfkit010/-/placeholder-pdfkit010-3.3.0.tgz#4ccf1d63730ef1e934f453c1541ae64f3fc822f3"
+  integrity sha512-tfXvynZDT68VoQg80cSdN5TET3ZzLMQCNHQpc3RJCi67YnhRromVhyCwMyi2tCdApGo2rkI46x6e9kCPvNsaBA==
+  dependencies:
+    "@signpdf/utils" "^3.3.0"
+
+"@signpdf/placeholder-plain@^3.3.0":
+  version "3.3.0"
+  resolved "https://registry.yarnpkg.com/@signpdf/placeholder-plain/-/placeholder-plain-3.3.0.tgz#12c1d8f59c383735be4f2e493afc105ed90f7425"
+  integrity sha512-n7jt1Dzo3wocI64Pb8YhB+gvHAeaxweR7oHj5Xn3CyUVsP8LmXEWwJOUdWmtTrDfAupEiQtcro/EeskLiNy1vA==
+  dependencies:
+    "@signpdf/placeholder-pdfkit010" "^3.3.0"
+    "@signpdf/utils" "^3.3.0"
+
+"@signpdf/signer-p12@^3.3.0":
+  version "3.3.0"
+  resolved "https://registry.yarnpkg.com/@signpdf/signer-p12/-/signer-p12-3.3.0.tgz#e2771729698d2b406cc3e8feadef17ac9b35cb2f"
+  integrity sha512-MLynYKgUBu29ojIueIDV34sIOFDFpP0s1gQORxCc0zhs1jfy0juqU2xQpjUayMbhzB4L0zS9dPwgHtok1f89Cg==
+  dependencies:
+    "@signpdf/utils" "^3.3.0"
+
+"@signpdf/signpdf@^3.3.0":
+  version "3.3.0"
+  resolved "https://registry.yarnpkg.com/@signpdf/signpdf/-/signpdf-3.3.0.tgz#49c61066d22f8200d1aa4abc177bb3b4f9da1077"
+  integrity sha512-/vy3dPTsTbLHdsKRarPQw8++UqN8GXxjEVnl4ZRl+o/zMWFqVb861RM5bxoRMGGMuPSvb1Rgt2lmVobEc0YUpw==
+  dependencies:
+    "@signpdf/utils" "^3.3.0"
+
+"@signpdf/utils@^3.3.0":
+  version "3.3.0"
+  resolved "https://registry.yarnpkg.com/@signpdf/utils/-/utils-3.3.0.tgz#b30daf5d2755c614afa56093e35e33d559658644"
+  integrity sha512-ArOP0MIhCfdChh1oZkog81TPeSY2e5TvHQmXJ682T4+SKb6Z609uAZhqMQZ9xm+YenEf/eNMSE5KVwU+EudXug==
+
 "@sindresorhus/is@^4.0.0":
   version "4.6.0"
   resolved "https://registry.yarnpkg.com/@sindresorhus/is/-/is-4.6.0.tgz#3c7c9c46e678feefe7a2e5bb609d3dbd665ffb3f"
@@ -1213,6 +1247,13 @@
   version "2.1.0"
   resolved "https://registry.yarnpkg.com/@types/ms/-/ms-2.1.0.tgz#052aa67a48eccc4309d7f0191b7e41434b90bb78"
   integrity sha512-GsCCIZDE/p3i96vtEqx+7dBUGXrc7zeSK3wwPHIaRThS+9OhWIXRqzs4d6k1SVU8g91DrNRWxWUGhp5KXQb2VA==
+
+"@types/node-forge@^1.3.14":
+  version "1.3.14"
+  resolved "https://registry.yarnpkg.com/@types/node-forge/-/node-forge-1.3.14.tgz#006c2616ccd65550560c2757d8472eb6d3ecea0b"
+  integrity sha512-mhVF2BnD4BO+jtOp7z1CdzaK4mbuK0LLQYAvdOLqHTavxFNq4zA1EmYkpnFjP8HOUzedfQkRnp0E2ulSAYSzAw==
+  dependencies:
+    "@types/node" "*"
 
 "@types/node@*":
   version "25.9.3"
@@ -3380,6 +3421,11 @@ node-api-version@^0.2.0:
   integrity sha512-2xP/IGGMmmSQpI1+O/k72jF/ykvZ89JeuKX3TLJAYPDVLUalrshrLHkeVcCCZqG/eEa635cr8IBYzgnDvM2O8Q==
   dependencies:
     semver "^7.3.5"
+
+node-forge@^1.4.0:
+  version "1.4.0"
+  resolved "https://registry.yarnpkg.com/node-forge/-/node-forge-1.4.0.tgz#1c7b7d8bdc2d078739f58287d589d903a11b2fc2"
+  integrity sha512-LarFH0+6VfriEhqMMcLX2F7SwSXeWwnEAJEsYm5QKWchiVYVvJyV9v7UDvUv+w5HO23ZpQTXDv/GxdDdMyOuoQ==
 
 node-gyp@11.5.0:
   version "11.5.0"
