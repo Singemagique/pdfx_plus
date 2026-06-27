@@ -4,8 +4,11 @@ import {
   makePageKey,
   newOverlayId,
   overlaysForPage,
+  type Geom,
   type Overlay,
-  type RGB
+  type RGB,
+  type StandardFontName,
+  type TextAlign
 } from '../../edit/model'
 import { useEdits } from '../../edit/EditProvider'
 import {
@@ -38,13 +41,40 @@ type Drag = {
   start: Overlay
   preview: Overlay
 }
+type TextEdit = {
+  id: string | null // null = a new box, else the overlay being re-edited
+  geom: Geom
+  value: string
+  fontSize: number
+  color: RGB
+  font: StandardFontName
+  align: TextAlign
+}
 
 const HANDLES: HandleId[] = ['tl', 'tr', 'bl', 'br']
+const TEXT_COLOR: RGB = { r: 0.1, g: 0.1, b: 0.12 }
+const TEXT_SIZE = 14
+const TEXT_WIDTH = 220 // default text box width, PDF points
+const LINE = 1.25
+
+const fontCss = (f: StandardFontName): string =>
+  f === 'Times'
+    ? '"Times New Roman", Times, serif'
+    : f === 'Courier'
+      ? '"Courier New", monospace'
+      : 'Helvetica, Arial, sans-serif'
 
 const cssColor = (c: RGB): string =>
   `rgb(${Math.round(c.r * 255)}, ${Math.round(c.g * 255)}, ${Math.round(c.b * 255)})`
 const cssRgba = (c: RGB, a: number): string =>
   `rgba(${Math.round(c.r * 255)}, ${Math.round(c.g * 255)}, ${Math.round(c.b * 255)}, ${a})`
+
+// Text box height (PDF) for N lines, keeping its top edge fixed.
+function textGeom(base: Geom, value: string, fontSize: number): Geom {
+  const lines = value.split('\n').length
+  const h = Math.max(fontSize * 1.4, lines * fontSize * LINE)
+  return { ...base, y: base.y + base.h - h, h }
+}
 
 function pathToPoints(path: number[], page: PageEntry, fit: FitSize): string {
   const out: string[] = []
@@ -77,11 +107,14 @@ export function OverlayLayer({ page, fit, active }: OverlayLayerProps): React.JS
   const urlCache = useRef<Map<string, string>>(new Map())
   const [draft, setDraft] = useState<Draft | null>(null)
   const [drag, setDrag] = useState<Drag | null>(null)
+  const [textEdit, setTextEdit] = useState<TextEdit | null>(null)
 
   const pageKey = makePageKey(page.source.id, page.pageIndex)
   const pageOverlays = overlaysForPage(edits.overlays, pageKey)
-  const drawing = active && edits.tool !== 'browse'
+  const drawing = active && (edits.tool === 'highlight' || edits.tool === 'ink')
+  const placing = active && edits.tool === 'text'
   const selecting = active && edits.tool === 'browse'
+  const capturing = drawing || placing
   const scale = pageScale(page, fit)
 
   const toPdf = (clientX: number, clientY: number): Pt => {
@@ -116,6 +149,8 @@ export function OverlayLayer({ page, fit, active }: OverlayLayerProps): React.JS
   useEffect(() => {
     if (!active) return
     const onKey = (e: KeyboardEvent): void => {
+      const t = e.target as HTMLElement | null
+      if (t && (t.tagName === 'TEXTAREA' || t.tagName === 'INPUT' || t.isContentEditable)) return
       if (e.key === 'Escape') return select(null)
       if ((e.key === 'Delete' || e.key === 'Backspace') && selectedId) {
         e.preventDefault()
@@ -169,6 +204,60 @@ export function OverlayLayer({ page, fit, active }: OverlayLayerProps): React.JS
       })
     }
     setDraft(null)
+  }
+
+  // ---- Text ----
+  const onLayerDown = (e: React.PointerEvent): void => {
+    if (drawing) return onDrawDown(e)
+    if (placing && !textEdit && e.button === 0) {
+      e.stopPropagation()
+      e.preventDefault()
+      const p = toPdf(e.clientX, e.clientY)
+      const h = TEXT_SIZE * 1.4
+      setTextEdit({
+        id: null,
+        value: '',
+        fontSize: TEXT_SIZE,
+        color: TEXT_COLOR,
+        font: 'Helvetica',
+        align: 'left',
+        geom: { x: p.x, y: p.y - h, w: TEXT_WIDTH, h, rotation: 0, opacity: 1 }
+      })
+    }
+  }
+
+  const commitText = (): void => {
+    const te = textEdit
+    if (!te) return
+    setTextEdit(null)
+    const value = te.value.replace(/[ \t]+$/gm, '').replace(/\n+$/, '')
+    if (!value.trim()) {
+      if (te.id) edits.removeOverlay(te.id)
+      return
+    }
+    const geom = textGeom(te.geom, value, te.fontSize)
+    const fields = {
+      type: 'text' as const,
+      text: value,
+      fontSize: te.fontSize,
+      color: te.color,
+      font: te.font,
+      align: te.align
+    }
+    if (te.id) {
+      const existing = edits.overlays.find((o) => o.id === te.id)
+      if (existing) edits.replaceOverlay({ ...existing, geom, ...fields })
+    } else {
+      const id = newOverlayId()
+      edits.addOverlay({
+        id,
+        pageKey,
+        z: pageOverlays.length,
+        createdAt: Date.now(),
+        geom,
+        ...fields
+      })
+    }
   }
 
   // ---- Select / move / resize ----
@@ -239,6 +328,29 @@ export function OverlayLayer({ page, fit, active }: OverlayLayerProps): React.JS
         </svg>
       )
     }
+    if (o.type === 'text') {
+      if (textEdit && textEdit.id === o.id) return null // being edited
+      const r = geomToCss(o.geom, page, fit)
+      return (
+        <div
+          key={o.id}
+          className="ov-text"
+          style={{
+            left: r.left,
+            top: r.top,
+            width: r.width,
+            fontSize: o.fontSize * scale,
+            lineHeight: LINE,
+            color: cssColor(o.color),
+            textAlign: o.align,
+            fontFamily: fontCss(o.font),
+            opacity: o.geom.opacity
+          }}
+        >
+          {o.text}
+        </div>
+      )
+    }
     if (o.type === 'image') {
       const r = geomToCss(o.geom, page, fit)
       const url = imageUrl(o.attachmentId)
@@ -274,6 +386,23 @@ export function OverlayLayer({ page, fit, active }: OverlayLayerProps): React.JS
           onPointerMove={onDragMove}
           onPointerUp={onDragEnd}
           onPointerCancel={onDragEnd}
+          onDoubleClick={
+            o.type === 'text'
+              ? (e) => {
+                  e.stopPropagation()
+                  select(o.id)
+                  setTextEdit({
+                    id: o.id,
+                    geom: o.geom,
+                    value: o.text,
+                    fontSize: o.fontSize,
+                    color: o.color,
+                    font: o.font,
+                    align: o.align
+                  })
+                }
+              : undefined
+          }
         />
         {isSel && (
           <>
@@ -316,15 +445,49 @@ export function OverlayLayer({ page, fit, active }: OverlayLayerProps): React.JS
   return (
     <div
       ref={layerRef}
-      className={`overlay-layer${drawing ? ' drawing' : ''}`}
-      style={{ pointerEvents: drawing ? 'auto' : 'none' }}
-      onPointerDown={onDrawDown}
+      className={`overlay-layer${drawing ? ' drawing' : ''}${placing ? ' placing' : ''}`}
+      style={{ pointerEvents: capturing ? 'auto' : 'none' }}
+      onPointerDown={onLayerDown}
       onPointerMove={onDrawMove}
       onPointerUp={onDrawUp}
       onPointerCancel={onDrawUp}
     >
       {pageOverlays.map((o) => renderVisual(effective(o)))}
       {selecting && pageOverlays.map((o) => renderChrome(effective(o)))}
+      {textEdit &&
+        (() => {
+          const r = geomToCss(textEdit.geom, page, fit)
+          return (
+            <textarea
+              className="ov-textedit"
+              autoFocus
+              value={textEdit.value}
+              placeholder="Type…"
+              spellCheck={false}
+              style={{
+                left: r.left,
+                top: r.top,
+                width: r.width,
+                minHeight: r.height,
+                fontSize: textEdit.fontSize * scale,
+                lineHeight: LINE,
+                color: cssColor(textEdit.color),
+                textAlign: textEdit.align,
+                fontFamily: fontCss(textEdit.font)
+              }}
+              onChange={(e) => setTextEdit({ ...textEdit, value: e.target.value })}
+              onBlur={commitText}
+              onPointerDown={(e) => e.stopPropagation()}
+              onKeyDown={(e) => {
+                e.stopPropagation()
+                if (e.key === 'Escape') {
+                  e.preventDefault()
+                  commitText()
+                }
+              }}
+            />
+          )
+        })()}
       {draft?.kind === 'highlight' &&
         (() => {
           const r = geomToCss(rectGeom(draft.start, draft.current, 1), page, fit)

@@ -10,7 +10,7 @@ import { groupByPage, type Overlay, type RGB } from './model'
 import type { Attachment } from '../pdfx/flatten'
 import type { EditLayer } from '../pdfx/build'
 
-export type ToolKind = 'browse' | 'highlight' | 'ink'
+export type ToolKind = 'browse' | 'highlight' | 'ink' | 'text'
 
 /** The page currently focused in full view, so palette actions know where to place things. */
 export interface CurrentPage {
