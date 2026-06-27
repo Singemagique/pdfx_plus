@@ -1,6 +1,42 @@
 import { useEffect, useRef } from 'react'
 import { useEdits, type ToolKind } from '../../edit/EditProvider'
-import { newOverlayId, type RGB } from '../../edit/model'
+import { newOverlayId, type RGB, type ShapeKind } from '../../edit/model'
+
+const SHAPE_KINDS: { kind: ShapeKind; label: string; icon: React.JSX.Element }[] = [
+  { kind: 'rect', label: 'Rectangle', icon: <rect x="3" y="5" width="18" height="14" rx="1" /> },
+  { kind: 'ellipse', label: 'Ellipse', icon: <ellipse cx="12" cy="12" rx="9" ry="7" /> },
+  { kind: 'line', label: 'Line', icon: <line x1="4" y1="20" x2="20" y2="4" /> },
+  {
+    kind: 'arrow',
+    label: 'Arrow',
+    icon: (
+      <>
+        <line x1="4" y1="20" x2="20" y2="4" />
+        <path d="M20 4l-6 1M20 4l-1 6" />
+      </>
+    )
+  },
+  {
+    kind: 'underline',
+    label: 'Underline',
+    icon: (
+      <>
+        <path d="M7 4v7a5 5 0 0 0 10 0V4" />
+        <line x1="5" y1="20" x2="19" y2="20" />
+      </>
+    )
+  },
+  {
+    kind: 'strike',
+    label: 'Strikethrough',
+    icon: (
+      <>
+        <path d="M7 7c.5-2 2.5-3 5-3s4.5 1 5 2M8 17c.5 2 2 3 4 3s5-1 5-3" />
+        <line x1="4" y1="12" x2="20" y2="12" />
+      </>
+    )
+  }
+]
 
 const cssColor = (c: RGB): string =>
   `rgb(${Math.round(c.r * 255)}, ${Math.round(c.g * 255)}, ${Math.round(c.b * 255)})`
@@ -38,6 +74,13 @@ function ToolIcon({ kind }: { kind: ToolKind }): React.JSX.Element {
         <path d="M9.5 19h5" />
       </svg>
     )
+  if (kind === 'shape')
+    return (
+      <svg {...common}>
+        <rect x="3" y="9" width="11" height="11" rx="1" />
+        <circle cx="16" cy="8" r="5" />
+      </svg>
+    )
   return (
     <svg {...common}>
       <path d="M3 21l4-1 11-11a2.8 2.8 0 0 0-4-4L3 16z" />
@@ -50,13 +93,15 @@ const TOOLS: { kind: ToolKind; label: string }[] = [
   { kind: 'browse', label: 'Browse' },
   { kind: 'highlight', label: 'Highlight' },
   { kind: 'ink', label: 'Draw' },
-  { kind: 'text', label: 'Text' }
+  { kind: 'text', label: 'Text' },
+  { kind: 'shape', label: 'Shape' }
 ]
 
 export function EditTools(): React.JSX.Element {
   const { tool, setTool, undo, redo, canUndo, canRedo } = useEdits()
   const { highlightPalette, highlightColor, setHighlightColor } = useEdits()
   const { overlays, addOverlay, addAttachment, currentPage, select } = useEdits()
+  const { shapeKind, setShapeKind } = useEdits()
   const fileRef = useRef<HTMLInputElement>(null)
 
   const onFile = async (e: React.ChangeEvent<HTMLInputElement>): Promise<void> => {
@@ -168,6 +213,32 @@ export function EditTools(): React.JSX.Element {
               title={`Highlight ${c.name}`}
               aria-label={`Highlight ${c.name}`}
             />
+          ))}
+        </span>
+      )}
+      {tool === 'shape' && (
+        <span className="tool-swatches">
+          {SHAPE_KINDS.map((s) => (
+            <button
+              key={s.kind}
+              className={`shape-btn${shapeKind === s.kind ? ' active' : ''}`}
+              onClick={() => setShapeKind(s.kind)}
+              title={s.label}
+              aria-label={s.label}
+            >
+              <svg
+                width="16"
+                height="16"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                {s.icon}
+              </svg>
+            </button>
           ))}
         </span>
       )}

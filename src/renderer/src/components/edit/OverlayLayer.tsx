@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
 import type { PageEntry } from '../../types'
 import {
   makePageKey,
@@ -33,7 +33,10 @@ interface OverlayLayerProps {
   active: boolean
 }
 
-type Draft = { kind: 'highlight'; start: Pt; current: Pt } | { kind: 'ink'; pts: number[] }
+type Draft =
+  | { kind: 'highlight'; start: Pt; current: Pt }
+  | { kind: 'ink'; pts: number[] }
+  | { kind: 'shape'; start: Pt; current: Pt }
 type Drag = {
   kind: 'move' | 'resize'
   handle?: HandleId
@@ -89,12 +92,15 @@ function pathToPoints(path: number[], page: PageEntry, fit: FitSize): string {
 function moveOverlay(o: Overlay, dx: number, dy: number): Overlay {
   const geom = { ...o.geom, x: o.geom.x + dx, y: o.geom.y + dy }
   if (o.type === 'ink') return { ...o, geom, paths: o.paths.map((p) => movePath(p, dx, dy)) }
+  if (o.type === 'shape' && o.points) return { ...o, geom, points: movePath(o.points, dx, dy) }
   return { ...o, geom }
 }
 function resizeOverlay(o: Overlay, handle: HandleId, p: Pt): Overlay {
   const geom = resizeGeom(o.geom, handle, p)
   if (o.type === 'ink')
     return { ...o, geom, paths: o.paths.map((pa) => scalePath(pa, o.geom, geom)) }
+  if (o.type === 'shape' && o.points)
+    return { ...o, geom, points: scalePath(o.points, o.geom, geom) }
   return { ...o, geom }
 }
 const geomEq = (a: Overlay['geom'], b: Overlay['geom']): boolean =>
@@ -111,7 +117,8 @@ export function OverlayLayer({ page, fit, active }: OverlayLayerProps): React.JS
 
   const pageKey = makePageKey(page.source.id, page.pageIndex)
   const pageOverlays = overlaysForPage(edits.overlays, pageKey)
-  const drawing = active && (edits.tool === 'highlight' || edits.tool === 'ink')
+  const drawing =
+    active && (edits.tool === 'highlight' || edits.tool === 'ink' || edits.tool === 'shape')
   const placing = active && edits.tool === 'text'
   const selecting = active && edits.tool === 'browse'
   const capturing = drawing || placing
@@ -170,7 +177,9 @@ export function OverlayLayer({ page, fit, active }: OverlayLayerProps): React.JS
     setDraft(
       edits.tool === 'highlight'
         ? { kind: 'highlight', start: p, current: p }
-        : { kind: 'ink', pts: [p.x, p.y] }
+        : edits.tool === 'shape'
+          ? { kind: 'shape', start: p, current: p }
+          : { kind: 'ink', pts: [p.x, p.y] }
     )
     layerRef.current?.setPointerCapture(e.pointerId)
   }
@@ -179,9 +188,9 @@ export function OverlayLayer({ page, fit, active }: OverlayLayerProps): React.JS
     e.stopPropagation()
     const p = toPdf(e.clientX, e.clientY)
     setDraft(
-      draft.kind === 'highlight'
-        ? { ...draft, current: p }
-        : { kind: 'ink', pts: [...draft.pts, p.x, p.y] }
+      draft.kind === 'ink'
+        ? { kind: 'ink', pts: [...draft.pts, p.x, p.y] }
+        : { ...draft, current: p }
     )
   }
   const onDrawUp = (e: React.PointerEvent): void => {
@@ -193,7 +202,23 @@ export function OverlayLayer({ page, fit, active }: OverlayLayerProps): React.JS
       const geom = rectGeom(draft.start, draft.current, 0.4)
       if (geom.w > 2 && geom.h > 2)
         edits.addOverlay({ ...base, geom, type: 'highlight', color: edits.highlightColor })
-    } else if (draft.pts.length >= 4) {
+    } else if (draft.kind === 'shape') {
+      const geom = rectGeom(draft.start, draft.current, 1)
+      const isLine = edits.shapeKind === 'line' || edits.shapeKind === 'arrow'
+      if (geom.w > 2 || geom.h > 2) {
+        edits.addOverlay({
+          ...base,
+          geom,
+          type: 'shape',
+          shape: edits.shapeKind,
+          color: edits.shapeColor,
+          strokeWidth: edits.shapeWidth,
+          ...(isLine
+            ? { points: [draft.start.x, draft.start.y, draft.current.x, draft.current.y] }
+            : {})
+        })
+      }
+    } else if (draft.kind === 'ink' && draft.pts.length >= 4) {
       edits.addOverlay({
         ...base,
         geom: boundsOfPath(draft.pts, 1),
@@ -325,6 +350,78 @@ export function OverlayLayer({ page, fit, active }: OverlayLayerProps): React.JS
               strokeLinecap="round"
             />
           ))}
+        </svg>
+      )
+    }
+    if (o.type === 'shape') {
+      const r = geomToCss(o.geom, page, fit)
+      const sw = o.strokeWidth * scale
+      const stroke = cssColor(o.color)
+      let el: ReactNode
+      if (o.shape === 'rect') {
+        el = (
+          <rect
+            x={r.left}
+            y={r.top}
+            width={r.width}
+            height={r.height}
+            fill="none"
+            stroke={stroke}
+            strokeWidth={sw}
+          />
+        )
+      } else if (o.shape === 'ellipse') {
+        el = (
+          <ellipse
+            cx={r.left + r.width / 2}
+            cy={r.top + r.height / 2}
+            rx={r.width / 2}
+            ry={r.height / 2}
+            fill="none"
+            stroke={stroke}
+            strokeWidth={sw}
+          />
+        )
+      } else if (o.shape === 'underline' || o.shape === 'strike') {
+        const yy = o.shape === 'underline' ? r.top + r.height : r.top + r.height / 2
+        el = (
+          <line
+            x1={r.left}
+            y1={yy}
+            x2={r.left + r.width}
+            y2={yy}
+            stroke={stroke}
+            strokeWidth={sw}
+            strokeLinecap="round"
+          />
+        )
+      } else {
+        const pts = o.points ?? [o.geom.x, o.geom.y + o.geom.h, o.geom.x + o.geom.w, o.geom.y]
+        const a = pointToCss(pts[0], pts[1], page, fit)
+        const b = pointToCss(pts[2], pts[3], page, fit)
+        const lines: number[][] = [[a.x, a.y, b.x, b.y]]
+        if (o.shape === 'arrow') {
+          const ang = Math.atan2(b.y - a.y, b.x - a.x)
+          const head = Math.max(8, sw * 3.5)
+          for (const da of [2.5, -2.5])
+            lines.push([b.x, b.y, b.x + head * Math.cos(ang + da), b.y + head * Math.sin(ang + da)])
+        }
+        el = lines.map((l, i) => (
+          <line
+            key={i}
+            x1={l[0]}
+            y1={l[1]}
+            x2={l[2]}
+            y2={l[3]}
+            stroke={stroke}
+            strokeWidth={sw}
+            strokeLinecap="round"
+          />
+        ))
+      }
+      return (
+        <svg key={o.id} className="ov-vector" width={fit.w} height={fit.h}>
+          {el}
         </svg>
       )
     }
@@ -516,6 +613,26 @@ export function OverlayLayer({ page, fit, active }: OverlayLayerProps): React.JS
           />
         </svg>
       )}
+      {draft?.kind === 'shape' &&
+        (() => {
+          const geom = rectGeom(draft.start, draft.current, 1)
+          const isLine = edits.shapeKind === 'line' || edits.shapeKind === 'arrow'
+          const preview: Overlay = {
+            id: '__draft',
+            pageKey,
+            z: 0,
+            createdAt: 0,
+            geom,
+            type: 'shape',
+            shape: edits.shapeKind,
+            color: edits.shapeColor,
+            strokeWidth: edits.shapeWidth,
+            ...(isLine
+              ? { points: [draft.start.x, draft.start.y, draft.current.x, draft.current.y] }
+              : {})
+          }
+          return renderVisual(preview)
+        })()}
     </div>
   )
 }
