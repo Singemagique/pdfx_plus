@@ -1,5 +1,10 @@
 import { useEffect } from 'react'
 import { useEdits, type ToolKind } from '../../edit/EditProvider'
+import type { RGB } from '../../edit/model'
+
+const cssColor = (c: RGB): string =>
+  `rgb(${Math.round(c.r * 255)}, ${Math.round(c.g * 255)}, ${Math.round(c.b * 255)})`
+const rgbEq = (a: RGB, b: RGB): boolean => a.r === b.r && a.g === b.g && a.b === b.b
 
 function ToolIcon({ kind }: { kind: ToolKind }): React.JSX.Element {
   const common = {
@@ -41,6 +46,7 @@ const TOOLS: { kind: ToolKind; label: string }[] = [
 
 export function EditTools(): React.JSX.Element {
   const { tool, setTool, undo, redo, canUndo, canRedo } = useEdits()
+  const { highlightPalette, highlightColor, setHighlightColor } = useEdits()
 
   // Undo/redo keyboard shortcuts while the editor surface (full view) is mounted.
   useEffect(() => {
@@ -67,6 +73,20 @@ export function EditTools(): React.JSX.Element {
           <span>{t.label}</span>
         </button>
       ))}
+      {tool === 'highlight' && (
+        <span className="tool-swatches">
+          {highlightPalette.map((c) => (
+            <button
+              key={c.name}
+              className={`swatch${rgbEq(c.rgb, highlightColor) ? ' active' : ''}`}
+              style={{ background: cssColor(c.rgb) }}
+              onClick={() => setHighlightColor(c.rgb)}
+              title={`Highlight ${c.name}`}
+              aria-label={`Highlight ${c.name}`}
+            />
+          ))}
+        </span>
+      )}
       <span className="tool-sep" />
       <button
         className="tool-btn icon-only"
