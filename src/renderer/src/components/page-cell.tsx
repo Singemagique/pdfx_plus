@@ -1,6 +1,8 @@
 import { memo } from 'react'
 import type { PageEntry } from '../types'
-import { pageDisplayWidth } from '../canvas/layout'
+import { pageCellWidth } from '../canvas/layout'
+import { useEdits } from '../edit/EditProvider'
+import { makePageKey } from '../edit/model'
 import { PageView } from './PageView'
 import { buildPageDragImage } from './page-drag-image'
 
@@ -35,6 +37,10 @@ function PageCellImpl({
   onPageDragStart,
   onPageDragEnd
 }: PageCellProps): React.JSX.Element {
+  const { rotations } = useEdits()
+  const rot = rotations.get(makePageKey(page.source.id, page.pageIndex)) ?? 0
+  const rotated = rot === 90 || rot === 270
+  const cellW = pageCellWidth(page, rotations)
   return (
     <div
       data-page-id={page.id}
@@ -49,7 +55,7 @@ function PageCellImpl({
               pointerEvents: 'none'
             }
           : {
-              width: pageDisplayWidth(page.width, page.height),
+              width: cellW,
               height: pageHeight,
               visibility: hidden ? 'hidden' : undefined
             }
@@ -75,13 +81,35 @@ function PageCellImpl({
       }}
       onDragEnd={onPageDragEnd}
     >
-      <PageView
-        pdf={page.source.pdf}
-        pageNumber={page.pageIndex + 1}
-        naturalWidth={page.width}
-        naturalHeight={page.height}
-        version={renderVersion}
-      />
+      {rot ? (
+        <div
+          className="page-rotor"
+          style={{
+            position: 'absolute',
+            top: '50%',
+            left: '50%',
+            width: rotated ? pageHeight : cellW,
+            height: rotated ? cellW : pageHeight,
+            transform: `translate(-50%, -50%) rotate(${rot}deg)`
+          }}
+        >
+          <PageView
+            pdf={page.source.pdf}
+            pageNumber={page.pageIndex + 1}
+            naturalWidth={page.width}
+            naturalHeight={page.height}
+            version={renderVersion}
+          />
+        </div>
+      ) : (
+        <PageView
+          pdf={page.source.pdf}
+          pageNumber={page.pageIndex + 1}
+          naturalWidth={page.width}
+          naturalHeight={page.height}
+          version={renderVersion}
+        />
+      )}
       <span className="page-number">{visibleNumber}</span>
     </div>
   )
