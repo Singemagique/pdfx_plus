@@ -11,6 +11,12 @@ files:
   - '!{.env,.env.*,.npmrc,pnpm-lock.yaml,yarn.lock}'
   - '!{tsconfig.json,tsconfig.node.json,tsconfig.web.json}'
   - '!scripts/**'
+  # Development-only artifacts that must never ship inside the app.
+  - '!{CONTRIBUTING.md,vitest.config.mts,.gitattributes,vitest.config.mjs}'
+  - '!docs/**'
+  - '!.github/**'
+  - '!coverage/**'
+  - '!**/*.test.{ts,tsx}'
   # Ship only the compiled native addon, not its sources or build tree.
   - '!native/**'
   - 'native/build/Release/*.node'
@@ -21,10 +27,25 @@ fileAssociations:
     name: PDFX Collection
     description: PDFX multi-document PDF collection
     role: Viewer
+    mimeType: application/x-pdfx
 mac:
   category: public.app-category.productivity
 win:
   executableName: pdfx
+linux:
+  target:
+    - AppImage
+    - deb
+    - rpm
+  category: Office
+  maintainer: PDFx Maintainers <maintainers@pdfx.app>
+  synopsis: One file. Many documents. Still a PDF.
+  description: >-
+    PDFx bundles many PDF documents into a single backwards-compatible .pdfx
+    file (a valid PDF) and provides a minimal cross-platform viewer and editor.
+  icon: build/icon.png
+  mimeTypes:
+    - application/x-pdfx
 nsis:
   artifactName: ${name}-${version}-setup.${ext}
   shortcutName: ${productName}
