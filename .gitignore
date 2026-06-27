@@ -6,6 +6,12 @@ out
 *.tsbuildinfo
 .smoke
 
+# Test coverage output (Vitest / V8).
+coverage
+
+# This is a Yarn (classic) project; never commit an npm lockfile.
+package-lock.json
+
 # Generated native build tree (node-gyp output; rebuilt by `yarn build:native` on postinstall).
 # Keeping it untracked avoids committing compiled binaries and leaking local absolute paths.
 native/build/

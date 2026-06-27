@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Lint, typecheck, test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: yarn
+
+      # The check job only typechecks, lints, and runs pure-node unit tests, so it
+      # skips lifecycle scripts: no Electron binary download and no native build
+      # (the mac-only glass addon, which self-skips off macOS anyway). Faster and
+      # more robust than a full install. The build matrix below does a full install.
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile --ignore-scripts
+
+      - name: Typecheck (node + web)
+        run: yarn typecheck
+
+      - name: Prettier check
+        run: yarn format:check
+
+      - name: Unit tests
+        run: yarn test:run
+
+  build:
+    name: Build (${{ matrix.os }})
+    needs: check
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest, ubuntu-latest]
+    env:
+      # Build forks without signing/notarization secrets.
+      CSC_IDENTITY_AUTO_DISCOVERY: false
+      ELECTRON_CACHE: ${{ github.workspace }}/.cache/electron
+      ELECTRON_BUILDER_CACHE: ${{ github.workspace }}/.cache/electron-builder
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: yarn
+
+      - name: Cache Electron downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ github.workspace }}/.cache/electron
+            ${{ github.workspace }}/.cache/electron-builder
+          key: ${{ runner.os }}-electron-${{ hashFiles('yarn.lock') }}
+          restore-keys: ${{ runner.os }}-electron-
+
+      # ubuntu-latest is 24.04: rpmbuild is needed for electron-builder's RPM
+      # target, and the classic AppImage runtime needs FUSE2 (libfuse2t64 on 24.04).
+      - name: Linux packaging dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y rpm libfuse2t64
+
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+
+      - name: Build (macOS)
+        if: matrix.os == 'macos-latest'
+        run: yarn build:mac --publish never
+
+      - name: Build (Windows)
+        if: matrix.os == 'windows-latest'
+        run: yarn build:win --publish never
+
+      - name: Build (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: yarn build:linux --publish never
+
+      - name: Upload packaged artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pdfx-${{ matrix.os }}
+          path: dist/
+          if-no-files-found: ignore

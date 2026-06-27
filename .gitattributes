@@ -1,0 +1,15 @@
+# Normalize line endings to LF on checkin and checkout on every platform.
+# Keeps the Prettier format gate (prettier --check .) stable on Windows too.
+* text=auto eol=lf
+
+# Binary assets must never be line-ending normalized.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.avif binary
+*.icns binary
+*.ico binary
+*.pdf binary
+*.pdfx binary
