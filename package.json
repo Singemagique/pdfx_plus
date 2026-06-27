@@ -33,7 +33,9 @@
     "@signpdf/signer-p12": "^3.3.0",
     "@signpdf/signpdf": "^3.3.0",
     "@signpdf/utils": "^3.3.0",
-    "node-forge": "^1.4.0"
+    "asn1js": "3.0.10",
+    "node-forge": "^1.4.0",
+    "pkijs": "3.4.0"
   },
   "devDependencies": {
     "@electron-toolkit/tsconfig": "1.0.1",

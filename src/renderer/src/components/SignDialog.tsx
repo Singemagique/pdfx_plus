@@ -4,7 +4,7 @@ interface SignDialogProps {
   busy: boolean
   onSign: (
     cert: Uint8Array,
-    opts: { passphrase: string; reason?: string; name?: string }
+    opts: { passphrase: string; reason?: string; name?: string; tsaUrl?: string }
   ) => Promise<boolean>
   onClose: () => void
 }
@@ -15,6 +15,7 @@ export function SignDialog({ busy, onSign, onClose }: SignDialogProps): React.JS
   const [passphrase, setPassphrase] = useState('')
   const [reason, setReason] = useState('')
   const [name, setName] = useState('')
+  const [tsaUrl, setTsaUrl] = useState('')
   const fileRef = useRef<HTMLInputElement>(null)
 
   const onCertFile = async (e: React.ChangeEvent<HTMLInputElement>): Promise<void> => {
@@ -28,7 +29,8 @@ export function SignDialog({ busy, onSign, onClose }: SignDialogProps): React.JS
     const ok = await onSign(cert.bytes, {
       passphrase,
       reason: reason || undefined,
-      name: name || undefined
+      name: name || undefined,
+      tsaUrl: tsaUrl.trim() || undefined
     })
     if (ok) onClose()
   }
@@ -72,6 +74,13 @@ export function SignDialog({ busy, onSign, onClose }: SignDialogProps): React.JS
           placeholder="Reason (optional)"
           value={reason}
           onChange={(e) => setReason(e.target.value)}
+        />
+        <input
+          className="sign-input"
+          type="text"
+          placeholder="Timestamp authority URL (optional, → B-T)"
+          value={tsaUrl}
+          onChange={(e) => setTsaUrl(e.target.value)}
           onKeyDown={(e) => e.key === 'Enter' && void submit()}
         />
         <div className="sign-actions">

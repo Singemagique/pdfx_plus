@@ -69,7 +69,7 @@ export function useExport(
   const signAndExport = useCallback(
     async (
       certBytes: Uint8Array,
-      opts: { passphrase: string; reason?: string; name?: string }
+      opts: { passphrase: string; reason?: string; name?: string; tsaUrl?: string }
     ): Promise<boolean> => {
       if (docs.length === 0) {
         flash('Nothing to sign')

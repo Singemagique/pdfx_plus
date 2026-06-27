@@ -20,6 +20,8 @@ export interface SignOptions {
   reason?: string
   name?: string
   location?: string
+  /** RFC3161 Timestamp Authority URL — when set, upgrades the signature to PAdES B-T. */
+  tsaUrl?: string
 }
 
 const api = {
