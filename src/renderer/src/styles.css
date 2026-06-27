@@ -969,6 +969,16 @@ body {
   overflow: visible;
 }
 
+/* Pending-redaction marker: solid black (as exported) + red outline so it reads as "to be removed".
+   The actual content is removed on export by the PDFium pass. */
+.ov-redaction {
+  position: absolute;
+  pointer-events: none;
+  background: #000;
+  outline: 1.5px solid #e5484d;
+  outline-offset: -1px;
+}
+
 .overlay-layer.cropping {
   cursor: crosshair;
 }

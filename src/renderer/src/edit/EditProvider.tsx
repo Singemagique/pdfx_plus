@@ -18,7 +18,15 @@ import {
 import type { Attachment } from '../pdfx/flatten'
 import type { EditLayer } from '../pdfx/build'
 
-export type ToolKind = 'browse' | 'highlight' | 'ink' | 'text' | 'shape' | 'crop' | 'form'
+export type ToolKind =
+  | 'browse'
+  | 'highlight'
+  | 'ink'
+  | 'text'
+  | 'shape'
+  | 'crop'
+  | 'form'
+  | 'redact'
 
 /** The page currently focused in full view, so palette actions know where to place things. */
 export interface CurrentPage {

@@ -65,7 +65,7 @@ function viewBox(crop: Box, media: Box): Box {
  * Editor-applied rotation is NOT undone here: it is removed from the stored crop at capture
  * time and re-applied as extra /Rotate, so only the source's intrinsic angle matters.
  */
-function unrotateCrop(c: CropBox, intrinsic: number, W: number, H: number): CropBox {
+export function unrotateCrop(c: CropBox, intrinsic: number, W: number, H: number): CropBox {
   switch (intrinsic) {
     case 90:
       return { x: W - c.y - c.h, y: c.x, w: c.h, h: c.w }

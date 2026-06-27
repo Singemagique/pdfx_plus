@@ -184,8 +184,10 @@ export function redactPdf(
   try {
     for (const { pageIndex, rects } of pages) {
       if (rects.length === 0) continue
+      // Fail closed: a page that needs redaction but won't load must abort the whole export rather
+      // than silently yield an un-redacted document.
       const page = pdfium.FPDF_LoadPage(doc, pageIndex)
-      if (!page) continue
+      if (!page) throw new Error(`redact: FPDF_LoadPage failed for page ${pageIndex}`)
       try {
         redactPage(pdfium, page, rects)
       } finally {

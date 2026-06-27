@@ -46,7 +46,9 @@ export function serializeMirror(
     if (doc.pages.length === 0) continue
     doc.pages.forEach((page, pi) => {
       const key = makePageKey(page.sourceKey, page.pageIndex)
-      const overlays = edits.overlays.get(key) ?? []
+      // Redaction overlays are applied destructively on export (see redact-export.ts), so they are
+      // never written to the editable mirror — a reopened .pdfx must not carry the redacted content.
+      const overlays = (edits.overlays.get(key) ?? []).filter((o) => o.type !== 'redaction')
       const rotation = edits.rotations?.get(key) ?? 0
       const crop = edits.crops?.get(key)
       if (overlays.length === 0 && !rotation && !crop) return

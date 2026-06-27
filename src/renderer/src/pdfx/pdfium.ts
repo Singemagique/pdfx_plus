@@ -2,7 +2,7 @@
 // returns the shared instance used by the redaction pipeline (./redact). Kept separate from
 // redact.ts so the engine stays pure and unit-testable with a module injected directly.
 import { init } from '@embedpdf/pdfium'
-import wasmUrl from '@embedpdf/pdfium/dist/pdfium.wasm?url'
+import wasmUrl from '@embedpdf/pdfium/pdfium.wasm?url'
 import type { PdfiumModule } from './redact'
 
 let instance: Promise<PdfiumModule> | null = null
