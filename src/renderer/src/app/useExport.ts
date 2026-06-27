@@ -3,6 +3,7 @@ import { zipSync } from 'fflate'
 import { buildPdf, buildPdfx, stripExtension } from '../pdfx/format'
 import type { EditLayer } from '../pdfx/build'
 import { toExportPage } from '../pdfx/source'
+import { applyRedactedBytes, buildRedactedSources } from '../pdfx/redact-export'
 import type { DocEntry } from '../types'
 
 const PDFX_FILTER = { name: 'PDFX', extensions: ['pdfx'] }
@@ -30,17 +31,25 @@ export function useExport(
       setBusy(true)
       try {
         const filename = path.split(/[\\/]/).pop() ?? `untitled.${kind}`
+        // Redactions are applied destructively to the source bytes first (both export kinds).
+        const redacted = await buildRedactedSources(editLayer, docs)
         // .pdfx embeds the manifest that lets PDFx re-split the collection; a plain
         // .pdf is a flat, manifest-free PDF that any tool reads as one document.
         const bytes =
           kind === 'pdfx'
             ? await buildPdfx(
-                docs.map((doc) => ({ name: doc.name, pages: doc.pages.map(toExportPage) })),
+                docs.map((doc) => ({
+                  name: doc.name,
+                  pages: applyRedactedBytes(doc.pages.map(toExportPage), redacted)
+                })),
                 stripExtension(filename).replace(/\.pdf$/i, ''),
                 editLayer
               )
             : await buildPdf(
-                docs.flatMap((doc) => doc.pages.map(toExportPage)),
+                applyRedactedBytes(
+                  docs.flatMap((doc) => doc.pages.map(toExportPage)),
+                  redacted
+                ),
                 editLayer
               )
         const saved = await window.api.writeFile(path, bytes)
@@ -64,6 +73,7 @@ export function useExport(
     if (!path) return
     setBusy(true)
     try {
+      const redacted = await buildRedactedSources(editLayer, docs)
       const entries: Record<string, Uint8Array> = {}
       const used = new Set<string>()
       for (const doc of docs) {
@@ -71,7 +81,10 @@ export function useExport(
         let filename = `${safeName}.pdf`
         for (let n = 2; used.has(filename); n++) filename = `${safeName} (${n}).pdf`
         used.add(filename)
-        entries[filename] = await buildPdf(doc.pages.map(toExportPage), editLayer)
+        entries[filename] = await buildPdf(
+          applyRedactedBytes(doc.pages.map(toExportPage), redacted),
+          editLayer
+        )
       }
       const saved = await window.api.writeFile(path, zipSync(entries))
       flash(`Saved ${saved}`)

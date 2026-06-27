@@ -43,6 +43,7 @@ type Draft =
   | { kind: 'ink'; pts: number[] }
   | { kind: 'shape'; start: Pt; current: Pt }
   | { kind: 'crop'; start: Pt; current: Pt }
+  | { kind: 'redaction'; start: Pt; current: Pt }
 type Drag = {
   kind: 'move' | 'resize'
   handle?: HandleId
@@ -146,7 +147,11 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
   const pageKey = makePageKey(page.source.id, page.pageIndex)
   const pageOverlays = overlaysForPage(edits.overlays, pageKey)
   const drawing =
-    active && (edits.tool === 'highlight' || edits.tool === 'ink' || edits.tool === 'shape')
+    active &&
+    (edits.tool === 'highlight' ||
+      edits.tool === 'ink' ||
+      edits.tool === 'shape' ||
+      edits.tool === 'redact')
   const cropping = active && edits.tool === 'crop'
   const placing = active && edits.tool === 'text'
   const selecting = active && edits.tool === 'browse'
@@ -275,11 +280,13 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
     setDraft(
       cropping
         ? { kind: 'crop', start: p, current: p }
-        : edits.tool === 'highlight'
-          ? { kind: 'highlight', start: p, current: p }
-          : edits.tool === 'shape'
-            ? { kind: 'shape', start: p, current: p }
-            : { kind: 'ink', pts: [p.x, p.y] }
+        : edits.tool === 'redact'
+          ? { kind: 'redaction', start: p, current: p }
+          : edits.tool === 'highlight'
+            ? { kind: 'highlight', start: p, current: p }
+            : edits.tool === 'shape'
+              ? { kind: 'shape', start: p, current: p }
+              : { kind: 'ink', pts: [p.x, p.y] }
     )
     layerRef.current?.setPointerCapture(e.pointerId)
   }
@@ -313,6 +320,10 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
       const geom = rectGeom(draft.start, draft.current, 0.4)
       if (geom.w > 2 && geom.h > 2)
         edits.addOverlay({ ...base, geom, type: 'highlight', color: edits.highlightColor })
+    } else if (draft.kind === 'redaction') {
+      const geom = rectGeom(draft.start, draft.current, 1)
+      if (geom.w > 2 && geom.h > 2)
+        edits.addOverlay({ ...base, geom, type: 'redaction', fill: { r: 0, g: 0, b: 0 } })
     } else if (draft.kind === 'shape') {
       const geom = rectGeom(draft.start, draft.current, 1)
       const isLine = edits.shapeKind === 'line' || edits.shapeKind === 'arrow'
@@ -431,6 +442,18 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
   const effective = (o: Overlay): Overlay => (drag && drag.preview.id === o.id ? drag.preview : o)
 
   const renderVisual = (o: Overlay): React.JSX.Element | null => {
+    if (o.type === 'redaction') {
+      // A pending-redaction marker: solid black (matching the exported box) with a red outline so
+      // it reads as "will be removed", not a black shape. The content is removed only on export.
+      const r = geomToCss(o.geom, page, fit)
+      return (
+        <div
+          key={o.id}
+          className="ov-redaction"
+          style={{ left: r.left, top: r.top, width: r.width, height: r.height }}
+        />
+      )
+    }
     if (o.type === 'highlight') {
       const r = geomToCss(o.geom, page, fit)
       return (
@@ -726,6 +749,16 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
                 height: r.height,
                 background: cssRgba(edits.highlightColor, 0.3)
               }}
+            />
+          )
+        })()}
+      {draft?.kind === 'redaction' &&
+        (() => {
+          const r = geomToCss(rectGeom(draft.start, draft.current, 1), page, fit)
+          return (
+            <div
+              className="ov-redaction"
+              style={{ left: r.left, top: r.top, width: r.width, height: r.height }}
             />
           )
         })()}
