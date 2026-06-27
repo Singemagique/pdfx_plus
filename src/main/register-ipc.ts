@@ -86,7 +86,13 @@ export function registerIpc(getPending: () => string[], clearPending: () => void
       _event,
       pdf: Uint8Array,
       p12: Uint8Array,
-      opts: { passphrase?: string; reason?: string; name?: string; location?: string }
+      opts: {
+        passphrase?: string
+        reason?: string
+        name?: string
+        location?: string
+        tsaUrl?: string
+      }
     ): Promise<Uint8Array> => {
       if (!ArrayBuffer.isView(pdf) || !ArrayBuffer.isView(p12)) {
         throw new Error('sign-pdf: invalid payload')
@@ -101,7 +107,8 @@ export function registerIpc(getPending: () => string[], clearPending: () => void
         passphrase: String(o.passphrase ?? ''),
         reason: o.reason != null ? String(o.reason) : undefined,
         name: o.name != null ? String(o.name) : undefined,
-        location: o.location != null ? String(o.location) : undefined
+        location: o.location != null ? String(o.location) : undefined,
+        tsaUrl: o.tsaUrl ? String(o.tsaUrl) : undefined
       })
     }
   )

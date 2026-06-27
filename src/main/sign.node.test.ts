@@ -2,8 +2,11 @@ import { describe, expect, it } from 'vitest'
 import { createHash } from 'node:crypto'
 import { PDFDocument, StandardFonts } from 'pdf-lib'
 import forge from 'node-forge'
+import * as pkijs from 'pkijs'
+import * as asn1js from 'asn1js'
 
 import { signPdf } from './sign'
+import { makeLocalTsa } from './tsa-local'
 
 // A self-signed test credential as PKCS#12 bytes + its expected common name.
 function makeP12(passphrase: string): { p12: Uint8Array; cn: string } {
@@ -85,5 +88,27 @@ describe('signPdf', () => {
   it('throws on a wrong passphrase (never returns a half-signed file)', async () => {
     const { p12 } = makeP12('correct')
     await expect(signPdf(await makePdf(), p12, { passphrase: 'wrong' })).rejects.toBeTruthy()
+  })
+
+  it('upgrades to PAdES B-T when a TSA is configured (timestamp token embedded)', async () => {
+    const { p12 } = makeP12('pw')
+    const issue = await makeLocalTsa()
+    const signed = await signPdf(
+      await makePdf(),
+      p12,
+      { passphrase: 'pw', tsaUrl: 'http://local-tsa' },
+      issue // inject the local issuer so the test stays offline
+    )
+    const s = Buffer.from(signed).toString('latin1')
+    expect(s).toContain('/ETSI.CAdES.detached') // still PAdES
+    const cmsHex = s.match(/\/Contents\s*<([0-9A-Fa-f]+)>/)![1]
+    const der = Buffer.from(cmsHex, 'hex') // zero-padded; fromBER reads the CMS prefix
+    const ci = new pkijs.ContentInfo({
+      schema: asn1js.fromBER(der.buffer.slice(der.byteOffset, der.byteOffset + der.byteLength))
+        .result
+    })
+    const sd = new pkijs.SignedData({ schema: ci.content })
+    const attrs = sd.signerInfos[0].unsignedAttrs?.attributes ?? []
+    expect(attrs.some((a) => a.type === '1.2.840.113549.1.9.16.2.14')).toBe(true) // id-aa-timeStampToken
   })
 })
