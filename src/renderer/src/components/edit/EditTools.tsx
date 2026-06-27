@@ -82,6 +82,13 @@ function ToolIcon({ kind }: { kind: ToolKind }): React.JSX.Element {
         <circle cx="16" cy="8" r="5" />
       </svg>
     )
+  if (kind === 'crop')
+    return (
+      <svg {...common}>
+        <path d="M6 2v14a2 2 0 0 0 2 2h14" />
+        <path d="M2 6h14a2 2 0 0 1 2 2v14" />
+      </svg>
+    )
   return (
     <svg {...common}>
       <path d="M3 21l4-1 11-11a2.8 2.8 0 0 0-4-4L3 16z" />
@@ -95,13 +102,15 @@ const TOOLS: { kind: ToolKind; label: string }[] = [
   { kind: 'highlight', label: 'Highlight' },
   { kind: 'ink', label: 'Draw' },
   { kind: 'text', label: 'Text' },
-  { kind: 'shape', label: 'Shape' }
+  { kind: 'shape', label: 'Shape' },
+  { kind: 'crop', label: 'Crop' }
 ]
 
 export function EditTools(): React.JSX.Element {
   const { tool, setTool, undo, redo, canUndo, canRedo } = useEdits()
   const { highlightPalette, highlightColor, setHighlightColor } = useEdits()
   const { overlays, addOverlay, addAttachment, currentPage, select, rotatePage } = useEdits()
+  const { crops, setCrop } = useEdits()
   const { shapeKind, setShapeKind, shapeColor, shapePalette, setShapeColor } = useEdits()
   const { inkColor, inkPalette, setInkColor, inkWidth, inkWidths, setInkWidth } = useEdits()
   const { savedSignature, setSavedSignature } = useEdits()
@@ -336,6 +345,31 @@ export function EditTools(): React.JSX.Element {
                 aria-label={`Shape ${c.name}`}
               />
             ))}
+          </span>
+        )}
+        {tool === 'crop' && (
+          <span className="tool-swatches">
+            <span className="tool-hint">Drag to crop</span>
+            <button
+              className="shape-btn"
+              onClick={() => currentPage && setCrop(currentPage.pageKey, null)}
+              disabled={!currentPage || !crops.get(currentPage.pageKey)}
+              title="Remove crop from this page"
+              aria-label="Reset crop"
+            >
+              <svg
+                width="16"
+                height="16"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="M6 6l12 12M18 6L6 18" />
+              </svg>
+            </button>
           </span>
         )}
         <span className="tool-sep" />

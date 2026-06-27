@@ -969,6 +969,31 @@ body {
   overflow: visible;
 }
 
+.overlay-layer.cropping {
+  cursor: crosshair;
+}
+
+/* Crop preview: dim the margins outside the kept region, outline the crop rect. */
+.ov-crop-mask {
+  position: absolute;
+  top: 0;
+  left: 0;
+  pointer-events: none;
+  overflow: visible;
+}
+.ov-crop-mask path {
+  fill: rgba(15, 17, 21, 0.5);
+}
+.ov-crop-rect {
+  fill: none;
+  stroke: #74a9ff;
+  stroke-width: 1.5;
+  stroke-dasharray: 6 4;
+}
+.ov-crop-rect.live {
+  stroke: #fff;
+}
+
 /* Selection / move / resize chrome (Browse tool). The layer itself is pointer-
    transparent so empty areas pan; these interactive bits opt back in. */
 .ov-hitbox {
@@ -1093,6 +1118,12 @@ body {
   align-items: center;
   gap: 6px;
   padding: 0 6px;
+}
+
+.tool-hint {
+  font-size: 11px;
+  color: var(--muted, rgba(120, 124, 134, 0.9));
+  white-space: nowrap;
 }
 
 .swatch {

@@ -3,7 +3,7 @@
 // are keyed by page key (sourceId#pageIndex), which is regenerated each load; the mirror keys
 // by (document index, page-within-document) instead, and we translate on both ends.
 
-import { makePageKey, newOverlayId, type Overlay } from '../edit/model'
+import { makePageKey, newOverlayId, type CropBox, type Overlay } from '../edit/model'
 import type { DocEntry } from '../types'
 import type { Attachment } from './flatten'
 import type { EditLayer } from './build'
@@ -48,11 +48,13 @@ export function serializeMirror(
       const key = makePageKey(page.sourceKey, page.pageIndex)
       const overlays = edits.overlays.get(key) ?? []
       const rotation = edits.rotations?.get(key) ?? 0
-      if (overlays.length === 0 && !rotation) return
+      const crop = edits.crops?.get(key)
+      if (overlays.length === 0 && !rotation && !crop) return
       editsArr.push({
         doc: docIndex,
         page: pi,
         ...(rotation ? { rotation } : {}),
+        ...(crop ? { crop } : {}),
         ...(overlays.length ? { overlays } : {})
       })
       for (const o of overlays) {
@@ -76,20 +78,23 @@ export function serializeMirror(
 export interface ImportedMirror {
   overlays: Overlay[]
   rotations: Array<[string, number]>
+  crops: Array<[string, CropBox]>
   attachments: Array<[string, Attachment]>
 }
 
-/** Reconstruct overlays/rotations/attachments from a manifest, keyed to the freshly-loaded docs. */
+/** Reconstruct overlays/rotations/crops/attachments from a manifest, keyed to the freshly-loaded docs. */
 export function deserializeMirror(manifest: PdfxManifest, docs: DocEntry[]): ImportedMirror | null {
   if (!manifest.edits || manifest.edits.length === 0) return null
   const overlays: Overlay[] = []
   const rotations: Array<[string, number]> = []
+  const crops: Array<[string, CropBox]> = []
 
   for (const edit of manifest.edits) {
     const page = docs[edit.doc]?.pages[edit.page]
     if (!page) continue
     const key = makePageKey(page.source.id, page.pageIndex)
     if (edit.rotation) rotations.push([key, edit.rotation])
+    if (edit.crop) crops.push([key, edit.crop])
     for (const o of edit.overlays ?? []) {
       overlays.push({ ...o, id: newOverlayId(), pageKey: key })
     }
@@ -98,5 +103,5 @@ export function deserializeMirror(manifest: PdfxManifest, docs: DocEntry[]): Imp
   const attachments: Array<[string, Attachment]> = Object.entries(manifest.attachments ?? {}).map(
     ([id, a]) => [id, { bytes: fromBase64(a.data), mime: a.mime }]
   )
-  return { overlays, rotations, attachments }
+  return { overlays, rotations, crops, attachments }
 }

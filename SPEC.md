@@ -71,6 +71,7 @@ compatible.
       "doc": 0,
       "page": 0,
       "rotation": 90,
+      "crop": { "x": 36, "y": 36, "w": 540, "h": 720 },
       "overlays": [
         {
           "type": "highlight",
@@ -84,10 +85,11 @@ compatible.
 }
 ```
 
-| Field         | Type   | Description                                                                                                                                                                           |
-| ------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `edits`       | array  | Per-page editable annotations, keyed by `doc` (index into `documents`) + `page` (index within that document). Each entry may carry a `rotation` (degrees CW) and an `overlays` array. |
-| `attachments` | object | Base64 image payloads referenced by `image`/`signatureVisual` overlays.                                                                                                               |
+| Field          | Type   | Description                                                                                                                                                                                                |
+| -------------- | ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `edits`        | array  | Per-page editable annotations, keyed by `doc` (index into `documents`) + `page` (index within that document). Each entry may carry a `rotation` (degrees CW), a `crop` rectangle, and an `overlays` array. |
+| `edits[].crop` | object | Optional page crop `{ x, y, w, h }` in PDF points (origin bottom-left, unrotated page space). A flattened writer applies it as the page `/CropBox`; the mirror preserves it for re-editing.                |
+| `attachments`  | object | Base64 image payloads referenced by `image`/`signatureVisual` overlays.                                                                                                                                    |
 
 Whether the page content is also flattened is a writer choice: PDFx's
 **Export .pdfx** keeps pages clean and relies on the mirror (so the file

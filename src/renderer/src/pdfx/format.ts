@@ -1,5 +1,5 @@
 import type { PDFDocumentProxy } from 'pdfjs-dist'
-import type { Overlay } from '../edit/model'
+import type { CropBox, Overlay } from '../edit/model'
 
 export { buildPdf, buildPdfx } from './build'
 
@@ -16,6 +16,8 @@ export interface ManifestEdit {
   doc: number
   page: number
   rotation?: number
+  /** Crop rectangle in PDF points (origin bottom-left); applied via /CropBox on export. */
+  crop?: CropBox
   overlays?: Overlay[]
 }
 

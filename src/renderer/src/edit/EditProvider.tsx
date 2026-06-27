@@ -6,11 +6,11 @@
 
 import { createContext, useCallback, useContext, useMemo, useState } from 'react'
 import { apply, canRedo, canUndo, initHistory, redo, undo, type History } from './history'
-import { groupByPage, type Overlay, type RGB, type ShapeKind } from './model'
+import { groupByPage, type CropBox, type Overlay, type RGB, type ShapeKind } from './model'
 import type { Attachment } from '../pdfx/flatten'
 import type { EditLayer } from '../pdfx/build'
 
-export type ToolKind = 'browse' | 'highlight' | 'ink' | 'text' | 'shape'
+export type ToolKind = 'browse' | 'highlight' | 'ink' | 'text' | 'shape' | 'crop'
 
 /** The page currently focused in full view, so palette actions know where to place things. */
 export interface CurrentPage {
@@ -53,12 +53,16 @@ export interface EditStore {
   setCurrentPage: (p: CurrentPage | null) => void
   rotations: Map<string, number>
   rotatePage: (pageKey: string, delta: number) => void
+  crops: Map<string, CropBox>
+  /** Set (or clear, with null) the crop rectangle for a page. */
+  setCrop: (pageKey: string, box: CropBox | null) => void
   savedSignature: Uint8Array | null
   setSavedSignature: (bytes: Uint8Array | null) => void
-  /** Merge a loaded PDFX v1.1 mirror (overlays/rotations/attachments) into the store. */
+  /** Merge a loaded PDFX v1.1 mirror (overlays/rotations/crops/attachments) into the store. */
   loadEditState: (s: {
     overlays: Overlay[]
     rotations: Array<[string, number]>
+    crops: Array<[string, CropBox]>
     attachments: Array<[string, Attachment]>
   }) => void
   /** Overlays + attachments shaped for the flatten-on-export pipeline. */
@@ -103,6 +107,7 @@ export function useEditStore(): EditStore {
   const [currentPage, setCurrentPage] = useState<CurrentPage | null>(null)
 
   const [rotations, setRotations] = useState<Map<string, number>>(() => new Map())
+  const [crops, setCrops] = useState<Map<string, CropBox>>(() => new Map())
   const [savedSignature, setSavedSignature] = useState<Uint8Array | null>(null)
 
   const addAttachment = useCallback((id: string, bytes: Uint8Array, mime: string) => {
@@ -119,10 +124,20 @@ export function useEditStore(): EditStore {
     })
   }, [])
 
+  const setCrop = useCallback((pageKey: string, box: CropBox | null) => {
+    setCrops((m) => {
+      const n = new Map(m)
+      if (box) n.set(pageKey, box)
+      else n.delete(pageKey)
+      return n
+    })
+  }, [])
+
   const loadEditState = useCallback(
     (s: {
       overlays: Overlay[]
       rotations: Array<[string, number]>
+      crops: Array<[string, CropBox]>
       attachments: Array<[string, Attachment]>
     }) => {
       if (s.overlays.length) {
@@ -136,6 +151,13 @@ export function useEditStore(): EditStore {
         setRotations((m) => {
           const n = new Map(m)
           for (const [k, v] of s.rotations) n.set(k, v)
+          return n
+        })
+      }
+      if (s.crops.length) {
+        setCrops((m) => {
+          const n = new Map(m)
+          for (const [k, v] of s.crops) n.set(k, v)
           return n
         })
       }
@@ -189,8 +211,8 @@ export function useEditStore(): EditStore {
   const doRedo = useCallback(() => setHistory((h) => redo(h)), [])
 
   const editLayer = useMemo<EditLayer>(
-    () => ({ overlays: groupByPage(overlays), attachments, rotations }),
-    [overlays, attachments, rotations]
+    () => ({ overlays: groupByPage(overlays), attachments, rotations, crops }),
+    [overlays, attachments, rotations, crops]
   )
 
   return {
@@ -227,6 +249,8 @@ export function useEditStore(): EditStore {
     setCurrentPage,
     rotations,
     rotatePage,
+    crops,
+    setCrop,
     savedSignature,
     setSavedSignature,
     loadEditState,

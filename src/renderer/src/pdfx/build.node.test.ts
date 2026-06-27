@@ -8,7 +8,8 @@ import {
   PDFName,
   PDFRawStream,
   PDFStream,
-  PDFString
+  PDFString,
+  degrees
 } from 'pdf-lib'
 
 import { buildPdf, buildPdfx, type EditLayer } from './build'
@@ -168,6 +169,43 @@ describe('buildPdf', () => {
     const reloaded = await PDFDocument.load(out)
     expect(reloaded.getPageCount()).toBe(2)
     expect(extractEmbeddedFile(reloaded, MANIFEST_NAME)).toBeNull()
+  })
+
+  it('applies a page crop as the /CropBox on export', async () => {
+    const bytes = await makeSourcePdf() // 200×200
+    const pageKey = makePageKey('a', 0)
+    const editLayer: EditLayer = {
+      overlays: new Map(),
+      attachments: new Map(),
+      crops: new Map([[pageKey, { x: 20, y: 30, w: 120, h: 100 }]])
+    }
+    const out = await buildPdf([{ bytes, sourceKey: 'a', pageIndex: 0 }], editLayer)
+    const reloaded = await PDFDocument.load(out)
+    const cb = reloaded.getPage(0).getCropBox()
+    // Source MediaBox starts at (0,0), so the crop maps straight through.
+    expect(cb).toEqual({ x: 20, y: 30, width: 120, height: 100 })
+    // MediaBox is untouched — only the visible window shrinks.
+    expect(reloaded.getPage(0).getMediaBox()).toEqual({ x: 0, y: 0, width: 200, height: 200 })
+  })
+
+  it('compensates for a source page intrinsic /Rotate when applying the crop', async () => {
+    // Portrait 200×400 page stored with /Rotate 90 → pdf.js (and thus the editor) sees it as a
+    // 400×200 landscape page, so the user's crop is captured in that rotation-baked space.
+    const doc = await PDFDocument.create()
+    doc.addPage([200, 400]).setRotation(degrees(90))
+    const bytes = await doc.save()
+    const pageKey = makePageKey('r', 0)
+    const editLayer: EditLayer = {
+      overlays: new Map(),
+      attachments: new Map(),
+      crops: new Map([[pageKey, { x: 50, y: 30, w: 100, h: 40 }]]) // editor (visual 400×200) space
+    }
+    const out = await buildPdf([{ bytes, sourceKey: 'r', pageIndex: 0 }], editLayer)
+    const reloaded = await PDFDocument.load(out)
+    // Visual {50,30,100,40} on a /Rotate-90 page maps to unrotated user space {130,50,40,100}.
+    expect(reloaded.getPage(0).getCropBox()).toEqual({ x: 130, y: 50, width: 40, height: 100 })
+    // /Rotate is preserved so a viewer still rotates the cropped region back to what was shown.
+    expect(reloaded.getPage(0).getRotation().angle).toBe(90)
   })
 })
 
