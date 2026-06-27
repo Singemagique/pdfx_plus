@@ -10,6 +10,7 @@ interface ToolbarProps {
   onExport: () => void
   onExportPdf: () => void
   onExportZip: () => void
+  onSign: () => void
 }
 
 const isMac = window.api.platform === 'darwin'
@@ -25,7 +26,8 @@ export function Toolbar({
   onOpen,
   onExport,
   onExportPdf,
-  onExportZip
+  onExportZip,
+  onSign
 }: ToolbarProps): React.JSX.Element {
   return (
     <header className={`toolbar${isMac ? ' mac' : ''}`}>
@@ -92,6 +94,14 @@ export function Toolbar({
       </button>
       <button className="btn glass" onClick={onExportZip} disabled={busy || documentCount === 0}>
         Export zip
+      </button>
+      <button
+        className="btn glass"
+        onClick={onSign}
+        disabled={busy || documentCount === 0}
+        title="Cryptographically sign a flattened copy (PAdES) with a .p12 certificate"
+      >
+        Sign
       </button>
     </header>
   )

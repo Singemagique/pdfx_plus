@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { computeLayout } from './canvas/layout'
 import { Toolbar } from './components/Toolbar'
+import { SignDialog } from './components/SignDialog'
 import { FullView } from './components/FullView'
 import { CollectionCanvas } from './components/CollectionCanvas'
 import type { CanvasHandle } from './components/Canvas'
@@ -18,6 +19,7 @@ const TOAST_MS = 4000
 
 export default function App(): React.JSX.Element {
   const [busy, setBusy] = useState(false)
+  const [signOpen, setSignOpen] = useState(false)
   const [scale, setScale] = useState(1)
   const [renderVersion, setRenderVersion] = useState(0)
   const [toast, setToast] = useState<string | null>(null)
@@ -39,7 +41,12 @@ export default function App(): React.JSX.Element {
     [docs, editStore.rotations]
   )
 
-  const { exportCollection, exportZip } = useExport(docs, editStore.editLayer, setBusy, flash)
+  const { exportCollection, exportZip, signAndExport } = useExport(
+    docs,
+    editStore.editLayer,
+    setBusy,
+    flash
+  )
   const { addFiles, openViaDialog, addPagesToDoc, handleExternalDropFiles } = useImport(
     collection,
     editStore.loadEditState,
@@ -116,6 +123,7 @@ export default function App(): React.JSX.Element {
           onExport={() => exportCollection('pdfx')}
           onExportPdf={() => exportCollection('pdf')}
           onExportZip={exportZip}
+          onSign={() => setSignOpen(true)}
         />
 
         <CollectionCanvas
@@ -158,6 +166,10 @@ export default function App(): React.JSX.Element {
             />
             <EditTools />
           </>
+        )}
+
+        {signOpen && (
+          <SignDialog busy={busy} onSign={signAndExport} onClose={() => setSignOpen(false)} />
         )}
 
         {toast && <div className="toast">{toast}</div>}

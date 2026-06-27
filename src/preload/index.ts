@@ -15,6 +15,13 @@ export interface SaveFilter {
   extensions: string[]
 }
 
+export interface SignOptions {
+  passphrase?: string
+  reason?: string
+  name?: string
+  location?: string
+}
+
 const api = {
   platform: process.platform,
   rendererReady: (): Promise<void> => ipcRenderer.invoke('pdfx:renderer-ready'),
@@ -36,6 +43,8 @@ const api = {
     ipcRenderer.invoke('pdfx:markup-to-pdf', html, fitPageHeightPx),
   writeFile: (path: string, data: Uint8Array): Promise<string> =>
     ipcRenderer.invoke('pdfx:write-file', path, data),
+  signPdf: (pdf: Uint8Array, p12: Uint8Array, opts: SignOptions): Promise<Uint8Array> =>
+    ipcRenderer.invoke('pdfx:sign-pdf', pdf, p12, opts),
   openFiles: (): Promise<OpenedFile[]> => ipcRenderer.invoke('pdfx:open-files'),
   onFilesOpened: (callback: (files: OpenedFile[]) => void): (() => void) => {
     const listener = (_event: Electron.IpcRendererEvent, files: OpenedFile[]): void =>
