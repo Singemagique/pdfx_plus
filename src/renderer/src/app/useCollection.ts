@@ -55,6 +55,25 @@ export function useCollection(flash: (message: string) => void) {
     [docs]
   )
 
+  const duplicatePage = useCallback(
+    (target: PageRef) => {
+      const doc = docsRef.current.find((d) => d.id === target.docId)
+      const index = doc?.pages.findIndex((p) => p.id === target.pageId) ?? -1
+      if (!doc || index === -1) return
+      const orig = doc.pages[index]
+      // New page + source ids give the copy an independent identity (own annotations/rotation).
+      const copy: PageEntry = {
+        ...orig,
+        id: crypto.randomUUID(),
+        source: { ...orig.source, id: crypto.randomUUID() }
+      }
+      setDocs((prev) => pageOps.insertPagesAfter(prev, doc.id, index, [copy]))
+      setSelected({ docId: doc.id, pageId: copy.id })
+      flash('Page duplicated')
+    },
+    [flash]
+  )
+
   const insertPagesAfter = useCallback((target: SelectedTarget, entries: PageEntry[]) => {
     if (entries.length === 0) return
     setDocs((prev) => pageOps.insertPagesAfter(prev, target.doc.id, target.index, entries))
@@ -103,6 +122,7 @@ export function useCollection(flash: (message: string) => void) {
     renameDoc,
     moveDoc,
     deletePage,
+    duplicatePage,
     copySelected,
     pasteAfterSelected,
     insertPagesAfter,

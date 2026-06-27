@@ -57,6 +57,7 @@ export default function App(): React.JSX.Element {
     active: !fullViewState.fullView,
     selected: collection.selected,
     onDeletePage: collection.deletePage,
+    onDuplicate: collection.duplicatePage,
     onCopy: collection.copySelected,
     onPaste,
     onClearSelection: collection.clearSelection
