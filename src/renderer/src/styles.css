@@ -969,6 +969,82 @@ body {
   overflow: visible;
 }
 
+/* Sign dialog (PAdES) */
+.sign-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(8, 9, 12, 0.55);
+  backdrop-filter: blur(2px);
+}
+.sign-dialog {
+  width: 360px;
+  max-width: 92vw;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 22px;
+  border-radius: 12px;
+  background: var(--surface, #1b1d23);
+  color: var(--ink, #e8e8ec);
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.5);
+}
+.sign-dialog h2 {
+  margin: 0;
+  font-size: 18px;
+}
+.sign-hint {
+  margin: 0 0 4px;
+  font-size: 12px;
+  color: var(--muted, rgba(150, 153, 162, 0.9));
+  line-height: 1.4;
+}
+.sign-cert-btn {
+  padding: 10px 12px;
+  border: 1px dashed rgba(140, 150, 170, 0.55);
+  border-radius: 8px;
+  background: rgba(120, 169, 255, 0.08);
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sign-cert-btn:hover {
+  border-color: #74a9ff;
+}
+.sign-input {
+  padding: 9px 11px;
+  border: 1px solid rgba(140, 150, 170, 0.3);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.04);
+  color: inherit;
+  font-size: 13px;
+  outline: none;
+}
+.sign-input:focus {
+  border-color: #74a9ff;
+}
+.sign-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 6px;
+}
+.btn.glass.primary {
+  background: #3b82f6;
+  color: #fff;
+  border-color: #3b82f6;
+}
+.btn.glass.primary:disabled {
+  opacity: 0.5;
+}
+
 /* Pending-redaction marker: solid black (as exported) + red outline so it reads as "to be removed".
    The actual content is removed on export by the PDFium pass. */
 .ov-redaction {

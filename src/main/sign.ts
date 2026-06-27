@@ -3,7 +3,7 @@
 // Adds an ETSI.CAdES.detached signature placeholder, then signs with the .p12. See the
 // signpdf-pades-api memory note for the flow + gotchas.
 import { PDFDocument } from 'pdf-lib'
-import signpdf from '@signpdf/signpdf'
+import { SignPdf } from '@signpdf/signpdf'
 import { P12Signer } from '@signpdf/signer-p12'
 import { plainAddPlaceholder } from '@signpdf/placeholder-plain'
 import { SUBFILTER_ETSI_CADES_DETACHED } from '@signpdf/utils'
@@ -39,6 +39,6 @@ export async function signPdf(
     subFilter: SUBFILTER_ETSI_CADES_DETACHED
   })
   const signer = new P12Signer(Buffer.from(p12), { passphrase: opts.passphrase ?? '' })
-  const signed = await signpdf.sign(withPlaceholder, signer)
+  const signed = await new SignPdf().sign(withPlaceholder, signer)
   return new Uint8Array(signed)
 }

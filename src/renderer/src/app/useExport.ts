@@ -64,6 +64,44 @@ export function useExport(
     [docs, editLayer, flash, setBusy]
   )
 
+  // Flatten everything (incl. redaction) into a plain PDF, cryptographically sign it with a .p12
+  // credential (in the main process), and save the signed copy. The editable project is untouched.
+  const signAndExport = useCallback(
+    async (
+      certBytes: Uint8Array,
+      opts: { passphrase: string; reason?: string; name?: string }
+    ): Promise<boolean> => {
+      if (docs.length === 0) {
+        flash('Nothing to sign')
+        return false
+      }
+      const path = await window.api.chooseSavePath('signed.pdf', PDF_FILTER)
+      if (!path) return false
+      setBusy(true)
+      try {
+        const redacted = await buildRedactedSources(editLayer, docs)
+        const flat = await buildPdf(
+          applyRedactedBytes(
+            docs.flatMap((doc) => doc.pages.map(toExportPage)),
+            redacted
+          ),
+          editLayer
+        )
+        const signed = await window.api.signPdf(flat, certBytes, opts)
+        const saved = await window.api.writeFile(path, signed)
+        flash(`Signed ${saved}`)
+        return true
+      } catch (error) {
+        console.error('Signing failed', error)
+        flash('Signing failed — check the certificate and passphrase')
+        return false
+      } finally {
+        setBusy(false)
+      }
+    },
+    [docs, editLayer, flash, setBusy]
+  )
+
   const exportZip = useCallback(async () => {
     if (docs.length === 0) {
       flash('Nothing to export')
@@ -96,5 +134,5 @@ export function useExport(
     }
   }, [docs, editLayer, flash, setBusy])
 
-  return { exportCollection, exportZip }
+  return { exportCollection, exportZip, signAndExport }
 }

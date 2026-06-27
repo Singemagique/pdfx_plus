@@ -3,6 +3,7 @@ import { basename, isAbsolute } from 'path'
 import { existsSync } from 'fs'
 import { writeFile } from 'fs/promises'
 import { markupToPdf } from './markup'
+import { signPdf } from './sign'
 import { OpenedFile, IMPORTABLE, readFiles, expandDropPaths } from './file-intake'
 import { clipboardFilePaths } from './clipboard'
 import { readResource } from './resource'
@@ -78,6 +79,32 @@ export function registerIpc(getPending: () => string[], clearPending: () => void
     await writeFile(path, data)
     return basename(path)
   })
+
+  ipcMain.handle(
+    'pdfx:sign-pdf',
+    async (
+      _event,
+      pdf: Uint8Array,
+      p12: Uint8Array,
+      opts: { passphrase?: string; reason?: string; name?: string; location?: string }
+    ): Promise<Uint8Array> => {
+      if (!ArrayBuffer.isView(pdf) || !ArrayBuffer.isView(p12)) {
+        throw new Error('sign-pdf: invalid payload')
+      }
+      // Bound payloads (parity with write-file) so a compromised renderer can't OOM the main process.
+      if (pdf.byteLength > MAX_WRITE_BYTES || p12.byteLength > 4 * 1024 * 1024) {
+        throw new Error('sign-pdf: payload too large')
+      }
+      const o = opts ?? {}
+      // Coerce options to strings so a misbehaving renderer can't inject non-string values.
+      return signPdf(pdf, p12, {
+        passphrase: String(o.passphrase ?? ''),
+        reason: o.reason != null ? String(o.reason) : undefined,
+        name: o.name != null ? String(o.name) : undefined,
+        location: o.location != null ? String(o.location) : undefined
+      })
+    }
+  )
 
   ipcMain.handle('pdfx:open-files', async (): Promise<OpenedFile[]> => {
     const mainWindow = getMainWindow()
