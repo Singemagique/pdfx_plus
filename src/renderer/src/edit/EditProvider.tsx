@@ -27,7 +27,11 @@ export interface EditStore {
   highlightPalette: NamedColor[]
   setHighlightColor: (rgb: RGB) => void
   inkColor: RGB
+  inkPalette: NamedColor[]
+  setInkColor: (rgb: RGB) => void
   inkWidth: number
+  inkWidths: number[]
+  setInkWidth: (w: number) => void
   shapeKind: ShapeKind
   setShapeKind: (s: ShapeKind) => void
   shapeColor: RGB
@@ -65,22 +69,24 @@ const HIGHLIGHT_PALETTE: NamedColor[] = [
   { name: 'Green', rgb: { r: 0.5, g: 0.92, b: 0.45 } },
   { name: 'Pink', rgb: { r: 1, g: 0.58, b: 0.8 } }
 ]
-const INK_COLOR: RGB = { r: 0.1, g: 0.1, b: 0.12 }
-const INK_WIDTH = 2
-const SHAPE_PALETTE: NamedColor[] = [
+// Shared stroke palette for the pen (ink) and shapes; they just default differently.
+const STROKE_PALETTE: NamedColor[] = [
   { name: 'Red', rgb: { r: 0.85, g: 0.15, b: 0.18 } },
   { name: 'Black', rgb: { r: 0.1, g: 0.1, b: 0.12 } },
   { name: 'Blue', rgb: { r: 0.13, g: 0.42, b: 0.9 } },
   { name: 'Green', rgb: { r: 0.13, g: 0.6, b: 0.25 } }
 ]
+const STROKE_WIDTHS = [1.5, 3, 6]
 const SHAPE_WIDTH = 2
 
 export function useEditStore(): EditStore {
   const [history, setHistory] = useState<History<EditState>>(() => initHistory({ overlays: [] }))
   const [tool, setToolState] = useState<ToolKind>('browse')
   const [highlightColor, setHighlightColor] = useState<RGB>(HIGHLIGHT_PALETTE[0].rgb)
+  const [inkColor, setInkColor] = useState<RGB>(STROKE_PALETTE[1].rgb) // black
+  const [inkWidth, setInkWidth] = useState<number>(STROKE_WIDTHS[0])
   const [shapeKind, setShapeKind] = useState<ShapeKind>('rect')
-  const [shapeColor, setShapeColor] = useState<RGB>(SHAPE_PALETTE[0].rgb)
+  const [shapeColor, setShapeColor] = useState<RGB>(STROKE_PALETTE[0].rgb) // red
   const [selectedId, setSelectedId] = useState<string | null>(null)
   // Image/stamp bytes, embedded as PDF file streams on export and referenced by overlays.
   const [attachments, setAttachments] = useState<Map<string, Attachment>>(() => new Map())
@@ -140,12 +146,16 @@ export function useEditStore(): EditStore {
     highlightColor,
     highlightPalette: HIGHLIGHT_PALETTE,
     setHighlightColor,
-    inkColor: INK_COLOR,
-    inkWidth: INK_WIDTH,
+    inkColor,
+    inkPalette: STROKE_PALETTE,
+    setInkColor,
+    inkWidth,
+    inkWidths: STROKE_WIDTHS,
+    setInkWidth,
     shapeKind,
     setShapeKind,
     shapeColor,
-    shapePalette: SHAPE_PALETTE,
+    shapePalette: STROKE_PALETTE,
     setShapeColor,
     shapeWidth: SHAPE_WIDTH,
     selectedId,

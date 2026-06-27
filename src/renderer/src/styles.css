@@ -1144,6 +1144,12 @@ body {
   color: var(--accent-ink);
 }
 
+.width-dot {
+  display: block;
+  border-radius: 50%;
+  background: currentColor;
+}
+
 .full-nav {
   position: absolute;
   top: 50%;
