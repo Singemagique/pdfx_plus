@@ -4,9 +4,12 @@ import {
   boundsOfPath,
   clientToPdf,
   geomToCss,
+  movePath,
   pageScale,
   pointToCss,
-  rectGeom
+  rectGeom,
+  resizeGeom,
+  scalePath
 } from './overlay-geometry'
 
 const page = { width: 200, height: 400 } // PDF points
@@ -63,5 +66,35 @@ describe('boundsOfPath', () => {
   })
   it('returns a zero box for an empty path', () => {
     expect(boundsOfPath([])).toMatchObject({ x: 0, y: 0, w: 0, h: 0 })
+  })
+})
+
+describe('resizeGeom', () => {
+  const start = { x: 100, y: 100, w: 50, h: 40, rotation: 0, opacity: 1 }
+  it('drags the top-left CSS corner, keeping the PDF bottom-right (x+w, y) fixed', () => {
+    // top-left CSS handle is PDF (x, y+h); its opposite is (x+w, y) = (150, 100).
+    expect(resizeGeom(start, 'tl', { x: 120, y: 160 })).toMatchObject({
+      x: 120,
+      y: 100,
+      w: 30,
+      h: 60
+    })
+  })
+  it('preserves rotation', () => {
+    expect(resizeGeom({ ...start, rotation: 15 }, 'br', { x: 200, y: 50 }).rotation).toBe(15)
+  })
+})
+
+describe('movePath', () => {
+  it('translates only x at even indices and y at odd indices', () => {
+    expect(movePath([10, 20, 30, 40], 5, -3)).toEqual([15, 17, 35, 37])
+  })
+})
+
+describe('scalePath', () => {
+  it('rescales points as the box doubles in width', () => {
+    const from = { x: 0, y: 0, w: 100, h: 100, rotation: 0, opacity: 1 }
+    const to = { x: 0, y: 0, w: 200, h: 100, rotation: 0, opacity: 1 }
+    expect(scalePath([50, 50], from, to)).toEqual([100, 50])
   })
 })
