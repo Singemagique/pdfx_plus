@@ -33,6 +33,32 @@ function streamBytes(stream: PDFStream): Uint8Array {
   return filter && String(filter).includes('FlateDecode') ? unzlibSync(raw) : raw
 }
 
+// Decode a page's content stream(s) to a single operator string (whitespace-normalized),
+// inflating Flate as needed — used to assert which graphics operators were emitted.
+function pageContent(pdf: PDFDocument, i: number): string {
+  const page = pdf.getPage(i)
+  const resolved = pdf.context.lookup(page.node.get(PDFName.of('Contents')))
+  const streams =
+    resolved instanceof PDFArray
+      ? resolved.asArray().map((ref) => pdf.context.lookup(ref))
+      : [resolved]
+  let out = ''
+  for (const s of streams) {
+    if (s instanceof PDFStream) out += new TextDecoder('latin1').decode(streamBytes(s)) + '\n'
+  }
+  return out.replace(/\s+/g, ' ')
+}
+
+const HIGHLIGHT = (pageKey: string): Overlay => ({
+  id: 'h',
+  pageKey,
+  z: 0,
+  createdAt: 0,
+  geom: { x: 10, y: 20, w: 30, h: 40, rotation: 0, opacity: 0.4 },
+  type: 'highlight',
+  color: { r: 1, g: 0.9, b: 0.2 }
+})
+
 // Recover the embedded 'pdfx-manifest.json' bytes from saved PDFX bytes by walking the
 // catalog's EmbeddedFiles name tree (Names -> EmbeddedFiles -> Names = [name, filespec, ...]).
 // Typed lookups resolve indirect references; robust unlike a raw byte-substring search.
@@ -206,6 +232,53 @@ describe('buildPdf', () => {
     expect(reloaded.getPage(0).getCropBox()).toEqual({ x: 130, y: 50, width: 40, height: 100 })
     // /Rotate is preserved so a viewer still rotates the cropped region back to what was shown.
     expect(reloaded.getPage(0).getRotation().angle).toBe(90)
+  })
+
+  it('uses CropBox ∩ MediaBox (not the raw CropBox) so an oversized CropBox crops correctly', async () => {
+    // /CropBox [0,0,300,400] extends past /MediaBox [0,0,200,400]; pdf.js (and thus the editor)
+    // sizes the page to the 200×400 intersection, so the crop must too — at intrinsic /Rotate 90.
+    const doc = await PDFDocument.create()
+    const p = doc.addPage([200, 400])
+    p.setCropBox(0, 0, 300, 400)
+    p.setRotation(degrees(90))
+    const bytes = await doc.save()
+    const pageKey = makePageKey('c', 0)
+    const editLayer: EditLayer = {
+      overlays: new Map(),
+      attachments: new Map(),
+      crops: new Map([[pageKey, { x: 50, y: 30, w: 100, h: 40 }]]) // editor visual 400×200 space
+    }
+    const out = await buildPdf([{ bytes, sourceKey: 'c', pageIndex: 0 }], editLayer)
+    const cb = await PDFDocument.load(out).then((d) => d.getPage(0).getCropBox())
+    // Intersected W=200 ⇒ {130,50,40,100}; the raw CropBox W=300 would wrongly give x=230 (off-page).
+    expect(cb).toEqual({ x: 130, y: 50, width: 40, height: 100 })
+  })
+
+  it('draws overlays through a rotation transform on an intrinsic-/Rotate source page', async () => {
+    const doc = await PDFDocument.create()
+    doc.addPage([200, 400]).setRotation(degrees(90)) // unrotated W=200, H=400
+    const bytes = await doc.save()
+    const pageKey = makePageKey('r', 0)
+    const editLayer: EditLayer = {
+      overlays: new Map([[pageKey, [HIGHLIGHT(pageKey)]]]),
+      attachments: new Map()
+    }
+    const out = await buildPdf([{ bytes, sourceKey: 'r', pageIndex: 0 }], editLayer)
+    const content = pageContent(await PDFDocument.load(out), 0)
+    // The visual->unrotated matrix (W=200) wraps the overlay draw so it lands where the user saw it.
+    expect(content).toContain('0 1 -1 0 200 0 cm')
+  })
+
+  it('adds no rotation transform when the source page is unrotated', async () => {
+    const bytes = await makeSourcePdf() // 200×200, /Rotate 0
+    const pageKey = makePageKey('a', 0)
+    const editLayer: EditLayer = {
+      overlays: new Map([[pageKey, [HIGHLIGHT(pageKey)]]]),
+      attachments: new Map()
+    }
+    const out = await buildPdf([{ bytes, sourceKey: 'a', pageIndex: 0 }], editLayer)
+    const content = pageContent(await PDFDocument.load(out), 0)
+    expect(content).not.toContain('0 1 -1 0') // no intrinsic-rotation matrix emitted
   })
 })
 

@@ -1,4 +1,11 @@
-import { PDFDocument, PDFPage, degrees } from 'pdf-lib'
+import {
+  PDFDocument,
+  PDFPage,
+  concatTransformationMatrix,
+  degrees,
+  popGraphicsState,
+  pushGraphicsState
+} from 'pdf-lib'
 
 import { MANIFEST_NAME, PDFX_VERSION } from './format'
 import type { ExportDocument, ExportPage, PdfxManifest } from './format'
@@ -27,6 +34,29 @@ export interface EditLayer {
   crops?: Map<string, CropBox>
 }
 
+interface Box {
+  x: number
+  y: number
+  width: number
+  height: number
+}
+
+/**
+ * The page's visible view box = CropBox ∩ MediaBox, matching how pdf.js derives the dimensions
+ * the editor captured overlay/crop coordinates against (PDFPageProxy.view). pdf-lib's getCropBox()
+ * returns the raw /CropBox, which a PDF may legally extend past the /MediaBox; intersecting keeps
+ * the export math in the same coordinate space for every valid box configuration. Degenerate
+ * intersections fall back to the MediaBox, as pdf.js does.
+ */
+function viewBox(crop: Box, media: Box): Box {
+  const x0 = Math.max(crop.x, media.x)
+  const y0 = Math.max(crop.y, media.y)
+  const x1 = Math.min(crop.x + crop.width, media.x + media.width)
+  const y1 = Math.min(crop.y + crop.height, media.y + media.height)
+  if (x1 > x0 && y1 > y0) return { x: x0, y: y0, width: x1 - x0, height: y1 - y0 }
+  return { x: media.x, y: media.y, width: media.width, height: media.height }
+}
+
 /**
  * Map a crop captured in the editor's page space back into the unrotated user space that
  * setCropBox() expects. pdf.js bakes a source page's intrinsic /Rotate into the page
@@ -48,6 +78,31 @@ function unrotateCrop(c: CropBox, intrinsic: number, W: number, H: number): Crop
   }
 }
 
+/**
+ * Content-stream matrix (the `cm` operator's a,b,c,d,e,f) that maps the editor's page space —
+ * where pdf.js has baked the source page's intrinsic /Rotate into the page dimensions — into
+ * the page's unrotated user space. Overlays are stored in that visual space; drawing them
+ * through this matrix (inside a q…Q) places them at unrotated coordinates so the page's /Rotate
+ * then displays them exactly where the user put them. Returns null for an unrotated page (no-op).
+ * (W, H) are the unrotated view-box dimensions. Mirrors the rect logic in unrotateCrop.
+ */
+function intrinsicMatrix(
+  intrinsic: number,
+  W: number,
+  H: number
+): [number, number, number, number, number, number] | null {
+  switch (intrinsic) {
+    case 90:
+      return [0, 1, -1, 0, W, 0]
+    case 180:
+      return [-1, 0, 0, -1, W, H]
+    case 270:
+      return [0, -1, 1, 0, 0, H]
+    default:
+      return null
+  }
+}
+
 async function bakePage(
   page: PDFPage,
   exportPage: ExportPage,
@@ -56,24 +111,32 @@ async function bakePage(
 ): Promise<void> {
   if (!edits) return
   const key = makePageKey(exportPage.sourceKey, exportPage.pageIndex)
-  // The source page's intrinsic /Rotate, captured before any editor rotation delta is added.
+  // The source page's intrinsic /Rotate and its original (pre-crop) unrotated view box. Both are
+  // captured up front because the editor's overlay/crop coordinates live in pdf.js's
+  // rotation-baked "visual" space, which we reconcile with pdf-lib's unrotated space below.
   const intrinsic = (((page.getRotation().angle % 360) + 360) % 360) as number
+  const view0 = viewBox(page.getCropBox(), page.getMediaBox())
   const rot = edits.rotations?.get(key)
   if (rot) {
     page.setRotation(degrees((((intrinsic + rot) % 360) + 360) % 360))
   }
   const crop = edits.crops?.get(key)
   if (crop && crop.w > 0 && crop.h > 0) {
-    // The crop is in the editor's (intrinsic-rotation-baked) page space; map it into pdf-lib's
-    // unrotated user space, then offset by the view-box origin so non-(0,0) boxes crop right.
-    const view = page.getCropBox()
-    const u = unrotateCrop(crop, intrinsic, view.width, view.height)
-    page.setCropBox(view.x + u.x, view.y + u.y, u.w, u.h)
+    // Map the crop into unrotated user space, then offset by the view-box origin so pages whose
+    // box does not start at (0,0) crop correctly.
+    const u = unrotateCrop(crop, intrinsic, view0.width, view0.height)
+    page.setCropBox(view0.x + u.x, view0.y + u.y, u.w, u.h)
   }
   const list = edits.overlays.get(key)
   if (res && list && list.length > 0) {
     const sorted = [...list].sort((a, b) => a.z - b.z || a.createdAt - b.createdAt)
+    // On a source page with intrinsic /Rotate, draw overlays through a transform that converts
+    // their visual-space coordinates to unrotated space; the page's /Rotate then shows them where
+    // the user placed them. This handles every overlay type (text angle, images, ink, shapes).
+    const m = intrinsicMatrix(intrinsic, view0.width, view0.height)
+    if (m) page.pushOperators(pushGraphicsState(), concatTransformationMatrix(...m))
     await flattenPageOverlays(page, sorted, res)
+    if (m) page.pushOperators(popGraphicsState())
   }
 }
 
