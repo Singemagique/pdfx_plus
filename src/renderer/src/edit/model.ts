@@ -94,15 +94,19 @@ export const DRAWABLE_TYPES = [
   'text',
   'highlight',
   'shape',
-  'signatureVisual'
+  'signatureVisual',
+  'formValue'
 ] as const
 
 /**
  * Overlay types NOT drawn by the pdf-lib flatten pass:
  *  - `redaction` is applied by the external PDFium pre-pass (PRD §4.5) before re-assembly.
- *  - `formValue` is applied through pdf-lib's AcroForm API + form.flatten().
+ *
+ * `formValue` IS drawn — the filled value is painted over its AcroForm field rectangle on
+ * flatten (the underlying interactive widget is left untouched), and the value round-trips
+ * through the PDFX mirror so the field stays editable on reopen.
  */
-export const NON_DRAWN_TYPES = ['redaction', 'formValue'] as const
+export const NON_DRAWN_TYPES = ['redaction'] as const
 
 export const isDrawable = (o: Overlay): boolean =>
   (DRAWABLE_TYPES as readonly string[]).includes(o.type)

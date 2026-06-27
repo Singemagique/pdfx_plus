@@ -6,11 +6,19 @@
 
 import { createContext, useCallback, useContext, useMemo, useState } from 'react'
 import { apply, canRedo, canUndo, initHistory, redo, undo, type History } from './history'
-import { groupByPage, type CropBox, type Overlay, type RGB, type ShapeKind } from './model'
+import {
+  groupByPage,
+  newOverlayId,
+  type CropBox,
+  type Geom,
+  type Overlay,
+  type RGB,
+  type ShapeKind
+} from './model'
 import type { Attachment } from '../pdfx/flatten'
 import type { EditLayer } from '../pdfx/build'
 
-export type ToolKind = 'browse' | 'highlight' | 'ink' | 'text' | 'shape' | 'crop'
+export type ToolKind = 'browse' | 'highlight' | 'ink' | 'text' | 'shape' | 'crop' | 'form'
 
 /** The page currently focused in full view, so palette actions know where to place things. */
 export interface CurrentPage {
@@ -56,6 +64,8 @@ export interface EditStore {
   crops: Map<string, CropBox>
   /** Set (or clear, with null) the crop rectangle for a page. */
   setCrop: (pageKey: string, box: CropBox | null) => void
+  /** Upsert a form field's value as a formValue overlay (empty string / false clears it). */
+  setFormValue: (pageKey: string, field: string, value: string | boolean, geom: Geom) => void
   savedSignature: Uint8Array | null
   setSavedSignature: (bytes: Uint8Array | null) => void
   /** Merge a loaded PDFX v1.1 mirror (overlays/rotations/crops/attachments) into the store. */
@@ -132,6 +142,38 @@ export function useEditStore(): EditStore {
       return n
     })
   }, [])
+
+  const setFormValue = useCallback(
+    (pageKey: string, field: string, value: string | boolean, geom: Geom) => {
+      // Always upsert (never auto-remove) so a cleared/unchecked field stays cleared in the editor.
+      // Flatten draws only non-empty values; '' and false paint nothing. Consecutive edits to the
+      // same field coalesce into one undo step (so typing doesn't flood/evict the undo stack).
+      setHistory((h) =>
+        apply(
+          h,
+          (d) => {
+            const i = d.overlays.findIndex(
+              (o) => o.type === 'formValue' && o.pageKey === pageKey && o.field === field
+            )
+            if (i >= 0) (d.overlays[i] as Extract<Overlay, { type: 'formValue' }>).value = value
+            else
+              d.overlays.push({
+                id: newOverlayId(),
+                pageKey,
+                z: d.overlays.length,
+                createdAt: Date.now(),
+                geom,
+                type: 'formValue',
+                field,
+                value
+              })
+          },
+          `formValue:${pageKey}:${field}`
+        )
+      )
+    },
+    []
+  )
 
   const loadEditState = useCallback(
     (s: {
@@ -251,6 +293,7 @@ export function useEditStore(): EditStore {
     rotatePage,
     crops,
     setCrop,
+    setFormValue,
     savedSignature,
     setSavedSignature,
     loadEditState,

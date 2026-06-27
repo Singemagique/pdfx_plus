@@ -994,6 +994,34 @@ body {
   stroke: #fff;
 }
 
+/* Fillable AcroForm field controls (Form tool). The layer is pointer-transparent; these opt in. */
+.ov-form-input,
+.ov-form-check {
+  position: absolute;
+  pointer-events: auto;
+  box-sizing: border-box;
+  margin: 0;
+}
+.ov-form-input {
+  padding: 0 3px;
+  border: 1px solid rgba(116, 169, 255, 0.85);
+  background: rgba(116, 169, 255, 0.12);
+  border-radius: 2px;
+  color: #14141a;
+  font-family: Helvetica, Arial, sans-serif;
+  line-height: 1.1;
+  resize: none;
+  outline: none;
+}
+.ov-form-input:focus {
+  border-color: #3b82f6;
+  background: rgba(116, 169, 255, 0.2);
+}
+.ov-form-check {
+  cursor: pointer;
+  accent-color: #3b82f6;
+}
+
 /* Selection / move / resize chrome (Browse tool). The layer itself is pointer-
    transparent so empty areas pan; these interactive bits opt back in. */
 .ov-hitbox {

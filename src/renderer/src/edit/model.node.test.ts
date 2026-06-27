@@ -76,8 +76,19 @@ describe('remapDuplicatedPage', () => {
 })
 
 describe('isDrawable', () => {
-  it('marks draw-pass types but excludes redaction and form values', () => {
+  it('marks draw-pass types (incl. form values) but excludes redaction', () => {
     expect(isDrawable(img('k'))).toBe(true)
+    const formValue: Overlay = {
+      id: newOverlayId(),
+      pageKey: 'k',
+      z: 0,
+      createdAt: 0,
+      geom: { x: 0, y: 0, w: 10, h: 4, rotation: 0, opacity: 1 },
+      type: 'formValue',
+      field: 'name',
+      value: 'Ada'
+    }
+    expect(isDrawable(formValue)).toBe(true)
     const redaction: Overlay = {
       id: newOverlayId(),
       pageKey: 'k',

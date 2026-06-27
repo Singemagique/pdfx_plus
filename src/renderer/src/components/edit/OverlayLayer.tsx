@@ -19,6 +19,7 @@ import {
   pageScale,
   pointToCss,
   rectGeom,
+  rectToVisual,
   resizeGeom,
   scalePath,
   type CssRect,
@@ -57,6 +58,27 @@ type TextEdit = {
   color: RGB
   font: StandardFontName
   align: TextAlign
+}
+
+/** A fillable AcroForm field detected on the page via pdf.js getAnnotations. */
+type FormField = {
+  name: string
+  kind: 'text' | 'checkbox'
+  geom: Geom
+  multiline: boolean
+  initial: string | boolean
+}
+
+/** The subset of a pdf.js widget-annotation we read (getAnnotations returns `any`). */
+interface PdfAnnotation {
+  fieldType?: string
+  fieldName?: string
+  rect?: number[]
+  checkBox?: boolean
+  multiLine?: boolean
+  fieldValue?: unknown
+  readOnly?: boolean
+  hidden?: boolean
 }
 
 const HANDLES: HandleId[] = ['tl', 'tr', 'bl', 'br']
@@ -119,6 +141,7 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
   const [draft, setDraft] = useState<Draft | null>(null)
   const [drag, setDrag] = useState<Drag | null>(null)
   const [textEdit, setTextEdit] = useState<TextEdit | null>(null)
+  const [formFields, setFormFields] = useState<FormField[]>([])
 
   const pageKey = makePageKey(page.source.id, page.pageIndex)
   const pageOverlays = overlaysForPage(edits.overlays, pageKey)
@@ -127,9 +150,15 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
   const cropping = active && edits.tool === 'crop'
   const placing = active && edits.tool === 'text'
   const selecting = active && edits.tool === 'browse'
+  const formMode = active && edits.tool === 'form'
   const capturing = drawing || placing || cropping
   const cropBox = edits.crops.get(pageKey)
   const scale = pageScale(page, fit)
+
+  const formValueOf = (name: string): string | boolean | undefined => {
+    const o = pageOverlays.find((ov) => ov.type === 'formValue' && ov.field === name)
+    return o && o.type === 'formValue' ? o.value : undefined
+  }
 
   const toPdf = (clientX: number, clientY: number): Pt => {
     const rect = layerRef.current!.getBoundingClientRect()
@@ -140,6 +169,68 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
   useEffect(() => {
     if (active) setCurrentPage({ pageKey, width: page.width, height: page.height })
   }, [active, pageKey, page.width, page.height, setCurrentPage])
+
+  // Detect fillable AcroForm fields (text + checkbox) on the focused page via pdf.js.
+  useEffect(() => {
+    if (!active) {
+      setFormFields([])
+      return
+    }
+    let cancelled = false
+    page.source.pdf
+      .getPage(page.pageIndex + 1)
+      .then(async (p) => {
+        const anns = (await p.getAnnotations({ intent: 'display' })) as PdfAnnotation[]
+        // pdf.js returns annotation rects in UNROTATED user space; map them into the same
+        // visual space the rest of the overlay model uses (page.width/height bake in /Rotate).
+        const rotate = (((p.rotate ?? 0) % 360) + 360) % 360
+        const fields: FormField[] = []
+        const seen = new Set<string>() // one control per field name (a field may have many widgets)
+        for (const a of anns) {
+          const r = a.rect
+          if (a.readOnly || a.hidden || !a.fieldName || !r || r.length < 4) continue
+          const isText = a.fieldType === 'Tx'
+          const isCheckbox = a.fieldType === 'Btn' && !!a.checkBox
+          if ((!isText && !isCheckbox) || seen.has(a.fieldName)) continue
+          seen.add(a.fieldName)
+          const rect = {
+            x: Math.min(r[0], r[2]),
+            y: Math.min(r[1], r[3]),
+            w: Math.abs(r[2] - r[0]),
+            h: Math.abs(r[3] - r[1])
+          }
+          const geom: Geom = { ...rectToVisual(rect, rotate, page.width, page.height), rotation: 0, opacity: 1 } // prettier-ignore
+          const fv = a.fieldValue
+          fields.push(
+            isText
+              ? {
+                  name: a.fieldName,
+                  kind: 'text',
+                  geom,
+                  multiline: !!a.multiLine,
+                  initial: typeof fv === 'string' ? fv : ''
+                }
+              : {
+                  name: a.fieldName,
+                  kind: 'checkbox',
+                  geom,
+                  multiline: false,
+                  initial: typeof fv === 'string' && fv !== 'Off' && fv !== ''
+                }
+          )
+        }
+        return fields
+      })
+      .then((fields) => {
+        if (!cancelled) setFormFields(fields)
+      })
+      .catch(() => {
+        if (!cancelled) setFormFields([])
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [active, page])
 
   // Object URLs for image overlays, revoked on unmount.
   useEffect(() => {
@@ -675,6 +766,55 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
         : cropBox
           ? cropMask(geomToCss({ ...cropBox, rotation: 0, opacity: 1 }, page, fit), false)
           : null}
+      {formMode &&
+        formFields.map((f) => {
+          const r = geomToCss(f.geom, page, fit)
+          const cur = formValueOf(f.name)
+          const style = { left: r.left, top: r.top, width: r.width, height: r.height }
+          const stop = (e: React.PointerEvent): void => e.stopPropagation()
+          if (f.kind === 'checkbox') {
+            const checked = cur === undefined ? f.initial === true : cur === true
+            return (
+              <input
+                key={f.name}
+                type="checkbox"
+                className="ov-form-check"
+                style={style}
+                checked={checked}
+                title={f.name}
+                onPointerDown={stop}
+                onChange={(e) => edits.setFormValue(pageKey, f.name, e.target.checked, f.geom)}
+              />
+            )
+          }
+          const value = cur === undefined ? String(f.initial ?? '') : String(cur)
+          const inputStyle = { ...style, fontSize: Math.min(14, r.height * 0.62) }
+          const onChange = (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>): void =>
+            edits.setFormValue(pageKey, f.name, e.target.value, f.geom)
+          return f.multiline ? (
+            <textarea
+              key={f.name}
+              className="ov-form-input"
+              style={inputStyle}
+              value={value}
+              placeholder={f.name}
+              spellCheck={false}
+              onPointerDown={stop}
+              onChange={onChange}
+            />
+          ) : (
+            <input
+              key={f.name}
+              className="ov-form-input"
+              style={inputStyle}
+              value={value}
+              placeholder={f.name}
+              spellCheck={false}
+              onPointerDown={stop}
+              onChange={onChange}
+            />
+          )
+        })}
     </div>
   )
 }
