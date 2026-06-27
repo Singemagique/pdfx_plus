@@ -1,6 +1,6 @@
 # PDFX Format Specification
 
-**Version 1.0 — draft**
+**Version 1.1 — draft**
 
 PDFX is a backwards-compatible extension of PDF for bundling multiple documents
 into a single file. Every `.pdfx` file is a fully valid PDF; PDFX-aware viewers
@@ -54,6 +54,46 @@ The manifest is a UTF-8 encoded JSON object:
 
 The page counts partition the PDF's page sequence: document _i_ owns the pages
 starting immediately after the pages of document _i − 1_.
+
+### Version 1.1 — editable mirror (optional, additive)
+
+PDFX 1.1 adds two **optional** top-level manifest keys that let a PDFX-aware
+editor reopen a file with its annotations still editable. They are ignored by
+1.0 readers and by plain PDF viewers, so the file stays fully backward
+compatible.
+
+```json
+{
+  "pdfx": "1.1",
+  "documents": [{ "name": "Contract", "pages": 2 }],
+  "edits": [
+    {
+      "doc": 0,
+      "page": 0,
+      "rotation": 90,
+      "overlays": [
+        {
+          "type": "highlight",
+          "geom": { "x": 64, "y": 612, "w": 300, "h": 18, "rotation": 0, "opacity": 0.4 },
+          "color": { "r": 1, "g": 0.9, "b": 0.2 }
+        }
+      ]
+    }
+  ],
+  "attachments": { "stamp-1": { "mime": "image/png", "data": "<base64>" } }
+}
+```
+
+| Field         | Type   | Description                                                                                                                                                                           |
+| ------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `edits`       | array  | Per-page editable annotations, keyed by `doc` (index into `documents`) + `page` (index within that document). Each entry may carry a `rotation` (degrees CW) and an `overlays` array. |
+| `attachments` | object | Base64 image payloads referenced by `image`/`signatureVisual` overlays.                                                                                                               |
+
+Whether the page content is also flattened is a writer choice: PDFx's
+**Export .pdfx** keeps pages clean and relies on the mirror (so the file
+reopens editable), while a flattened export (any-viewer-visible annotations)
+omits the mirror. An integrity/canonicalization hash is reserved for a future
+revision; 1.1 readers treat the mirror as advisory.
 
 ## Reader behavior
 

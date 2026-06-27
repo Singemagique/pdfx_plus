@@ -71,7 +71,7 @@ async function dropFilesAsNewDocs(
     const conv = findConverter(file.name, file.data)
     const name = conv ? conv.rename(file.name) : file.name
     const data = conv ? await conv.toPdf(file.name, file.data, undefined, file.path) : file.data
-    newDocs.push(...(await importIntoDocs(name, data)))
+    newDocs.push(...(await importIntoDocs(name, data)).docs)
   }
   deps.spliceDocsAfter(anchorDocId, newDocs)
 }

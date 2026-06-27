@@ -1,4 +1,5 @@
 import type { PDFDocumentProxy } from 'pdfjs-dist'
+import type { Overlay } from '../edit/model'
 
 export { buildPdf, buildPdfx } from './build'
 
@@ -10,10 +11,26 @@ export interface PdfxManifestDocument {
   pages: number
 }
 
+/** PDFX v1.1 editable-edit record for one page, keyed by document + page index. */
+export interface ManifestEdit {
+  doc: number
+  page: number
+  rotation?: number
+  overlays?: Overlay[]
+}
+
+/** A base64-encoded image attachment referenced by image/signature overlays. */
+export interface ManifestAttachment {
+  mime: string
+  data: string
+}
+
 export interface PdfxManifest {
   pdfx: string
   title?: string
   documents: PdfxManifestDocument[]
+  edits?: ManifestEdit[]
+  attachments?: Record<string, ManifestAttachment>
 }
 
 export interface PagePartition {

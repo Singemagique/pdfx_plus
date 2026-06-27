@@ -1,6 +1,7 @@
 import { getDocument } from 'pdfjs-dist'
 import { partitionPages, readManifest, stripExtension } from './format'
 import { findConverter } from './convert'
+import { deserializeMirror, type ImportedMirror } from './mirror'
 import type { DocEntry, PageEntry, PdfSource } from '../types'
 
 interface PageSize {
@@ -52,14 +53,22 @@ export function pagesFromSource(
   }))
 }
 
-export async function importIntoDocs(filename: string, bytes: Uint8Array): Promise<DocEntry[]> {
+export interface ImportResult {
+  docs: DocEntry[]
+  mirror: ImportedMirror | null
+}
+
+export async function importIntoDocs(filename: string, bytes: Uint8Array): Promise<ImportResult> {
   const { source, sizes } = await loadSource(bytes)
   const manifest = await readManifest(source.pdf)
-  return partitionPages(manifest, source.pdf.numPages, stripExtension(filename)).map((part) => ({
-    id: crypto.randomUUID(),
-    name: part.name,
-    pages: pagesFromSource(source, sizes, part.indices)
-  }))
+  const docs = partitionPages(manifest, source.pdf.numPages, stripExtension(filename)).map(
+    (part) => ({
+      id: crypto.randomUUID(),
+      name: part.name,
+      pages: pagesFromSource(source, sizes, part.indices)
+    })
+  )
+  return { docs, mirror: manifest ? deserializeMirror(manifest, docs) : null }
 }
 
 export const toExportPage = (page: PageEntry): ExportPageRef => ({

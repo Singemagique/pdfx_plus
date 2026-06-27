@@ -42,6 +42,7 @@ export default function App(): React.JSX.Element {
   const { exportCollection, exportZip } = useExport(docs, editStore.editLayer, setBusy, flash)
   const { addFiles, openViaDialog, addPagesToDoc, handleExternalDropFiles } = useImport(
     collection,
+    editStore.loadEditState,
     setBusy,
     flash
   )
