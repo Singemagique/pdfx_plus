@@ -17,6 +17,8 @@ export interface EditStore {
   tool: ToolKind
   setTool: (t: ToolKind) => void
   highlightColor: RGB
+  highlightPalette: NamedColor[]
+  setHighlightColor: (rgb: RGB) => void
   inkColor: RGB
   inkWidth: number
   addOverlay: (o: Overlay) => void
@@ -34,13 +36,23 @@ interface EditState {
   overlays: Overlay[]
 }
 
-const HIGHLIGHT_COLOR: RGB = { r: 1, g: 0.9, b: 0.2 }
+export interface NamedColor {
+  name: string
+  rgb: RGB
+}
+
+const HIGHLIGHT_PALETTE: NamedColor[] = [
+  { name: 'Yellow', rgb: { r: 1, g: 0.9, b: 0.2 } },
+  { name: 'Green', rgb: { r: 0.5, g: 0.92, b: 0.45 } },
+  { name: 'Pink', rgb: { r: 1, g: 0.58, b: 0.8 } }
+]
 const INK_COLOR: RGB = { r: 0.1, g: 0.1, b: 0.12 }
 const INK_WIDTH = 2
 
 export function useEditStore(): EditStore {
   const [history, setHistory] = useState<History<EditState>>(() => initHistory({ overlays: [] }))
   const [tool, setTool] = useState<ToolKind>('browse')
+  const [highlightColor, setHighlightColor] = useState<RGB>(HIGHLIGHT_PALETTE[0].rgb)
   // Image overlays will register bytes here once the PNG-stamp tool lands; empty for now.
   const [attachments] = useState<Map<string, Attachment>>(() => new Map())
 
@@ -75,7 +87,9 @@ export function useEditStore(): EditStore {
     overlays,
     tool,
     setTool,
-    highlightColor: HIGHLIGHT_COLOR,
+    highlightColor,
+    highlightPalette: HIGHLIGHT_PALETTE,
+    setHighlightColor,
     inkColor: INK_COLOR,
     inkWidth: INK_WIDTH,
     addOverlay,
