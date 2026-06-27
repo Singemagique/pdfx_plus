@@ -1,4 +1,9 @@
-import type { DocEntry } from '../types'
+import type { DocEntry, PageEntry } from '../types'
+import { makePageKey } from '../edit/model'
+
+export type Rotations = Map<string, number>
+
+const isRotated = (rot: number | undefined): boolean => rot === 90 || rot === 270
 
 export const BASE_PAGE_HEIGHT = 280
 export const PAGE_GAP = 18
@@ -35,18 +40,26 @@ export function pageDisplayWidth(width: number, height: number): number {
   return Math.max(6, Math.round((BASE_PAGE_HEIGHT * width) / height))
 }
 
-function docWidth(doc: DocEntry): number {
+/** Display width at the fixed strip height, accounting for a 90°/270° rotation. */
+export function pageCellWidth(page: PageEntry, rotations?: Rotations): number {
+  const rot = rotations?.get(makePageKey(page.source.id, page.pageIndex))
+  return isRotated(rot)
+    ? pageDisplayWidth(page.height, page.width)
+    : pageDisplayWidth(page.width, page.height)
+}
+
+function docWidth(doc: DocEntry, rotations?: Rotations): number {
   const pages = doc.pages
   const stripWidth =
-    pages.reduce((sum, p) => sum + pageDisplayWidth(p.width, p.height), 0) +
+    pages.reduce((sum, p) => sum + pageCellWidth(p, rotations), 0) +
     Math.max(0, pages.length - 1) * PAGE_GAP
   return stripWidth + ADD_PAGE_SLOT + CARD_PAD_X * 2
 }
 
 export const DOC_HEIGHT = CARD_PAD_TOP + HEADER_BLOCK + BASE_PAGE_HEIGHT + CARD_PAD_BOTTOM
 
-export function computeLayout(docs: DocEntry[]): CanvasLayout {
-  const widths = docs.map((doc) => Math.max(MIN_DOC_WIDTH, docWidth(doc)))
+export function computeLayout(docs: DocEntry[], rotations?: Rotations): CanvasLayout {
+  const widths = docs.map((doc) => Math.max(MIN_DOC_WIDTH, docWidth(doc, rotations)))
   const contentWidth = Math.max(1, ...widths)
 
   let y = 0

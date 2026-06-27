@@ -34,7 +34,10 @@ export default function App(): React.JSX.Element {
   const fullViewState = useFullView()
   const editStore = useEditStore()
   const docs = collection.docs
-  const layout = useMemo(() => computeLayout(docs), [docs])
+  const layout = useMemo(
+    () => computeLayout(docs, editStore.rotations),
+    [docs, editStore.rotations]
+  )
 
   const { exportCollection, exportZip } = useExport(docs, editStore.editLayer, setBusy, flash)
   const { addFiles, openViaDialog, addPagesToDoc, handleExternalDropFiles } = useImport(
