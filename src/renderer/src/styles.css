@@ -935,6 +935,62 @@ body {
   overflow: visible;
 }
 
+/* Selection / move / resize chrome (Browse tool). The layer itself is pointer-
+   transparent so empty areas pan; these interactive bits opt back in. */
+.ov-hitbox {
+  position: absolute;
+  pointer-events: auto;
+  cursor: move;
+}
+
+.ov-selected {
+  position: absolute;
+  pointer-events: none;
+  outline: 1.5px solid var(--select);
+  outline-offset: 1px;
+  border-radius: 2px;
+}
+
+.ov-handle {
+  position: absolute;
+  pointer-events: auto;
+  width: 11px;
+  height: 11px;
+  transform: translate(-50%, -50%);
+  background: #fff;
+  border: 1.5px solid var(--select);
+  border-radius: 2px;
+}
+
+.ov-handle-tl,
+.ov-handle-br {
+  cursor: nwse-resize;
+}
+.ov-handle-tr,
+.ov-handle-bl {
+  cursor: nesw-resize;
+}
+
+.ov-delete {
+  position: absolute;
+  pointer-events: auto;
+  transform: translate(-25%, -75%);
+  width: 20px;
+  height: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: var(--select);
+  color: #fff;
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+  box-shadow: 0 1px 5px rgba(0, 0, 0, 0.35);
+}
+
 /* Floating editor tool palette, shown while the full-view editing surface is open. */
 .edit-tools {
   position: fixed;

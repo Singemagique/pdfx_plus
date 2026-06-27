@@ -65,6 +65,43 @@ export function rectGeom(a: Pt, b: Pt, opacity = 1): Geom {
   }
 }
 
+/** CSS-corner identifiers for the four resize handles. */
+export type HandleId = 'tl' | 'tr' | 'bl' | 'br'
+
+// The PDF point of the corner OPPOSITE a CSS-corner handle — it stays fixed while
+// dragging. CSS top = PDF y+h, CSS bottom = PDF y; CSS left = PDF x, right = x+w.
+function oppositeCorner(g: Geom, handle: HandleId): Pt {
+  switch (handle) {
+    case 'tl':
+      return { x: g.x + g.w, y: g.y }
+    case 'tr':
+      return { x: g.x, y: g.y }
+    case 'bl':
+      return { x: g.x + g.w, y: g.y + g.h }
+    case 'br':
+      return { x: g.x, y: g.y + g.h }
+  }
+}
+
+/** New geom when a resize handle is dragged to PDF point `p` (opposite corner fixed). */
+export function resizeGeom(start: Geom, handle: HandleId, p: Pt): Geom {
+  const g = rectGeom(oppositeCorner(start, handle), p, start.opacity)
+  g.rotation = start.rotation
+  return g
+}
+
+/** Translate a flat [x0,y0,…] point list by (dx, dy) in PDF space. */
+export function movePath(path: number[], dx: number, dy: number): number[] {
+  return path.map((v, i) => (i % 2 === 0 ? v + dx : v + dy))
+}
+
+/** Rescale a point list as its bounding box goes from `from` to `to`. */
+export function scalePath(path: number[], from: Geom, to: Geom): number[] {
+  const sx = from.w === 0 ? 1 : to.w / from.w
+  const sy = from.h === 0 ? 1 : to.h / from.h
+  return path.map((v, i) => (i % 2 === 0 ? to.x + (v - from.x) * sx : to.y + (v - from.y) * sy))
+}
+
 /** Bounding geom (PDF) of a flat [x0,y0,x1,y1,…] point list — used as an ink stroke's box. */
 export function boundsOfPath(path: number[], opacity = 1): Geom {
   let minX = Infinity
