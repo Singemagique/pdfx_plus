@@ -1,4 +1,4 @@
-import { PDFDocument, PDFPage } from 'pdf-lib'
+import { PDFDocument, PDFPage, degrees } from 'pdf-lib'
 
 import { MANIFEST_NAME, PDFX_VERSION } from './format'
 import type { ExportDocument, ExportPage, PdfxManifest } from './format'
@@ -20,6 +20,8 @@ import {
 export interface EditLayer {
   overlays: Map<string, Overlay[]>
   attachments: Map<string, Attachment>
+  /** Per-page extra rotation in degrees CW, keyed by page key. Applied via /Rotate. */
+  rotations?: Map<string, number>
 }
 
 async function bakePage(
@@ -28,11 +30,17 @@ async function bakePage(
   edits: EditLayer | undefined,
   res: FlattenResources | undefined
 ): Promise<void> {
-  if (!edits || !res) return
-  const list = edits.overlays.get(makePageKey(exportPage.sourceKey, exportPage.pageIndex))
-  if (!list || list.length === 0) return
-  const sorted = [...list].sort((a, b) => a.z - b.z || a.createdAt - b.createdAt)
-  await flattenPageOverlays(page, sorted, res)
+  if (!edits) return
+  const key = makePageKey(exportPage.sourceKey, exportPage.pageIndex)
+  const rot = edits.rotations?.get(key)
+  if (rot) {
+    page.setRotation(degrees((((page.getRotation().angle + rot) % 360) + 360) % 360))
+  }
+  const list = edits.overlays.get(key)
+  if (res && list && list.length > 0) {
+    const sorted = [...list].sort((a, b) => a.z - b.z || a.createdAt - b.createdAt)
+    await flattenPageOverlays(page, sorted, res)
+  }
 }
 
 export async function buildPdf(pages: ExportPage[], edits?: EditLayer): Promise<Uint8Array> {

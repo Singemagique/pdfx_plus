@@ -13,7 +13,7 @@ import {
 import { useEdits } from '../../edit/EditProvider'
 import {
   boundsOfPath,
-  clientToPdf,
+  clientToPdfRotated,
   geomToCss,
   movePath,
   pageScale,
@@ -28,7 +28,10 @@ import {
 
 interface OverlayLayerProps {
   page: PageEntry
+  /** Upright CSS size of the page box (before any rotation transform). */
   fit: FitSize
+  /** Page rotation in degrees CW (0/90/180/270). */
+  rot: number
   /** Editing is enabled only on the focused, settled page. */
   active: boolean
 }
@@ -106,7 +109,7 @@ function resizeOverlay(o: Overlay, handle: HandleId, p: Pt): Overlay {
 const geomEq = (a: Overlay['geom'], b: Overlay['geom']): boolean =>
   a.x === b.x && a.y === b.y && a.w === b.w && a.h === b.h
 
-export function OverlayLayer({ page, fit, active }: OverlayLayerProps): React.JSX.Element {
+export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): React.JSX.Element {
   const edits = useEdits()
   const { selectedId, select, setCurrentPage } = edits
   const layerRef = useRef<HTMLDivElement>(null)
@@ -126,7 +129,7 @@ export function OverlayLayer({ page, fit, active }: OverlayLayerProps): React.JS
 
   const toPdf = (clientX: number, clientY: number): Pt => {
     const rect = layerRef.current!.getBoundingClientRect()
-    return clientToPdf(clientX, clientY, rect, page)
+    return clientToPdfRotated(clientX, clientY, rect, fit, page, rot)
   }
 
   // Report this page as the placement target for palette actions (e.g. stamping).

@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest'
 import {
   boundsOfPath,
   clientToPdf,
+  clientToPdfRotated,
   geomToCss,
   movePath,
   pageScale,
@@ -46,6 +47,30 @@ describe('clientToPdf', () => {
     expect(clientToPdf(1000, 500, rect, page)).toEqual({ x: 0, y: 400 }) // top-left → PDF top
     expect(clientToPdf(1100, 700, rect, page)).toEqual({ x: 200, y: 0 }) // bottom-right → PDF origin
     expect(clientToPdf(1050, 600, rect, page)).toEqual({ x: 100, y: 200 }) // center
+  })
+})
+
+describe('clientToPdfRotated', () => {
+  const box = { w: 100, h: 200 } // upright CSS box, aspect matches page (200x400)
+  const near = (p: { x: number; y: number }, x: number, y: number): void => {
+    expect(p.x).toBeCloseTo(x, 6)
+    expect(p.y).toBeCloseTo(y, 6)
+  }
+  it('matches clientToPdf when rotation is 0', () => {
+    const bbox = { left: 0, top: 0, width: 100, height: 200 }
+    expect(clientToPdfRotated(50, 100, bbox, box, page, 0)).toEqual(
+      clientToPdf(50, 100, bbox, page)
+    )
+  })
+  it('flips x and y at 180°', () => {
+    const bbox = { left: 0, top: 0, width: 100, height: 200 }
+    near(clientToPdfRotated(0, 0, bbox, box, page, 180), 200, 0) // top-left → bottom-right
+    near(clientToPdfRotated(50, 100, bbox, box, page, 180), 100, 200) // centre stays centre
+  })
+  it('keeps the centre fixed at 90°', () => {
+    // at 90° the on-screen bbox is swapped (200 wide, 100 tall); centre is invariant.
+    const bbox = { left: 0, top: 0, width: 200, height: 100 }
+    near(clientToPdfRotated(100, 50, bbox, box, page, 90), 100, 200)
   })
 })
 

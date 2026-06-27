@@ -53,6 +53,33 @@ export function clientToPdf(clientX: number, clientY: number, rect: CssRect, pag
   return { x: fx * page.width, y: (1 - fy) * page.height }
 }
 
+/**
+ * Client point → natural PDF point when the page box (upright CSS size `box`) is rendered
+ * CSS-rotated by `rot` degrees CW and uniformly zoom-scaled. `bbox` is the layer's on-screen
+ * axis-aligned rect. Inverts rotation+scale about the box centre, then maps to page points.
+ */
+export function clientToPdfRotated(
+  clientX: number,
+  clientY: number,
+  bbox: CssRect,
+  box: FitSize,
+  page: PageBox,
+  rot: number
+): Pt {
+  const r = ((rot % 360) + 360) % 360
+  if (r === 0) return clientToPdf(clientX, clientY, bbox, page)
+  const swapped = r === 90 || r === 270
+  const s = bbox.width / (swapped ? box.h : box.w) // zoom scale extracted from the bbox
+  const cx = bbox.left + bbox.width / 2
+  const cy = bbox.top + bbox.height / 2
+  const vx = clientX - cx
+  const vy = clientY - cy
+  const a = (r * Math.PI) / 180
+  const lx = (vx * Math.cos(a) + vy * Math.sin(a)) / s + box.w / 2
+  const ly = (-vx * Math.sin(a) + vy * Math.cos(a)) / s + box.h / 2
+  return { x: (lx / box.w) * page.width, y: (1 - ly / box.h) * page.height }
+}
+
 /** Normalized geom (PDF) spanning two corner points — used for drag-rectangle tools. */
 export function rectGeom(a: Pt, b: Pt, opacity = 1): Geom {
   return {
