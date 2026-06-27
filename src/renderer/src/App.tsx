@@ -11,6 +11,8 @@ import { useImport } from './app/useImport'
 import { usePaste } from './app/usePaste'
 import { useDragController } from './app/useDragController'
 import { useKeyboardShortcuts } from './app/useKeyboardShortcuts'
+import { EditProvider, useEditStore } from './edit/EditProvider'
+import { EditTools } from './components/edit/EditTools'
 
 const TOAST_MS = 4000
 
@@ -30,10 +32,11 @@ export default function App(): React.JSX.Element {
 
   const collection = useCollection(flash)
   const fullViewState = useFullView()
+  const editStore = useEditStore()
   const docs = collection.docs
   const layout = useMemo(() => computeLayout(docs), [docs])
 
-  const { exportCollection, exportZip } = useExport(docs, setBusy, flash)
+  const { exportCollection, exportZip } = useExport(docs, editStore.editLayer, setBusy, flash)
   const { addFiles, openViaDialog, addPagesToDoc, handleExternalDropFiles } = useImport(
     collection,
     setBusy,
@@ -86,68 +89,73 @@ export default function App(): React.JSX.Element {
   const fullViewDoc = fullView ? docs.find((d) => d.id === fullView.docId) : undefined
 
   return (
-    <div
-      className={
-        'app' + (drag.committing ? ' committing' : '') + (drag.dragKind ? ' dragging' : '')
-      }
-      onDragEnter={drag.handlers.onDragEnter}
-      onDragOver={drag.handlers.onDragOver}
-      onDragLeave={drag.handlers.onDragLeave}
-      onDrop={drag.handlers.onDrop}
-    >
-      <Toolbar
-        documentCount={docs.length}
-        pageCount={totalPages}
-        busy={busy}
-        zoom={scale}
-        onZoomIn={() => canvasRef.current?.zoomIn()}
-        onZoomOut={() => canvasRef.current?.zoomOut()}
-        onZoomReset={() => canvasRef.current?.reset()}
-        onOpen={openViaDialog}
-        onExport={() => exportCollection('pdfx')}
-        onExportZip={exportZip}
-      />
-
-      <CollectionCanvas
-        docs={docs}
-        layout={layout}
-        busy={busy}
-        pagesDraggable={totalPages >= 2}
-        renderVersion={renderVersion}
-        selected={collection.selected}
-        hiddenPageId={fullViewState.hiddenPageId}
-        dragKind={drag.dragKind}
-        draggingPage={drag.draggingPage}
-        dropTarget={drag.dropTarget}
-        collapsedId={drag.collapsedId}
-        externalCount={drag.externalCount}
-        canvasRef={canvasRef}
-        onScaleChange={onScaleChange}
-        onSettle={onSettle}
-        onBackgroundClick={collection.clearSelection}
-        onOpen={openViaDialog}
-        onSelectPage={collection.selectPage}
-        onOpenPage={fullViewState.openPage}
-        onPageDragStart={drag.startPageDrag}
-        onPageDragEnd={drag.clearDrag}
-        onAddPage={addPagesToDoc}
-        onMoveDoc={collection.moveDoc}
-        onRemoveDoc={collection.removeDoc}
-        onRenameDoc={collection.renameDoc}
-      />
-
-      {fullView && fullViewDoc && (
-        <FullView
-          docs={docs}
-          startDocId={fullView.docId}
-          startPageId={fullView.pageId}
-          originRect={fullView.originRect}
-          onActivePageChange={fullViewState.setHiddenPageId}
-          onClose={fullViewState.closeFullView}
+    <EditProvider store={editStore}>
+      <div
+        className={
+          'app' + (drag.committing ? ' committing' : '') + (drag.dragKind ? ' dragging' : '')
+        }
+        onDragEnter={drag.handlers.onDragEnter}
+        onDragOver={drag.handlers.onDragOver}
+        onDragLeave={drag.handlers.onDragLeave}
+        onDrop={drag.handlers.onDrop}
+      >
+        <Toolbar
+          documentCount={docs.length}
+          pageCount={totalPages}
+          busy={busy}
+          zoom={scale}
+          onZoomIn={() => canvasRef.current?.zoomIn()}
+          onZoomOut={() => canvasRef.current?.zoomOut()}
+          onZoomReset={() => canvasRef.current?.reset()}
+          onOpen={openViaDialog}
+          onExport={() => exportCollection('pdfx')}
+          onExportZip={exportZip}
         />
-      )}
 
-      {toast && <div className="toast">{toast}</div>}
-    </div>
+        <CollectionCanvas
+          docs={docs}
+          layout={layout}
+          busy={busy}
+          pagesDraggable={totalPages >= 2}
+          renderVersion={renderVersion}
+          selected={collection.selected}
+          hiddenPageId={fullViewState.hiddenPageId}
+          dragKind={drag.dragKind}
+          draggingPage={drag.draggingPage}
+          dropTarget={drag.dropTarget}
+          collapsedId={drag.collapsedId}
+          externalCount={drag.externalCount}
+          canvasRef={canvasRef}
+          onScaleChange={onScaleChange}
+          onSettle={onSettle}
+          onBackgroundClick={collection.clearSelection}
+          onOpen={openViaDialog}
+          onSelectPage={collection.selectPage}
+          onOpenPage={fullViewState.openPage}
+          onPageDragStart={drag.startPageDrag}
+          onPageDragEnd={drag.clearDrag}
+          onAddPage={addPagesToDoc}
+          onMoveDoc={collection.moveDoc}
+          onRemoveDoc={collection.removeDoc}
+          onRenameDoc={collection.renameDoc}
+        />
+
+        {fullView && fullViewDoc && (
+          <>
+            <FullView
+              docs={docs}
+              startDocId={fullView.docId}
+              startPageId={fullView.pageId}
+              originRect={fullView.originRect}
+              onActivePageChange={fullViewState.setHiddenPageId}
+              onClose={fullViewState.closeFullView}
+            />
+            <EditTools />
+          </>
+        )}
+
+        {toast && <div className="toast">{toast}</div>}
+      </div>
+    </EditProvider>
   )
 }
