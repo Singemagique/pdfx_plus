@@ -8,6 +8,7 @@ interface ToolbarProps {
   onZoomReset: () => void
   onOpen: () => void
   onExport: () => void
+  onExportPdf: () => void
   onExportZip: () => void
 }
 
@@ -23,6 +24,7 @@ export function Toolbar({
   onZoomReset,
   onOpen,
   onExport,
+  onExportPdf,
   onExportZip
 }: ToolbarProps): React.JSX.Element {
   return (
@@ -72,7 +74,20 @@ export function Toolbar({
       <button className="btn glass" onClick={onOpen} disabled={busy}>
         Open
       </button>
-      <button className="btn glass" onClick={onExport} disabled={busy || documentCount === 0}>
+      <button
+        className="btn glass"
+        onClick={onExportPdf}
+        disabled={busy || documentCount === 0}
+        title="Flatten everything into one standard PDF (no PDFx data) — opens anywhere"
+      >
+        Export PDF
+      </button>
+      <button
+        className="btn glass"
+        onClick={onExport}
+        disabled={busy || documentCount === 0}
+        title="A valid PDF that also remembers the separate documents, so PDFx can re-split it"
+      >
         Export .pdfx
       </button>
       <button className="btn glass" onClick={onExportZip} disabled={busy || documentCount === 0}>
