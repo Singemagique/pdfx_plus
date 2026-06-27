@@ -30,11 +30,19 @@ export function useExport(
       setBusy(true)
       try {
         const filename = path.split(/[\\/]/).pop() ?? `untitled.${kind}`
-        const bytes = await buildPdfx(
-          docs.map((doc) => ({ name: doc.name, pages: doc.pages.map(toExportPage) })),
-          stripExtension(filename).replace(/\.pdf$/i, ''),
-          editLayer
-        )
+        // .pdfx embeds the manifest that lets PDFx re-split the collection; a plain
+        // .pdf is a flat, manifest-free PDF that any tool reads as one document.
+        const bytes =
+          kind === 'pdfx'
+            ? await buildPdfx(
+                docs.map((doc) => ({ name: doc.name, pages: doc.pages.map(toExportPage) })),
+                stripExtension(filename).replace(/\.pdf$/i, ''),
+                editLayer
+              )
+            : await buildPdf(
+                docs.flatMap((doc) => doc.pages.map(toExportPage)),
+                editLayer
+              )
         const saved = await window.api.writeFile(path, bytes)
         flash(`Saved ${saved}`)
       } catch (error) {
