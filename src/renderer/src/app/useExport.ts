@@ -1,6 +1,7 @@
 import { useCallback } from 'react'
 import { zipSync } from 'fflate'
 import { buildPdf, buildPdfx, stripExtension } from '../pdfx/format'
+import type { EditLayer } from '../pdfx/build'
 import { toExportPage } from '../pdfx/source'
 import type { DocEntry } from '../types'
 
@@ -11,6 +12,7 @@ const ILLEGAL_FILENAME_CHARS = /[\\/:*?"<>|]/g
 
 export function useExport(
   docs: DocEntry[],
+  editLayer: EditLayer,
   setBusy: (busy: boolean) => void,
   flash: (message: string) => void
 ) {
@@ -30,7 +32,8 @@ export function useExport(
         const filename = path.split(/[\\/]/).pop() ?? `untitled.${kind}`
         const bytes = await buildPdfx(
           docs.map((doc) => ({ name: doc.name, pages: doc.pages.map(toExportPage) })),
-          stripExtension(filename).replace(/\.pdf$/i, '')
+          stripExtension(filename).replace(/\.pdf$/i, ''),
+          editLayer
         )
         const saved = await window.api.writeFile(path, bytes)
         flash(`Saved ${saved}`)
@@ -41,7 +44,7 @@ export function useExport(
         setBusy(false)
       }
     },
-    [docs, flash, setBusy]
+    [docs, editLayer, flash, setBusy]
   )
 
   const exportZip = useCallback(async () => {
@@ -60,7 +63,7 @@ export function useExport(
         let filename = `${safeName}.pdf`
         for (let n = 2; used.has(filename); n++) filename = `${safeName} (${n}).pdf`
         used.add(filename)
-        entries[filename] = await buildPdf(doc.pages.map(toExportPage))
+        entries[filename] = await buildPdf(doc.pages.map(toExportPage), editLayer)
       }
       const saved = await window.api.writeFile(path, zipSync(entries))
       flash(`Saved ${saved}`)
@@ -70,7 +73,7 @@ export function useExport(
     } finally {
       setBusy(false)
     }
-  }, [docs, flash, setBusy])
+  }, [docs, editLayer, flash, setBusy])
 
   return { exportCollection, exportZip }
 }

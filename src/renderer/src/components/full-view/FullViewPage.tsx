@@ -1,5 +1,6 @@
 import type { PageEntry } from '../../types'
 import { PageView } from '../PageView'
+import { OverlayLayer } from '../edit/OverlayLayer'
 import type { View } from './geometry'
 import { DOUBLE_CLICK_ZOOM, fitInto, TRANSITION_MS } from './geometry'
 
@@ -64,6 +65,7 @@ export function FullViewPage(props: FullViewPageProps): React.JSX.Element {
           version={isCurrent ? renderVersion : 0}
           eager={isCurrent}
         />
+        {isCurrent && <OverlayLayer page={p} fit={size} active={interactive && !animating} />}
       </div>
     </div>
   )
