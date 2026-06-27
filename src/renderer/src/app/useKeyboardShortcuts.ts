@@ -5,6 +5,7 @@ interface KeyboardShortcutDeps {
   active: boolean
   selected: PageRef | null
   onDeletePage: (target: PageRef) => void
+  onDuplicate: (target: PageRef) => void
   onCopy: () => void
   onPaste: () => void
   onClearSelection: () => void
@@ -19,6 +20,7 @@ export function useKeyboardShortcuts({
   active,
   selected,
   onDeletePage,
+  onDuplicate,
   onCopy,
   onPaste,
   onClearSelection
@@ -30,6 +32,9 @@ export function useKeyboardShortcuts({
       if ((event.key === 'Backspace' || event.key === 'Delete') && selected) {
         event.preventDefault()
         onDeletePage(selected)
+      } else if (mod && event.key.toLowerCase() === 'd' && selected) {
+        event.preventDefault()
+        onDuplicate(selected)
       } else if (mod && event.key.toLowerCase() === 'c' && selected) {
         onCopy()
       } else if (mod && event.key.toLowerCase() === 'v') {
@@ -40,5 +45,5 @@ export function useKeyboardShortcuts({
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [active, selected, onDeletePage, onCopy, onPaste, onClearSelection])
+  }, [active, selected, onDeletePage, onDuplicate, onCopy, onPaste, onClearSelection])
 }
