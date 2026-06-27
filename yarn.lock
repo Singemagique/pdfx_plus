@@ -350,6 +350,11 @@
     minimatch "^9.0.3"
     plist "^3.1.0"
 
+"@embedpdf/pdfium@^2.14.4":
+  version "2.14.4"
+  resolved "https://registry.yarnpkg.com/@embedpdf/pdfium/-/pdfium-2.14.4.tgz#e3c722a5b90ed97dc673c41722ffe41509d3cff0"
+  integrity sha512-0tDPQEH1WtfXcASNVp5U3dqfzZboNvcE4rDok/P4JCN+DCTaJDG2E9lYHGMo9FtuS2IdHgrzkmPRpOo5WV9MKQ==
+
 "@emnapi/core@1.11.1":
   version "1.11.1"
   resolved "https://registry.yarnpkg.com/@emnapi/core/-/core-1.11.1.tgz#b9e1064f3a6b1631e241e638eb48d736bfd372a6"
