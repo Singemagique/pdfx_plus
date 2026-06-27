@@ -1150,6 +1150,50 @@ body {
   background: currentColor;
 }
 
+.sig-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.5);
+}
+
+.sig-modal {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 18px;
+  border-radius: 14px;
+  background: var(--overlay-strong);
+  box-shadow:
+    0 20px 60px rgba(0, 0, 0, 0.5),
+    inset 0 0 0 1px var(--hairline);
+}
+
+.sig-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.sig-canvas {
+  width: 600px;
+  height: 200px;
+  max-width: 80vw;
+  background: #fff;
+  border-radius: 8px;
+  touch-action: none;
+  cursor: crosshair;
+}
+
+.sig-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .full-nav {
   position: absolute;
   top: 50%;

@@ -53,6 +53,8 @@ export interface EditStore {
   setCurrentPage: (p: CurrentPage | null) => void
   rotations: Map<string, number>
   rotatePage: (pageKey: string, delta: number) => void
+  savedSignature: Uint8Array | null
+  setSavedSignature: (bytes: Uint8Array | null) => void
   /** Overlays + attachments shaped for the flatten-on-export pipeline. */
   editLayer: EditLayer
 }
@@ -95,6 +97,7 @@ export function useEditStore(): EditStore {
   const [currentPage, setCurrentPage] = useState<CurrentPage | null>(null)
 
   const [rotations, setRotations] = useState<Map<string, number>>(() => new Map())
+  const [savedSignature, setSavedSignature] = useState<Uint8Array | null>(null)
 
   const addAttachment = useCallback((id: string, bytes: Uint8Array, mime: string) => {
     setAttachments((m) => new Map(m).set(id, { bytes, mime }))
@@ -187,6 +190,8 @@ export function useEditStore(): EditStore {
     setCurrentPage,
     rotations,
     rotatePage,
+    savedSignature,
+    setSavedSignature,
     editLayer
   }
 }

@@ -1,6 +1,7 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useEdits, type ToolKind } from '../../edit/EditProvider'
 import { newOverlayId, type RGB, type ShapeKind } from '../../edit/model'
+import { SignaturePad } from './SignaturePad'
 
 const SHAPE_KINDS: { kind: ShapeKind; label: string; icon: React.JSX.Element }[] = [
   { kind: 'rect', label: 'Rectangle', icon: <rect x="3" y="5" width="18" height="14" rx="1" /> },
@@ -103,25 +104,27 @@ export function EditTools(): React.JSX.Element {
   const { overlays, addOverlay, addAttachment, currentPage, select, rotatePage } = useEdits()
   const { shapeKind, setShapeKind, shapeColor, shapePalette, setShapeColor } = useEdits()
   const { inkColor, inkPalette, setInkColor, inkWidth, inkWidths, setInkWidth } = useEdits()
+  const { savedSignature, setSavedSignature } = useEdits()
   const fileRef = useRef<HTMLInputElement>(null)
+  const [padOpen, setPadOpen] = useState(false)
 
-  const onFile = async (e: React.ChangeEvent<HTMLInputElement>): Promise<void> => {
-    const file = e.target.files?.[0]
-    e.target.value = '' // allow re-picking the same file
-    if (!file || !currentPage) return
-    const bytes = new Uint8Array(await file.arrayBuffer())
-    const mime = file.type === 'image/jpeg' ? 'image/jpeg' : 'image/png'
+  const placeImage = async (
+    bytes: Uint8Array,
+    mime: 'image/png' | 'image/jpeg',
+    widthFrac = 0.4
+  ): Promise<void> => {
+    if (!currentPage) return
     let natW = 1
     let natH = 1
     try {
-      const bmp = await createImageBitmap(new Blob([bytes], { type: mime }))
+      const bmp = await createImageBitmap(new Blob([new Uint8Array(bytes)], { type: mime }))
       natW = bmp.width
       natH = bmp.height
       bmp.close()
     } catch {
       /* keep 1:1 fallback */
     }
-    const targetW = Math.min(currentPage.width * 0.4, natW)
+    const targetW = Math.min(currentPage.width * widthFrac, natW)
     const targetH = (targetW * natH) / natW
     const attachmentId = newOverlayId()
     addAttachment(attachmentId, bytes, mime)
@@ -148,6 +151,19 @@ export function EditTools(): React.JSX.Element {
     select(id)
   }
 
+  const onFile = async (e: React.ChangeEvent<HTMLInputElement>): Promise<void> => {
+    const file = e.target.files?.[0]
+    e.target.value = '' // allow re-picking the same file
+    if (!file) return
+    const bytes = new Uint8Array(await file.arrayBuffer())
+    await placeImage(bytes, file.type === 'image/jpeg' ? 'image/jpeg' : 'image/png')
+  }
+
+  const onSign = (): void => {
+    if (savedSignature) void placeImage(savedSignature, 'image/png', 0.3)
+    else setPadOpen(true)
+  }
+
   // Undo/redo keyboard shortcuts while the editor surface (full view) is mounted.
   useEffect(() => {
     const onKey = (e: KeyboardEvent): void => {
@@ -163,205 +179,258 @@ export function EditTools(): React.JSX.Element {
   }, [undo, redo])
 
   return (
-    <div className="edit-tools">
-      {TOOLS.map((t) => (
+    <>
+      <div className="edit-tools">
+        {TOOLS.map((t) => (
+          <button
+            key={t.kind}
+            className={`tool-btn${tool === t.kind ? ' active' : ''}`}
+            onClick={() => setTool(t.kind)}
+            title={t.label}
+          >
+            <ToolIcon kind={t.kind} />
+            <span>{t.label}</span>
+          </button>
+        ))}
         <button
-          key={t.kind}
-          className={`tool-btn${tool === t.kind ? ' active' : ''}`}
-          onClick={() => setTool(t.kind)}
-          title={t.label}
+          className="tool-btn"
+          onClick={() => fileRef.current?.click()}
+          title="Place an image or signature (PNG / JPEG)"
         >
-          <ToolIcon kind={t.kind} />
-          <span>{t.label}</span>
+          <svg
+            width="16"
+            height="16"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
+            <rect x="3" y="4" width="18" height="16" rx="2" />
+            <circle cx="8.5" cy="9.5" r="1.5" />
+            <path d="M21 16l-5-5-9 9" />
+          </svg>
+          <span>Image</span>
         </button>
-      ))}
-      <button
-        className="tool-btn"
-        onClick={() => fileRef.current?.click()}
-        title="Place an image or signature (PNG / JPEG)"
-      >
-        <svg
-          width="16"
-          height="16"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="2"
-          strokeLinecap="round"
-          strokeLinejoin="round"
+        <input
+          ref={fileRef}
+          type="file"
+          accept="image/png,image/jpeg"
+          style={{ display: 'none' }}
+          onChange={(e) => void onFile(e)}
+        />
+        <button
+          className="tool-btn"
+          onClick={onSign}
+          title={savedSignature ? 'Stamp your saved signature' : 'Draw a signature'}
         >
-          <rect x="3" y="4" width="18" height="16" rx="2" />
-          <circle cx="8.5" cy="9.5" r="1.5" />
-          <path d="M21 16l-5-5-9 9" />
-        </svg>
-        <span>Image</span>
-      </button>
-      <input
-        ref={fileRef}
-        type="file"
-        accept="image/png,image/jpeg"
-        style={{ display: 'none' }}
-        onChange={(e) => void onFile(e)}
-      />
-      {tool === 'highlight' && (
-        <span className="tool-swatches">
-          {highlightPalette.map((c) => (
-            <button
-              key={c.name}
-              className={`swatch${rgbEq(c.rgb, highlightColor) ? ' active' : ''}`}
-              style={{ background: cssColor(c.rgb) }}
-              onClick={() => setHighlightColor(c.rgb)}
-              title={`Highlight ${c.name}`}
-              aria-label={`Highlight ${c.name}`}
-            />
-          ))}
-        </span>
-      )}
-      {tool === 'ink' && (
-        <span className="tool-swatches">
-          {inkPalette.map((c) => (
-            <button
-              key={c.name}
-              className={`swatch${rgbEq(c.rgb, inkColor) ? ' active' : ''}`}
-              style={{ background: cssColor(c.rgb) }}
-              onClick={() => setInkColor(c.rgb)}
-              title={c.name}
-              aria-label={`Ink ${c.name}`}
-            />
-          ))}
-          <span className="tool-sep" />
-          {inkWidths.map((w, i) => (
-            <button
-              key={w}
-              className={`shape-btn${inkWidth === w ? ' active' : ''}`}
-              onClick={() => setInkWidth(w)}
-              title={['Thin', 'Medium', 'Thick'][i] ?? `${w}px`}
-              aria-label={`Width ${w}`}
+          <svg
+            width="16"
+            height="16"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
+            <path d="M3 17c3 0 4-7 6-7s2 5 4 5 3-8 5-8" />
+            <path d="M3 21h18" />
+          </svg>
+          <span>Sign</span>
+        </button>
+        {savedSignature && (
+          <button
+            className="tool-btn icon-only"
+            onClick={() => setPadOpen(true)}
+            title="Redraw signature"
+          >
+            <svg
+              width="15"
+              height="15"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
             >
-              <span className="width-dot" style={{ width: 5 + i * 4, height: 5 + i * 4 }} />
-            </button>
-          ))}
-        </span>
-      )}
-      {tool === 'shape' && (
-        <span className="tool-swatches">
-          {SHAPE_KINDS.map((s) => (
-            <button
-              key={s.kind}
-              className={`shape-btn${shapeKind === s.kind ? ' active' : ''}`}
-              onClick={() => setShapeKind(s.kind)}
-              title={s.label}
-              aria-label={s.label}
-            >
-              <svg
-                width="16"
-                height="16"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
+              <path d="M12 20h9" />
+              <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4z" />
+            </svg>
+          </button>
+        )}
+        {tool === 'highlight' && (
+          <span className="tool-swatches">
+            {highlightPalette.map((c) => (
+              <button
+                key={c.name}
+                className={`swatch${rgbEq(c.rgb, highlightColor) ? ' active' : ''}`}
+                style={{ background: cssColor(c.rgb) }}
+                onClick={() => setHighlightColor(c.rgb)}
+                title={`Highlight ${c.name}`}
+                aria-label={`Highlight ${c.name}`}
+              />
+            ))}
+          </span>
+        )}
+        {tool === 'ink' && (
+          <span className="tool-swatches">
+            {inkPalette.map((c) => (
+              <button
+                key={c.name}
+                className={`swatch${rgbEq(c.rgb, inkColor) ? ' active' : ''}`}
+                style={{ background: cssColor(c.rgb) }}
+                onClick={() => setInkColor(c.rgb)}
+                title={c.name}
+                aria-label={`Ink ${c.name}`}
+              />
+            ))}
+            <span className="tool-sep" />
+            {inkWidths.map((w, i) => (
+              <button
+                key={w}
+                className={`shape-btn${inkWidth === w ? ' active' : ''}`}
+                onClick={() => setInkWidth(w)}
+                title={['Thin', 'Medium', 'Thick'][i] ?? `${w}px`}
+                aria-label={`Width ${w}`}
               >
-                {s.icon}
-              </svg>
-            </button>
-          ))}
-          <span className="tool-sep" />
-          {shapePalette.map((c) => (
-            <button
-              key={c.name}
-              className={`swatch${rgbEq(c.rgb, shapeColor) ? ' active' : ''}`}
-              style={{ background: cssColor(c.rgb) }}
-              onClick={() => setShapeColor(c.rgb)}
-              title={c.name}
-              aria-label={`Shape ${c.name}`}
-            />
-          ))}
-        </span>
+                <span className="width-dot" style={{ width: 5 + i * 4, height: 5 + i * 4 }} />
+              </button>
+            ))}
+          </span>
+        )}
+        {tool === 'shape' && (
+          <span className="tool-swatches">
+            {SHAPE_KINDS.map((s) => (
+              <button
+                key={s.kind}
+                className={`shape-btn${shapeKind === s.kind ? ' active' : ''}`}
+                onClick={() => setShapeKind(s.kind)}
+                title={s.label}
+                aria-label={s.label}
+              >
+                <svg
+                  width="16"
+                  height="16"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  {s.icon}
+                </svg>
+              </button>
+            ))}
+            <span className="tool-sep" />
+            {shapePalette.map((c) => (
+              <button
+                key={c.name}
+                className={`swatch${rgbEq(c.rgb, shapeColor) ? ' active' : ''}`}
+                style={{ background: cssColor(c.rgb) }}
+                onClick={() => setShapeColor(c.rgb)}
+                title={c.name}
+                aria-label={`Shape ${c.name}`}
+              />
+            ))}
+          </span>
+        )}
+        <span className="tool-sep" />
+        <button
+          className="tool-btn icon-only"
+          onClick={() => currentPage && rotatePage(currentPage.pageKey, -90)}
+          disabled={!currentPage}
+          title="Rotate page left"
+        >
+          <svg
+            width="16"
+            height="16"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
+            <path d="M3 9a9 9 0 1 0 3-5" />
+            <path d="M3 3v5h5" />
+          </svg>
+        </button>
+        <button
+          className="tool-btn icon-only"
+          onClick={() => currentPage && rotatePage(currentPage.pageKey, 90)}
+          disabled={!currentPage}
+          title="Rotate page right"
+        >
+          <svg
+            width="16"
+            height="16"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
+            <path d="M21 9a9 9 0 1 1-3-5" />
+            <path d="M21 3v5h-5" />
+          </svg>
+        </button>
+        <span className="tool-sep" />
+        <button
+          className="tool-btn icon-only"
+          onClick={undo}
+          disabled={!canUndo}
+          title="Undo (Ctrl/Cmd+Z)"
+        >
+          <svg
+            width="16"
+            height="16"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
+            <path d="M9 14L4 9l5-5" />
+            <path d="M4 9h11a5 5 0 0 1 0 10h-1" />
+          </svg>
+        </button>
+        <button
+          className="tool-btn icon-only"
+          onClick={redo}
+          disabled={!canRedo}
+          title="Redo (Ctrl/Cmd+Shift+Z)"
+        >
+          <svg
+            width="16"
+            height="16"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
+            <path d="M15 14l5-5-5-5" />
+            <path d="M20 9H9a5 5 0 0 0 0 10h1" />
+          </svg>
+        </button>
+      </div>
+      {padOpen && (
+        <SignaturePad
+          onSave={(bytes) => {
+            setSavedSignature(bytes)
+            setPadOpen(false)
+            void placeImage(bytes, 'image/png', 0.3)
+          }}
+          onClose={() => setPadOpen(false)}
+        />
       )}
-      <span className="tool-sep" />
-      <button
-        className="tool-btn icon-only"
-        onClick={() => currentPage && rotatePage(currentPage.pageKey, -90)}
-        disabled={!currentPage}
-        title="Rotate page left"
-      >
-        <svg
-          width="16"
-          height="16"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="2"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-        >
-          <path d="M3 9a9 9 0 1 0 3-5" />
-          <path d="M3 3v5h5" />
-        </svg>
-      </button>
-      <button
-        className="tool-btn icon-only"
-        onClick={() => currentPage && rotatePage(currentPage.pageKey, 90)}
-        disabled={!currentPage}
-        title="Rotate page right"
-      >
-        <svg
-          width="16"
-          height="16"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="2"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-        >
-          <path d="M21 9a9 9 0 1 1-3-5" />
-          <path d="M21 3v5h-5" />
-        </svg>
-      </button>
-      <span className="tool-sep" />
-      <button
-        className="tool-btn icon-only"
-        onClick={undo}
-        disabled={!canUndo}
-        title="Undo (Ctrl/Cmd+Z)"
-      >
-        <svg
-          width="16"
-          height="16"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="2"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-        >
-          <path d="M9 14L4 9l5-5" />
-          <path d="M4 9h11a5 5 0 0 1 0 10h-1" />
-        </svg>
-      </button>
-      <button
-        className="tool-btn icon-only"
-        onClick={redo}
-        disabled={!canRedo}
-        title="Redo (Ctrl/Cmd+Shift+Z)"
-      >
-        <svg
-          width="16"
-          height="16"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="2"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-        >
-          <path d="M15 14l5-5-5-5" />
-          <path d="M20 9H9a5 5 0 0 0 0 10h1" />
-        </svg>
-      </button>
-    </div>
+    </>
   )
 }
