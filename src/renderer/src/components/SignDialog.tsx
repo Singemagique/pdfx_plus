@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 
 interface CardToken {
   slot: number
@@ -26,6 +26,8 @@ interface SignDialogProps {
   ) => Promise<boolean>
   /** List the tokens (cards) present in a PKCS#11 module. */
   listTokens: (modulePath: string) => Promise<CardToken[]>
+  /** Probe common install locations for PKCS#11 modules (OpenSC, ActivClient, …). */
+  findModules: () => Promise<Array<{ path: string; label: string }>>
   /** Resolve a picked module file to an absolute path (Electron webUtils). */
   pathForFile: (file: File) => string
   /** Human-readable location of the visible-signature placement, or null = invisible. */
@@ -51,6 +53,7 @@ export function SignDialog({
   onSign,
   onSignCard,
   listTokens,
+  findModules,
   pathForFile,
   placementLabel,
   onClearPlacement,
@@ -99,12 +102,13 @@ export function SignDialog({
     }
   }
 
-  const detect = async (): Promise<void> => {
-    if (!modulePath.trim()) return
+  const detect = async (path?: string): Promise<void> => {
+    const mod = (path ?? modulePath).trim()
+    if (!mod) return
     setDetecting(true)
     setCardError('')
     try {
-      const found = await listTokens(modulePath.trim())
+      const found = await listTokens(mod)
       setTokens(found)
       setSelectedSlot(found.length ? found[0].slot : null)
       if (!found.length) setCardError('No card detected — is it inserted?')
@@ -116,6 +120,27 @@ export function SignDialog({
       setDetecting(false)
     }
   }
+
+  // When the smart-card tab first opens, probe common install locations for a PKCS#11 module and,
+  // if one is present, auto-fill it and detect the card — so a typical CAC/PIV setup needs no manual
+  // path hunting. Runs once; the user can still Browse to a different module.
+  const autoProbed = useRef(false)
+  useEffect(() => {
+    if (mode !== 'card' || autoProbed.current) return
+    autoProbed.current = true
+    void (async () => {
+      try {
+        const mods = await findModules()
+        if (mods.length && !modulePath.trim()) {
+          setModulePath(mods[0].path)
+          await detect(mods[0].path)
+        }
+      } catch {
+        /* probing failed — the user can browse manually */
+      }
+    })()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode])
 
   const shared: SignAppearanceOpts = {
     reason: reason || undefined,

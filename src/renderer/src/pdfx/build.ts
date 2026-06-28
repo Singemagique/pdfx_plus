@@ -201,18 +201,34 @@ export async function buildPdf(pages: ExportPage[], edits?: EditLayer): Promise<
   const output = await PDFDocument.create()
   const res = edits ? createFlattenResources(output, edits.attachments) : undefined
   const sources = new Map<string, PDFDocument>()
+  let ordinal = 0
   for (const page of pages) {
-    let source = sources.get(page.sourceKey)
-    if (!source) {
-      source = await PDFDocument.load(page.bytes, { ignoreEncryption: true })
-      sources.set(page.sourceKey, source)
+    ordinal++
+    // Tag any failure with which page failed, so a single bad source (e.g. one odd scan) is
+    // identifiable instead of surfacing as a bare "Export failed".
+    try {
+      let source = sources.get(page.sourceKey)
+      if (!source) {
+        source = await PDFDocument.load(page.bytes, { ignoreEncryption: true })
+        sources.set(page.sourceKey, source)
+      }
+      const [copied] = await output.copyPages(source, [page.pageIndex])
+      output.addPage(copied)
+      await bakePage(copied, page, edits, res)
+    } catch (e) {
+      throw new Error(
+        `Export failed on page ${ordinal} (source page ${page.pageIndex + 1}): ${e instanceof Error ? e.message : String(e)}`
+      )
     }
-    const [copied] = await output.copyPages(source, [page.pageIndex])
-    output.addPage(copied)
-    await bakePage(copied, page, edits, res)
   }
   output.setProducer(`PDFX ${PDFX_VERSION}`)
-  return output.save()
+  try {
+    return await output.save()
+  } catch (e) {
+    throw new Error(
+      `Export failed while writing the combined PDF: ${e instanceof Error ? e.message : String(e)}`
+    )
+  }
 }
 
 export async function buildPdfx(

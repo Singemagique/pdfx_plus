@@ -188,6 +188,7 @@ export default function App(): React.JSX.Element {
             onSign={signAndExport}
             onSignCard={signWithCardAndExport}
             listTokens={(modulePath) => window.api.listCardTokens(modulePath)}
+            findModules={() => window.api.findCardModules()}
             pathForFile={(file) => window.api.getPathForFile(file)}
             placementLabel={editStore.signaturePlacement?.label ?? null}
             onClearPlacement={() => editStore.setSignaturePlacement(null)}

@@ -9,6 +9,7 @@
 // naturally aligned elsewhere, so CK_ATTRIBUTE/CK_MECHANISM use koffi.pack on win32, koffi.struct
 // otherwise. Validated end-to-end against SoftHSM2 (x64).
 import * as koffi from 'koffi'
+import { existsSync } from 'node:fs'
 import type { RawSigner } from './sign-pkcs11'
 
 const ULONG = 'unsigned long'
@@ -224,6 +225,67 @@ function finalize(modulePath: string, f: Funcs): void {
   } else {
     initCount.set(modulePath, n - 1)
   }
+}
+
+/** A PKCS#11 module found at a common install location. */
+export interface FoundModule {
+  path: string
+  label: string
+}
+
+// Common PKCS#11 module install locations per platform. Probed so the user doesn't have to hunt for
+// the .dll/.so themselves — covers OpenSC and the usual CAC/PIV middlewares (ActivClient, etc.).
+const MODULE_CANDIDATES: Record<string, FoundModule[]> = {
+  win32: [
+    { path: 'C:\\Windows\\System32\\opensc-pkcs11.dll', label: 'OpenSC' },
+    {
+      path: 'C:\\Program Files\\OpenSC Project\\OpenSC\\pkcs11\\opensc-pkcs11.dll',
+      label: 'OpenSC'
+    },
+    { path: 'C:\\Program Files (x86)\\OpenSC Project\\OpenSC\\pkcs11\\opensc-pkcs11.dll', label: 'OpenSC (x86)' }, // prettier-ignore
+    { path: 'C:\\Windows\\System32\\acpkcs211.dll', label: 'ActivClient (CAC)' },
+    {
+      path: 'C:\\Program Files\\HID Global\\ActivClient\\acpkcs211.dll',
+      label: 'ActivClient (CAC)'
+    },
+    { path: 'C:\\Program Files (x86)\\HID Global\\ActivClient\\acpkcs211.dll', label: 'ActivClient (CAC)' }, // prettier-ignore
+    { path: 'C:\\Windows\\System32\\acpkcs11.dll', label: 'ActivClient' },
+    { path: 'C:\\Windows\\System32\\eTPKCS11.dll', label: 'SafeNet eToken' },
+    { path: 'C:\\Windows\\System32\\cmP11.dll', label: 'Charismathics' },
+    { path: 'C:\\Program Files\\Yubico\\Yubico PIV Tool\\bin\\libykcs11.dll', label: 'YubiKey PIV' }
+  ],
+  darwin: [
+    { path: '/Library/OpenSC/lib/opensc-pkcs11.so', label: 'OpenSC' },
+    { path: '/usr/local/lib/opensc-pkcs11.so', label: 'OpenSC' },
+    { path: '/opt/homebrew/lib/opensc-pkcs11.so', label: 'OpenSC (Homebrew)' },
+    { path: '/Library/Frameworks/eToken.framework/Versions/Current/libeToken.dylib', label: 'SafeNet eToken' }, // prettier-ignore
+    { path: '/usr/local/lib/libykcs11.dylib', label: 'YubiKey PIV' }
+  ],
+  linux: [
+    { path: '/usr/lib/x86_64-linux-gnu/opensc-pkcs11.so', label: 'OpenSC' },
+    { path: '/usr/lib/opensc-pkcs11.so', label: 'OpenSC' },
+    { path: '/usr/lib64/opensc-pkcs11.so', label: 'OpenSC' },
+    { path: '/usr/local/lib/opensc-pkcs11.so', label: 'OpenSC' },
+    { path: '/usr/lib/x86_64-linux-gnu/libykcs11.so', label: 'YubiKey PIV' },
+    { path: '/usr/lib/libcackey.so', label: 'CACKey (CAC)' }
+  ]
+}
+
+/** Probe common install locations and return the PKCS#11 modules that actually exist on disk. */
+export function findModules(): FoundModule[] {
+  const candidates = MODULE_CANDIDATES[process.platform] ?? []
+  const seen = new Set<string>()
+  const out: FoundModule[] = []
+  for (const c of candidates) {
+    if (seen.has(c.path)) continue
+    seen.add(c.path)
+    try {
+      if (existsSync(c.path)) out.push(c)
+    } catch {
+      /* unreadable path — skip */
+    }
+  }
+  return out
 }
 
 /** Enumerate tokens (cards) currently present, across all slots of `modulePath`. */

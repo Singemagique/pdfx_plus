@@ -4,7 +4,7 @@ import { existsSync } from 'fs'
 import { writeFile } from 'fs/promises'
 import { markupToPdf } from './markup'
 import { signPdf, signPdfWithCard } from './sign'
-import { listTokens } from './pkcs11'
+import { listTokens, findModules } from './pkcs11'
 import { OpenedFile, IMPORTABLE, readFiles, expandDropPaths } from './file-intake'
 import { clipboardFilePaths } from './clipboard'
 import { readResource } from './resource'
@@ -126,6 +126,12 @@ export function registerIpc(getPending: () => string[], clearPending: () => void
     }
     return p
   }
+
+  // Probe common install locations for PKCS#11 modules so the smart-card signer can auto-fill them.
+  ipcMain.handle(
+    'pdfx:pkcs11-find-modules',
+    async (): Promise<Array<{ path: string; label: string }>> => findModules()
+  )
 
   // Enumerate the tokens (cards) currently present in a PKCS#11 module, for the smart-card signer.
   ipcMain.handle(

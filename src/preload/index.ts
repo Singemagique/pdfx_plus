@@ -70,6 +70,8 @@ const api = {
     ipcRenderer.invoke('pdfx:write-file', path, data),
   signPdf: (pdf: Uint8Array, p12: Uint8Array, opts: SignOptions): Promise<Uint8Array> =>
     ipcRenderer.invoke('pdfx:sign-pdf', pdf, p12, opts),
+  findCardModules: (): Promise<Array<{ path: string; label: string }>> =>
+    ipcRenderer.invoke('pdfx:pkcs11-find-modules'),
   listCardTokens: (modulePath: string): Promise<Pkcs11Token[]> =>
     ipcRenderer.invoke('pdfx:pkcs11-list-tokens', modulePath),
   signPdfWithCard: (
