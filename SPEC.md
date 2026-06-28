@@ -90,12 +90,24 @@ compatible.
 | `edits`        | array  | Per-page editable annotations, keyed by `doc` (index into `documents`) + `page` (index within that document). Each entry may carry a `rotation` (degrees CW), a `crop` rectangle, and an `overlays` array. |
 | `edits[].crop` | object | Optional page crop `{ x, y, w, h }` in PDF points (origin bottom-left, unrotated page space). A flattened writer applies it as the page `/CropBox`; the mirror preserves it for re-editing.                |
 | `attachments`  | object | Base64 image payloads referenced by `image`/`signatureVisual` overlays.                                                                                                                                    |
+| `integrity`    | object | A tamper record over the **decoded** page content: `{ canonAlg: "pdfx-canon/1", flattenedSha256, pageHashes[] }`. Excludes the manifest itself.                                                            |
 
 Whether the page content is also flattened is a writer choice: PDFx's
 **Export .pdfx** keeps pages clean and relies on the mirror (so the file
 reopens editable), while a flattened export (any-viewer-visible annotations)
-omits the mirror. An integrity/canonicalization hash is reserved for a future
-revision; 1.1 readers treat the mirror as advisory.
+omits the mirror.
+
+**Integrity (`pdfx-canon/1`).** Because PDF serialization is not byte-stable,
+the hash is computed over a _semantic_ canonical form of each page — geometry
+(`MediaBox`/effective `CropBox`/normalized `Rotate`) under canonical number
+formatting, plus the content streams **decoded** and re-tokenized (numbers
+canonicalized, strings length-tagged, whitespace collapsed) — so it is invariant
+to compression, object numbering, whitespace, and date/`/ID` drift.
+`pageHashes[i] = SHA-256(page_i)` and
+`flattenedSha256 = SHA-256(domain + pageCount + concat(pageHashes))`. On open, a
+reader recomputes and compares: a mismatch means the flattened content was
+altered by another tool, so the mirror's edits may be stale. This ships
+**advisory** (warning only) and an unknown `canonAlg` is never enforced.
 
 ## Reader behavior
 

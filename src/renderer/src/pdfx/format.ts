@@ -1,5 +1,6 @@
 import type { PDFDocumentProxy } from 'pdfjs-dist'
 import type { CropBox, Overlay } from '../edit/model'
+import type { IntegrityRecord } from './canonicalize'
 
 export { buildPdf, buildPdfx } from './build'
 
@@ -33,6 +34,8 @@ export interface PdfxManifest {
   documents: PdfxManifestDocument[]
   edits?: ManifestEdit[]
   attachments?: Record<string, ManifestAttachment>
+  /** pdfx-canon/1 tamper record over the flattened page content (PRD §4.6). */
+  integrity?: IntegrityRecord
 }
 
 export interface PagePartition {
