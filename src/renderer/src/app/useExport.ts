@@ -60,7 +60,7 @@ export function useExport(
         flash(`Saved ${saved}`)
       } catch (error) {
         console.error('Export failed', error)
-        flash('Export failed')
+        flash(`Export failed: ${error instanceof Error ? error.message : String(error)}`)
       } finally {
         setBusy(false)
       }
@@ -198,7 +198,7 @@ export function useExport(
       flash(`Saved ${saved}`)
     } catch (error) {
       console.error('Export failed', error)
-      flash('Export failed')
+      flash(`Export failed: ${error instanceof Error ? error.message : String(error)}`)
     } finally {
       setBusy(false)
     }
