@@ -1,6 +1,11 @@
 import {
   PDFDocument,
+  PDFDict,
+  PDFHexString,
+  PDFName,
   PDFPage,
+  PDFRef,
+  PDFString,
   concatTransformationMatrix,
   degrees,
   popGraphicsState,
@@ -104,6 +109,47 @@ function intrinsicMatrix(
   }
 }
 
+/** Fully-qualified AcroForm field name of a widget annotation (walks the /Parent chain). */
+function widgetFieldName(ctx: PDFDocument['context'], dict: PDFDict): string | undefined {
+  const parts: string[] = []
+  let d: PDFDict | undefined = dict
+  for (let guard = 0; d && guard < 32; guard++) {
+    const t = d.get(PDFName.of('T'))
+    if (t instanceof PDFString || t instanceof PDFHexString) parts.unshift(t.decodeText())
+    const parent = d.get(PDFName.of('Parent'))
+    d =
+      parent instanceof PDFRef
+        ? ctx.lookupMaybe(parent, PDFDict)
+        : parent instanceof PDFDict
+          ? parent
+          : undefined
+  }
+  return parts.length ? parts.join('.') : undefined
+}
+
+/**
+ * Remove the interactive widget annotations of fields we've FILLED (painted) so the original
+ * widget appearance (its old value) doesn't double with the flattened value — and a cleared field
+ * doesn't keep showing its old value. Untouched fields keep their widgets (and pre-filled values).
+ */
+function removeFilledWidgets(page: PDFPage, filled: Set<string>): void {
+  const annots = page.node.Annots()
+  if (!annots) return
+  const ctx = page.doc.context
+  const keep: Array<ReturnType<typeof annots.get>> = []
+  for (let i = 0; i < annots.size(); i++) {
+    const ref = annots.get(i)
+    const dict = ref instanceof PDFRef ? ctx.lookupMaybe(ref, PDFDict) : ref instanceof PDFDict ? ref : undefined // prettier-ignore
+    const isWidget = !!dict && dict.get(PDFName.of('Subtype')) === PDFName.of('Widget')
+    if (isWidget) {
+      const name = widgetFieldName(ctx, dict)
+      if (name && filled.has(name)) continue // drop this widget
+    }
+    keep.push(ref)
+  }
+  page.node.set(PDFName.of('Annots'), ctx.obj(keep))
+}
+
 async function bakePage(
   page: PDFPage,
   exportPage: ExportPage,
@@ -139,24 +185,50 @@ async function bakePage(
     await flattenPageOverlays(page, sorted, res)
     if (m) page.pushOperators(popGraphicsState())
   }
+  // Form fill paints the value as page content; drop the matching interactive widget so its own
+  // appearance (the original value) doesn't render on top of — and double with — the painted one.
+  if (list) {
+    const filled = new Set(
+      list
+        .filter((o) => o.type === 'formValue')
+        .map((o) => (o as Extract<Overlay, { type: 'formValue' }>).field)
+    )
+    if (filled.size) removeFilledWidgets(page, filled)
+  }
 }
 
 export async function buildPdf(pages: ExportPage[], edits?: EditLayer): Promise<Uint8Array> {
   const output = await PDFDocument.create()
   const res = edits ? createFlattenResources(output, edits.attachments) : undefined
   const sources = new Map<string, PDFDocument>()
+  let ordinal = 0
   for (const page of pages) {
-    let source = sources.get(page.sourceKey)
-    if (!source) {
-      source = await PDFDocument.load(page.bytes, { ignoreEncryption: true })
-      sources.set(page.sourceKey, source)
+    ordinal++
+    // Tag any failure with which page failed, so a single bad source (e.g. one odd scan) is
+    // identifiable instead of surfacing as a bare "Export failed".
+    try {
+      let source = sources.get(page.sourceKey)
+      if (!source) {
+        source = await PDFDocument.load(page.bytes, { ignoreEncryption: true })
+        sources.set(page.sourceKey, source)
+      }
+      const [copied] = await output.copyPages(source, [page.pageIndex])
+      output.addPage(copied)
+      await bakePage(copied, page, edits, res)
+    } catch (e) {
+      throw new Error(
+        `Export failed on page ${ordinal} (source page ${page.pageIndex + 1}): ${e instanceof Error ? e.message : String(e)}`
+      )
     }
-    const [copied] = await output.copyPages(source, [page.pageIndex])
-    output.addPage(copied)
-    await bakePage(copied, page, edits, res)
   }
   output.setProducer(`PDFX ${PDFX_VERSION}`)
-  return output.save()
+  try {
+    return await output.save()
+  } catch (e) {
+    throw new Error(
+      `Export failed while writing the combined PDF: ${e instanceof Error ? e.message : String(e)}`
+    )
+  }
 }
 
 export async function buildPdfx(

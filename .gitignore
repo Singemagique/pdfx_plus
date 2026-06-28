@@ -25,3 +25,4 @@ native/build/
 *.pfx
 *.keystore
 *.mobileprovision
+test-document-to-sign.pdf

@@ -119,6 +119,7 @@ async function drawTextOverlay(
   const lines = o.text.split('\n')
   let lineTop = y + h - o.fontSize // first baseline near the top of the box
   for (const line of lines) {
+    if (lineTop < y) break // don't spill text below the box (e.g. a tiny signature appearance)
     const width = font.widthOfTextAtSize(line, o.fontSize)
     page.drawText(line, {
       x: alignedX(x, w, width, o.align),
@@ -208,6 +209,19 @@ async function drawFormValue(
   res: FlattenResources
 ): Promise<void> {
   const { x, y, w, h } = o.geom
+  if (o.control === 'radio') {
+    // A chosen radio option: a filled dot centred in the option's rect (geom is that rect).
+    if (!o.value) return
+    const r = Math.min(w, h) * 0.3
+    page.drawEllipse({
+      x: x + w / 2,
+      y: y + h / 2,
+      xScale: r,
+      yScale: r,
+      color: rgb(0.1, 0.1, 0.12)
+    })
+    return
+  }
   if (typeof o.value === 'boolean') {
     if (!o.value) return
     const pad = Math.min(w, h) * 0.22

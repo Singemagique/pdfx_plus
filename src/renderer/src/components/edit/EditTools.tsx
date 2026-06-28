@@ -103,6 +103,13 @@ function ToolIcon({ kind }: { kind: ToolKind }): React.JSX.Element {
         <path d="M3 6h18M3 19h18" />
       </svg>
     )
+  if (kind === 'signature')
+    return (
+      <svg {...common}>
+        <path d="M3 17c3 0 4-7 6-7s2 5 4 5 3-8 5-8" />
+        <path d="M3 21h18" />
+      </svg>
+    )
   return (
     <svg {...common}>
       <path d="M3 21l4-1 11-11a2.8 2.8 0 0 0-4-4L3 16z" />
@@ -119,7 +126,8 @@ const TOOLS: { kind: ToolKind; label: string }[] = [
   { kind: 'shape', label: 'Shape' },
   { kind: 'crop', label: 'Crop' },
   { kind: 'form', label: 'Form' },
-  { kind: 'redact', label: 'Redact' }
+  { kind: 'redact', label: 'Redact' },
+  { kind: 'signature', label: 'Signature' }
 ]
 
 export function EditTools(): React.JSX.Element {
@@ -130,6 +138,7 @@ export function EditTools(): React.JSX.Element {
   const { shapeKind, setShapeKind, shapeColor, shapePalette, setShapeColor } = useEdits()
   const { inkColor, inkPalette, setInkColor, inkWidth, inkWidths, setInkWidth } = useEdits()
   const { savedSignature, setSavedSignature } = useEdits()
+  const { signaturePlacement, setSignaturePlacement } = useEdits()
   const fileRef = useRef<HTMLInputElement>(null)
   const [padOpen, setPadOpen] = useState(false)
 
@@ -184,8 +193,31 @@ export function EditTools(): React.JSX.Element {
     await placeImage(bytes, file.type === 'image/jpeg' ? 'image/jpeg' : 'image/png')
   }
 
+  // Place where the (certificate) signature's visible appearance goes — showing the user's drawn
+  // signature. This links the drawn signature to a real cryptographic signature: the appearance is
+  // rendered at this spot when the user signs with their certificate (toolbar "Sign"). The marker is
+  // movable with the Signature tool. (Needs a drawn signature first — onSign opens the pad if absent.)
+  const placeDrawnSignature = (): void => {
+    if (!currentPage) return
+    const w = Math.min(240, currentPage.width * 0.55)
+    const h = Math.min(74, currentPage.height * 0.14)
+    setSignaturePlacement({
+      pageKey: currentPage.pageKey,
+      geom: {
+        x: currentPage.width * 0.1,
+        y: currentPage.height * 0.1,
+        w,
+        h,
+        rotation: 0,
+        opacity: 1
+      },
+      label: 'drawn signature'
+    })
+    setTool('signature') // show the marker + let the user drag a new box to re-place it
+  }
+
   const onSign = (): void => {
-    if (savedSignature) void placeImage(savedSignature, 'image/png', 0.3)
+    if (savedSignature) placeDrawnSignature()
     else setPadOpen(true)
   }
 
@@ -248,7 +280,11 @@ export function EditTools(): React.JSX.Element {
         <button
           className="tool-btn"
           onClick={onSign}
-          title={savedSignature ? 'Stamp your saved signature' : 'Draw a signature'}
+          title={
+            savedSignature
+              ? 'Place your drawn signature (then “Sign” on the toolbar to certify it)'
+              : 'Draw a signature to use with certificate signing'
+          }
         >
           <svg
             width="16"
@@ -361,6 +397,35 @@ export function EditTools(): React.JSX.Element {
                 aria-label={`Shape ${c.name}`}
               />
             ))}
+          </span>
+        )}
+        {tool === 'signature' && (
+          <span className="tool-swatches">
+            <span className="tool-hint">
+              {signaturePlacement
+                ? `Signature: ${signaturePlacement.label}`
+                : 'Drag a box, or click a form signature field'}
+            </span>
+            <button
+              className="shape-btn"
+              onClick={() => setSignaturePlacement(null)}
+              disabled={!signaturePlacement}
+              title="Clear signature placement"
+              aria-label="Clear signature placement"
+            >
+              <svg
+                width="16"
+                height="16"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="M6 6l12 12M18 6L6 18" />
+              </svg>
+            </button>
           </span>
         )}
         {tool === 'crop' && (
@@ -476,7 +541,7 @@ export function EditTools(): React.JSX.Element {
           onSave={(bytes) => {
             setSavedSignature(bytes)
             setPadOpen(false)
-            void placeImage(bytes, 'image/png', 0.3)
+            placeDrawnSignature()
           }}
           onClose={() => setPadOpen(false)}
         />

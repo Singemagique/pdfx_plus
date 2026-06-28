@@ -988,8 +988,11 @@ body {
   gap: 10px;
   padding: 22px;
   border-radius: 12px;
-  background: var(--surface, #1b1d23);
+  /* --surface is the white PAGE color; use the elevated-overlay color so the panel is dark in dark
+     mode (and light in light mode) instead of washing out white text on a white surface. */
+  background: var(--overlay-strong, #1b1d23);
   color: var(--ink, #e8e8ec);
+  color-scheme: light dark;
   box-shadow: 0 18px 60px rgba(0, 0, 0, 0.5);
 }
 .sign-dialog h2 {
@@ -1020,21 +1023,101 @@ body {
 }
 .sign-input {
   padding: 9px 11px;
-  border: 1px solid rgba(140, 150, 170, 0.3);
+  border: 1px solid var(--hairline, rgba(140, 150, 170, 0.3));
   border-radius: 8px;
-  background: rgba(255, 255, 255, 0.04);
-  color: inherit;
+  background: var(--control, rgba(255, 255, 255, 0.04));
+  color: var(--ink);
   font-size: 13px;
   outline: none;
 }
 .sign-input:focus {
   border-color: #74a9ff;
 }
+/* Native <select> dropdown list — keep options legible in dark mode (UA may render them light). */
+.sign-input option {
+  background: var(--overlay-strong);
+  color: var(--ink);
+}
 .sign-actions {
   display: flex;
   justify-content: flex-end;
   gap: 8px;
   margin-top: 6px;
+}
+.sign-modes {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 2px;
+}
+.sign-mode {
+  flex: 1;
+  padding: 7px 10px;
+  border: 1px solid var(--hairline, rgba(140, 150, 170, 0.3));
+  border-radius: 8px;
+  background: var(--group-bg, rgba(255, 255, 255, 0.03));
+  color: inherit;
+  cursor: pointer;
+  font-size: 13px;
+}
+.sign-mode.active {
+  border-color: #74a9ff;
+  background: rgba(120, 169, 255, 0.12);
+}
+.sign-module-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.sign-module-row .sign-input {
+  flex: 1;
+  min-width: 0;
+}
+.sign-module-hint {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--ink-soft, rgba(160, 168, 184, 0.85));
+  word-break: break-word;
+}
+.sign-card-error {
+  margin: 0;
+  font-size: 12px;
+  color: #f87171;
+}
+.sign-appearance {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 9px 11px;
+  border: 1px solid var(--hairline, rgba(140, 150, 170, 0.3));
+  border-radius: 8px;
+  background: var(--group-bg, rgba(255, 255, 255, 0.03));
+  font-size: 12px;
+}
+.sign-appearance-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.sign-link {
+  background: none;
+  border: none;
+  color: #74a9ff;
+  cursor: pointer;
+  font-size: 12px;
+  padding: 0;
+  white-space: nowrap;
+}
+.sign-link:hover {
+  text-decoration: underline;
+}
+.sign-check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--ink-soft);
+  cursor: pointer;
 }
 .btn.glass.primary {
   background: #3b82f6;
@@ -1057,6 +1140,52 @@ body {
 
 .overlay-layer.cropping {
   cursor: crosshair;
+}
+.overlay-layer.signing {
+  cursor: crosshair;
+}
+
+/* Signature placement: the marker box (drag preview + persistent) and clickable field targets. */
+.ov-sigbox {
+  position: absolute;
+  pointer-events: none;
+  border: 1.5px dashed #3b82f6;
+  border-radius: 2px;
+  background: rgba(59, 130, 246, 0.08);
+  display: flex;
+  align-items: flex-start;
+  justify-content: flex-start;
+  overflow: hidden;
+}
+.ov-sigbox span {
+  font-size: 11px;
+  font-weight: 600;
+  color: #2563eb;
+  background: rgba(255, 255, 255, 0.85);
+  padding: 1px 5px;
+  border-bottom-right-radius: 3px;
+  white-space: nowrap;
+}
+.ov-sigbox.placed {
+  border-style: solid;
+  border-color: rgba(59, 130, 246, 0.7);
+}
+.ov-sig-target {
+  position: absolute;
+  border: 1.5px dashed #3b82f6;
+  border-radius: 2px;
+  background: rgba(59, 130, 246, 0.1);
+  color: #2563eb;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.12s;
+}
+.ov-sig-target:hover {
+  background: rgba(59, 130, 246, 0.22);
 }
 
 /* Crop preview on a collection thumbnail (dims the cropped-away area). */
@@ -1102,7 +1231,9 @@ body {
 .ov-form-input {
   padding: 0 3px;
   border: 1px solid rgba(116, 169, 255, 0.85);
-  background: rgba(116, 169, 255, 0.12);
+  /* Opaque so the field's OWN value (rendered by pdf.js underneath) doesn't show through and
+     double with what we draw on top. */
+  background: #eef3fc;
   border-radius: 2px;
   color: #14141a;
   font-family: Helvetica, Arial, sans-serif;
@@ -1112,11 +1243,38 @@ body {
 }
 .ov-form-input:focus {
   border-color: #3b82f6;
-  background: rgba(116, 169, 255, 0.2);
+  background: #e3ecfb;
 }
 .ov-form-check {
   cursor: pointer;
   accent-color: #3b82f6;
+  background: #eef3fc; /* opaque — cover the widget's own check beneath */
+}
+/* Radio option: a circle that fills when chosen (mirrors the flattened dot). */
+.ov-form-radio {
+  position: absolute;
+  pointer-events: auto;
+  box-sizing: border-box;
+  padding: 0;
+  border: 1px solid rgba(116, 169, 255, 0.85);
+  background: #eef3fc; /* opaque — cover the widget's own dot beneath */
+  border-radius: 50%;
+  cursor: pointer;
+}
+.ov-form-radio.checked {
+  background: radial-gradient(circle at center, #14141a 0 38%, transparent 40%), #e3ecfb;
+}
+/* Dropdown / list box. Opaque fill so the field's own rendered options don't show through a
+   multi-row list box. A list box (size>1) anchors its top to the field. */
+.ov-form-select {
+  padding: 0 2px;
+  color: #14141a;
+  cursor: pointer;
+  background: #eef3fc;
+}
+.ov-form-select[size]:not([size='1']) {
+  height: auto;
+  align-self: flex-start;
 }
 
 /* Selection / move / resize chrome (Browse tool). The layer itself is pointer-
@@ -1184,6 +1342,11 @@ body {
   z-index: 30;
   display: flex;
   align-items: center;
+  justify-content: center;
+  /* Stay within the viewport and wrap onto extra rows on a narrow window, instead of overflowing
+     past both edges (the bar is centered, so overflow clips the end tools out of reach). */
+  flex-wrap: wrap;
+  max-width: calc(100vw - 24px);
   gap: 4px;
   padding: 6px;
   border-radius: 14px;

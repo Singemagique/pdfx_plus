@@ -14,6 +14,7 @@ import { useDragController } from './app/useDragController'
 import { useKeyboardShortcuts } from './app/useKeyboardShortcuts'
 import { EditProvider, useEditStore } from './edit/EditProvider'
 import { EditTools } from './components/edit/EditTools'
+import { makePageKey } from './edit/model'
 
 const TOAST_MS = 4000
 
@@ -41,11 +42,30 @@ export default function App(): React.JSX.Element {
     [docs, editStore.rotations]
   )
 
-  const { exportCollection, exportZip, signAndExport } = useExport(
+  // Drop a signature placement whose page no longer exists (its document/page was removed), so a
+  // dangling placement can't silently produce no appearance — or land on the wrong page — on sign.
+  const { signaturePlacement, setSignaturePlacement } = editStore
+  useEffect(() => {
+    if (!signaturePlacement) return
+    const exists = docs.some((d) =>
+      d.pages.some((p) => makePageKey(p.source.id, p.pageIndex) === signaturePlacement.pageKey)
+    )
+    if (!exists) setSignaturePlacement(null)
+  }, [docs, signaturePlacement, setSignaturePlacement])
+
+  const {
+    exportCollection,
+    exportZip,
+    signAndExport,
+    signWithCardAndExport,
+    signWithWindowsCertAndExport
+  } = useExport(
     docs,
     editStore.editLayer,
     setBusy,
-    flash
+    flash,
+    editStore.signaturePlacement,
+    editStore.savedSignature
   )
   const { addFiles, openViaDialog, addPagesToDoc, handleExternalDropFiles } = useImport(
     collection,
@@ -169,7 +189,25 @@ export default function App(): React.JSX.Element {
         )}
 
         {signOpen && (
-          <SignDialog busy={busy} onSign={signAndExport} onClose={() => setSignOpen(false)} />
+          <SignDialog
+            busy={busy}
+            onSign={signAndExport}
+            onSignCard={signWithCardAndExport}
+            listTokens={(modulePath) => window.api.listCardTokens(modulePath)}
+            findModules={() => window.api.findCardModules()}
+            listWindowsCerts={() => window.api.listWindowsCerts()}
+            onSignWindowsCert={signWithWindowsCertAndExport}
+            platform={window.api.platform}
+            pathForFile={(file) => window.api.getPathForFile(file)}
+            placementLabel={editStore.signaturePlacement?.label ?? null}
+            onClearPlacement={() => editStore.setSignaturePlacement(null)}
+            onPlaceRequest={() => {
+              editStore.setTool('signature')
+              setSignOpen(false)
+            }}
+            hasSavedSignature={!!editStore.savedSignature}
+            onClose={() => setSignOpen(false)}
+          />
         )}
 
         {toast && <div className="toast">{toast}</div>}

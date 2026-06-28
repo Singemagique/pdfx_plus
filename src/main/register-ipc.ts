@@ -3,7 +3,10 @@ import { basename, isAbsolute } from 'path'
 import { existsSync } from 'fs'
 import { writeFile } from 'fs/promises'
 import { markupToPdf } from './markup'
-import { signPdf } from './sign'
+import { signPdf, signPdfWithCard, signPdfWithWindowsCert } from './sign'
+import { listTokens, findModules, cardCertDer } from './pkcs11'
+import { certInfoFromDer, certInfoFromP12, type SignerInfo } from './cert-info'
+import { listWindowsCerts } from './windows-cert'
 import { OpenedFile, IMPORTABLE, readFiles, expandDropPaths } from './file-intake'
 import { clipboardFilePaths } from './clipboard'
 import { readResource } from './resource'
@@ -105,6 +108,166 @@ export function registerIpc(getPending: () => string[], clearPending: () => void
       // Coerce options to strings so a misbehaving renderer can't inject non-string values.
       return signPdf(pdf, p12, {
         passphrase: String(o.passphrase ?? ''),
+        reason: o.reason != null ? String(o.reason) : undefined,
+        name: o.name != null ? String(o.name) : undefined,
+        location: o.location != null ? String(o.location) : undefined,
+        tsaUrl: o.tsaUrl ? String(o.tsaUrl) : undefined
+      })
+    }
+  )
+
+  // Read a PKCS#12's signing-certificate identity (subject + issuer DN) so the visible signature
+  // appearance can show "digitally signed by …" before signing. Returns null if it can't be parsed
+  // (e.g. wrong passphrase) — the appearance then falls back to its generic form.
+  ipcMain.handle(
+    'pdfx:p12-cert-info',
+    async (_event, p12: Uint8Array, passphrase: unknown): Promise<SignerInfo | null> => {
+      if (!ArrayBuffer.isView(p12) || p12.byteLength > 4 * 1024 * 1024) {
+        throw new Error('p12-cert-info: invalid payload')
+      }
+      return certInfoFromP12(p12, String(passphrase ?? ''))
+    }
+  )
+
+  // Validate a renderer-supplied PKCS#11 module path before handing it to koffi.load (which
+  // dlopen/LoadLibrary's it into the main process). The renderer is trusted, but mirror the
+  // write-file guards — absolute path, no null-byte truncation, and a native-library extension.
+  const validModulePath = (p: unknown): string => {
+    if (typeof p !== 'string' || !p || p.includes('\0') || !isAbsolute(p)) {
+      throw new Error('A valid absolute PKCS#11 module path is required')
+    }
+    if (!/\.(dll|so|dylib)$/i.test(p)) {
+      throw new Error('PKCS#11 module must be a .dll, .so or .dylib')
+    }
+    return p
+  }
+
+  // Probe common install locations for PKCS#11 modules so the smart-card signer can auto-fill them.
+  ipcMain.handle(
+    'pdfx:pkcs11-find-modules',
+    async (): Promise<Array<{ path: string; label: string }>> => findModules()
+  )
+
+  // Enumerate the tokens (cards) currently present in a PKCS#11 module, for the smart-card signer.
+  ipcMain.handle(
+    'pdfx:pkcs11-list-tokens',
+    async (
+      _event,
+      modulePath: unknown
+    ): Promise<
+      Array<{ slot: number; label: string; manufacturer: string; model: string; serial: string }>
+    > => {
+      return listTokens(validModulePath(modulePath))
+    }
+  )
+
+  // Read the smart-card signing certificate's identity (subject + issuer DN) WITHOUT a PIN prompt —
+  // certificate objects are public on the token — so the visible appearance can show the card's
+  // identity before the one real PIN prompt at signing. Returns null if it can't be read.
+  ipcMain.handle(
+    'pdfx:card-cert-info',
+    async (
+      _event,
+      pkcs11: { modulePath?: string; slot?: number; tokenLabel?: string; certLabel?: string }
+    ): Promise<SignerInfo | null> => {
+      const c = pkcs11 ?? {}
+      const slot =
+        typeof c.slot === 'number' &&
+        Number.isInteger(c.slot) &&
+        c.slot >= 0 &&
+        c.slot <= 0xffffffff
+          ? c.slot
+          : undefined
+      const der = cardCertDer({
+        modulePath: validModulePath(c.modulePath),
+        pin: '',
+        slot,
+        tokenLabel: c.tokenLabel != null ? String(c.tokenLabel) : undefined,
+        certLabel: c.certLabel != null ? String(c.certLabel) : undefined
+      })
+      return der ? certInfoFromDer(der) : null
+    }
+  )
+
+  ipcMain.handle(
+    'pdfx:sign-pdf-card',
+    async (
+      _event,
+      pdf: Uint8Array,
+      pkcs11: {
+        modulePath?: string
+        pin?: string
+        slot?: number
+        tokenLabel?: string
+        certLabel?: string
+      },
+      opts: { reason?: string; name?: string; location?: string; tsaUrl?: string }
+    ): Promise<Uint8Array> => {
+      if (!ArrayBuffer.isView(pdf) || pdf.byteLength > MAX_WRITE_BYTES) {
+        throw new Error('sign-pdf-card: invalid payload')
+      }
+      const c = pkcs11 ?? {}
+      const o = opts ?? {}
+      // Only accept a valid non-negative 32-bit integer slot; anything else falls back to auto-pick.
+      const slot =
+        typeof c.slot === 'number' &&
+        Number.isInteger(c.slot) &&
+        c.slot >= 0 &&
+        c.slot <= 0xffffffff
+          ? c.slot
+          : undefined
+      return signPdfWithCard(
+        pdf,
+        {
+          modulePath: validModulePath(c.modulePath),
+          pin: String(c.pin ?? ''),
+          slot,
+          tokenLabel: c.tokenLabel != null ? String(c.tokenLabel) : undefined,
+          certLabel: c.certLabel != null ? String(c.certLabel) : undefined
+        },
+        {
+          reason: o.reason != null ? String(o.reason) : undefined,
+          name: o.name != null ? String(o.name) : undefined,
+          location: o.location != null ? String(o.location) : undefined,
+          tsaUrl: o.tsaUrl ? String(o.tsaUrl) : undefined
+        }
+      )
+    }
+  )
+
+  // List signing certificates in the Windows store (a CAC/PIV card's certs appear here). Win-only.
+  ipcMain.handle(
+    'pdfx:win-cert-list',
+    async (): Promise<
+      Array<{
+        thumbprint: string
+        subject: string
+        issuer: string
+        notAfter: string
+        keyUsage: string
+      }>
+    > => {
+      if (process.platform !== 'win32') return []
+      return listWindowsCerts()
+    }
+  )
+
+  ipcMain.handle(
+    'pdfx:sign-pdf-win-cert',
+    async (
+      _event,
+      pdf: Uint8Array,
+      thumbprint: unknown,
+      opts: { reason?: string; name?: string; location?: string; tsaUrl?: string }
+    ): Promise<Uint8Array> => {
+      if (!ArrayBuffer.isView(pdf) || pdf.byteLength > MAX_WRITE_BYTES) {
+        throw new Error('sign-pdf-win-cert: invalid payload')
+      }
+      if (typeof thumbprint !== 'string' || !/^[0-9A-Fa-f]{40}$/.test(thumbprint)) {
+        throw new Error('sign-pdf-win-cert: invalid certificate thumbprint')
+      }
+      const o = opts ?? {}
+      return signPdfWithWindowsCert(pdf, thumbprint, {
         reason: o.reason != null ? String(o.reason) : undefined,
         name: o.name != null ? String(o.name) : undefined,
         location: o.location != null ? String(o.location) : undefined,

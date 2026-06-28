@@ -24,6 +24,44 @@ export interface SignOptions {
   tsaUrl?: string
 }
 
+/** A token (smart card) present in a PKCS#11 module. */
+export interface Pkcs11Token {
+  slot: number
+  label: string
+  manufacturer: string
+  model: string
+  serial: string
+}
+
+/** A signing certificate in the Windows store (its key may be on a smart card). */
+export interface WindowsCert {
+  thumbprint: string
+  subject: string
+  issuer: string
+  notAfter: string
+  keyUsage: string
+}
+
+/** A signer's certificate identity (X.500 DN strings) for the visible signature appearance. */
+export interface SignerInfo {
+  subject: string
+  issuer: string
+}
+
+/** Locates the signing credential on a smart card via a PKCS#11 module. */
+export interface CardSignOptions {
+  /** Absolute path to the PKCS#11 module (.dll/.so/.dylib). */
+  modulePath: string
+  /** User PIN. */
+  pin: string
+  /** Slot id (omit to auto-pick by tokenLabel, else the first token). */
+  slot?: number
+  /** Token label to match when no slot is given. */
+  tokenLabel?: string
+  /** Certificate label, to disambiguate a token holding several certificates. */
+  certLabel?: string
+}
+
 const api = {
   platform: process.platform,
   rendererReady: (): Promise<void> => ipcRenderer.invoke('pdfx:renderer-ready'),
@@ -47,6 +85,27 @@ const api = {
     ipcRenderer.invoke('pdfx:write-file', path, data),
   signPdf: (pdf: Uint8Array, p12: Uint8Array, opts: SignOptions): Promise<Uint8Array> =>
     ipcRenderer.invoke('pdfx:sign-pdf', pdf, p12, opts),
+  /** Subject + issuer of a PKCS#12's signing certificate (for the appearance); null if unreadable. */
+  p12CertInfo: (p12: Uint8Array, passphrase: string): Promise<SignerInfo | null> =>
+    ipcRenderer.invoke('pdfx:p12-cert-info', p12, passphrase),
+  findCardModules: (): Promise<Array<{ path: string; label: string }>> =>
+    ipcRenderer.invoke('pdfx:pkcs11-find-modules'),
+  listCardTokens: (modulePath: string): Promise<Pkcs11Token[]> =>
+    ipcRenderer.invoke('pdfx:pkcs11-list-tokens', modulePath),
+  /** Subject + issuer of a smart card's signing certificate (no PIN prompt); null if unreadable. */
+  cardCertInfo: (card: Omit<CardSignOptions, 'pin'>): Promise<SignerInfo | null> =>
+    ipcRenderer.invoke('pdfx:card-cert-info', card),
+  signPdfWithCard: (
+    pdf: Uint8Array,
+    card: CardSignOptions,
+    opts: Omit<SignOptions, 'passphrase'>
+  ): Promise<Uint8Array> => ipcRenderer.invoke('pdfx:sign-pdf-card', pdf, card, opts),
+  listWindowsCerts: (): Promise<WindowsCert[]> => ipcRenderer.invoke('pdfx:win-cert-list'),
+  signPdfWithWindowsCert: (
+    pdf: Uint8Array,
+    thumbprint: string,
+    opts: Omit<SignOptions, 'passphrase'>
+  ): Promise<Uint8Array> => ipcRenderer.invoke('pdfx:sign-pdf-win-cert', pdf, thumbprint, opts),
   openFiles: (): Promise<OpenedFile[]> => ipcRenderer.invoke('pdfx:open-files'),
   onFilesOpened: (callback: (files: OpenedFile[]) => void): (() => void) => {
     const listener = (_event: Electron.IpcRendererEvent, files: OpenedFile[]): void =>
