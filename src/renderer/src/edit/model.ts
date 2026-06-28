@@ -90,7 +90,13 @@ export type Overlay =
       points?: number[]
     })
   | (BaseOverlay & { type: 'redaction'; fill: RGB })
-  | (BaseOverlay & { type: 'formValue'; field: string; value: string | boolean })
+  | (BaseOverlay & {
+      type: 'formValue'
+      field: string
+      value: string | boolean
+      /** Render hint: 'radio' fills a dot at `geom` (the chosen option). Absent → text/checkbox. */
+      control?: 'radio'
+    })
   | (BaseOverlay & {
       type: 'signatureVisual'
       attachmentId?: string

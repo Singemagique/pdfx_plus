@@ -1247,6 +1247,33 @@ body {
   cursor: pointer;
   accent-color: #3b82f6;
 }
+/* Radio option: a circle that fills when chosen (mirrors the flattened dot). */
+.ov-form-radio {
+  position: absolute;
+  pointer-events: auto;
+  box-sizing: border-box;
+  padding: 0;
+  border: 1px solid rgba(116, 169, 255, 0.85);
+  background: rgba(116, 169, 255, 0.12);
+  border-radius: 50%;
+  cursor: pointer;
+}
+.ov-form-radio.checked {
+  background:
+    radial-gradient(circle at center, #14141a 0 38%, transparent 40%), rgba(116, 169, 255, 0.2);
+}
+/* Dropdown / list box. Opaque fill so the field's own rendered options don't show through a
+   multi-row list box. A list box (size>1) anchors its top to the field. */
+.ov-form-select {
+  padding: 0 2px;
+  color: #14141a;
+  cursor: pointer;
+  background: #eef3fc;
+}
+.ov-form-select[size]:not([size='1']) {
+  height: auto;
+  align-self: flex-start;
+}
 
 /* Selection / move / resize chrome (Browse tool). The layer itself is pointer-
    transparent so empty areas pan; these interactive bits opt back in. */

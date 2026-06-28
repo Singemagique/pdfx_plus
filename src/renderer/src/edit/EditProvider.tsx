@@ -74,8 +74,15 @@ export interface EditStore {
   crops: Map<string, CropBox>
   /** Set (or clear, with null) the crop rectangle for a page. */
   setCrop: (pageKey: string, box: CropBox | null) => void
-  /** Upsert a form field's value as a formValue overlay (empty string / false clears it). */
-  setFormValue: (pageKey: string, field: string, value: string | boolean, geom: Geom) => void
+  /** Upsert a form field's value as a formValue overlay (empty string / false clears it). For
+   *  radios, `geom` is the chosen option's rect and `control` is 'radio'. */
+  setFormValue: (
+    pageKey: string,
+    field: string,
+    value: string | boolean,
+    geom: Geom,
+    control?: 'radio'
+  ) => void
   savedSignature: Uint8Array | null
   setSavedSignature: (bytes: Uint8Array | null) => void
   /** Where the next cryptographic signature's visible appearance goes (null = invisible). */
@@ -158,7 +165,7 @@ export function useEditStore(): EditStore {
   }, [])
 
   const setFormValue = useCallback(
-    (pageKey: string, field: string, value: string | boolean, geom: Geom) => {
+    (pageKey: string, field: string, value: string | boolean, geom: Geom, control?: 'radio') => {
       // Always upsert (never auto-remove) so a cleared/unchecked field stays cleared in the editor.
       // Flatten draws only non-empty values; '' and false paint nothing. Consecutive edits to the
       // same field coalesce into one undo step (so typing doesn't flood/evict the undo stack).
@@ -169,8 +176,12 @@ export function useEditStore(): EditStore {
             const i = d.overlays.findIndex(
               (o) => o.type === 'formValue' && o.pageKey === pageKey && o.field === field
             )
-            if (i >= 0) (d.overlays[i] as Extract<Overlay, { type: 'formValue' }>).value = value
-            else
+            if (i >= 0) {
+              const o = d.overlays[i] as Extract<Overlay, { type: 'formValue' }>
+              o.value = value
+              o.geom = geom // a radio moves the dot to the newly-picked option's rect
+              o.control = control
+            } else
               d.overlays.push({
                 id: newOverlayId(),
                 pageKey,
@@ -179,7 +190,8 @@ export function useEditStore(): EditStore {
                 geom,
                 type: 'formValue',
                 field,
-                value
+                value,
+                ...(control ? { control } : {})
               })
           },
           `formValue:${pageKey}:${field}`

@@ -66,6 +66,49 @@ describe('mirror round-trip', () => {
     expect(imported!.crops).toEqual([[newKey, { x: 5, y: 6, w: 70, h: 80 }]]) // crop rebinds too
   })
 
+  it('round-trips a filled radio form value (value + control + chosen-option geom)', () => {
+    const key = makePageKey('s1', 0)
+    const radio: Overlay = {
+      id: 'r1',
+      pageKey: key,
+      z: 0,
+      createdAt: 0,
+      geom: { x: 200, y: 620, w: 16, h: 16, rotation: 0, opacity: 1 },
+      type: 'formValue',
+      field: 'plan',
+      value: '1',
+      control: 'radio'
+    }
+    const editLayer: EditLayer = {
+      overlays: new Map([[key, [radio]]]),
+      attachments: new Map(),
+      rotations: new Map(),
+      crops: new Map()
+    }
+    const mirror = serializeMirror(
+      [{ name: 'A', pages: [{ bytes: new Uint8Array(), sourceKey: 's1', pageIndex: 0 }] }],
+      editLayer
+    )
+    const manifest: PdfxManifest = {
+      pdfx: '1.1',
+      documents: [{ name: 'A', pages: 1 }],
+      edits: mirror!.edits,
+      attachments: mirror!.attachments
+    }
+    const page: PageEntry = {
+      id: 'p1',
+      source: { id: 'newsrc', bytes: new Uint8Array(), pdf: null as never },
+      pageIndex: 0,
+      width: 612,
+      height: 792
+    }
+    const imported = deserializeMirror(manifest, [{ id: 'd1', name: 'A', pages: [page] }])
+    const o = imported!.overlays[0]
+    expect(o.type).toBe('formValue')
+    expect(o).toMatchObject({ field: 'plan', value: '1', control: 'radio' })
+    expect(o.geom).toMatchObject({ x: 200, y: 620, w: 16, h: 16 })
+  })
+
   it('returns null when there are no edits', () => {
     const docs: ExportDocument[] = [
       { name: 'A', pages: [{ bytes: new Uint8Array(), sourceKey: 's1', pageIndex: 0 }] }

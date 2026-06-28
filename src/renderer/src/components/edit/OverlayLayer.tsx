@@ -74,12 +74,32 @@ type FormField = {
 /** An unsigned AcroForm signature field — a target for placing the signature appearance. */
 type SigField = { name: string; geom: Geom }
 
+/** A radio-button group: one widget (option) per choice, all sharing the field name. */
+type RadioOption = { value: string; geom: Geom }
+type RadioGroup = { name: string; options: RadioOption[]; initial: string }
+
+/** A choice field — a dropdown (combo) or list box. `multi` allows several selections (joined by
+ *  newline in the stored value, which flatten draws as multiple lines). */
+type ChoiceField = {
+  name: string
+  geom: Geom
+  combo: boolean
+  multi: boolean
+  options: { value: string; label: string }[]
+  initial: string
+}
+
 /** The subset of a pdf.js widget-annotation we read (getAnnotations returns `any`). */
 interface PdfAnnotation {
   fieldType?: string
   fieldName?: string
   rect?: number[]
   checkBox?: boolean
+  radioButton?: boolean
+  buttonValue?: string
+  combo?: boolean
+  multiSelect?: boolean
+  options?: { exportValue?: string; displayValue?: string }[]
   multiLine?: boolean
   fieldValue?: unknown
   readOnly?: boolean
@@ -147,6 +167,8 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
   const [drag, setDrag] = useState<Drag | null>(null)
   const [textEdit, setTextEdit] = useState<TextEdit | null>(null)
   const [formFields, setFormFields] = useState<FormField[]>([])
+  const [radioGroups, setRadioGroups] = useState<RadioGroup[]>([])
+  const [choiceFields, setChoiceFields] = useState<ChoiceField[]>([])
   const [sigFields, setSigFields] = useState<SigField[]>([])
 
   const pageKey = makePageKey(page.source.id, page.pageIndex)
@@ -181,14 +203,18 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
     if (active) setCurrentPage({ pageKey, width: page.width, height: page.height })
   }, [active, pageKey, page.width, page.height, setCurrentPage])
 
-  // Detect fillable AcroForm fields (text + checkbox) on the focused page via pdf.js.
+  // Detect fillable AcroForm fields (text, checkbox, radio, dropdown, list box) via pdf.js.
   useEffect(() => {
     if (!active) {
       setFormFields([])
+      setRadioGroups([])
+      setChoiceFields([])
       setSigFields([])
       return
     }
     let cancelled = false
+    const firstString = (v: unknown): string =>
+      Array.isArray(v) ? (typeof v[0] === 'string' ? v[0] : '') : typeof v === 'string' ? v : ''
     page.source.pdf
       .getPage(page.pageIndex + 1)
       .then(async (p) => {
@@ -198,8 +224,11 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
         const rotate = (((p.rotate ?? 0) % 360) + 360) % 360
         const fields: FormField[] = []
         const sigs: SigField[] = []
+        const radios = new Map<string, RadioGroup>()
+        const choices: ChoiceField[] = []
         const seen = new Set<string>() // one control per field name (a field may have many widgets)
         const sigSeen = new Set<string>()
+        const choiceSeen = new Set<string>()
         for (const a of anns) {
           const r = a.rect
           if (a.readOnly || a.hidden || !r || r.length < 4) continue
@@ -222,8 +251,45 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
             }
             continue
           }
-          // Text/checkbox fields are keyed by name, so they need one.
-          if (!a.fieldName) continue
+          // The remaining fillable fields are keyed by name, so they need one. Skip zero-size widgets.
+          if (!a.fieldName || rect.w <= 1 || rect.h <= 1) continue
+          // Radio group: accumulate one option (widget) per choice, all sharing the field name.
+          if (a.fieldType === 'Btn' && a.radioButton) {
+            let g = radios.get(a.fieldName)
+            if (!g) {
+              g = { name: a.fieldName, options: [], initial: firstString(a.fieldValue) }
+              radios.set(a.fieldName, g)
+            }
+            if (a.buttonValue != null) g.options.push({ value: String(a.buttonValue), geom })
+            continue
+          }
+          // Choice: a dropdown (combo) or single/multi-select list box.
+          if (a.fieldType === 'Ch') {
+            if (choiceSeen.has(a.fieldName)) continue
+            choiceSeen.add(a.fieldName)
+            const options = (a.options ?? []).map((o) => ({
+              value: o.exportValue ?? o.displayValue ?? '',
+              label: o.displayValue ?? o.exportValue ?? ''
+            }))
+            // The painted value is the display label(s); multi-select joins them with newlines.
+            const exportVals = Array.isArray(a.fieldValue)
+              ? (a.fieldValue as unknown[]).filter((v): v is string => typeof v === 'string')
+              : typeof a.fieldValue === 'string'
+                ? [a.fieldValue]
+                : []
+            const initial = exportVals
+              .map((ev) => options.find((o) => o.value === ev)?.label ?? ev)
+              .join('\n')
+            choices.push({
+              name: a.fieldName,
+              geom,
+              combo: !!a.combo,
+              multi: !!a.multiSelect,
+              options,
+              initial
+            })
+            continue
+          }
           const isText = a.fieldType === 'Tx'
           const isCheckbox = a.fieldType === 'Btn' && !!a.checkBox
           if ((!isText && !isCheckbox) || seen.has(a.fieldName)) continue
@@ -247,17 +313,21 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
                 }
           )
         }
-        return { fields, sigs }
+        return { fields, sigs, radios: [...radios.values()], choices }
       })
       .then((res) => {
         if (cancelled) return
         setFormFields(res.fields)
         setSigFields(res.sigs)
+        setRadioGroups(res.radios)
+        setChoiceFields(res.choices)
       })
       .catch(() => {
         if (cancelled) return
         setFormFields([])
         setSigFields([])
+        setRadioGroups([])
+        setChoiceFields([])
       })
     return () => {
       cancelled = true
@@ -898,6 +968,68 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
               onPointerDown={stop}
               onChange={onChange}
             />
+          )
+        })}
+      {/* Radio groups: one circle per option; picking one moves the selected dot exclusively. */}
+      {formMode &&
+        radioGroups.flatMap((g) => {
+          const cur = formValueOf(g.name)
+          const sel = cur === undefined ? g.initial : String(cur)
+          return g.options.map((opt, i) => {
+            const r = geomToCss(opt.geom, page, fit)
+            const checked = sel === opt.value
+            return (
+              <button
+                key={`${g.name}-${i}`}
+                className={`ov-form-radio${checked ? ' checked' : ''}`}
+                style={{ left: r.left, top: r.top, width: r.width, height: r.height }}
+                title={`${g.name}: ${opt.value}`}
+                onPointerDown={(e) => e.stopPropagation()}
+                onClick={(e) => {
+                  e.stopPropagation()
+                  edits.setFormValue(pageKey, g.name, opt.value, opt.geom, 'radio')
+                }}
+              />
+            )
+          })
+        })}
+      {/* Choice fields: a dropdown (combo) or single/multi-select list box; the chosen label(s) are
+          painted on flatten (multi-select joins them with newlines). */}
+      {formMode &&
+        choiceFields.map((c) => {
+          const r = geomToCss(c.geom, page, fit)
+          const cur = formValueOf(c.name)
+          const raw = cur === undefined ? c.initial : String(cur)
+          const size = c.combo
+            ? 1
+            : Math.max(2, Math.min(c.options.length, Math.floor(r.height / 18)))
+          const onChange = (e: React.ChangeEvent<HTMLSelectElement>): void => {
+            const v = c.multi
+              ? Array.from(e.target.selectedOptions)
+                  .map((o) => o.value)
+                  .join('\n')
+              : e.target.value
+            edits.setFormValue(pageKey, c.name, v, c.geom)
+          }
+          return (
+            <select
+              key={c.name}
+              className="ov-form-input ov-form-select"
+              style={{ left: r.left, top: r.top, width: r.width, height: r.height, fontSize: Math.min(14, (r.height / size) * 0.7) }} // prettier-ignore
+              value={c.multi ? raw.split('\n').filter(Boolean) : raw}
+              multiple={c.multi}
+              size={size}
+              title={c.name}
+              onPointerDown={(e) => e.stopPropagation()}
+              onChange={onChange}
+            >
+              {!c.multi && <option value="">— {c.name} —</option>}
+              {c.options.map((o, i) => (
+                <option key={i} value={o.label}>
+                  {o.label}
+                </option>
+              ))}
+            </select>
           )
         })}
       {/* Click a detected (unsigned) signature field to place the signature there. */}

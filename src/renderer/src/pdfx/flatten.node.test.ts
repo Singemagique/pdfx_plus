@@ -138,4 +138,19 @@ describe('flatten on export', () => {
     expect(reloaded.getPageCount()).toBe(1)
     expect(pageImageXObjectCount(reloaded, 0)).toBe(0)
   })
+
+  it('flattens every form-value kind (checkbox, radio dot, choice/text) into a valid PDF', async () => {
+    const src = await makeSourcePdf(1)
+    const pages = [{ bytes: src, sourceKey: 'a', pageIndex: 0 }]
+    const overlays = new Map<string, Overlay[]>()
+    overlays.set(makePageKey('a', 0), [
+      base({ type: 'formValue', field: 'agree', value: true, z: 0 }), // checkbox → X
+      base({ type: 'formValue', field: 'plan', value: '1', control: 'radio', z: 1 }), // radio → dot
+      base({ type: 'formValue', field: 'country', value: 'Canada', z: 2 }) // dropdown/text → text
+    ])
+    const out = await buildPdf(pages, { overlays, attachments: new Map() })
+    const plain = await buildPdf(pages)
+    expect(out.length).toBeGreaterThan(plain.length) // content was actually baked
+    await expect(PDFDocument.load(out)).resolves.toBeTruthy()
+  })
 })
