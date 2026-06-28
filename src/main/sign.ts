@@ -10,6 +10,7 @@ import { SUBFILTER_ETSI_CADES_DETACHED, Signer } from '@signpdf/utils'
 import { addSignatureTimestamp, tsaIssuer, type TokenIssuer } from './timestamp'
 import { CmsSigner } from './sign-pkcs11'
 import { openCard, type Pkcs11Options } from './pkcs11'
+import { windowsCertCredential } from './windows-cert'
 
 export interface SignOptions {
   /** PKCS#12 passphrase (empty string if the credential has none). */
@@ -105,4 +106,23 @@ export async function signPdfWithCard(
   } finally {
     card.close()
   }
+}
+
+/**
+ * Sign `bytes` with a certificate from the Windows certificate store (Windows only). The key may
+ * live on a smart card (CAC/PIV) — Windows shows its own PIN prompt and performs the signature, so
+ * no PKCS#11 module is needed. Throws (without producing a file) if the cert can't be used.
+ */
+export async function signPdfWithWindowsCert(
+  bytes: Uint8Array,
+  thumbprint: string,
+  opts: SignOptions = {},
+  getToken?: TokenIssuer
+): Promise<Uint8Array> {
+  const cred = await windowsCertCredential(thumbprint)
+  const base: Signer = new CmsSigner(cred.certDer, cred.rawSign)
+  const signer = opts.tsaUrl
+    ? new TimestampingSigner(base, getToken ?? tsaIssuer(opts.tsaUrl))
+    : base
+  return placeAndSign(bytes, signer, opts)
 }

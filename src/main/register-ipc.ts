@@ -3,8 +3,9 @@ import { basename, isAbsolute } from 'path'
 import { existsSync } from 'fs'
 import { writeFile } from 'fs/promises'
 import { markupToPdf } from './markup'
-import { signPdf, signPdfWithCard } from './sign'
+import { signPdf, signPdfWithCard, signPdfWithWindowsCert } from './sign'
 import { listTokens, findModules } from './pkcs11'
+import { listWindowsCerts } from './windows-cert'
 import { OpenedFile, IMPORTABLE, readFiles, expandDropPaths } from './file-intake'
 import { clipboardFilePaths } from './clipboard'
 import { readResource } from './resource'
@@ -189,6 +190,47 @@ export function registerIpc(getPending: () => string[], clearPending: () => void
           tsaUrl: o.tsaUrl ? String(o.tsaUrl) : undefined
         }
       )
+    }
+  )
+
+  // List signing certificates in the Windows store (a CAC/PIV card's certs appear here). Win-only.
+  ipcMain.handle(
+    'pdfx:win-cert-list',
+    async (): Promise<
+      Array<{
+        thumbprint: string
+        subject: string
+        issuer: string
+        notAfter: string
+        keyUsage: string
+      }>
+    > => {
+      if (process.platform !== 'win32') return []
+      return listWindowsCerts()
+    }
+  )
+
+  ipcMain.handle(
+    'pdfx:sign-pdf-win-cert',
+    async (
+      _event,
+      pdf: Uint8Array,
+      thumbprint: unknown,
+      opts: { reason?: string; name?: string; location?: string; tsaUrl?: string }
+    ): Promise<Uint8Array> => {
+      if (!ArrayBuffer.isView(pdf) || pdf.byteLength > MAX_WRITE_BYTES) {
+        throw new Error('sign-pdf-win-cert: invalid payload')
+      }
+      if (typeof thumbprint !== 'string' || !/^[0-9A-Fa-f]{40}$/.test(thumbprint)) {
+        throw new Error('sign-pdf-win-cert: invalid certificate thumbprint')
+      }
+      const o = opts ?? {}
+      return signPdfWithWindowsCert(pdf, thumbprint, {
+        reason: o.reason != null ? String(o.reason) : undefined,
+        name: o.name != null ? String(o.name) : undefined,
+        location: o.location != null ? String(o.location) : undefined,
+        tsaUrl: o.tsaUrl ? String(o.tsaUrl) : undefined
+      })
     }
   )
 

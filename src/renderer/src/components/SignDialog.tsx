@@ -7,6 +7,16 @@ interface CardToken {
   model: string
 }
 
+interface WindowsCert {
+  thumbprint: string
+  subject: string
+  issuer: string
+  notAfter: string
+  keyUsage: string
+}
+
+type SignMode = 'wincert' | 'card' | 'file'
+
 interface SignAppearanceOpts {
   reason?: string
   name?: string
@@ -28,6 +38,12 @@ interface SignDialogProps {
   listTokens: (modulePath: string) => Promise<CardToken[]>
   /** Probe common install locations for PKCS#11 modules (OpenSC, ActivClient, …). */
   findModules: () => Promise<Array<{ path: string; label: string }>>
+  /** List signing certificates from the Windows store (Windows only). */
+  listWindowsCerts: () => Promise<WindowsCert[]>
+  /** Sign with a Windows-store certificate (Windows handles the card PIN prompt). */
+  onSignWindowsCert: (thumbprint: string, opts: SignAppearanceOpts) => Promise<boolean>
+  /** 'win32' enables the Windows-certificate tab (and makes it the default). */
+  platform: string
   /** Resolve a picked module file to an absolute path (Electron webUtils). */
   pathForFile: (file: File) => string
   /** Human-readable location of the visible-signature placement, or null = invisible. */
@@ -39,6 +55,20 @@ interface SignDialogProps {
   /** Whether the user has a saved hand-drawn signature to optionally include. */
   hasSavedSignature: boolean
   onClose: () => void
+}
+
+/** Common Name out of an X.500 distinguished name, falling back to the whole string. */
+const cn = (dn: string): string => /CN=([^,]+)/i.exec(dn)?.[1].trim() ?? dn
+/** A readable one-line label for a Windows-store certificate. The key-usage hint helps tell a CAC's
+ *  signing cert (Non-Repudiation) apart from its identical-named authentication cert. */
+const certLabel = (c: WindowsCert): string => {
+  const usage = /NonRepudiation/i.test(c.keyUsage)
+    ? ' · signing'
+    : /DigitalSignature/i.test(c.keyUsage)
+      ? ' · auth'
+      : ''
+  const exp = c.notAfter ? ` · exp ${c.notAfter.slice(0, 10)}` : ''
+  return `${cn(c.subject)} — ${cn(c.issuer)}${exp}${usage}`
 }
 
 // A few common PKCS#11 module locations to point users at when they don't know their card's module.
@@ -54,6 +84,9 @@ export function SignDialog({
   onSignCard,
   listTokens,
   findModules,
+  listWindowsCerts,
+  onSignWindowsCert,
+  platform,
   pathForFile,
   placementLabel,
   onClearPlacement,
@@ -61,7 +94,9 @@ export function SignDialog({
   hasSavedSignature,
   onClose
 }: SignDialogProps): React.JSX.Element {
-  const [mode, setMode] = useState<'file' | 'card'>('file')
+  const isWin = platform === 'win32'
+  // On Windows the cert store (incl. an inserted CAC/PIV card) is the easiest path, so default to it.
+  const [mode, setMode] = useState<SignMode>(isWin ? 'wincert' : 'file')
   const [cert, setCert] = useState<{ name: string; bytes: Uint8Array } | null>(null)
   const [passphrase, setPassphrase] = useState('')
   const [reason, setReason] = useState('')
@@ -80,10 +115,36 @@ export function SignDialog({
   const [cardError, setCardError] = useState('')
   const moduleRef = useRef<HTMLInputElement>(null)
 
-  const switchMode = (m: 'file' | 'card'): void => {
+  // Windows certificate-store state.
+  const [winCerts, setWinCerts] = useState<WindowsCert[] | null>(null)
+  const [selectedThumb, setSelectedThumb] = useState<string>('')
+  const [winError, setWinError] = useState('')
+
+  const switchMode = (m: SignMode): void => {
     setMode(m)
     setCardError('') // don't carry a stale "no card" message between modes
   }
+
+  // Load the Windows store certs when that tab is shown (refresh each open so an inserted/removed
+  // card is reflected). Done once per dialog mount via the guard.
+  const winLoaded = useRef(false)
+  useEffect(() => {
+    if (mode !== 'wincert' || winLoaded.current) return
+    winLoaded.current = true
+    void (async () => {
+      try {
+        const certs = await listWindowsCerts()
+        setWinCerts(certs)
+        setSelectedThumb(certs[0]?.thumbprint ?? '')
+        if (certs.length === 0)
+          setWinError('No signing certificates found. Insert your card, then reopen this dialog.')
+      } catch (err) {
+        setWinCerts([])
+        setWinError(`Could not read the Windows certificate store: ${(err as Error).message}`)
+      }
+    })()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode])
 
   const onCertFile = async (e: React.ChangeEvent<HTMLInputElement>): Promise<void> => {
     const f = e.target.files?.[0]
@@ -152,7 +213,10 @@ export function SignDialog({
   const submit = async (): Promise<void> => {
     if (busy) return
     let ok = false
-    if (mode === 'file') {
+    if (mode === 'wincert') {
+      if (!selectedThumb) return
+      ok = await onSignWindowsCert(selectedThumb, shared)
+    } else if (mode === 'file') {
       if (!cert) return
       ok = await onSign(cert.bytes, { passphrase, ...shared })
     } else {
@@ -168,7 +232,8 @@ export function SignDialog({
     }
   }
 
-  const canSign = mode === 'file' ? !!cert : !!modulePath.trim() && !!pin
+  const canSign =
+    mode === 'wincert' ? !!selectedThumb : mode === 'file' ? !!cert : !!modulePath.trim() && !!pin
 
   return (
     <div className="sign-overlay" onPointerDown={onClose}>
@@ -179,6 +244,16 @@ export function SignDialog({
           unsigned.
         </p>
         <div className="sign-modes" role="tablist">
+          {isWin && (
+            <button
+              role="tab"
+              aria-selected={mode === 'wincert'}
+              className={`sign-mode ${mode === 'wincert' ? 'active' : ''}`}
+              onClick={() => switchMode('wincert')}
+            >
+              Windows / CAC
+            </button>
+          )}
           <button
             role="tab"
             aria-selected={mode === 'file'}
@@ -193,11 +268,33 @@ export function SignDialog({
             className={`sign-mode ${mode === 'card' ? 'active' : ''}`}
             onClick={() => switchMode('card')}
           >
-            Smart card
+            Smart card (PKCS#11)
           </button>
         </div>
 
-        {mode === 'file' ? (
+        {mode === 'wincert' ? (
+          <>
+            <p className="sign-module-hint">
+              Signs with a certificate from your Windows store — including an inserted CAC/PIV card.
+              Windows will prompt for your PIN. No extra software needed.
+            </p>
+            {winCerts && winCerts.length > 0 && (
+              <select
+                className="sign-input"
+                value={selectedThumb}
+                onChange={(e) => setSelectedThumb(e.target.value)}
+              >
+                {winCerts.map((c) => (
+                  <option key={c.thumbprint} value={c.thumbprint}>
+                    {certLabel(c)}
+                  </option>
+                ))}
+              </select>
+            )}
+            {winCerts === null && <p className="sign-module-hint">Reading certificates…</p>}
+            {winError && <p className="sign-card-error">{winError}</p>}
+          </>
+        ) : mode === 'file' ? (
           <>
             <button className="sign-cert-btn" onClick={() => fileRef.current?.click()}>
               {cert ? `🔑 ${cert.name}` : 'Choose certificate (.p12 / .pfx)…'}

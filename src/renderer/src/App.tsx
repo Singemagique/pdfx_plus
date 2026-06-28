@@ -53,7 +53,13 @@ export default function App(): React.JSX.Element {
     if (!exists) setSignaturePlacement(null)
   }, [docs, signaturePlacement, setSignaturePlacement])
 
-  const { exportCollection, exportZip, signAndExport, signWithCardAndExport } = useExport(
+  const {
+    exportCollection,
+    exportZip,
+    signAndExport,
+    signWithCardAndExport,
+    signWithWindowsCertAndExport
+  } = useExport(
     docs,
     editStore.editLayer,
     setBusy,
@@ -189,6 +195,9 @@ export default function App(): React.JSX.Element {
             onSignCard={signWithCardAndExport}
             listTokens={(modulePath) => window.api.listCardTokens(modulePath)}
             findModules={() => window.api.findCardModules()}
+            listWindowsCerts={() => window.api.listWindowsCerts()}
+            onSignWindowsCert={signWithWindowsCertAndExport}
+            platform={window.api.platform}
             pathForFile={(file) => window.api.getPathForFile(file)}
             placementLabel={editStore.signaturePlacement?.label ?? null}
             onClearPlacement={() => editStore.setSignaturePlacement(null)}

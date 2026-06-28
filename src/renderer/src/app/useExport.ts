@@ -172,6 +172,23 @@ export function useExport(
     [flattenAndSign, appearanceOf]
   )
 
+  // Sign with a certificate from the Windows store (the key may be on a smart card; Windows prompts
+  // for the PIN). No PKCS#11 module needed.
+  const signWithWindowsCertAndExport = useCallback(
+    (
+      thumbprint: string,
+      opts: { reason?: string; name?: string; tsaUrl?: string; includeImage?: boolean }
+    ): Promise<boolean> => {
+      const { includeImage: _omit, ...sign } = opts
+      return flattenAndSign(
+        (flat) => window.api.signPdfWithWindowsCert(flat, thumbprint, sign),
+        'Signing failed — the card may have been removed or the PIN cancelled',
+        appearanceOf(opts)
+      )
+    },
+    [flattenAndSign, appearanceOf]
+  )
+
   const exportZip = useCallback(async () => {
     if (docs.length === 0) {
       flash('Nothing to export')
@@ -204,5 +221,11 @@ export function useExport(
     }
   }, [docs, editLayer, flash, setBusy])
 
-  return { exportCollection, exportZip, signAndExport, signWithCardAndExport }
+  return {
+    exportCollection,
+    exportZip,
+    signAndExport,
+    signWithCardAndExport,
+    signWithWindowsCertAndExport
+  }
 }

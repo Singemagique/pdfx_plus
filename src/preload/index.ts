@@ -33,6 +33,15 @@ export interface Pkcs11Token {
   serial: string
 }
 
+/** A signing certificate in the Windows store (its key may be on a smart card). */
+export interface WindowsCert {
+  thumbprint: string
+  subject: string
+  issuer: string
+  notAfter: string
+  keyUsage: string
+}
+
 /** Locates the signing credential on a smart card via a PKCS#11 module. */
 export interface CardSignOptions {
   /** Absolute path to the PKCS#11 module (.dll/.so/.dylib). */
@@ -79,6 +88,12 @@ const api = {
     card: CardSignOptions,
     opts: Omit<SignOptions, 'passphrase'>
   ): Promise<Uint8Array> => ipcRenderer.invoke('pdfx:sign-pdf-card', pdf, card, opts),
+  listWindowsCerts: (): Promise<WindowsCert[]> => ipcRenderer.invoke('pdfx:win-cert-list'),
+  signPdfWithWindowsCert: (
+    pdf: Uint8Array,
+    thumbprint: string,
+    opts: Omit<SignOptions, 'passphrase'>
+  ): Promise<Uint8Array> => ipcRenderer.invoke('pdfx:sign-pdf-win-cert', pdf, thumbprint, opts),
   openFiles: (): Promise<OpenedFile[]> => ipcRenderer.invoke('pdfx:open-files'),
   onFilesOpened: (callback: (files: OpenedFile[]) => void): (() => void) => {
     const listener = (_event: Electron.IpcRendererEvent, files: OpenedFile[]): void =>
