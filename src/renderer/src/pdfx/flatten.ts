@@ -119,6 +119,7 @@ async function drawTextOverlay(
   const lines = o.text.split('\n')
   let lineTop = y + h - o.fontSize // first baseline near the top of the box
   for (const line of lines) {
+    if (lineTop < y) break // don't spill text below the box (e.g. a tiny signature appearance)
     const width = font.widthOfTextAtSize(line, o.fontSize)
     page.drawText(line, {
       x: alignedX(x, w, width, o.align),

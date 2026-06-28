@@ -988,8 +988,11 @@ body {
   gap: 10px;
   padding: 22px;
   border-radius: 12px;
-  background: var(--surface, #1b1d23);
+  /* --surface is the white PAGE color; use the elevated-overlay color so the panel is dark in dark
+     mode (and light in light mode) instead of washing out white text on a white surface. */
+  background: var(--overlay-strong, #1b1d23);
   color: var(--ink, #e8e8ec);
+  color-scheme: light dark;
   box-shadow: 0 18px 60px rgba(0, 0, 0, 0.5);
 }
 .sign-dialog h2 {
@@ -1020,15 +1023,20 @@ body {
 }
 .sign-input {
   padding: 9px 11px;
-  border: 1px solid rgba(140, 150, 170, 0.3);
+  border: 1px solid var(--hairline, rgba(140, 150, 170, 0.3));
   border-radius: 8px;
-  background: rgba(255, 255, 255, 0.04);
-  color: inherit;
+  background: var(--control, rgba(255, 255, 255, 0.04));
+  color: var(--ink);
   font-size: 13px;
   outline: none;
 }
 .sign-input:focus {
   border-color: #74a9ff;
+}
+/* Native <select> dropdown list — keep options legible in dark mode (UA may render them light). */
+.sign-input option {
+  background: var(--overlay-strong);
+  color: var(--ink);
 }
 .sign-actions {
   display: flex;
@@ -1044,9 +1052,9 @@ body {
 .sign-mode {
   flex: 1;
   padding: 7px 10px;
-  border: 1px solid rgba(140, 150, 170, 0.3);
+  border: 1px solid var(--hairline, rgba(140, 150, 170, 0.3));
   border-radius: 8px;
-  background: rgba(255, 255, 255, 0.03);
+  background: var(--group-bg, rgba(255, 255, 255, 0.03));
   color: inherit;
   cursor: pointer;
   font-size: 13px;
@@ -1068,13 +1076,48 @@ body {
   margin: 0;
   font-size: 11px;
   line-height: 1.5;
-  color: rgba(160, 168, 184, 0.85);
+  color: var(--ink-soft, rgba(160, 168, 184, 0.85));
   word-break: break-word;
 }
 .sign-card-error {
   margin: 0;
   font-size: 12px;
   color: #f87171;
+}
+.sign-appearance {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 9px 11px;
+  border: 1px solid var(--hairline, rgba(140, 150, 170, 0.3));
+  border-radius: 8px;
+  background: var(--group-bg, rgba(255, 255, 255, 0.03));
+  font-size: 12px;
+}
+.sign-appearance-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.sign-link {
+  background: none;
+  border: none;
+  color: #74a9ff;
+  cursor: pointer;
+  font-size: 12px;
+  padding: 0;
+  white-space: nowrap;
+}
+.sign-link:hover {
+  text-decoration: underline;
+}
+.sign-check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--ink-soft);
+  cursor: pointer;
 }
 .btn.glass.primary {
   background: #3b82f6;
@@ -1097,6 +1140,52 @@ body {
 
 .overlay-layer.cropping {
   cursor: crosshair;
+}
+.overlay-layer.signing {
+  cursor: crosshair;
+}
+
+/* Signature placement: the marker box (drag preview + persistent) and clickable field targets. */
+.ov-sigbox {
+  position: absolute;
+  pointer-events: none;
+  border: 1.5px dashed #3b82f6;
+  border-radius: 2px;
+  background: rgba(59, 130, 246, 0.08);
+  display: flex;
+  align-items: flex-start;
+  justify-content: flex-start;
+  overflow: hidden;
+}
+.ov-sigbox span {
+  font-size: 11px;
+  font-weight: 600;
+  color: #2563eb;
+  background: rgba(255, 255, 255, 0.85);
+  padding: 1px 5px;
+  border-bottom-right-radius: 3px;
+  white-space: nowrap;
+}
+.ov-sigbox.placed {
+  border-style: solid;
+  border-color: rgba(59, 130, 246, 0.7);
+}
+.ov-sig-target {
+  position: absolute;
+  border: 1.5px dashed #3b82f6;
+  border-radius: 2px;
+  background: rgba(59, 130, 246, 0.1);
+  color: #2563eb;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.12s;
+}
+.ov-sig-target:hover {
+  background: rgba(59, 130, 246, 0.22);
 }
 
 /* Crop preview on a collection thumbnail (dims the cropped-away area). */

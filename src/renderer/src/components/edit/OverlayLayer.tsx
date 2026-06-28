@@ -44,6 +44,7 @@ type Draft =
   | { kind: 'shape'; start: Pt; current: Pt }
   | { kind: 'crop'; start: Pt; current: Pt }
   | { kind: 'redaction'; start: Pt; current: Pt }
+  | { kind: 'signature'; start: Pt; current: Pt }
 type Drag = {
   kind: 'move' | 'resize'
   handle?: HandleId
@@ -69,6 +70,9 @@ type FormField = {
   multiline: boolean
   initial: string | boolean
 }
+
+/** An unsigned AcroForm signature field — a target for placing the signature appearance. */
+type SigField = { name: string; geom: Geom }
 
 /** The subset of a pdf.js widget-annotation we read (getAnnotations returns `any`). */
 interface PdfAnnotation {
@@ -143,6 +147,7 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
   const [drag, setDrag] = useState<Drag | null>(null)
   const [textEdit, setTextEdit] = useState<TextEdit | null>(null)
   const [formFields, setFormFields] = useState<FormField[]>([])
+  const [sigFields, setSigFields] = useState<SigField[]>([])
 
   const pageKey = makePageKey(page.source.id, page.pageIndex)
   const pageOverlays = overlaysForPage(edits.overlays, pageKey)
@@ -156,7 +161,8 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
   const placing = active && edits.tool === 'text'
   const selecting = active && edits.tool === 'browse'
   const formMode = active && edits.tool === 'form'
-  const capturing = drawing || placing || cropping
+  const signing = active && edits.tool === 'signature'
+  const capturing = drawing || placing || cropping || signing
   const cropBox = edits.crops.get(pageKey)
   const scale = pageScale(page, fit)
 
@@ -179,6 +185,7 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
   useEffect(() => {
     if (!active) {
       setFormFields([])
+      setSigFields([])
       return
     }
     let cancelled = false
@@ -190,14 +197,12 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
         // visual space the rest of the overlay model uses (page.width/height bake in /Rotate).
         const rotate = (((p.rotate ?? 0) % 360) + 360) % 360
         const fields: FormField[] = []
+        const sigs: SigField[] = []
         const seen = new Set<string>() // one control per field name (a field may have many widgets)
+        const sigSeen = new Set<string>()
         for (const a of anns) {
           const r = a.rect
-          if (a.readOnly || a.hidden || !a.fieldName || !r || r.length < 4) continue
-          const isText = a.fieldType === 'Tx'
-          const isCheckbox = a.fieldType === 'Btn' && !!a.checkBox
-          if ((!isText && !isCheckbox) || seen.has(a.fieldName)) continue
-          seen.add(a.fieldName)
+          if (a.readOnly || a.hidden || !r || r.length < 4) continue
           const rect = {
             x: Math.min(r[0], r[2]),
             y: Math.min(r[1], r[3]),
@@ -205,6 +210,24 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
             h: Math.abs(r[3] - r[1])
           }
           const geom: Geom = { ...rectToVisual(rect, rotate, page.width, page.height), rotation: 0, opacity: 1 } // prettier-ignore
+          if (a.fieldType === 'Sig') {
+            // Offer UNSIGNED signature fields as appearance targets. A name isn't required (some
+            // fields have none); de-dupe by name-or-rect and skip zero-size / signed widgets.
+            const fv = a.fieldValue
+            const signed = fv != null && fv !== ''
+            const key = a.fieldName || `${rect.x},${rect.y},${rect.w},${rect.h}`
+            if (!signed && !sigSeen.has(key) && rect.w > 1 && rect.h > 1) {
+              sigSeen.add(key)
+              sigs.push({ name: a.fieldName ?? '', geom })
+            }
+            continue
+          }
+          // Text/checkbox fields are keyed by name, so they need one.
+          if (!a.fieldName) continue
+          const isText = a.fieldType === 'Tx'
+          const isCheckbox = a.fieldType === 'Btn' && !!a.checkBox
+          if ((!isText && !isCheckbox) || seen.has(a.fieldName)) continue
+          seen.add(a.fieldName)
           const fv = a.fieldValue
           fields.push(
             isText
@@ -224,13 +247,17 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
                 }
           )
         }
-        return fields
+        return { fields, sigs }
       })
-      .then((fields) => {
-        if (!cancelled) setFormFields(fields)
+      .then((res) => {
+        if (cancelled) return
+        setFormFields(res.fields)
+        setSigFields(res.sigs)
       })
       .catch(() => {
-        if (!cancelled) setFormFields([])
+        if (cancelled) return
+        setFormFields([])
+        setSigFields([])
       })
     return () => {
       cancelled = true
@@ -273,20 +300,22 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
 
   // ---- Drawing (highlight / ink) ----
   const onDrawDown = (e: React.PointerEvent): void => {
-    if (!(drawing || cropping) || e.button !== 0) return
+    if (!(drawing || cropping || signing) || e.button !== 0) return
     e.stopPropagation()
     e.preventDefault()
     const p = toPdf(e.clientX, e.clientY)
     setDraft(
-      cropping
-        ? { kind: 'crop', start: p, current: p }
-        : edits.tool === 'redact'
-          ? { kind: 'redaction', start: p, current: p }
-          : edits.tool === 'highlight'
-            ? { kind: 'highlight', start: p, current: p }
-            : edits.tool === 'shape'
-              ? { kind: 'shape', start: p, current: p }
-              : { kind: 'ink', pts: [p.x, p.y] }
+      signing
+        ? { kind: 'signature', start: p, current: p }
+        : cropping
+          ? { kind: 'crop', start: p, current: p }
+          : edits.tool === 'redact'
+            ? { kind: 'redaction', start: p, current: p }
+            : edits.tool === 'highlight'
+              ? { kind: 'highlight', start: p, current: p }
+              : edits.tool === 'shape'
+                ? { kind: 'shape', start: p, current: p }
+                : { kind: 'ink', pts: [p.x, p.y] }
     )
     layerRef.current?.setPointerCapture(e.pointerId)
   }
@@ -312,6 +341,17 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
       const w = Math.min(page.width, g.x + g.w) - x
       const h = Math.min(page.height, g.y + g.h) - y
       if (w > 8 && h > 8) edits.setCrop(pageKey, { x, y, w, h })
+      setDraft(null)
+      return
+    }
+    if (draft.kind === 'signature') {
+      const geom = rectGeom(draft.start, draft.current, 1)
+      if (geom.w > 8 && geom.h > 8)
+        edits.setSignaturePlacement({
+          pageKey,
+          geom,
+          label: `drawn box · page ${page.pageIndex + 1}`
+        })
       setDraft(null)
       return
     }
@@ -355,7 +395,7 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
 
   // ---- Text ----
   const onLayerDown = (e: React.PointerEvent): void => {
-    if (drawing || cropping) return onDrawDown(e)
+    if (drawing || cropping || signing) return onDrawDown(e)
     if (placing && !textEdit && e.button === 0) {
       e.stopPropagation()
       e.preventDefault()
@@ -693,7 +733,7 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
   return (
     <div
       ref={layerRef}
-      className={`overlay-layer${drawing ? ' drawing' : ''}${placing ? ' placing' : ''}${cropping ? ' cropping' : ''}`}
+      className={`overlay-layer${drawing ? ' drawing' : ''}${placing ? ' placing' : ''}${cropping ? ' cropping' : ''}${signing ? ' signing' : ''}`}
       style={{ pointerEvents: capturing ? 'auto' : 'none' }}
       onPointerDown={onLayerDown}
       onPointerMove={onDrawMove}
@@ -760,6 +800,18 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
               className="ov-redaction"
               style={{ left: r.left, top: r.top, width: r.width, height: r.height }}
             />
+          )
+        })()}
+      {draft?.kind === 'signature' &&
+        (() => {
+          const r = geomToCss(rectGeom(draft.start, draft.current, 1), page, fit)
+          return (
+            <div
+              className="ov-sigbox draft"
+              style={{ left: r.left, top: r.top, width: r.width, height: r.height }}
+            >
+              <span>✍ Signature</span>
+            </div>
           )
         })()}
       {draft?.kind === 'ink' && (
@@ -848,6 +900,49 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
             />
           )
         })}
+      {/* Click a detected (unsigned) signature field to place the signature there. */}
+      {signing &&
+        sigFields.map((f, i) => {
+          const r = geomToCss(f.geom, page, fit)
+          const named = f.name ? `field “${f.name}”` : 'signature field'
+          return (
+            <button
+              key={`sig-${i}`}
+              className="ov-sig-target"
+              style={{ left: r.left, top: r.top, width: r.width, height: r.height }}
+              title={`Place signature in ${named}`}
+              onPointerDown={(e) => e.stopPropagation()}
+              onClick={(e) => {
+                e.stopPropagation()
+                edits.setSignaturePlacement({
+                  pageKey,
+                  geom: f.geom,
+                  fieldName: f.name || undefined,
+                  label: `${named} · page ${page.pageIndex + 1}`
+                })
+              }}
+            >
+              <span>✍ Sign here</span>
+            </button>
+          )
+        })}
+      {/* Persistent marker showing where the signature will appear (any tool). */}
+      {edits.signaturePlacement?.pageKey === pageKey &&
+        (() => {
+          const r = geomToCss(
+            { ...edits.signaturePlacement.geom, rotation: 0, opacity: 1 },
+            page,
+            fit
+          )
+          return (
+            <div
+              className="ov-sigbox placed"
+              style={{ left: r.left, top: r.top, width: r.width, height: r.height }}
+            >
+              <span>✍ Signature</span>
+            </div>
+          )
+        })()}
     </div>
   )
 }

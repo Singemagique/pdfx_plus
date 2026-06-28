@@ -13,7 +13,8 @@ import {
   type Geom,
   type Overlay,
   type RGB,
-  type ShapeKind
+  type ShapeKind,
+  type SignaturePlacement
 } from './model'
 import type { Attachment } from '../pdfx/flatten'
 import type { EditLayer } from '../pdfx/build'
@@ -27,6 +28,7 @@ export type ToolKind =
   | 'crop'
   | 'form'
   | 'redact'
+  | 'signature'
 
 /** The page currently focused in full view, so palette actions know where to place things. */
 export interface CurrentPage {
@@ -76,6 +78,9 @@ export interface EditStore {
   setFormValue: (pageKey: string, field: string, value: string | boolean, geom: Geom) => void
   savedSignature: Uint8Array | null
   setSavedSignature: (bytes: Uint8Array | null) => void
+  /** Where the next cryptographic signature's visible appearance goes (null = invisible). */
+  signaturePlacement: SignaturePlacement | null
+  setSignaturePlacement: (p: SignaturePlacement | null) => void
   /** Merge a loaded PDFX v1.1 mirror (overlays/rotations/crops/attachments) into the store. */
   loadEditState: (s: {
     overlays: Overlay[]
@@ -127,6 +132,7 @@ export function useEditStore(): EditStore {
   const [rotations, setRotations] = useState<Map<string, number>>(() => new Map())
   const [crops, setCrops] = useState<Map<string, CropBox>>(() => new Map())
   const [savedSignature, setSavedSignature] = useState<Uint8Array | null>(null)
+  const [signaturePlacement, setSignaturePlacement] = useState<SignaturePlacement | null>(null)
 
   const addAttachment = useCallback((id: string, bytes: Uint8Array, mime: string) => {
     setAttachments((m) => new Map(m).set(id, { bytes, mime }))
@@ -304,6 +310,8 @@ export function useEditStore(): EditStore {
     setFormValue,
     savedSignature,
     setSavedSignature,
+    signaturePlacement,
+    setSignaturePlacement,
     loadEditState,
     editLayer
   }

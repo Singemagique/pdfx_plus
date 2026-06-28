@@ -34,6 +34,19 @@ export interface CropBox {
   h: number
 }
 
+/**
+ * Where a (cryptographic) signature's visible appearance is placed. `geom` is in the same
+ * 'visual' overlay space as Overlay.geom, so it flattens through the normal pipeline. Set either
+ * by drawing a box or by clicking a detected AcroForm signature field (then `fieldName` is its
+ * name and `label` a human-readable location). At most one placement exists at a time.
+ */
+export interface SignaturePlacement {
+  pageKey: string
+  geom: Geom
+  fieldName?: string
+  label: string
+}
+
 export type StandardFontName = 'Helvetica' | 'Times' | 'Courier'
 export type TextAlign = 'left' | 'center' | 'right'
 export type ShapeKind = 'rect' | 'ellipse' | 'line' | 'arrow' | 'underline' | 'strike'

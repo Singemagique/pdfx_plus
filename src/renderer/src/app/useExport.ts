@@ -4,6 +4,8 @@ import { buildPdf, buildPdfx, stripExtension } from '../pdfx/format'
 import type { EditLayer } from '../pdfx/build'
 import { toExportPage } from '../pdfx/source'
 import { applyRedactedBytes, buildRedactedSources } from '../pdfx/redact-export'
+import { withSignatureAppearance, type AppearanceOptions } from '../pdfx/signature-appearance'
+import type { SignaturePlacement } from '../edit/model'
 import type { DocEntry } from '../types'
 
 const PDFX_FILTER = { name: 'PDFX', extensions: ['pdfx'] }
@@ -15,7 +17,9 @@ export function useExport(
   docs: DocEntry[],
   editLayer: EditLayer,
   setBusy: (busy: boolean) => void,
-  flash: (message: string) => void
+  flash: (message: string) => void,
+  signaturePlacement: SignaturePlacement | null,
+  savedSignature: Uint8Array | null
 ) {
   const exportCollection = useCallback(
     async (kind: 'pdfx' | 'pdf') => {
@@ -68,7 +72,11 @@ export function useExport(
   // cryptographically sign it, and save the signed copy. The editable project is untouched. `sign`
   // differs only by credential source (.p12 file vs. smart card); flattening + save are shared.
   const flattenAndSign = useCallback(
-    async (sign: (flat: Uint8Array) => Promise<Uint8Array>, failHint: string): Promise<boolean> => {
+    async (
+      sign: (flat: Uint8Array) => Promise<Uint8Array>,
+      failHint: string,
+      appearance: AppearanceOptions | null
+    ): Promise<boolean> => {
       if (docs.length === 0) {
         flash('Nothing to sign')
         return false
@@ -77,13 +85,19 @@ export function useExport(
       if (!path) return false
       setBusy(true)
       try {
-        const redacted = await buildRedactedSources(editLayer, docs)
+        // When a placement is set, splice the visible appearance into a copy of the edit layer so
+        // the cryptographic signature (applied next, to the flattened bytes) covers it.
+        const layer =
+          signaturePlacement && appearance
+            ? await withSignatureAppearance(editLayer, signaturePlacement, appearance)
+            : editLayer
+        const redacted = await buildRedactedSources(layer, docs)
         const flat = await buildPdf(
           applyRedactedBytes(
             docs.flatMap((doc) => doc.pages.map(toExportPage)),
             redacted
           ),
-          editLayer
+          layer
         )
         const signed = await sign(flat)
         const saved = await window.api.writeFile(path, signed)
@@ -97,20 +111,43 @@ export function useExport(
         setBusy(false)
       }
     },
-    [docs, editLayer, flash, setBusy]
+    [docs, editLayer, flash, setBusy, signaturePlacement]
+  )
+
+  // Build the visible-appearance options from the dialog opts (null when signing invisibly).
+  const appearanceOf = useCallback(
+    (opts: { name?: string; reason?: string; includeImage?: boolean }): AppearanceOptions | null =>
+      signaturePlacement
+        ? {
+            name: opts.name,
+            reason: opts.reason,
+            date: new Date(),
+            image: opts.includeImage ? savedSignature : null
+          }
+        : null,
+    [signaturePlacement, savedSignature]
   )
 
   // Sign with a PKCS#12 (.p12) credential file.
   const signAndExport = useCallback(
     (
       certBytes: Uint8Array,
-      opts: { passphrase: string; reason?: string; name?: string; tsaUrl?: string }
-    ): Promise<boolean> =>
-      flattenAndSign(
-        (flat) => window.api.signPdf(flat, certBytes, opts),
-        'Signing failed — check the certificate and passphrase'
-      ),
-    [flattenAndSign]
+      opts: {
+        passphrase: string
+        reason?: string
+        name?: string
+        tsaUrl?: string
+        includeImage?: boolean
+      }
+    ): Promise<boolean> => {
+      const { includeImage: _omit, ...sign } = opts
+      return flattenAndSign(
+        (flat) => window.api.signPdf(flat, certBytes, sign),
+        'Signing failed — check the certificate and passphrase',
+        appearanceOf(opts)
+      )
+    },
+    [flattenAndSign, appearanceOf]
   )
 
   // Sign with a smart card / HSM via PKCS#11 (the key never leaves the token).
@@ -123,13 +160,16 @@ export function useExport(
         tokenLabel?: string
         certLabel?: string
       },
-      opts: { reason?: string; name?: string; tsaUrl?: string }
-    ): Promise<boolean> =>
-      flattenAndSign(
-        (flat) => window.api.signPdfWithCard(flat, card, opts),
-        'Card signing failed — check the module path, PIN and that the card is inserted'
-      ),
-    [flattenAndSign]
+      opts: { reason?: string; name?: string; tsaUrl?: string; includeImage?: boolean }
+    ): Promise<boolean> => {
+      const { includeImage: _omit, ...sign } = opts
+      return flattenAndSign(
+        (flat) => window.api.signPdfWithCard(flat, card, sign),
+        'Card signing failed — check the module path, PIN and that the card is inserted',
+        appearanceOf(opts)
+      )
+    },
+    [flattenAndSign, appearanceOf]
   )
 
   const exportZip = useCallback(async () => {

@@ -7,22 +7,35 @@ interface CardToken {
   model: string
 }
 
+interface SignAppearanceOpts {
+  reason?: string
+  name?: string
+  tsaUrl?: string
+  /** Draw the saved hand-drawn signature image inside the visible appearance. */
+  includeImage?: boolean
+}
+
 interface SignDialogProps {
   busy: boolean
   /** Sign with a PKCS#12 (.p12) file. */
-  onSign: (
-    cert: Uint8Array,
-    opts: { passphrase: string; reason?: string; name?: string; tsaUrl?: string }
-  ) => Promise<boolean>
+  onSign: (cert: Uint8Array, opts: SignAppearanceOpts & { passphrase: string }) => Promise<boolean>
   /** Sign with a smart card / HSM via PKCS#11. */
   onSignCard: (
     card: { modulePath: string; pin: string; slot?: number; tokenLabel?: string },
-    opts: { reason?: string; name?: string; tsaUrl?: string }
+    opts: SignAppearanceOpts
   ) => Promise<boolean>
   /** List the tokens (cards) present in a PKCS#11 module. */
   listTokens: (modulePath: string) => Promise<CardToken[]>
   /** Resolve a picked module file to an absolute path (Electron webUtils). */
   pathForFile: (file: File) => string
+  /** Human-readable location of the visible-signature placement, or null = invisible. */
+  placementLabel: string | null
+  /** Clear the placement (sign invisibly). */
+  onClearPlacement: () => void
+  /** Close the dialog and switch to the Signature placement tool. */
+  onPlaceRequest: () => void
+  /** Whether the user has a saved hand-drawn signature to optionally include. */
+  hasSavedSignature: boolean
   onClose: () => void
 }
 
@@ -39,6 +52,10 @@ export function SignDialog({
   onSignCard,
   listTokens,
   pathForFile,
+  placementLabel,
+  onClearPlacement,
+  onPlaceRequest,
+  hasSavedSignature,
   onClose
 }: SignDialogProps): React.JSX.Element {
   const [mode, setMode] = useState<'file' | 'card'>('file')
@@ -47,6 +64,7 @@ export function SignDialog({
   const [reason, setReason] = useState('')
   const [name, setName] = useState('')
   const [tsaUrl, setTsaUrl] = useState('')
+  const [includeImage, setIncludeImage] = useState(true)
   const fileRef = useRef<HTMLInputElement>(null)
 
   // Smart-card state.
@@ -99,25 +117,29 @@ export function SignDialog({
     }
   }
 
-  const shared = {
+  const shared: SignAppearanceOpts = {
     reason: reason || undefined,
     name: name || undefined,
-    tsaUrl: tsaUrl.trim() || undefined
+    tsaUrl: tsaUrl.trim() || undefined,
+    includeImage: !!placementLabel && hasSavedSignature && includeImage
   }
 
   const submit = async (): Promise<void> => {
     if (busy) return
+    let ok = false
     if (mode === 'file') {
       if (!cert) return
-      const ok = await onSign(cert.bytes, { passphrase, ...shared })
-      if (ok) onClose()
+      ok = await onSign(cert.bytes, { passphrase, ...shared })
     } else {
       if (!modulePath.trim() || !pin) return
-      const ok = await onSignCard(
+      ok = await onSignCard(
         { modulePath: modulePath.trim(), pin, slot: selectedSlot ?? undefined },
         shared
       )
-      if (ok) onClose()
+    }
+    if (ok) {
+      onClearPlacement() // the placement is consumed; don't leave a stale marker behind
+      onClose()
     }
   }
 
@@ -254,6 +276,37 @@ export function SignDialog({
           onChange={(e) => setTsaUrl(e.target.value)}
           onKeyDown={(e) => e.key === 'Enter' && void submit()}
         />
+
+        <div className="sign-appearance">
+          {placementLabel ? (
+            <>
+              <div className="sign-appearance-row">
+                <span>✍ Visible · {placementLabel}</span>
+                <button type="button" className="sign-link" onClick={onClearPlacement}>
+                  Make invisible
+                </button>
+              </div>
+              {hasSavedSignature && (
+                <label className="sign-check">
+                  <input
+                    type="checkbox"
+                    checked={includeImage}
+                    onChange={(e) => setIncludeImage(e.target.checked)}
+                  />
+                  Include my drawn signature image
+                </label>
+              )}
+            </>
+          ) : (
+            <div className="sign-appearance-row">
+              <span>Invisible signature (whole document)</span>
+              <button type="button" className="sign-link" onClick={onPlaceRequest}>
+                Place on page…
+              </button>
+            </div>
+          )}
+        </div>
+
         <div className="sign-actions">
           {/* Always closable — `busy` is app-wide, so don't trap the user during a long sign. */}
           <button className="btn glass" onClick={onClose}>
