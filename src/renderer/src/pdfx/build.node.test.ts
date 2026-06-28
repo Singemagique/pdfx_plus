@@ -16,6 +16,7 @@ import { buildPdf, buildPdfx, type EditLayer } from './build'
 import { MANIFEST_NAME, partitionPages, stripExtension } from './format'
 import type { ExportDocument, ExportPage, PdfxManifest } from './format'
 import { deserializeMirror } from './mirror'
+import { integrityOf } from './canonicalize'
 import { makePageKey, type Overlay } from '../edit/model'
 
 // Build a tiny standalone single-page PDF we can use as an import source.
@@ -116,6 +117,21 @@ describe('buildPdfx', () => {
       { name: 'NDA', pages: 2 },
       { name: 'Invoice', pages: 1 }
     ])
+  })
+
+  it('embeds a pdfx-canon/1 integrity record that matches the assembled content', async () => {
+    const bytes = await makeSourcePdf()
+    const documents: ExportDocument[] = [
+      { name: 'A', pages: [{ bytes, sourceKey: 'a', pageIndex: 0 }] }
+    ]
+    const out = await buildPdfx(documents, 'X')
+    const manifest = JSON.parse(
+      new TextDecoder().decode(extractEmbeddedFile(await PDFDocument.load(out), MANIFEST_NAME)!)
+    ) as PdfxManifest
+    expect(manifest.integrity?.canonAlg).toBe('pdfx-canon/1')
+    // Recomputing over the EXPORTED bytes matches the stored hash (the manifest is excluded).
+    const actual = await integrityOf(out)
+    expect(actual.flattenedSha256).toBe(manifest.integrity?.flattenedSha256)
   })
 
   it('skips documents with no pages', async () => {

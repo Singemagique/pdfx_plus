@@ -28,9 +28,10 @@ export function useImport(
           const data = conv
             ? await conv.toPdf(file.name, file.data, undefined, file.path)
             : file.data
-          const { docs: entries, mirror } = await importIntoDocs(name, data)
+          const { docs: entries, mirror, integrityWarning } = await importIntoDocs(name, data)
           setDocs((prev) => [...prev, ...dedupeNames(prev, entries)])
           if (mirror) loadEditState(mirror)
+          if (integrityWarning) flash(integrityWarning)
         } catch (error) {
           console.error(`Failed to import ${file.name}`, error)
           failed.push(file.name)

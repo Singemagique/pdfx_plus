@@ -18,6 +18,7 @@ import {
   type FlattenResources
 } from './flatten'
 import { serializeMirror } from './mirror'
+import { computeIntegrity } from './canonicalize'
 
 /**
  * The optional edit layer baked into pages on export (PRD §4.4). Overlays are keyed by
@@ -192,6 +193,10 @@ export async function buildPdfx(
       manifest.attachments = mirror.attachments
     }
   }
+
+  // pdfx-canon/1 tamper record over the assembled page content, computed BEFORE the manifest is
+  // attached so the manifest itself is excluded from the hash (PRD §4.6).
+  manifest.integrity = await computeIntegrity(output)
 
   await output.attach(new TextEncoder().encode(JSON.stringify(manifest, null, 2)), MANIFEST_NAME, {
     mimeType: 'application/json',
