@@ -4,11 +4,11 @@
 // signpdf-pades-api memory note for the flow + gotchas.
 import { PDFDocument } from 'pdf-lib'
 import { SignPdf } from '@signpdf/signpdf'
-import { P12Signer } from '@signpdf/signer-p12'
 import { plainAddPlaceholder } from '@signpdf/placeholder-plain'
 import { SUBFILTER_ETSI_CADES_DETACHED, Signer } from '@signpdf/utils'
 import { addSignatureTimestamp, tsaIssuer, type TokenIssuer } from './timestamp'
 import { CmsSigner } from './sign-pkcs11'
+import { p12ToCredential } from './p12'
 import { openCard, type Pkcs11Options } from './pkcs11'
 import { windowsCertCredential } from './windows-cert'
 
@@ -42,15 +42,22 @@ class TimestampingSigner extends Signer {
   }
 }
 
-/** Add the signing placeholder, then run @signpdf with `signer`, returning signed PDF bytes. */
+/** Add the signing placeholder, then run @signpdf with `signer`, returning signed PDF bytes.
+ *  `bundledCerts` is how many certificates the CMS will embed (1 = signer only); a chain enlarges
+ *  the signature, so the placeholder must grow to fit it. */
 async function placeAndSign(
   bytes: Uint8Array,
   signer: Signer,
-  opts: SignOptions
+  opts: SignOptions,
+  bundledCerts = 1
 ): Promise<Uint8Array> {
   // @signpdf/placeholder-plain parses a classic xref TABLE, so re-save without xref streams.
   const doc = await PDFDocument.load(bytes)
   const flat = await doc.save({ useObjectStreams: false })
+  // Size the /Contents placeholder to the largest CMS we might produce: a timestamp token + TSA cert
+  // chain needs the most room; a bundled signer-cert chain (the .p12 path) also exceeds the 8192-byte
+  // default. Over-sizing only pads /Contents with zeros, so err large.
+  const signatureLength = opts.tsaUrl ? 32768 : bundledCerts > 1 ? 16384 : undefined
   const withPlaceholder = plainAddPlaceholder({
     pdfBuffer: Buffer.from(flat),
     reason: opts.reason ?? 'Signed with PDFx',
@@ -58,8 +65,7 @@ async function placeAndSign(
     name: opts.name ?? '',
     location: opts.location ?? '',
     subFilter: SUBFILTER_ETSI_CADES_DETACHED,
-    // A timestamp token + TSA cert chain needs more room than the default 8192-byte placeholder.
-    ...(opts.tsaUrl ? { signatureLength: 32768 } : {})
+    ...(signatureLength ? { signatureLength } : {})
   })
   const signed = await new SignPdf().sign(withPlaceholder, signer)
   return new Uint8Array(signed)
@@ -68,7 +74,8 @@ async function placeAndSign(
 /**
  * Sign `bytes` with a PKCS#12 (.p12) credential, returning PAdES-B-B-signed PDF bytes. Throws if
  * the credential/passphrase is wrong or the PDF can't be prepared, so callers never get a
- * half-signed file.
+ * half-signed file. Routes through the in-house CmsSigner (not @signpdf's P12Signer) so the .p12
+ * signature carries the PAdES signing-certificate-v2 attribute, matching the card/Windows paths.
  */
 export async function signPdf(
   bytes: Uint8Array,
@@ -77,11 +84,12 @@ export async function signPdf(
   // Injectable token issuer (defaults to the real TSA client) so tests run a local TSA offline.
   getToken?: TokenIssuer
 ): Promise<Uint8Array> {
-  const base: Signer = new P12Signer(Buffer.from(p12), { passphrase: opts.passphrase ?? '' })
+  const cred = p12ToCredential(p12, opts.passphrase ?? '')
+  const base: Signer = new CmsSigner(cred.certDer, cred.rawSign, cred.chainDer)
   const signer = opts.tsaUrl
     ? new TimestampingSigner(base, getToken ?? tsaIssuer(opts.tsaUrl))
     : base
-  return placeAndSign(bytes, signer, opts)
+  return placeAndSign(bytes, signer, opts, 1 + cred.chainDer.length)
 }
 
 /**
