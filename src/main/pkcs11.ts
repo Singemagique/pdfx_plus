@@ -351,6 +351,59 @@ export interface CardCredential {
 }
 
 /**
+ * Read the signing certificate (DER) off the token WITHOUT logging in. Certificate objects are
+ * public on PKCS#11 tokens, so this needs no PIN — letting the visible signature appearance show the
+ * card's identity (subject/issuer) before the one real PIN prompt at signing time. Returns null if no
+ * certificate can be read (the appearance just falls back to its generic form).
+ */
+export function cardCertDer(opts: Pkcs11Options): Uint8Array | null {
+  const f = load(opts.modulePath)
+  initialize(opts.modulePath, f)
+  let session: number | null = null
+  try {
+    const slots = getSlotsWithToken(f)
+    if (!slots.length) return null
+    let slot = opts.slot
+    if (slot == null) {
+      slot =
+        opts.tokenLabel != null
+          ? slots.find((s) => tokenInfo(f, s).label === opts.tokenLabel)
+          : slots[0]
+      if (slot == null) return null
+    }
+    const sessRef = [0]
+    ck('C_OpenSession', f.C_OpenSession(slot, CKF_SERIAL_SESSION, null, null, sessRef))
+    session = sessRef[0]
+    const certs = findObjects(f, session, [
+      { type: CKA_CLASS, value: ulongValue(CKO_CERTIFICATE) },
+      { type: CKA_CERTIFICATE_TYPE, value: ulongValue(CKC_X_509) }
+    ])
+    if (!certs.length) return null
+    let certHandle = certs[0]
+    if (opts.certLabel != null) {
+      const match = certs.find(
+        (h) => getAttribute(f, session as number, h, CKA_LABEL).toString('utf8') === opts.certLabel
+      )
+      if (match == null) return null
+      certHandle = match
+    }
+    const certBytes = getAttribute(f, session, certHandle, CKA_VALUE)
+    return certBytes.length ? new Uint8Array(certBytes) : null
+  } catch {
+    return null
+  } finally {
+    if (session != null) {
+      try {
+        f.C_CloseSession(session)
+      } catch {
+        /* ignore */
+      }
+    }
+    finalize(opts.modulePath, f)
+  }
+}
+
+/**
  * Open a session on the token, log in with the PIN, locate the signing certificate and its matching
  * private key, and return a credential whose `rawSign` delegates to the card. The session stays open
  * until `close()` is called (so the CMS signed attributes can be signed in-session).

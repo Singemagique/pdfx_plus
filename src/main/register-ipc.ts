@@ -4,7 +4,8 @@ import { existsSync } from 'fs'
 import { writeFile } from 'fs/promises'
 import { markupToPdf } from './markup'
 import { signPdf, signPdfWithCard, signPdfWithWindowsCert } from './sign'
-import { listTokens, findModules } from './pkcs11'
+import { listTokens, findModules, cardCertDer } from './pkcs11'
+import { certInfoFromDer, certInfoFromP12, type SignerInfo } from './cert-info'
 import { listWindowsCerts } from './windows-cert'
 import { OpenedFile, IMPORTABLE, readFiles, expandDropPaths } from './file-intake'
 import { clipboardFilePaths } from './clipboard'
@@ -115,6 +116,19 @@ export function registerIpc(getPending: () => string[], clearPending: () => void
     }
   )
 
+  // Read a PKCS#12's signing-certificate identity (subject + issuer DN) so the visible signature
+  // appearance can show "digitally signed by …" before signing. Returns null if it can't be parsed
+  // (e.g. wrong passphrase) — the appearance then falls back to its generic form.
+  ipcMain.handle(
+    'pdfx:p12-cert-info',
+    async (_event, p12: Uint8Array, passphrase: unknown): Promise<SignerInfo | null> => {
+      if (!ArrayBuffer.isView(p12) || p12.byteLength > 4 * 1024 * 1024) {
+        throw new Error('p12-cert-info: invalid payload')
+      }
+      return certInfoFromP12(p12, String(passphrase ?? ''))
+    }
+  )
+
   // Validate a renderer-supplied PKCS#11 module path before handing it to koffi.load (which
   // dlopen/LoadLibrary's it into the main process). The renderer is trusted, but mirror the
   // write-file guards — absolute path, no null-byte truncation, and a native-library extension.
@@ -144,6 +158,34 @@ export function registerIpc(getPending: () => string[], clearPending: () => void
       Array<{ slot: number; label: string; manufacturer: string; model: string; serial: string }>
     > => {
       return listTokens(validModulePath(modulePath))
+    }
+  )
+
+  // Read the smart-card signing certificate's identity (subject + issuer DN) WITHOUT a PIN prompt —
+  // certificate objects are public on the token — so the visible appearance can show the card's
+  // identity before the one real PIN prompt at signing. Returns null if it can't be read.
+  ipcMain.handle(
+    'pdfx:card-cert-info',
+    async (
+      _event,
+      pkcs11: { modulePath?: string; slot?: number; tokenLabel?: string; certLabel?: string }
+    ): Promise<SignerInfo | null> => {
+      const c = pkcs11 ?? {}
+      const slot =
+        typeof c.slot === 'number' &&
+        Number.isInteger(c.slot) &&
+        c.slot >= 0 &&
+        c.slot <= 0xffffffff
+          ? c.slot
+          : undefined
+      const der = cardCertDer({
+        modulePath: validModulePath(c.modulePath),
+        pin: '',
+        slot,
+        tokenLabel: c.tokenLabel != null ? String(c.tokenLabel) : undefined,
+        certLabel: c.certLabel != null ? String(c.certLabel) : undefined
+      })
+      return der ? certInfoFromDer(der) : null
     }
   )
 

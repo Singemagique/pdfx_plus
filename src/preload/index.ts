@@ -42,6 +42,12 @@ export interface WindowsCert {
   keyUsage: string
 }
 
+/** A signer's certificate identity (X.500 DN strings) for the visible signature appearance. */
+export interface SignerInfo {
+  subject: string
+  issuer: string
+}
+
 /** Locates the signing credential on a smart card via a PKCS#11 module. */
 export interface CardSignOptions {
   /** Absolute path to the PKCS#11 module (.dll/.so/.dylib). */
@@ -79,10 +85,16 @@ const api = {
     ipcRenderer.invoke('pdfx:write-file', path, data),
   signPdf: (pdf: Uint8Array, p12: Uint8Array, opts: SignOptions): Promise<Uint8Array> =>
     ipcRenderer.invoke('pdfx:sign-pdf', pdf, p12, opts),
+  /** Subject + issuer of a PKCS#12's signing certificate (for the appearance); null if unreadable. */
+  p12CertInfo: (p12: Uint8Array, passphrase: string): Promise<SignerInfo | null> =>
+    ipcRenderer.invoke('pdfx:p12-cert-info', p12, passphrase),
   findCardModules: (): Promise<Array<{ path: string; label: string }>> =>
     ipcRenderer.invoke('pdfx:pkcs11-find-modules'),
   listCardTokens: (modulePath: string): Promise<Pkcs11Token[]> =>
     ipcRenderer.invoke('pdfx:pkcs11-list-tokens', modulePath),
+  /** Subject + issuer of a smart card's signing certificate (no PIN prompt); null if unreadable. */
+  cardCertInfo: (card: Omit<CardSignOptions, 'pin'>): Promise<SignerInfo | null> =>
+    ipcRenderer.invoke('pdfx:card-cert-info', card),
   signPdfWithCard: (
     pdf: Uint8Array,
     card: CardSignOptions,

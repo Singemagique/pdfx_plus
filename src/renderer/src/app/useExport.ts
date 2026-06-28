@@ -136,7 +136,7 @@ export function useExport(
 
   // Sign with a PKCS#12 (.p12) credential file.
   const signAndExport = useCallback(
-    (
+    async (
       certBytes: Uint8Array,
       opts: {
         passphrase: string
@@ -147,18 +147,23 @@ export function useExport(
       }
     ): Promise<boolean> => {
       const { includeImage: _omit, ...sign } = opts
+      // When a visible appearance will be drawn, read the cert's identity (subject/issuer) so it can
+      // show the standard "digitally signed by …" block. Best-effort — null falls back to generic.
+      const signer = signaturePlacement
+        ? ((await window.api.p12CertInfo(certBytes, opts.passphrase)) ?? undefined)
+        : undefined
       return flattenAndSign(
         (flat) => window.api.signPdf(flat, certBytes, sign),
         'Signing failed — check the certificate and passphrase',
-        appearanceOf(opts)
+        appearanceOf({ ...opts, signer })
       )
     },
-    [flattenAndSign, appearanceOf]
+    [flattenAndSign, appearanceOf, signaturePlacement]
   )
 
   // Sign with a smart card / HSM via PKCS#11 (the key never leaves the token).
   const signWithCardAndExport = useCallback(
-    (
+    async (
       card: {
         modulePath: string
         pin: string
@@ -169,13 +174,19 @@ export function useExport(
       opts: { reason?: string; name?: string; tsaUrl?: string; includeImage?: boolean }
     ): Promise<boolean> => {
       const { includeImage: _omit, ...sign } = opts
+      // Read the card cert's identity for the appearance WITHOUT the PIN (cert objects are public), so
+      // it doesn't trigger a second prompt. The pin is dropped before this call.
+      const { pin: _pin, ...cardId } = card
+      const signer = signaturePlacement
+        ? ((await window.api.cardCertInfo(cardId)) ?? undefined)
+        : undefined
       return flattenAndSign(
         (flat) => window.api.signPdfWithCard(flat, card, sign),
         'Card signing failed — check the module path, PIN and that the card is inserted',
-        appearanceOf(opts)
+        appearanceOf({ ...opts, signer })
       )
     },
-    [flattenAndSign, appearanceOf]
+    [flattenAndSign, appearanceOf, signaturePlacement]
   )
 
   // Sign with a certificate from the Windows store (the key may be on a smart card; Windows prompts

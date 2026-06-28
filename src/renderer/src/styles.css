@@ -1342,6 +1342,11 @@ body {
   z-index: 30;
   display: flex;
   align-items: center;
+  justify-content: center;
+  /* Stay within the viewport and wrap onto extra rows on a narrow window, instead of overflowing
+     past both edges (the bar is centered, so overflow clips the end tools out of reach). */
+  flex-wrap: wrap;
+  max-width: calc(100vw - 24px);
   gap: 4px;
   padding: 6px;
   border-radius: 14px;
