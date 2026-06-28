@@ -20,14 +20,20 @@ const ID_SIGNING_CERTIFICATE_V2 = '1.2.840.113549.1.9.16.2.47'
 /** Produce an RSASSA-PKCS1-v1_5 (SHA-256) signature over `data`. */
 export type RawSigner = (data: ArrayBuffer) => Promise<ArrayBuffer>
 
-/** Build a detached CMS SignedData over `content`, signing the signed attributes with `sign`. */
+/** Build a detached CMS SignedData over `content`, signing the signed attributes with `sign`.
+ *  `chainDer` are any additional (intermediate/root) certificates to bundle alongside the signer
+ *  cert — included in SignedData.certificates to help validators build the path. */
 export async function buildDetachedCms(
   certDer: ArrayBuffer,
   content: Uint8Array,
   sign: RawSigner,
-  signingTime = new Date()
+  signingTime = new Date(),
+  chainDer: ArrayBuffer[] = []
 ): Promise<ArrayBuffer> {
   const cert = new pkijs.Certificate({ schema: asn1js.fromBER(certDer).result })
+  const chainCerts = chainDer.map(
+    (der) => new pkijs.Certificate({ schema: asn1js.fromBER(der).result })
+  )
   const digest = await webcrypto.subtle.digest('SHA-256', content as unknown as BufferSource)
   // PAdES/CAdES requires signing-certificate-v2: bind the signer cert by its hash so the signature
   // can't be re-attributed to a different certificate. SHA-256 is the DEFAULT ESSCertIDv2
@@ -81,18 +87,20 @@ export async function buildDetachedCms(
     version: 1,
     digestAlgorithms: [sha256Alg()],
     encapContentInfo: new pkijs.EncapsulatedContentInfo({ eContentType: ID_DATA }), // detached
-    certificates: [cert],
+    certificates: [cert, ...chainCerts],
     signerInfos: [signerInfo]
   })
   const ci = new pkijs.ContentInfo({ contentType: ID_SIGNED_DATA, content: sd.toSchema() })
   return ci.toSchema().toBER(false)
 }
 
-/** A @signpdf Signer that detaches CMS over the ByteRange content via a RawSigner. */
+/** A @signpdf Signer that detaches CMS over the ByteRange content via a RawSigner. `chainDer` are
+ *  optional intermediate/root certs to bundle (the .p12 path passes the certs from its bag). */
 export class CmsSigner extends Signer {
   constructor(
     private readonly certDer: ArrayBuffer,
-    private readonly rawSign: RawSigner
+    private readonly rawSign: RawSigner,
+    private readonly chainDer: ArrayBuffer[] = []
   ) {
     super()
   }
@@ -101,7 +109,8 @@ export class CmsSigner extends Signer {
       this.certDer,
       new Uint8Array(pdfBuffer),
       this.rawSign,
-      signingTime
+      signingTime,
+      this.chainDer
     )
     return Buffer.from(cms)
   }
