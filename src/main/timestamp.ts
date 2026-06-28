@@ -7,9 +7,7 @@
 import { webcrypto } from 'node:crypto'
 import * as pkijs from 'pkijs'
 import * as asn1js from 'asn1js'
-
-// pkijs needs a WebCrypto engine or every digest/parse-with-crypto throws.
-pkijs.setEngine('pdfx', new pkijs.CryptoEngine({ name: 'pdfx', crypto: webcrypto as Crypto }))
+import './pkijs-engine'
 
 const ID_AA_TIMESTAMPTOKEN = '1.2.840.113549.1.9.16.2.14'
 const ID_SIGNED_DATA = '1.2.840.113549.1.7.2'

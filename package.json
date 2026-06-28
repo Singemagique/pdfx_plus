@@ -34,6 +34,7 @@
     "@signpdf/signpdf": "^3.3.0",
     "@signpdf/utils": "^3.3.0",
     "asn1js": "3.0.10",
+    "koffi": "^3.0.2",
     "node-forge": "^1.4.0",
     "pkijs": "3.4.0"
   },

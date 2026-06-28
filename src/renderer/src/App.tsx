@@ -41,7 +41,7 @@ export default function App(): React.JSX.Element {
     [docs, editStore.rotations]
   )
 
-  const { exportCollection, exportZip, signAndExport } = useExport(
+  const { exportCollection, exportZip, signAndExport, signWithCardAndExport } = useExport(
     docs,
     editStore.editLayer,
     setBusy,
@@ -169,7 +169,14 @@ export default function App(): React.JSX.Element {
         )}
 
         {signOpen && (
-          <SignDialog busy={busy} onSign={signAndExport} onClose={() => setSignOpen(false)} />
+          <SignDialog
+            busy={busy}
+            onSign={signAndExport}
+            onSignCard={signWithCardAndExport}
+            listTokens={(modulePath) => window.api.listCardTokens(modulePath)}
+            pathForFile={(file) => window.api.getPathForFile(file)}
+            onClose={() => setSignOpen(false)}
+          />
         )}
 
         {toast && <div className="toast">{toast}</div>}

@@ -64,13 +64,11 @@ export function useExport(
     [docs, editLayer, flash, setBusy]
   )
 
-  // Flatten everything (incl. redaction) into a plain PDF, cryptographically sign it with a .p12
-  // credential (in the main process), and save the signed copy. The editable project is untouched.
-  const signAndExport = useCallback(
-    async (
-      certBytes: Uint8Array,
-      opts: { passphrase: string; reason?: string; name?: string; tsaUrl?: string }
-    ): Promise<boolean> => {
+  // Flatten everything (incl. redaction) into a plain PDF, ask `sign` (in the main process) to
+  // cryptographically sign it, and save the signed copy. The editable project is untouched. `sign`
+  // differs only by credential source (.p12 file vs. smart card); flattening + save are shared.
+  const flattenAndSign = useCallback(
+    async (sign: (flat: Uint8Array) => Promise<Uint8Array>, failHint: string): Promise<boolean> => {
       if (docs.length === 0) {
         flash('Nothing to sign')
         return false
@@ -87,19 +85,51 @@ export function useExport(
           ),
           editLayer
         )
-        const signed = await window.api.signPdf(flat, certBytes, opts)
+        const signed = await sign(flat)
         const saved = await window.api.writeFile(path, signed)
         flash(`Signed ${saved}`)
         return true
       } catch (error) {
         console.error('Signing failed', error)
-        flash('Signing failed — check the certificate and passphrase')
+        flash(failHint)
         return false
       } finally {
         setBusy(false)
       }
     },
     [docs, editLayer, flash, setBusy]
+  )
+
+  // Sign with a PKCS#12 (.p12) credential file.
+  const signAndExport = useCallback(
+    (
+      certBytes: Uint8Array,
+      opts: { passphrase: string; reason?: string; name?: string; tsaUrl?: string }
+    ): Promise<boolean> =>
+      flattenAndSign(
+        (flat) => window.api.signPdf(flat, certBytes, opts),
+        'Signing failed — check the certificate and passphrase'
+      ),
+    [flattenAndSign]
+  )
+
+  // Sign with a smart card / HSM via PKCS#11 (the key never leaves the token).
+  const signWithCardAndExport = useCallback(
+    (
+      card: {
+        modulePath: string
+        pin: string
+        slot?: number
+        tokenLabel?: string
+        certLabel?: string
+      },
+      opts: { reason?: string; name?: string; tsaUrl?: string }
+    ): Promise<boolean> =>
+      flattenAndSign(
+        (flat) => window.api.signPdfWithCard(flat, card, opts),
+        'Card signing failed — check the module path, PIN and that the card is inserted'
+      ),
+    [flattenAndSign]
   )
 
   const exportZip = useCallback(async () => {
@@ -134,5 +164,5 @@ export function useExport(
     }
   }, [docs, editLayer, flash, setBusy])
 
-  return { exportCollection, exportZip, signAndExport }
+  return { exportCollection, exportZip, signAndExport, signWithCardAndExport }
 }

@@ -3,7 +3,8 @@ import { basename, isAbsolute } from 'path'
 import { existsSync } from 'fs'
 import { writeFile } from 'fs/promises'
 import { markupToPdf } from './markup'
-import { signPdf } from './sign'
+import { signPdf, signPdfWithCard } from './sign'
+import { listTokens } from './pkcs11'
 import { OpenedFile, IMPORTABLE, readFiles, expandDropPaths } from './file-intake'
 import { clipboardFilePaths } from './clipboard'
 import { readResource } from './resource'
@@ -110,6 +111,78 @@ export function registerIpc(getPending: () => string[], clearPending: () => void
         location: o.location != null ? String(o.location) : undefined,
         tsaUrl: o.tsaUrl ? String(o.tsaUrl) : undefined
       })
+    }
+  )
+
+  // Validate a renderer-supplied PKCS#11 module path before handing it to koffi.load (which
+  // dlopen/LoadLibrary's it into the main process). The renderer is trusted, but mirror the
+  // write-file guards — absolute path, no null-byte truncation, and a native-library extension.
+  const validModulePath = (p: unknown): string => {
+    if (typeof p !== 'string' || !p || p.includes('\0') || !isAbsolute(p)) {
+      throw new Error('A valid absolute PKCS#11 module path is required')
+    }
+    if (!/\.(dll|so|dylib)$/i.test(p)) {
+      throw new Error('PKCS#11 module must be a .dll, .so or .dylib')
+    }
+    return p
+  }
+
+  // Enumerate the tokens (cards) currently present in a PKCS#11 module, for the smart-card signer.
+  ipcMain.handle(
+    'pdfx:pkcs11-list-tokens',
+    async (
+      _event,
+      modulePath: unknown
+    ): Promise<
+      Array<{ slot: number; label: string; manufacturer: string; model: string; serial: string }>
+    > => {
+      return listTokens(validModulePath(modulePath))
+    }
+  )
+
+  ipcMain.handle(
+    'pdfx:sign-pdf-card',
+    async (
+      _event,
+      pdf: Uint8Array,
+      pkcs11: {
+        modulePath?: string
+        pin?: string
+        slot?: number
+        tokenLabel?: string
+        certLabel?: string
+      },
+      opts: { reason?: string; name?: string; location?: string; tsaUrl?: string }
+    ): Promise<Uint8Array> => {
+      if (!ArrayBuffer.isView(pdf) || pdf.byteLength > MAX_WRITE_BYTES) {
+        throw new Error('sign-pdf-card: invalid payload')
+      }
+      const c = pkcs11 ?? {}
+      const o = opts ?? {}
+      // Only accept a valid non-negative 32-bit integer slot; anything else falls back to auto-pick.
+      const slot =
+        typeof c.slot === 'number' &&
+        Number.isInteger(c.slot) &&
+        c.slot >= 0 &&
+        c.slot <= 0xffffffff
+          ? c.slot
+          : undefined
+      return signPdfWithCard(
+        pdf,
+        {
+          modulePath: validModulePath(c.modulePath),
+          pin: String(c.pin ?? ''),
+          slot,
+          tokenLabel: c.tokenLabel != null ? String(c.tokenLabel) : undefined,
+          certLabel: c.certLabel != null ? String(c.certLabel) : undefined
+        },
+        {
+          reason: o.reason != null ? String(o.reason) : undefined,
+          name: o.name != null ? String(o.name) : undefined,
+          location: o.location != null ? String(o.location) : undefined,
+          tsaUrl: o.tsaUrl ? String(o.tsaUrl) : undefined
+        }
+      )
     }
   )
 

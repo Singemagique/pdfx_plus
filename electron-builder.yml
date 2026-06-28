@@ -22,6 +22,11 @@ files:
   - 'native/build/Release/*.node'
 asarUnpack:
   - native/build/Release/*.node
+  # Native addons (e.g. koffi's prebuilt PKCS#11 FFI binding) can't be require()d from inside an
+  # asar, so they must live unpacked on disk.
+  - '**/*.node'
+  - node_modules/koffi/**
+  - node_modules/@koromix/**
 fileAssociations:
   - ext: pdfx
     name: PDFX Collection

@@ -1036,6 +1036,46 @@ body {
   gap: 8px;
   margin-top: 6px;
 }
+.sign-modes {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 2px;
+}
+.sign-mode {
+  flex: 1;
+  padding: 7px 10px;
+  border: 1px solid rgba(140, 150, 170, 0.3);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.03);
+  color: inherit;
+  cursor: pointer;
+  font-size: 13px;
+}
+.sign-mode.active {
+  border-color: #74a9ff;
+  background: rgba(120, 169, 255, 0.12);
+}
+.sign-module-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.sign-module-row .sign-input {
+  flex: 1;
+  min-width: 0;
+}
+.sign-module-hint {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.5;
+  color: rgba(160, 168, 184, 0.85);
+  word-break: break-word;
+}
+.sign-card-error {
+  margin: 0;
+  font-size: 12px;
+  color: #f87171;
+}
 .btn.glass.primary {
   background: #3b82f6;
   color: #fff;
