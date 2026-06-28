@@ -116,13 +116,19 @@ export function useExport(
 
   // Build the visible-appearance options from the dialog opts (null when signing invisibly).
   const appearanceOf = useCallback(
-    (opts: { name?: string; reason?: string; includeImage?: boolean }): AppearanceOptions | null =>
+    (opts: {
+      name?: string
+      reason?: string
+      includeImage?: boolean
+      signer?: { subject: string; issuer: string }
+    }): AppearanceOptions | null =>
       signaturePlacement
         ? {
             name: opts.name,
             reason: opts.reason,
             date: new Date(),
-            image: opts.includeImage ? savedSignature : null
+            image: opts.includeImage ? savedSignature : null,
+            signer: opts.signer
           }
         : null,
     [signaturePlacement, savedSignature]
@@ -177,9 +183,15 @@ export function useExport(
   const signWithWindowsCertAndExport = useCallback(
     (
       thumbprint: string,
-      opts: { reason?: string; name?: string; tsaUrl?: string; includeImage?: boolean }
+      opts: {
+        reason?: string
+        name?: string
+        tsaUrl?: string
+        includeImage?: boolean
+        signer?: { subject: string; issuer: string }
+      }
     ): Promise<boolean> => {
-      const { includeImage: _omit, ...sign } = opts
+      const { includeImage: _omit, signer: _sig, ...sign } = opts
       return flattenAndSign(
         (flat) => window.api.signPdfWithWindowsCert(flat, thumbprint, sign),
         'Signing failed — the card may have been removed or the PIN cancelled',

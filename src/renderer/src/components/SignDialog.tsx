@@ -23,6 +23,8 @@ interface SignAppearanceOpts {
   tsaUrl?: string
   /** Draw the saved hand-drawn signature image inside the visible appearance. */
   includeImage?: boolean
+  /** The signing certificate's identity, for the "digitally signed by …" block (Windows path). */
+  signer?: { subject: string; issuer: string }
 }
 
 interface SignDialogProps {
@@ -215,7 +217,11 @@ export function SignDialog({
     let ok = false
     if (mode === 'wincert') {
       if (!selectedThumb) return
-      ok = await onSignWindowsCert(selectedThumb, shared)
+      const c = winCerts?.find((w) => w.thumbprint === selectedThumb)
+      ok = await onSignWindowsCert(selectedThumb, {
+        ...shared,
+        signer: c ? { subject: c.subject, issuer: c.issuer } : undefined
+      })
     } else if (mode === 'file') {
       if (!cert) return
       ok = await onSign(cert.bytes, { passphrase, ...shared })

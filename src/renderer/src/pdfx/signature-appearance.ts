@@ -12,11 +12,43 @@ export interface AppearanceOptions {
   date: Date
   /** PNG bytes of the user's drawn signature, drawn in the appearance when provided. */
   image?: Uint8Array | null
+  /** The signing certificate's identity — drives the standard "digitally signed by …" block. */
+  signer?: { subject: string; issuer: string }
 }
 
 const pad2 = (n: number): string => String(n).padStart(2, '0')
 function formatDate(d: Date): string {
-  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`
+  // PDF/Adobe-style timestamp, e.g. 2026.06.28 14:30:15.
+  return `${d.getFullYear()}.${pad2(d.getMonth() + 1)}.${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`
+}
+
+/** Common Name out of an X.500 distinguished name, falling back to the whole string. */
+const commonName = (dn: string): string => /CN=([^,]+)/i.exec(dn)?.[1].trim() ?? dn.trim()
+/** The DoD EDIPI (10-digit ID) trailing a CAC CN like LAST.FIRST.MIDDLE.1234567890. */
+const dodId = (cn: string): string | undefined => /(\d{9,16})\s*$/.exec(cn)?.[1]
+
+/** The lines of the appearance text. With a signing cert this is the standard identity block (name,
+ *  DoD ID, issuer, timestamp); otherwise a generic "Digitally signed" block. */
+function appearanceLines(opts: AppearanceOptions): string[] {
+  const reason = opts.reason?.trim()
+  if (opts.signer?.subject) {
+    const cn = commonName(opts.signer.subject)
+    const id = dodId(cn)
+    const issuer = commonName(opts.signer.issuer)
+    return [
+      `Digitally signed by ${cn}`,
+      ...(id ? [`DoD ID: ${id}`] : []),
+      ...(issuer ? [`Issuer: ${issuer}`] : []),
+      `Date: ${formatDate(opts.date)}`,
+      ...(reason ? [`Reason: ${reason}`] : [])
+    ]
+  }
+  return [
+    ...(opts.name?.trim() ? [opts.name.trim()] : []),
+    'Digitally signed',
+    `Date: ${formatDate(opts.date)}`,
+    ...(reason ? [`Reason: ${reason}`] : [])
+  ]
 }
 
 // Width/height ratio of a PNG, for fitting the image without distortion (falls back to a wide box).
@@ -111,12 +143,7 @@ export async function withSignatureAppearance(
   }
 
   // Metadata text, auto-sized to fit the text box (drawTextOverlay lays lines from the box top down).
-  const lines = [
-    ...(opts.name?.trim() ? [opts.name.trim()] : []),
-    'Digitally signed',
-    formatDate(opts.date),
-    ...(opts.reason?.trim() ? [`Reason: ${opts.reason.trim()}`] : [])
-  ]
+  const lines = appearanceLines(opts)
   const maxLen = Math.max(...lines.map((l) => l.length), 1)
   const sizeByHeight = textBoxH / lines.length / 1.25
   const sizeByWidth = innerW / (maxLen * 0.52)

@@ -193,8 +193,31 @@ export function EditTools(): React.JSX.Element {
     await placeImage(bytes, file.type === 'image/jpeg' ? 'image/jpeg' : 'image/png')
   }
 
+  // Place where the (certificate) signature's visible appearance goes — showing the user's drawn
+  // signature. This links the drawn signature to a real cryptographic signature: the appearance is
+  // rendered at this spot when the user signs with their certificate (toolbar "Sign"). The marker is
+  // movable with the Signature tool. (Needs a drawn signature first — onSign opens the pad if absent.)
+  const placeDrawnSignature = (): void => {
+    if (!currentPage) return
+    const w = Math.min(240, currentPage.width * 0.55)
+    const h = Math.min(74, currentPage.height * 0.14)
+    setSignaturePlacement({
+      pageKey: currentPage.pageKey,
+      geom: {
+        x: currentPage.width * 0.1,
+        y: currentPage.height * 0.1,
+        w,
+        h,
+        rotation: 0,
+        opacity: 1
+      },
+      label: 'drawn signature'
+    })
+    setTool('signature') // show the marker + let the user drag a new box to re-place it
+  }
+
   const onSign = (): void => {
-    if (savedSignature) void placeImage(savedSignature, 'image/png', 0.3)
+    if (savedSignature) placeDrawnSignature()
     else setPadOpen(true)
   }
 
@@ -257,7 +280,11 @@ export function EditTools(): React.JSX.Element {
         <button
           className="tool-btn"
           onClick={onSign}
-          title={savedSignature ? 'Stamp your saved signature' : 'Draw a signature'}
+          title={
+            savedSignature
+              ? 'Place your drawn signature (then “Sign” on the toolbar to certify it)'
+              : 'Draw a signature to use with certificate signing'
+          }
         >
           <svg
             width="16"
@@ -514,7 +541,7 @@ export function EditTools(): React.JSX.Element {
           onSave={(bytes) => {
             setSavedSignature(bytes)
             setPadOpen(false)
-            void placeImage(bytes, 'image/png', 0.3)
+            placeDrawnSignature()
           }}
           onClose={() => setPadOpen(false)}
         />

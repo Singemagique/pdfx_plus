@@ -30,7 +30,7 @@ describe('withSignatureAppearance', () => {
     const text = added.find((o) => o.type === 'text') as Extract<Overlay, { type: 'text' }>
     expect(text.text).toContain('Ada Lovelace')
     expect(text.text).toContain('Digitally signed')
-    expect(text.text).toContain('2026-06-27 14:30')
+    expect(text.text).toContain('Date: 2026.06.27 14:30')
     expect(text.text).toContain('Reason: Approval')
     // All appearance overlays sit within the placement rect.
     for (const o of added) {
@@ -40,6 +40,25 @@ describe('withSignatureAppearance', () => {
     // Original layer is not mutated.
     expect(base.overlays.size).toBe(0)
     expect(base.attachments.size).toBe(0)
+  })
+
+  it('renders the certificate identity (name, DoD ID, issuer, date) when a signer is given', async () => {
+    const base = baseLayer()
+    const out = await withSignatureAppearance(base, placement, {
+      date: new Date(2026, 5, 28, 9, 5, 3),
+      signer: {
+        subject: 'CN=JARA.ADAM.1290104722, OU=USA, OU=PKI, OU=DoD, O=U.S. Government, C=US',
+        issuer: 'CN=DOD ID CA-59, OU=PKI, OU=DoD, O=U.S. Government, C=US'
+      }
+    })
+    const text = (out.overlays.get('doc#0') ?? []).find((o) => o.type === 'text') as Extract<
+      Overlay,
+      { type: 'text' }
+    >
+    expect(text.text).toContain('Digitally signed by JARA.ADAM.1290104722')
+    expect(text.text).toContain('DoD ID: 1290104722')
+    expect(text.text).toContain('Issuer: DOD ID CA-59')
+    expect(text.text).toContain('Date: 2026.06.28 09:05:03')
   })
 
   it('adds an image overlay + attachment when an image is supplied', async () => {
