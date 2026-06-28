@@ -1,6 +1,11 @@
 import {
   PDFDocument,
+  PDFDict,
+  PDFHexString,
+  PDFName,
   PDFPage,
+  PDFRef,
+  PDFString,
   concatTransformationMatrix,
   degrees,
   popGraphicsState,
@@ -104,6 +109,47 @@ function intrinsicMatrix(
   }
 }
 
+/** Fully-qualified AcroForm field name of a widget annotation (walks the /Parent chain). */
+function widgetFieldName(ctx: PDFDocument['context'], dict: PDFDict): string | undefined {
+  const parts: string[] = []
+  let d: PDFDict | undefined = dict
+  for (let guard = 0; d && guard < 32; guard++) {
+    const t = d.get(PDFName.of('T'))
+    if (t instanceof PDFString || t instanceof PDFHexString) parts.unshift(t.decodeText())
+    const parent = d.get(PDFName.of('Parent'))
+    d =
+      parent instanceof PDFRef
+        ? ctx.lookupMaybe(parent, PDFDict)
+        : parent instanceof PDFDict
+          ? parent
+          : undefined
+  }
+  return parts.length ? parts.join('.') : undefined
+}
+
+/**
+ * Remove the interactive widget annotations of fields we've FILLED (painted) so the original
+ * widget appearance (its old value) doesn't double with the flattened value — and a cleared field
+ * doesn't keep showing its old value. Untouched fields keep their widgets (and pre-filled values).
+ */
+function removeFilledWidgets(page: PDFPage, filled: Set<string>): void {
+  const annots = page.node.Annots()
+  if (!annots) return
+  const ctx = page.doc.context
+  const keep: Array<ReturnType<typeof annots.get>> = []
+  for (let i = 0; i < annots.size(); i++) {
+    const ref = annots.get(i)
+    const dict = ref instanceof PDFRef ? ctx.lookupMaybe(ref, PDFDict) : ref instanceof PDFDict ? ref : undefined // prettier-ignore
+    const isWidget = !!dict && dict.get(PDFName.of('Subtype')) === PDFName.of('Widget')
+    if (isWidget) {
+      const name = widgetFieldName(ctx, dict)
+      if (name && filled.has(name)) continue // drop this widget
+    }
+    keep.push(ref)
+  }
+  page.node.set(PDFName.of('Annots'), ctx.obj(keep))
+}
+
 async function bakePage(
   page: PDFPage,
   exportPage: ExportPage,
@@ -138,6 +184,16 @@ async function bakePage(
     if (m) page.pushOperators(pushGraphicsState(), concatTransformationMatrix(...m))
     await flattenPageOverlays(page, sorted, res)
     if (m) page.pushOperators(popGraphicsState())
+  }
+  // Form fill paints the value as page content; drop the matching interactive widget so its own
+  // appearance (the original value) doesn't render on top of — and double with — the painted one.
+  if (list) {
+    const filled = new Set(
+      list
+        .filter((o) => o.type === 'formValue')
+        .map((o) => (o as Extract<Overlay, { type: 'formValue' }>).field)
+    )
+    if (filled.size) removeFilledWidgets(page, filled)
   }
 }
 

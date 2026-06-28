@@ -335,6 +335,37 @@ describe('formValue flatten', () => {
     const unchecked = await flattenWith(formValue(makePageKey('a', 0), 'agree', false))
     expect(checked.length).toBeGreaterThan(unchecked.length) // the X adds stroke operators
   })
+
+  it('removes the interactive widget of a filled field so its value does not double on export', async () => {
+    // A source whose text field already has a value (rendered by its widget appearance).
+    const srcDoc = await PDFDocument.create()
+    const srcPage = srcDoc.addPage([200, 200])
+    const tf = srcDoc.getForm().createTextField('fullName')
+    tf.setText('OLD VALUE')
+    tf.addToPage(srcPage, { x: 20, y: 100, width: 140, height: 18 })
+    const src = await srcDoc.save()
+    const pages = [{ bytes: src, sourceKey: 'a', pageIndex: 0 }]
+    const widgets = async (out: Uint8Array): Promise<number> => {
+      const pdf = await PDFDocument.load(out)
+      const annots = pdf.getPage(0).node.Annots()
+      let n = 0
+      for (let i = 0; annots && i < annots.size(); i++) {
+        const d = pdf.context.lookupMaybe(annots.get(i), PDFDict)
+        if (d && d.get(PDFName.of('Subtype')) === PDFName.of('Widget')) n++
+      }
+      return n
+    }
+    // Untouched: the widget survives the copy (its original value still shows).
+    expect(await widgets(await buildPdf(pages))).toBe(1)
+    // Filled: the widget is dropped — only the painted value remains, no doubling.
+    const editLayer: EditLayer = {
+      overlays: new Map([
+        [makePageKey('a', 0), [formValue(makePageKey('a', 0), 'fullName', 'NEW')]]
+      ]),
+      attachments: new Map()
+    }
+    expect(await widgets(await buildPdf(pages, editLayer))).toBe(0)
+  })
 })
 
 describe('format helpers', () => {

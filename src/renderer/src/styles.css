@@ -1231,7 +1231,9 @@ body {
 .ov-form-input {
   padding: 0 3px;
   border: 1px solid rgba(116, 169, 255, 0.85);
-  background: rgba(116, 169, 255, 0.12);
+  /* Opaque so the field's OWN value (rendered by pdf.js underneath) doesn't show through and
+     double with what we draw on top. */
+  background: #eef3fc;
   border-radius: 2px;
   color: #14141a;
   font-family: Helvetica, Arial, sans-serif;
@@ -1241,11 +1243,12 @@ body {
 }
 .ov-form-input:focus {
   border-color: #3b82f6;
-  background: rgba(116, 169, 255, 0.2);
+  background: #e3ecfb;
 }
 .ov-form-check {
   cursor: pointer;
   accent-color: #3b82f6;
+  background: #eef3fc; /* opaque — cover the widget's own check beneath */
 }
 /* Radio option: a circle that fills when chosen (mirrors the flattened dot). */
 .ov-form-radio {
@@ -1254,13 +1257,12 @@ body {
   box-sizing: border-box;
   padding: 0;
   border: 1px solid rgba(116, 169, 255, 0.85);
-  background: rgba(116, 169, 255, 0.12);
+  background: #eef3fc; /* opaque — cover the widget's own dot beneath */
   border-radius: 50%;
   cursor: pointer;
 }
 .ov-form-radio.checked {
-  background:
-    radial-gradient(circle at center, #14141a 0 38%, transparent 40%), rgba(116, 169, 255, 0.2);
+  background: radial-gradient(circle at center, #14141a 0 38%, transparent 40%), #e3ecfb;
 }
 /* Dropdown / list box. Opaque fill so the field's own rendered options don't show through a
    multi-row list box. A list box (size>1) anchors its top to the field. */
