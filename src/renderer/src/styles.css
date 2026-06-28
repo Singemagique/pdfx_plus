@@ -1059,6 +1059,17 @@ body {
   cursor: crosshair;
 }
 
+/* Crop preview on a collection thumbnail (dims the cropped-away area). */
+.cell-crop-mask {
+  position: absolute;
+  top: 0;
+  left: 0;
+  pointer-events: none;
+}
+.cell-crop-mask path {
+  fill: rgba(15, 17, 21, 0.5);
+}
+
 /* Crop preview: dim the margins outside the kept region, outline the crop rect. */
 .ov-crop-mask {
   position: absolute;
