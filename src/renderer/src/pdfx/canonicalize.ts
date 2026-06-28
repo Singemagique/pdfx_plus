@@ -8,8 +8,9 @@
 //
 // Scope: covers geometry + content-stream tokens (the load-bearing visible content for PDFx's copied
 // pages). Resource-program hashing (re-embedded fonts/images) and exotic content (Type3, tiling
-// patterns, OCG) are deferred per the PRD's advisory-first rollout; this ships advisory (warning
-// only) and is promoted to a hard gate once the determinism tests are trusted in CI.
+// patterns, OCG) remain out of scope, so tampering confined to those is not yet detected. This now
+// drives a HARD tamper gate on open (compareIntegrity): a definite mismatch blocks auto-loading the
+// saved edits and prompts the user, rather than only warning.
 import { PDFArray, PDFDocument, PDFName, PDFRawStream, PDFStream } from 'pdf-lib'
 import { unzlibSync } from 'fflate'
 
@@ -192,4 +193,34 @@ export async function computeIntegrity(doc: PDFDocument): Promise<IntegrityRecor
 export async function integrityOf(bytes: Uint8Array): Promise<IntegrityRecord> {
   const doc = await PDFDocument.load(bytes, { ignoreEncryption: true, updateMetadata: false })
   return computeIntegrity(doc)
+}
+
+export interface IntegrityComparison {
+  /** True only when the content provably differs from what the .pdfx recorded (a tamper signal). */
+  tampered: boolean
+  /** 1-based page numbers whose hash changed (empty when only the whole-doc hash differs). */
+  changedPages: number[]
+}
+
+/**
+ * Compare a freshly recomputed record (`actual`) against the one a .pdfx embedded (`record`).
+ * `tampered` is true ONLY when the algorithm matches AND the content hash differs — an absent record
+ * or an unknown algorithm cannot prove tampering, so it is treated as clean. The caller (the import
+ * gate) therefore blocks only on a definite mismatch and never on a can't-decide.
+ */
+export function compareIntegrity(
+  actual: IntegrityRecord,
+  record: IntegrityRecord | undefined
+): IntegrityComparison {
+  if (record?.canonAlg !== CANON_ALG) return { tampered: false, changedPages: [] }
+  if (actual.flattenedSha256 === record.flattenedSha256)
+    return { tampered: false, changedPages: [] }
+  // Past here the whole-doc hash already proves a mismatch → tampered. Localize to pages defensively:
+  // a malformed/short pageHashes must still report tampered, never throw (which would fail the gate
+  // open: checkIntegrity swallows exceptions to CLEAN).
+  const recHashes = Array.isArray(record.pageHashes) ? record.pageHashes : []
+  const changedPages = actual.pageHashes
+    .map((h, i) => (h !== recHashes[i] ? i + 1 : 0))
+    .filter((n) => n > 0)
+  return { tampered: true, changedPages }
 }

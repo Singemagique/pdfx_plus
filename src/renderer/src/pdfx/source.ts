@@ -2,7 +2,7 @@ import { getDocument } from 'pdfjs-dist'
 import { partitionPages, readManifest, stripExtension } from './format'
 import { findConverter } from './convert'
 import { deserializeMirror, type ImportedMirror } from './mirror'
-import { CANON_ALG, integrityOf } from './canonicalize'
+import { CANON_ALG, compareIntegrity, integrityOf, type IntegrityComparison } from './canonicalize'
 import type { DocEntry, PageEntry, PdfSource } from '../types'
 
 interface PageSize {
@@ -57,27 +57,22 @@ export function pagesFromSource(
 export interface ImportResult {
   docs: DocEntry[]
   mirror: ImportedMirror | null
-  /** Advisory message if the pdfx-canon/1 tamper check failed (the content was edited externally). */
-  integrityWarning?: string
+  /** pdfx-canon/1 tamper check; when `tampered`, the importer gates loading the (stale) edit mirror. */
+  integrity: IntegrityComparison
 }
 
-/** Recompute pdfx-canon/1 over the bytes and compare to the manifest record (advisory; PRD §4.6). */
+const CLEAN: IntegrityComparison = { tampered: false, changedPages: [] }
+
+/** Recompute pdfx-canon/1 over the bytes and compare to the manifest record (PRD §4.6 tamper gate). */
 async function checkIntegrity(
   bytes: Uint8Array,
   record?: { canonAlg: string; flattenedSha256: string; pageHashes: string[] }
-): Promise<string | undefined> {
-  if (record?.canonAlg !== CANON_ALG) return undefined // unknown alg → never enforced (advisory)
+): Promise<IntegrityComparison> {
+  if (record?.canonAlg !== CANON_ALG) return CLEAN // unknown/absent alg → can't prove tampering
   try {
-    const actual = await integrityOf(bytes)
-    if (actual.flattenedSha256 === record.flattenedSha256) return undefined
-    const changed = actual.pageHashes
-      .map((h, i) => (h !== record.pageHashes[i] ? i + 1 : 0))
-      .filter((n) => n > 0)
-    return changed.length
-      ? `Edited externally — page${changed.length > 1 ? 's' : ''} ${changed.join(', ')} changed since these edits were saved; they may be stale.`
-      : 'This .pdfx failed its integrity check; the edits may be stale.'
+    return compareIntegrity(await integrityOf(bytes), record)
   } catch {
-    return undefined // recompute failed → stay silent (advisory)
+    return CLEAN // recompute failed → can't prove tampering, so don't block
   }
 }
 
@@ -94,7 +89,7 @@ export async function importIntoDocs(filename: string, bytes: Uint8Array): Promi
   return {
     docs,
     mirror: manifest ? deserializeMirror(manifest, docs) : null,
-    integrityWarning: await checkIntegrity(bytes, manifest?.integrity)
+    integrity: await checkIntegrity(bytes, manifest?.integrity)
   }
 }
 
