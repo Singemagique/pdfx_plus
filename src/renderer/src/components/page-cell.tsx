@@ -2,9 +2,38 @@ import { memo } from 'react'
 import type { PageEntry } from '../types'
 import { pageCellWidth } from '../canvas/layout'
 import { useEdits } from '../edit/EditProvider'
-import { makePageKey } from '../edit/model'
+import { makePageKey, type CropBox } from '../edit/model'
 import { PageView } from './PageView'
 import { buildPageDragImage } from './page-drag-image'
+
+/** Dim the cropped-away area of a thumbnail (crop is in unrotated page points, origin bottom-left;
+ *  the box w×h is the unrotated PageView size, so this rotates with the page rotor). */
+function CropMask({
+  crop,
+  page,
+  w,
+  h
+}: {
+  crop: CropBox
+  page: PageEntry
+  w: number
+  h: number
+}): React.JSX.Element {
+  const sx = w / page.width
+  const sy = h / page.height
+  const left = crop.x * sx
+  const top = (page.height - crop.y - crop.h) * sy
+  const cw = crop.w * sx
+  const ch = crop.h * sy
+  return (
+    <svg className="cell-crop-mask" width={w} height={h}>
+      <path
+        d={`M0 0H${w}V${h}H0Z M${left} ${top}H${left + cw}V${top + ch}H${left}Z`}
+        fillRule="evenodd"
+      />
+    </svg>
+  )
+}
 
 interface PageCellProps {
   docId: string
@@ -37,10 +66,12 @@ function PageCellImpl({
   onPageDragStart,
   onPageDragEnd
 }: PageCellProps): React.JSX.Element {
-  const { rotations } = useEdits()
-  const rot = rotations.get(makePageKey(page.source.id, page.pageIndex)) ?? 0
+  const { rotations, crops } = useEdits()
+  const pageKey = makePageKey(page.source.id, page.pageIndex)
+  const rot = rotations.get(pageKey) ?? 0
   const rotated = rot === 90 || rot === 270
   const cellW = pageCellWidth(page, rotations)
+  const crop = crops.get(pageKey)
   return (
     <div
       data-page-id={page.id}
@@ -100,15 +131,26 @@ function PageCellImpl({
             naturalHeight={page.height}
             version={renderVersion}
           />
+          {crop && (
+            <CropMask
+              crop={crop}
+              page={page}
+              w={rotated ? pageHeight : cellW}
+              h={rotated ? cellW : pageHeight}
+            />
+          )}
         </div>
       ) : (
-        <PageView
-          pdf={page.source.pdf}
-          pageNumber={page.pageIndex + 1}
-          naturalWidth={page.width}
-          naturalHeight={page.height}
-          version={renderVersion}
-        />
+        <>
+          <PageView
+            pdf={page.source.pdf}
+            pageNumber={page.pageIndex + 1}
+            naturalWidth={page.width}
+            naturalHeight={page.height}
+            version={renderVersion}
+          />
+          {crop && <CropMask crop={crop} page={page} w={cellW} h={pageHeight} />}
+        </>
       )}
       <span className="page-number">{visibleNumber}</span>
     </div>
