@@ -1,7 +1,13 @@
 import { describe, expect, it } from 'vitest'
 import { PDFDocument, StandardFonts } from 'pdf-lib'
 
-import { CANON_ALG, canonicalNumber, computeIntegrity, integrityOf } from './canonicalize'
+import {
+  CANON_ALG,
+  canonicalNumber,
+  compareIntegrity,
+  computeIntegrity,
+  integrityOf
+} from './canonicalize'
 
 async function makePdf(body: string): Promise<Uint8Array> {
   const doc = await PDFDocument.create()
@@ -68,5 +74,49 @@ describe('pdfx-canon/1 integrity', () => {
     expect(rec.canonAlg).toBe(CANON_ALG)
     expect(rec.pageHashes).toHaveLength(2)
     expect(rec.flattenedSha256).toMatch(/^[0-9a-f]{64}$/)
+  })
+})
+
+describe('compareIntegrity (the import tamper gate)', () => {
+  it('is not tampered when the recomputed record matches the embedded one', async () => {
+    const rec = await integrityOf(await makePdf('Same content'))
+    expect(compareIntegrity(rec, rec)).toEqual({ tampered: false, changedPages: [] })
+  })
+
+  it('flags tampering and lists every changed page on a content mismatch', async () => {
+    const original = await integrityOf(await makePdf('Original wording'))
+    const edited = await integrityOf(await makePdf('Tampered wording'))
+    const cmp = compareIntegrity(edited, original)
+    expect(cmp.tampered).toBe(true)
+    expect(cmp.changedPages).toEqual([1, 2]) // both pages carry the changed text
+  })
+
+  it('localizes the mismatch to only the page(s) that differ', async () => {
+    const actual = await integrityOf(await makePdf('Body'))
+    // A record whose page-1 hash still matches but page-2 hash (and the whole-doc hash) does not.
+    const record = {
+      ...actual,
+      flattenedSha256: 'deadbeef',
+      pageHashes: [actual.pageHashes[0], 'changed']
+    }
+    expect(compareIntegrity(actual, record)).toEqual({ tampered: true, changedPages: [2] })
+  })
+
+  it('treats an absent record or unknown algorithm as clean (cannot prove tampering)', async () => {
+    const actual = await integrityOf(await makePdf('Body'))
+    expect(compareIntegrity(actual, undefined)).toEqual({ tampered: false, changedPages: [] })
+    expect(
+      compareIntegrity(actual, { ...actual, canonAlg: 'pdfx-canon/2', flattenedSha256: 'x' })
+    ).toEqual({ tampered: false, changedPages: [] })
+  })
+
+  it('still reports tampered (never throws → fails open) when pageHashes is malformed', async () => {
+    const actual = await integrityOf(await makePdf('Body'))
+    // Right alg + a definite whole-doc mismatch, but a corrupt pageHashes: must NOT crash to clean.
+    const malformed = { canonAlg: CANON_ALG, flattenedSha256: 'wrong' } as unknown as Parameters<
+      typeof compareIntegrity
+    >[1]
+    expect(() => compareIntegrity(actual, malformed)).not.toThrow()
+    expect(compareIntegrity(actual, malformed).tampered).toBe(true)
   })
 })

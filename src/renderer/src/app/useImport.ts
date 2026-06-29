@@ -28,10 +28,25 @@ export function useImport(
           const data = conv
             ? await conv.toPdf(file.name, file.data, undefined, file.path)
             : file.data
-          const { docs: entries, mirror, integrityWarning } = await importIntoDocs(name, data)
+          const { docs: entries, mirror, integrity } = await importIntoDocs(name, data)
+          // Tamper gate: if the .pdfx content no longer matches the hash its edits were saved
+          // against, block auto-loading those (possibly stale/forged) edits — but let the user
+          // explicitly recover them or cancel the open. With no mirror there's nothing to gate.
+          let loadMirror = mirror != null
+          if (integrity.tampered && mirror) {
+            const changed = integrity.changedPages
+            const detail =
+              changed.length === 0
+                ? 'The document content changed since these edits were saved.'
+                : changed.length > 10
+                  ? `${changed.length} pages changed since these edits were saved.`
+                  : `Page${changed.length > 1 ? 's' : ''} ${changed.join(', ')} changed since these edits were saved.`
+            const choice = await window.api.confirmIntegrity(detail)
+            if (choice === 2) continue // Cancel → don't open this file at all
+            loadMirror = choice === 1 // Load edits anyway; otherwise open without the edits
+          }
           setDocs((prev) => [...prev, ...dedupeNames(prev, entries)])
-          if (mirror) loadEditState(mirror)
-          if (integrityWarning) flash(integrityWarning)
+          if (loadMirror && mirror) loadEditState(mirror)
         } catch (error) {
           console.error(`Failed to import ${file.name}`, error)
           failed.push(file.name)

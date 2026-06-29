@@ -67,6 +67,10 @@ const api = {
   rendererReady: (): Promise<void> => ipcRenderer.invoke('pdfx:renderer-ready'),
   chooseSavePath: (defaultName: string, filter?: SaveFilter): Promise<string | null> =>
     ipcRenderer.invoke('pdfx:choose-save-path', defaultName, filter),
+  // Tamper-gate prompt for a .pdfx whose content no longer matches its saved edits. Resolves to the
+  // chosen button: 0 = open without edits, 1 = load edits anyway, 2 = cancel.
+  confirmIntegrity: (detail: string): Promise<number> =>
+    ipcRenderer.invoke('pdfx:confirm-integrity', detail),
   readClipboardImage: (): Promise<Uint8Array | null> =>
     ipcRenderer.invoke('pdfx:read-clipboard-image'),
   readClipboardFiles: (): Promise<OpenedFile[]> => ipcRenderer.invoke('pdfx:read-clipboard-files'),

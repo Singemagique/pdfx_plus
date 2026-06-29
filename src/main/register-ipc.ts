@@ -36,6 +36,29 @@ export function registerIpc(getPending: () => string[], clearPending: () => void
     }
   )
 
+  // The .pdfx tamper gate: when a file's content no longer matches the hash its saved edits were
+  // recorded against, ask the user (a blocking, modal native dialog) whether to load those possibly
+  // stale/forged edits. Returns the chosen button index: 0 = open without edits, 1 = load edits
+  // anyway, 2 = cancel. No window → 0 (the safe default: open the clean pages, skip the edits).
+  ipcMain.handle('pdfx:confirm-integrity', async (_event, detail: unknown): Promise<number> => {
+    const mainWindow = getMainWindow()
+    if (!mainWindow) return 0
+    // Bound the renderer-supplied detail (parity with the other IPC guards) so a crafted .pdfx can't
+    // feed a huge string into the native dialog.
+    const text = detail != null ? String(detail).slice(0, 2000) : ''
+    const { response } = await dialog.showMessageBox(mainWindow, {
+      type: 'warning',
+      title: 'Integrity check failed',
+      message: 'This .pdfx was modified outside PDFx since its saved edits were created.',
+      detail: `${text ? text + '\n\n' : ''}Loading those edits may misrepresent the document.`,
+      buttons: ['Open without edits', 'Load edits anyway', 'Cancel'],
+      defaultId: 0,
+      cancelId: 2,
+      noLink: true
+    })
+    return response
+  })
+
   ipcMain.handle('pdfx:read-clipboard-image', () => {
     const image = clipboard.readImage()
     return image.isEmpty() ? null : new Uint8Array(image.toPNG())
