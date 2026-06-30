@@ -118,6 +118,7 @@ export function registerIpc(getPending: () => string[], clearPending: () => void
         name?: string
         location?: string
         tsaUrl?: string
+        ltv?: boolean
       }
     ): Promise<Uint8Array> => {
       if (!ArrayBuffer.isView(pdf) || !ArrayBuffer.isView(p12)) {
@@ -134,7 +135,8 @@ export function registerIpc(getPending: () => string[], clearPending: () => void
         reason: o.reason != null ? String(o.reason) : undefined,
         name: o.name != null ? String(o.name) : undefined,
         location: o.location != null ? String(o.location) : undefined,
-        tsaUrl: o.tsaUrl ? String(o.tsaUrl) : undefined
+        tsaUrl: o.tsaUrl ? String(o.tsaUrl) : undefined,
+        ltv: o.ltv === true
       })
     }
   )
@@ -224,7 +226,7 @@ export function registerIpc(getPending: () => string[], clearPending: () => void
         tokenLabel?: string
         certLabel?: string
       },
-      opts: { reason?: string; name?: string; location?: string; tsaUrl?: string }
+      opts: { reason?: string; name?: string; location?: string; tsaUrl?: string; ltv?: boolean }
     ): Promise<Uint8Array> => {
       if (!ArrayBuffer.isView(pdf) || pdf.byteLength > MAX_WRITE_BYTES) {
         throw new Error('sign-pdf-card: invalid payload')
@@ -252,7 +254,8 @@ export function registerIpc(getPending: () => string[], clearPending: () => void
           reason: o.reason != null ? String(o.reason) : undefined,
           name: o.name != null ? String(o.name) : undefined,
           location: o.location != null ? String(o.location) : undefined,
-          tsaUrl: o.tsaUrl ? String(o.tsaUrl) : undefined
+          tsaUrl: o.tsaUrl ? String(o.tsaUrl) : undefined,
+          ltv: o.ltv === true
         }
       )
     }
@@ -281,7 +284,7 @@ export function registerIpc(getPending: () => string[], clearPending: () => void
       _event,
       pdf: Uint8Array,
       thumbprint: unknown,
-      opts: { reason?: string; name?: string; location?: string; tsaUrl?: string }
+      opts: { reason?: string; name?: string; location?: string; tsaUrl?: string; ltv?: boolean }
     ): Promise<Uint8Array> => {
       if (!ArrayBuffer.isView(pdf) || pdf.byteLength > MAX_WRITE_BYTES) {
         throw new Error('sign-pdf-win-cert: invalid payload')
@@ -294,7 +297,8 @@ export function registerIpc(getPending: () => string[], clearPending: () => void
         reason: o.reason != null ? String(o.reason) : undefined,
         name: o.name != null ? String(o.name) : undefined,
         location: o.location != null ? String(o.location) : undefined,
-        tsaUrl: o.tsaUrl ? String(o.tsaUrl) : undefined
+        tsaUrl: o.tsaUrl ? String(o.tsaUrl) : undefined,
+        ltv: o.ltv === true
       })
     }
   )

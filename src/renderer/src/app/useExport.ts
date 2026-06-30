@@ -144,6 +144,7 @@ export function useExport(
         name?: string
         tsaUrl?: string
         includeImage?: boolean
+        ltv?: boolean
       }
     ): Promise<boolean> => {
       const { includeImage: _omit, ...sign } = opts
@@ -171,7 +172,13 @@ export function useExport(
         tokenLabel?: string
         certLabel?: string
       },
-      opts: { reason?: string; name?: string; tsaUrl?: string; includeImage?: boolean }
+      opts: {
+        reason?: string
+        name?: string
+        tsaUrl?: string
+        includeImage?: boolean
+        ltv?: boolean
+      }
     ): Promise<boolean> => {
       const { includeImage: _omit, ...sign } = opts
       // Read the card cert's identity for the appearance WITHOUT the PIN (cert objects are public), so
@@ -199,6 +206,7 @@ export function useExport(
         name?: string
         tsaUrl?: string
         includeImage?: boolean
+        ltv?: boolean
         signer?: { subject: string; issuer: string }
       }
     ): Promise<boolean> => {

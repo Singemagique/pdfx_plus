@@ -10,7 +10,7 @@ import { addSignatureTimestamp, tsaIssuer, type TokenIssuer } from './timestamp'
 import { CmsSigner } from './sign-pkcs11'
 import { p12ToCredential } from './p12'
 import { openCard, type Pkcs11Options } from './pkcs11'
-import { windowsCertCredential } from './windows-cert'
+import { windowsCertCredential, windowsCertChain } from './windows-cert'
 import { addLtv } from './ltv'
 import { type RevocationFetcher } from './revocation'
 
@@ -110,7 +110,8 @@ export async function signPdfWithCard(
   bytes: Uint8Array,
   pkcs11: Pkcs11Options,
   opts: SignOptions = {},
-  getToken?: TokenIssuer
+  getToken?: TokenIssuer,
+  fetcher?: RevocationFetcher
 ): Promise<Uint8Array> {
   const card = openCard(pkcs11)
   try {
@@ -118,7 +119,10 @@ export async function signPdfWithCard(
     const signer = opts.tsaUrl
       ? new TimestampingSigner(base, getToken ?? tsaIssuer(opts.tsaUrl))
       : base
-    return await placeAndSign(bytes, signer, opts)
+    const signed = await placeAndSign(bytes, signer, opts)
+    // LTV with just the token's leaf cert (no chain read from the card yet); the DSS still carries
+    // the signer cert + its OCSP. Completing the chain from the card is a follow-up.
+    return opts.ltv ? await addLtv(signed, card.certDer, [], fetcher) : signed
   } finally {
     card.close()
   }
@@ -133,12 +137,18 @@ export async function signPdfWithWindowsCert(
   bytes: Uint8Array,
   thumbprint: string,
   opts: SignOptions = {},
-  getToken?: TokenIssuer
+  getToken?: TokenIssuer,
+  fetcher?: RevocationFetcher
 ): Promise<Uint8Array> {
   const cred = await windowsCertCredential(thumbprint)
   const base: Signer = new CmsSigner(cred.certDer, cred.rawSign)
   const signer = opts.tsaUrl
     ? new TimestampingSigner(base, getToken ?? tsaIssuer(opts.tsaUrl))
     : base
-  return placeAndSign(bytes, signer, opts)
+  const signed = await placeAndSign(bytes, signer, opts)
+  if (!opts.ltv) return signed
+  // Harvest the issuer chain from the Windows store (best-effort: leaf-only DSS if it can't be read)
+  // for the DSS. windowsCertChain returns [leaf, …issuers]; pass the issuers as chain candidates.
+  const chain = await windowsCertChain(thumbprint).catch(() => [])
+  return addLtv(signed, cred.certDer, chain.slice(1), fetcher)
 }
