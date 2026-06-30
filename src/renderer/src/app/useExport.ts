@@ -5,6 +5,7 @@ import type { EditLayer } from '../pdfx/build'
 import { toExportPage } from '../pdfx/source'
 import { applyRedactedBytes, buildRedactedSources } from '../pdfx/redact-export'
 import { withSignatureAppearance, type AppearanceOptions } from '../pdfx/signature-appearance'
+import { summarizeDss, dssNote } from '../pdfx/dss-info'
 import type { SignaturePlacement } from '../edit/model'
 import type { DocEntry } from '../types'
 
@@ -104,7 +105,9 @@ export function useExport(
         )
         const signed = await sign(flat)
         const saved = await window.api.writeFile(path, signed)
-        flash(`Signed ${saved}`)
+        // If LTV was embedded, report what's in the DSS — the only local confirmation when the
+        // verifier doesn't trust the signer's PKI (so no "LTV enabled" badge shows).
+        flash(`Signed ${saved}${dssNote(await summarizeDss(signed))}`)
         return true
       } catch (error) {
         console.error('Signing failed', error)
