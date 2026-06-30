@@ -1119,6 +1119,11 @@ body {
   color: var(--ink-soft);
   cursor: pointer;
 }
+.sign-hint-muted {
+  color: var(--ink-soft);
+  font-size: 12px;
+  opacity: 0.8;
+}
 .btn.glass.primary {
   background: #3b82f6;
   color: #fff;
@@ -1472,7 +1477,8 @@ body {
 .sig-backdrop {
   position: fixed;
   inset: 0;
-  z-index: 50;
+  /* Above the Sign dialog (z-index 50): the pad is opened from inside it. */
+  z-index: 60;
   display: flex;
   align-items: center;
   justify-content: center;

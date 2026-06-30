@@ -54,10 +54,12 @@ interface SignDialogProps {
   placementLabel: string | null
   /** Clear the placement (sign invisibly). */
   onClearPlacement: () => void
-  /** Close the dialog and switch to the Signature placement tool. */
+  /** Close the dialog and switch to the Signature placement tool (reopens once a box is placed). */
   onPlaceRequest: () => void
   /** Whether the user has a saved hand-drawn signature to optionally include. */
   hasSavedSignature: boolean
+  /** Open the pad to draw (or redraw) a hand-drawn signature to include in the appearance. */
+  onDrawSignature: () => void
   onClose: () => void
 }
 
@@ -96,6 +98,7 @@ export function SignDialog({
   onClearPlacement,
   onPlaceRequest,
   hasSavedSignature,
+  onDrawSignature,
   onClose
 }: SignDialogProps): React.JSX.Element {
   const isWin = platform === 'win32'
@@ -423,15 +426,27 @@ export function SignDialog({
                   Make invisible
                 </button>
               </div>
-              {hasSavedSignature && (
-                <label className="sign-check">
-                  <input
-                    type="checkbox"
-                    checked={includeImage}
-                    onChange={(e) => setIncludeImage(e.target.checked)}
-                  />
-                  Include my drawn signature image
-                </label>
+              {hasSavedSignature ? (
+                <div className="sign-appearance-row">
+                  <label className="sign-check">
+                    <input
+                      type="checkbox"
+                      checked={includeImage}
+                      onChange={(e) => setIncludeImage(e.target.checked)}
+                    />
+                    Include my drawn signature
+                  </label>
+                  <button type="button" className="sign-link" onClick={onDrawSignature}>
+                    Redraw
+                  </button>
+                </div>
+              ) : (
+                <div className="sign-appearance-row">
+                  <span className="sign-hint-muted">Cert identity will show. Add handwriting?</span>
+                  <button type="button" className="sign-link" onClick={onDrawSignature}>
+                    Draw signature…
+                  </button>
+                </div>
               )}
             </>
           ) : (
