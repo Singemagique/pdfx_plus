@@ -12,6 +12,7 @@ import { p12ToCredential } from './p12'
 import { openCard, type Pkcs11Options } from './pkcs11'
 import { windowsCertCredential, windowsCertChain } from './windows-cert'
 import { addLtv } from './ltv'
+import { addDocTimeStamp } from './doc-timestamp'
 import { type RevocationFetcher } from './revocation'
 
 export interface SignOptions {
@@ -44,6 +45,17 @@ class TimestampingSigner extends Signer {
     )
     return Buffer.from(bt)
   }
+}
+
+// After embedding the DSS (B-LT), add a document-level archive timestamp (B-LTA) when a TSA is
+// configured — it anchors the signature + DSS to a trusted time. Reuses the same injectable token
+// issuer as the B-T signature timestamp, so a missing TSA simply leaves the result at B-LT.
+async function archiveTimestamp(
+  ltvBytes: Uint8Array,
+  opts: SignOptions,
+  getToken?: TokenIssuer
+): Promise<Uint8Array> {
+  return opts.tsaUrl ? addDocTimeStamp(ltvBytes, getToken ?? tsaIssuer(opts.tsaUrl)) : ltvBytes
 }
 
 /** Add the signing placeholder, then run @signpdf with `signer`, returning signed PDF bytes.
@@ -96,8 +108,10 @@ export async function signPdf(
     ? new TimestampingSigner(base, getToken ?? tsaIssuer(opts.tsaUrl))
     : base
   const signed = await placeAndSign(bytes, signer, opts, 1 + cred.chainDer.length)
+  if (!opts.ltv) return signed
   // The PKCS#12 bag carries the chain, so LTV needs no network for certs — only revocation.
-  return opts.ltv ? addLtv(signed, cred.certDer, cred.chainDer, fetcher) : signed
+  const ltv = await addLtv(signed, cred.certDer, cred.chainDer, fetcher)
+  return archiveTimestamp(ltv, opts, getToken)
 }
 
 /**
@@ -120,9 +134,10 @@ export async function signPdfWithCard(
       ? new TimestampingSigner(base, getToken ?? tsaIssuer(opts.tsaUrl))
       : base
     const signed = await placeAndSign(bytes, signer, opts)
-    // LTV with just the token's leaf cert (no chain read from the card yet); the DSS still carries
-    // the signer cert + its OCSP. Completing the chain from the card is a follow-up.
-    return opts.ltv ? await addLtv(signed, card.certDer, [], fetcher) : signed
+    if (!opts.ltv) return signed
+    // The card holds only the leaf; addLtv completes the chain via AIA caIssuers.
+    const ltv = await addLtv(signed, card.certDer, [], fetcher)
+    return await archiveTimestamp(ltv, opts, getToken)
   } finally {
     card.close()
   }
@@ -150,5 +165,6 @@ export async function signPdfWithWindowsCert(
   // Harvest the issuer chain from the Windows store (best-effort: leaf-only DSS if it can't be read)
   // for the DSS. windowsCertChain returns [leaf, …issuers]; pass the issuers as chain candidates.
   const chain = await windowsCertChain(thumbprint).catch(() => [])
-  return addLtv(signed, cred.certDer, chain.slice(1), fetcher)
+  const ltv = await addLtv(signed, cred.certDer, chain.slice(1), fetcher)
+  return archiveTimestamp(ltv, opts, getToken)
 }
