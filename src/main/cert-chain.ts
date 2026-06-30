@@ -5,6 +5,7 @@
 import * as pkijs from 'pkijs'
 import * as asn1js from 'asn1js'
 import './pkijs-engine'
+import type { RevocationFetcher } from './revocation'
 
 const ID_AIA = '1.3.6.1.5.5.7.1.1' // authorityInfoAccess
 const ID_CDP = '2.5.29.31' // cRLDistributionPoints
@@ -104,6 +105,67 @@ export function buildChain(leafDer: ArrayBuffer, candidateDers: ArrayBuffer[]): 
     chain.push(parent.der)
     used.add(parent.der)
     current = parent.cert
+  }
+  return chain
+}
+
+const toArrayBuffer = (u8: Uint8Array): ArrayBuffer =>
+  u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength) as ArrayBuffer
+
+// Subject DN of a cert, as a stable string for cycle detection (null if unparseable).
+function subjectKey(der: ArrayBuffer): string | null {
+  try {
+    return parseCert(der).subject.typesAndValues.map((t) => `${t.type}=${t.value.valueBlock.value}`).join(',') // prettier-ignore
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Like buildChain, but when the chain stops short of a self-signed root, fetch the missing issuer
+ * certificates over the network via each top cert's AIA caIssuers URL (so e.g. a smart card that holds
+ * only the leaf still yields a full chain for the DSS). Stops at a self-signed root, when no issuer
+ * can be fetched, on a cycle, or after `maxFetch` fetches. Best-effort — returns whatever it has.
+ */
+export async function completeChain(
+  leafDer: ArrayBuffer,
+  knownCerts: ArrayBuffer[],
+  fetcher: RevocationFetcher,
+  maxFetch = 8
+): Promise<ArrayBuffer[]> {
+  const chain = buildChain(leafDer, knownCerts)
+  const seen = new Set(chain.map(subjectKey).filter((k): k is string => k !== null))
+  for (let i = 0; i < maxFetch; i++) {
+    let top: pkijs.Certificate
+    try {
+      top = parseCert(chain[chain.length - 1])
+    } catch {
+      break
+    }
+    if (isSelfIssued(top)) break
+
+    let fetched: ArrayBuffer | null = null
+    for (const url of revocationPointers(chain[chain.length - 1]).caIssuers) {
+      const bytes = await fetcher.fetchCaIssuers(url)
+      if (!bytes) continue
+      const der = toArrayBuffer(bytes)
+      let cert: pkijs.Certificate
+      try {
+        cert = parseCert(der)
+      } catch {
+        continue
+      }
+      // Only accept the genuine issuer (its subject == the top cert's issuer).
+      if (cert.subject.isEqual(top.issuer)) {
+        fetched = der
+        break
+      }
+    }
+    if (!fetched) break
+    const key = subjectKey(fetched)
+    if (key && seen.has(key)) break // cycle / already present
+    if (key) seen.add(key)
+    chain.push(fetched)
   }
   return chain
 }
