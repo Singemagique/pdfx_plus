@@ -14,6 +14,7 @@ import { useDragController } from './app/useDragController'
 import { useKeyboardShortcuts } from './app/useKeyboardShortcuts'
 import { EditProvider, useEditStore } from './edit/EditProvider'
 import { EditTools } from './components/edit/EditTools'
+import { SignaturePad } from './components/edit/SignaturePad'
 import { makePageKey } from './edit/model'
 
 const TOAST_MS = 4000
@@ -21,6 +22,10 @@ const TOAST_MS = 4000
 export default function App(): React.JSX.Element {
   const [busy, setBusy] = useState(false)
   const [signOpen, setSignOpen] = useState(false)
+  const [padOpen, setPadOpen] = useState(false)
+  // True while the Sign dialog is waiting for the user to place a box on the page (it closed itself
+  // to let them); when the placement lands we reopen the dialog so they never hunt for a 2nd button.
+  const awaitingPlacement = useRef(false)
   const [scale, setScale] = useState(1)
   const [renderVersion, setRenderVersion] = useState(0)
   const [toast, setToast] = useState<string | null>(null)
@@ -52,6 +57,25 @@ export default function App(): React.JSX.Element {
     )
     if (!exists) setSignaturePlacement(null)
   }, [docs, signaturePlacement, setSignaturePlacement])
+
+  // "Place on page" from the Sign dialog: switch to the signature tool, open the first page if we're
+  // in the collection view (placement needs the editor canvas), and close the dialog so the user can
+  // drag a box. The effect below reopens it once they do.
+  const requestPlacement = useCallback(() => {
+    awaitingPlacement.current = true
+    editStore.setTool('signature')
+    if (!fullViewState.fullView && docs[0]?.pages[0]) {
+      fullViewState.openPage(docs[0].id, docs[0].pages[0].id)
+    }
+    setSignOpen(false)
+  }, [editStore, fullViewState, docs])
+
+  useEffect(() => {
+    if (awaitingPlacement.current && signaturePlacement) {
+      awaitingPlacement.current = false
+      setSignOpen(true)
+    }
+  }, [signaturePlacement])
 
   const {
     exportCollection,
@@ -201,12 +225,23 @@ export default function App(): React.JSX.Element {
             pathForFile={(file) => window.api.getPathForFile(file)}
             placementLabel={editStore.signaturePlacement?.label ?? null}
             onClearPlacement={() => editStore.setSignaturePlacement(null)}
-            onPlaceRequest={() => {
-              editStore.setTool('signature')
+            onPlaceRequest={requestPlacement}
+            hasSavedSignature={!!editStore.savedSignature}
+            onDrawSignature={() => setPadOpen(true)}
+            onClose={() => {
+              awaitingPlacement.current = false
               setSignOpen(false)
             }}
-            hasSavedSignature={!!editStore.savedSignature}
-            onClose={() => setSignOpen(false)}
+          />
+        )}
+
+        {padOpen && (
+          <SignaturePad
+            onSave={(bytes) => {
+              editStore.setSavedSignature(bytes)
+              setPadOpen(false)
+            }}
+            onClose={() => setPadOpen(false)}
           />
         )}
 
