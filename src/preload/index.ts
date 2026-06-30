@@ -22,6 +22,8 @@ export interface SignOptions {
   location?: string
   /** RFC3161 Timestamp Authority URL — when set, upgrades the signature to PAdES B-T. */
   tsaUrl?: string
+  /** When set, embed a DSS (cert chain + OCSP/CRL) for long-term validation (PAdES B-LT). */
+  ltv?: boolean
 }
 
 /** A token (smart card) present in a PKCS#11 module. */

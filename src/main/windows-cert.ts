@@ -64,6 +64,37 @@ export async function listWindowsCerts(): Promise<WindowsCert[]> {
 
 const THUMB_RE = /^[0-9A-Fa-f]{40}$/
 
+/**
+ * Build the certificate chain above a Windows-store cert and return every element (leaf first) as
+ * DER, for embedding in an LTV DSS. Crucially this does NOT gate on X509Chain.Build()'s result:
+ * DoD roots are usually not in a civilian Windows trust store, so Build() returns false (untrusted
+ * root) even though it fully discovers the chain — and for a DSS we only need the certs, not a trust
+ * verdict. Revocation checking is disabled (we fetch OCSP/CRL ourselves) and unknown CAs are allowed
+ * so discovery isn't blocked. Returns [] if nothing can be read (LTV then falls back to leaf-only).
+ */
+export async function windowsCertChain(thumbprint: string): Promise<ArrayBuffer[]> {
+  if (!THUMB_RE.test(thumbprint)) throw new Error('Invalid certificate thumbprint')
+  const script = `
+$ErrorActionPreference='Stop'
+$c = Get-Item "Cert:\\CurrentUser\\My\\${thumbprint}"
+$ch = New-Object System.Security.Cryptography.X509Certificates.X509Chain
+$ch.ChainPolicy.RevocationMode = 'NoCheck'
+$ch.ChainPolicy.VerificationFlags = 'AllowUnknownCertificateAuthority'
+[void]$ch.Build($c)
+$ch.ChainElements | ForEach-Object { [Convert]::ToBase64String($_.Certificate.RawData) }
+`
+  const out = (await runPowerShell(script)).trim()
+  if (!out) return []
+  return out
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((b64) => {
+      const b = Buffer.from(b64, 'base64')
+      return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength)
+    })
+}
+
 /** A credential backed by a Windows-store certificate (its key may live on a smart card). */
 export async function windowsCertCredential(
   thumbprint: string

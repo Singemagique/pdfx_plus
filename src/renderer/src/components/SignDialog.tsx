@@ -21,6 +21,8 @@ interface SignAppearanceOpts {
   reason?: string
   name?: string
   tsaUrl?: string
+  /** Embed a DSS (cert chain + OCSP/CRL) so the signature validates long-term (PAdES B-LT). */
+  ltv?: boolean
   /** Draw the saved hand-drawn signature image inside the visible appearance. */
   includeImage?: boolean
   /** The signing certificate's identity, for the "digitally signed by …" block (Windows path). */
@@ -104,6 +106,7 @@ export function SignDialog({
   const [reason, setReason] = useState('')
   const [name, setName] = useState('')
   const [tsaUrl, setTsaUrl] = useState('')
+  const [ltv, setLtv] = useState(false)
   const [includeImage, setIncludeImage] = useState(true)
   const fileRef = useRef<HTMLInputElement>(null)
 
@@ -209,6 +212,7 @@ export function SignDialog({
     reason: reason || undefined,
     name: name || undefined,
     tsaUrl: tsaUrl.trim() || undefined,
+    ltv: ltv || undefined,
     includeImage: !!placementLabel && hasSavedSignature && includeImage
   }
 
@@ -404,6 +408,11 @@ export function SignDialog({
           onChange={(e) => setTsaUrl(e.target.value)}
           onKeyDown={(e) => e.key === 'Enter' && void submit()}
         />
+        <label className="sign-check">
+          <input type="checkbox" checked={ltv} onChange={(e) => setLtv(e.target.checked)} />
+          Embed long-term validation data (LTV · cert chain + OCSP/CRL). Needs network at signing;
+          add a timestamp above for the strongest result.
+        </label>
 
         <div className="sign-appearance">
           {placementLabel ? (
