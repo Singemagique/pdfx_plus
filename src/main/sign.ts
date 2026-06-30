@@ -11,6 +11,8 @@ import { CmsSigner } from './sign-pkcs11'
 import { p12ToCredential } from './p12'
 import { openCard, type Pkcs11Options } from './pkcs11'
 import { windowsCertCredential } from './windows-cert'
+import { addLtv } from './ltv'
+import { type RevocationFetcher } from './revocation'
 
 export interface SignOptions {
   /** PKCS#12 passphrase (empty string if the credential has none). */
@@ -21,6 +23,8 @@ export interface SignOptions {
   contactInfo?: string
   /** RFC3161 Timestamp Authority URL. When set, the signature is upgraded to PAdES B-T. */
   tsaUrl?: string
+  /** When true, embed a DSS (cert chain + OCSP/CRL) for long-term validation (PAdES B-LT). */
+  ltv?: boolean
 }
 
 /** Wrap any signer so it grafts an RFC3161 signature timestamp onto its CMS (B-B → B-T). Extends the
@@ -82,14 +86,18 @@ export async function signPdf(
   p12: Uint8Array,
   opts: SignOptions = {},
   // Injectable token issuer (defaults to the real TSA client) so tests run a local TSA offline.
-  getToken?: TokenIssuer
+  getToken?: TokenIssuer,
+  // Injectable revocation fetcher (defaults to the real HTTP client) so LTV tests run offline.
+  fetcher?: RevocationFetcher
 ): Promise<Uint8Array> {
   const cred = p12ToCredential(p12, opts.passphrase ?? '')
   const base: Signer = new CmsSigner(cred.certDer, cred.rawSign, cred.chainDer)
   const signer = opts.tsaUrl
     ? new TimestampingSigner(base, getToken ?? tsaIssuer(opts.tsaUrl))
     : base
-  return placeAndSign(bytes, signer, opts, 1 + cred.chainDer.length)
+  const signed = await placeAndSign(bytes, signer, opts, 1 + cred.chainDer.length)
+  // The PKCS#12 bag carries the chain, so LTV needs no network for certs — only revocation.
+  return opts.ltv ? addLtv(signed, cred.certDer, cred.chainDer, fetcher) : signed
 }
 
 /**
