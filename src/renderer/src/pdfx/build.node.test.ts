@@ -26,6 +26,55 @@ async function makeSourcePdf(): Promise<Uint8Array> {
   return doc.save()
 }
 
+// A PDF whose page carries an (empty) signature-field widget plus a regular text-field widget.
+async function makeSourceWithSigField(): Promise<Uint8Array> {
+  const doc = await PDFDocument.create()
+  const page = doc.addPage([300, 300])
+  const ctx = doc.context
+  const sig = ctx.register(
+    ctx.obj({
+      Type: 'Annot',
+      Subtype: 'Widget',
+      FT: 'Sig',
+      T: PDFString.of('Signature1'),
+      Rect: [50, 50, 250, 110],
+      P: page.ref
+    })
+  )
+  const txt = ctx.register(
+    ctx.obj({
+      Type: 'Annot',
+      Subtype: 'Widget',
+      FT: 'Tx',
+      T: PDFString.of('Name'),
+      Rect: [50, 150, 250, 180],
+      P: page.ref
+    })
+  )
+  page.node.set(PDFName.of('Annots'), ctx.obj([sig, txt]))
+  doc.catalog.set(
+    PDFName.of('AcroForm'),
+    ctx.register(ctx.obj({ Fields: [sig, txt], SigFlags: 3 }))
+  )
+  return doc.save()
+}
+
+// The /FT values of all widget annotations across the output's pages.
+async function annotFieldTypes(out: Uint8Array): Promise<string[]> {
+  const doc = await PDFDocument.load(out)
+  const types: string[] = []
+  for (const page of doc.getPages()) {
+    const annots = page.node.Annots()
+    if (!annots) continue
+    for (let i = 0; i < annots.size(); i++) {
+      const d = doc.context.lookupMaybe(annots.get(i), PDFDict)
+      const ft = d?.get(PDFName.of('FT'))
+      if (ft) types.push(ft.toString())
+    }
+  }
+  return types
+}
+
 // Decode a stream's bytes, inflating if pdf-lib FlateDecode'd it (it may, when saving
 // with object streams) and returning raw bytes otherwise — robust to the choice.
 function streamBytes(stream: PDFStream): Uint8Array {
@@ -211,6 +260,22 @@ describe('buildPdf', () => {
     const reloaded = await PDFDocument.load(out)
     expect(reloaded.getPageCount()).toBe(2)
     expect(extractEmbeddedFile(reloaded, MANIFEST_NAME)).toBeNull()
+  })
+
+  it('strips signature fields when signing, but keeps other form fields', async () => {
+    const bytes = await makeSourceWithSigField()
+    const signed = await buildPdf([{ bytes, sourceKey: 's', pageIndex: 0 }], undefined, {
+      stripSignatureFields: true
+    })
+    const types = await annotFieldTypes(signed)
+    expect(types).not.toContain('/Sig') // no leftover "sign here" field
+    expect(types).toContain('/Tx') // the text field survives
+  })
+
+  it('keeps signature fields on a normal export (no strip)', async () => {
+    const bytes = await makeSourceWithSigField()
+    const types = await annotFieldTypes(await buildPdf([{ bytes, sourceKey: 's', pageIndex: 0 }]))
+    expect(types).toContain('/Sig')
   })
 
   it('applies a page crop as the /CropBox on export', async () => {

@@ -150,6 +150,44 @@ function removeFilledWidgets(page: PDFPage, filled: Set<string>): void {
   page.node.set(PDFName.of('Annots'), ctx.obj(keep))
 }
 
+/** A widget annotation whose field type is /Sig (directly or inherited via the /Parent chain). */
+function isSignatureWidget(ctx: PDFDocument['context'], dict: PDFDict): boolean {
+  if (dict.get(PDFName.of('Subtype')) !== PDFName.of('Widget')) return false
+  let d: PDFDict | undefined = dict
+  for (let guard = 0; d && guard < 32; guard++) {
+    if (d.get(PDFName.of('FT')) === PDFName.of('Sig')) return true
+    const parent = d.get(PDFName.of('Parent'))
+    d =
+      parent instanceof PDFRef
+        ? ctx.lookupMaybe(parent, PDFDict)
+        : parent instanceof PDFDict
+          ? parent
+          : undefined
+  }
+  return false
+}
+
+/**
+ * Drop signature-field widget annotations from a flattened page. A PDF that's about to be signed must
+ * not carry an *empty* signature field — a viewer (Adobe) would render it as a dangling "click to
+ * sign here" field alongside our actual signature. And any already-signed source field is invalidated
+ * by the flatten (copyPages) anyway, so its now-meaningless widget should go too. Our own signature is
+ * added separately by the signer.
+ */
+function removeSignatureWidgets(page: PDFPage): void {
+  const annots = page.node.Annots()
+  if (!annots) return
+  const ctx = page.doc.context
+  const keep: Array<ReturnType<typeof annots.get>> = []
+  for (let i = 0; i < annots.size(); i++) {
+    const ref = annots.get(i)
+    const dict = ref instanceof PDFRef ? ctx.lookupMaybe(ref, PDFDict) : ref instanceof PDFDict ? ref : undefined // prettier-ignore
+    if (dict && isSignatureWidget(ctx, dict)) continue // drop the signature widget
+    keep.push(ref)
+  }
+  page.node.set(PDFName.of('Annots'), ctx.obj(keep))
+}
+
 async function bakePage(
   page: PDFPage,
   exportPage: ExportPage,
@@ -197,7 +235,11 @@ async function bakePage(
   }
 }
 
-export async function buildPdf(pages: ExportPage[], edits?: EditLayer): Promise<Uint8Array> {
+export async function buildPdf(
+  pages: ExportPage[],
+  edits?: EditLayer,
+  opts?: { stripSignatureFields?: boolean }
+): Promise<Uint8Array> {
   const output = await PDFDocument.create()
   const res = edits ? createFlattenResources(output, edits.attachments) : undefined
   const sources = new Map<string, PDFDocument>()
@@ -214,6 +256,9 @@ export async function buildPdf(pages: ExportPage[], edits?: EditLayer): Promise<
       }
       const [copied] = await output.copyPages(source, [page.pageIndex])
       output.addPage(copied)
+      // Before signing, strip empty/leftover signature fields so the signed PDF has only our
+      // signature — not a dangling "sign here" field Adobe would offer to sign.
+      if (opts?.stripSignatureFields) removeSignatureWidgets(copied)
       await bakePage(copied, page, edits, res)
     } catch (e) {
       throw new Error(

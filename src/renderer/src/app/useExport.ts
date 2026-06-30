@@ -97,7 +97,10 @@ export function useExport(
             docs.flatMap((doc) => doc.pages.map(toExportPage)),
             redacted
           ),
-          layer
+          layer,
+          // Strip any existing (empty) signature fields so the signed output carries only our
+          // signature, not a leftover field a viewer would offer to sign.
+          { stripSignatureFields: true }
         )
         const signed = await sign(flat)
         const saved = await window.api.writeFile(path, signed)
