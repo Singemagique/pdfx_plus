@@ -5,6 +5,7 @@ import * as asn1js from 'asn1js'
 
 import {
   buildOcspRequest,
+  certFromCaIssuers,
   collectRevocation,
   isSuccessfulOcsp,
   type RevocationFetcher
@@ -105,6 +106,39 @@ describe('isSuccessfulOcsp', () => {
   })
 })
 
+describe('certFromCaIssuers', () => {
+  it('returns the certificate from a bare DER response', async () => {
+    const cert = await makeCert({ subject: 'Issuing CA', issuer: 'Issuing CA' })
+    const out = certFromCaIssuers(new Uint8Array(cert))
+    expect(out).not.toBeNull()
+    const parsed = new pkijs.Certificate({
+      schema: asn1js.fromBER(out!.buffer as ArrayBuffer).result
+    })
+    expect(parsed.subject.typesAndValues[0].value.valueBlock.value).toBe('Issuing CA')
+  })
+
+  it('extracts the first certificate from a PKCS#7 certs-only bundle', async () => {
+    const cert = await makeCert({ subject: 'Bundle CA', issuer: 'Bundle CA' })
+    const ci = new pkijs.ContentInfo({
+      contentType: '1.2.840.113549.1.7.2',
+      content: new pkijs.SignedData({
+        version: 1,
+        encapContentInfo: new pkijs.EncapsulatedContentInfo({
+          eContentType: '1.2.840.113549.1.7.1'
+        }),
+        certificates: [new pkijs.Certificate({ schema: asn1js.fromBER(cert).result })],
+        signerInfos: []
+      }).toSchema()
+    })
+    const p7c = new Uint8Array(ci.toSchema().toBER(false))
+    expect(certFromCaIssuers(p7c)).not.toBeNull()
+  })
+
+  it('returns null on bytes that are neither a cert nor a bundle', () => {
+    expect(certFromCaIssuers(new Uint8Array([1, 2, 3, 4]))).toBeNull()
+  })
+})
+
 describe('collectRevocation', () => {
   // A fetcher that returns canned blobs and records the URLs it was asked for.
   function recordingFetcher(): RevocationFetcher & { ocspUrls: string[]; crlUrls: string[] } {
@@ -120,6 +154,9 @@ describe('collectRevocation', () => {
       async fetchCrl(url) {
         crlUrls.push(url)
         return new Uint8Array([0x30, 0x02, 0x05, 0x00])
+      },
+      async fetchCaIssuers() {
+        return null
       }
     }
   }
@@ -157,7 +194,11 @@ describe('collectRevocation', () => {
       3
     )
     const ca = await makeCert({ subject: 'CA', issuer: 'CA' }, 1)
-    const failing: RevocationFetcher = { fetchOcsp: async () => null, fetchCrl: async () => null }
+    const failing: RevocationFetcher = {
+      fetchOcsp: async () => null,
+      fetchCrl: async () => null,
+      fetchCaIssuers: async () => null
+    }
 
     const out = await collectRevocation([leaf, ca], failing)
     expect(out).toEqual({ ocsps: [], crls: [] })

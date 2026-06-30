@@ -3,7 +3,7 @@
 // append it all as a DSS (an append-only incremental update that doesn't disturb the signature).
 // Composes cert-chain.ts (buildChain) + revocation.ts (collectRevocation) + dss.ts (appendDss).
 // Runs in the MAIN process. The revocation fetcher is injectable so tests run offline.
-import { buildChain } from './cert-chain'
+import { completeChain } from './cert-chain'
 import { collectRevocation, httpRevocationFetcher, type RevocationFetcher } from './revocation'
 import { appendDss } from './dss'
 
@@ -20,7 +20,8 @@ export async function addLtv(
   chainCandidates: ArrayBuffer[],
   fetcher: RevocationFetcher = httpRevocationFetcher()
 ): Promise<Uint8Array> {
-  const chain = buildChain(leafDer, chainCandidates)
+  // Complete the chain via AIA caIssuers when it stops short (e.g. a card holding only the leaf).
+  const chain = await completeChain(leafDer, chainCandidates, fetcher)
   const { ocsps, crls } = await collectRevocation(chain, fetcher)
   return appendDss(signedPdf, {
     certs: chain.map((der) => new Uint8Array(der)),

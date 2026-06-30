@@ -22,6 +22,9 @@ export interface RevocationFetcher {
   fetchOcsp(cert: ArrayBuffer, issuer: ArrayBuffer, url: string): Promise<Uint8Array | null>
   /** GET the DER CRL at `url`, or null on any failure. */
   fetchCrl(url: string): Promise<Uint8Array | null>
+  /** GET the issuer certificate at an AIA caIssuers `url` (DER, PEM or a PKCS#7 bundle → first cert),
+   *  or null on any failure. Used to complete a chain that's missing intermediates. */
+  fetchCaIssuers(url: string): Promise<Uint8Array | null>
 }
 
 function parseCert(der: ArrayBuffer): pkijs.Certificate {
@@ -72,6 +75,31 @@ function toDer(bytes: Uint8Array): Uint8Array {
   }
 }
 
+// Normalize an AIA caIssuers response to a single DER certificate. Most responders serve a bare DER
+// (or PEM) cert; some serve a PKCS#7 "certs-only" bundle (.p7c) — take its first certificate. Returns
+// null if no certificate can be recovered.
+export function certFromCaIssuers(bytes: Uint8Array): Uint8Array | null {
+  const der = toDer(bytes)
+  const ab = der.buffer.slice(der.byteOffset, der.byteOffset + der.byteLength) as ArrayBuffer
+  // (1) a single X.509 certificate.
+  try {
+    const cert = new pkijs.Certificate({ schema: asn1js.fromBER(ab).result })
+    return new Uint8Array(cert.toSchema().toBER(false))
+  } catch {
+    /* not a bare cert — try a PKCS#7 bundle */
+  }
+  // (2) a PKCS#7 SignedData "certs-only" bundle → its first certificate.
+  try {
+    const ci = new pkijs.ContentInfo({ schema: asn1js.fromBER(ab).result })
+    const sd = new pkijs.SignedData({ schema: ci.content })
+    const first = sd.certificates?.[0]
+    if (first instanceof pkijs.Certificate) return new Uint8Array(first.toSchema().toBER(false))
+  } catch {
+    /* not a PKCS#7 bundle either */
+  }
+  return null
+}
+
 /** The real HTTP fetcher. OCSP via POST application/ocsp-request; CRL via GET. Both time-bounded. */
 export function httpRevocationFetcher(timeoutMs = 15000): RevocationFetcher {
   return {
@@ -97,6 +125,16 @@ export function httpRevocationFetcher(timeoutMs = 15000): RevocationFetcher {
         if (!res.ok) return null
         const buf = new Uint8Array(await res.arrayBuffer())
         return buf.length ? toDer(buf) : null
+      } catch {
+        return null
+      }
+    },
+    async fetchCaIssuers(url) {
+      try {
+        const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) })
+        if (!res.ok) return null
+        const buf = new Uint8Array(await res.arrayBuffer())
+        return buf.length ? certFromCaIssuers(buf) : null
       } catch {
         return null
       }

@@ -101,7 +101,8 @@ async function makeCert(opts: {
 
 const cannedFetcher: RevocationFetcher = {
   fetchOcsp: async () => new Uint8Array([0x30, 0x03, 0x0a, 0x01, 0x00]),
-  fetchCrl: async () => new Uint8Array([0x30, 0x02, 0x05, 0x00])
+  fetchCrl: async () => new Uint8Array([0x30, 0x02, 0x05, 0x00]),
+  fetchCaIssuers: async () => null
 }
 
 async function loadDss(pdf: Uint8Array): Promise<PDFDict> {
