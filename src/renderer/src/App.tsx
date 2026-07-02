@@ -20,7 +20,16 @@ import { makePageKey } from './edit/model'
 const TOAST_MS = 4000
 
 export default function App(): React.JSX.Element {
-  const [busy, setBusy] = useState(false)
+  // Ref-count busy instead of a plain boolean: overlapping operations (a 2nd-instance open / Explorer
+  // double-click that isn't gated) must not let the first one's setBusy(false) re-enable the toolbar
+  // while another is still running. Every caller pairs setBusy(true)/(false) via finally, so the
+  // count stays balanced. (P2-9)
+  const [busyCount, setBusyCount] = useState(0)
+  const busy = busyCount > 0
+  const setBusy = useCallback(
+    (b: boolean) => setBusyCount((n) => Math.max(0, n + (b ? 1 : -1))),
+    []
+  )
   const [signOpen, setSignOpen] = useState(false)
   const [padOpen, setPadOpen] = useState(false)
   // True while the Sign dialog is waiting for the user to place a box on the page (it closed itself
@@ -76,6 +85,13 @@ export default function App(): React.JSX.Element {
       setSignOpen(true)
     }
   }, [signaturePlacement])
+
+  // If the user abandons "Place on page" by switching away from the signature tool, drop the pending
+  // reopen latch — otherwise a later, unrelated signature placement would unexpectedly reopen the
+  // Sign dialog (the dialog closed via setSignOpen(false), which never runs onClose). (P2-4)
+  useEffect(() => {
+    if (editStore.tool !== 'signature') awaitingPlacement.current = false
+  }, [editStore.tool])
 
   const {
     exportCollection,

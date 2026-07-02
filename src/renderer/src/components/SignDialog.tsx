@@ -219,29 +219,38 @@ export function SignDialog({
     includeImage: !!placementLabel && hasSavedSignature && includeImage
   }
 
+  // `busy` only engages once the export/signing IPC starts — on the card path that's after a
+  // multi-second cert-info round-trip, so guarding on `busy` alone lets a second click start a whole
+  // second sign flow (two PIN prompts). This ref latches synchronously on the first click. (P2-3)
+  const submitting = useRef(false)
   const submit = async (): Promise<void> => {
-    if (busy) return
-    let ok = false
-    if (mode === 'wincert') {
-      if (!selectedThumb) return
-      const c = winCerts?.find((w) => w.thumbprint === selectedThumb)
-      ok = await onSignWindowsCert(selectedThumb, {
-        ...shared,
-        signer: c ? { subject: c.subject, issuer: c.issuer } : undefined
-      })
-    } else if (mode === 'file') {
-      if (!cert) return
-      ok = await onSign(cert.bytes, { passphrase, ...shared })
-    } else {
-      if (!modulePath.trim() || !pin) return
-      ok = await onSignCard(
-        { modulePath: modulePath.trim(), pin, slot: selectedSlot ?? undefined },
-        shared
-      )
-    }
-    if (ok) {
-      onClearPlacement() // the placement is consumed; don't leave a stale marker behind
-      onClose()
+    if (busy || submitting.current) return
+    submitting.current = true
+    try {
+      let ok = false
+      if (mode === 'wincert') {
+        if (!selectedThumb) return
+        const c = winCerts?.find((w) => w.thumbprint === selectedThumb)
+        ok = await onSignWindowsCert(selectedThumb, {
+          ...shared,
+          signer: c ? { subject: c.subject, issuer: c.issuer } : undefined
+        })
+      } else if (mode === 'file') {
+        if (!cert) return
+        ok = await onSign(cert.bytes, { passphrase, ...shared })
+      } else {
+        if (!modulePath.trim() || !pin) return
+        ok = await onSignCard(
+          { modulePath: modulePath.trim(), pin, slot: selectedSlot ?? undefined },
+          shared
+        )
+      }
+      if (ok) {
+        onClearPlacement() // the placement is consumed; don't leave a stale marker behind
+        onClose()
+      }
+    } finally {
+      submitting.current = false
     }
   }
 
