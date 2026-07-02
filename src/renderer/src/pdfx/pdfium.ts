@@ -15,7 +15,12 @@ export function getPdfium(): Promise<PdfiumModule> {
       const mod = await init({ wasmBinary })
       mod.PDFiumExt_Init()
       return mod as unknown as PdfiumModule
-    })()
+    })().catch((e) => {
+      // Don't cache a rejected init — a transient WASM fetch/compile failure would otherwise brick
+      // all redaction (fail-closed) until app restart. Reset so the next call retries.
+      instance = null
+      throw e
+    })
   }
   return instance
 }

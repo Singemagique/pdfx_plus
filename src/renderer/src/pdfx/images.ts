@@ -38,6 +38,39 @@ function pngSize(data: Uint8Array): { width: number; height: number } | null {
   return { width: dv.getUint32(16), height: dv.getUint32(20) }
 }
 
+// JPEG dimensions from the first SOF (start-of-frame) marker, WITHOUT decoding pixels — so a
+// decompression-bomb JPEG (e.g. 30000² → ~3.6 GB decoded) is rejected before createImageBitmap runs.
+// Exported for tests.
+export function jpegSize(data: Uint8Array): { width: number; height: number } | null {
+  if (!isJpeg(data)) return null
+  let i = 2
+  while (i + 9 < data.length) {
+    if (data[i] !== 0xff) {
+      i++
+      continue
+    }
+    let marker = data[i + 1]
+    while (marker === 0xff && i + 2 < data.length) marker = data[++i + 1] // skip fill bytes
+    if (marker === 0xd8 || marker === 0xd9 || (marker >= 0xd0 && marker <= 0xd7)) {
+      i += 2 // SOI / EOI / RSTn carry no length
+      continue
+    }
+    const len = (data[i + 2] << 8) | data[i + 3]
+    // SOF0..SOF15 hold the frame dimensions; skip the non-SOF markers in that range (DHT/DAC/DNL).
+    const isSof =
+      marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc
+    if (isSof) {
+      return { width: (data[i + 7] << 8) | data[i + 8], height: (data[i + 5] << 8) | data[i + 6] }
+    }
+    if (len <= 0) return null
+    i += 2 + len
+  }
+  return null
+}
+
+const oversizePixels = (d: { width: number; height: number }): boolean =>
+  d.width * d.height > MAX_IMAGE_PIXELS
+
 async function rasterToPng(bitmap: ImageBitmap): Promise<Uint8Array> {
   const scale = Math.min(1, MAX_RASTER_DIM / Math.max(bitmap.width, bitmap.height))
   const canvas = document.createElement('canvas')
@@ -54,14 +87,15 @@ export async function imageToPdf(
   pageSize?: { width: number; height: number }
 ): Promise<Uint8Array> {
   const doc = await PDFDocument.create()
+  const tooLarge = new Error('Image is too large to import')
   let image
   if (isPng(data)) {
     const dim = pngSize(data)
-    if (dim && dim.width * dim.height > MAX_IMAGE_PIXELS) {
-      throw new Error('Image is too large to import')
-    }
+    if (dim && oversizePixels(dim)) throw tooLarge
     image = await doc.embedPng(data)
   } else if (isJpeg(data)) {
+    const dim = jpegSize(data)
+    if (dim && oversizePixels(dim)) throw tooLarge // reject the bomb before decoding it
     const oriented = await createImageBitmap(toBlob(data))
     const raw = await createImageBitmap(toBlob(data), { imageOrientation: 'none' })
     const rotated = oriented.width !== raw.width
@@ -69,7 +103,12 @@ export async function imageToPdf(
     image = rotated ? await doc.embedPng(await rasterToPng(oriented)) : await doc.embedJpg(data)
     oriented.close()
   } else {
+    // WebP/GIF/BMP/AVIF: no cheap header parse here, so cap on the decoded bitmap's dimensions.
     const bitmap = await createImageBitmap(toBlob(data))
+    if (oversizePixels(bitmap)) {
+      bitmap.close()
+      throw tooLarge
+    }
     image = await doc.embedPng(await rasterToPng(bitmap))
     bitmap.close()
   }

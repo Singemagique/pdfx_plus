@@ -10,6 +10,7 @@ import {
   crlRevokesCert,
   isSuccessfulOcsp,
   ocspResponseRevoked,
+  readCapped,
   type RevocationFetcher
 } from './revocation'
 
@@ -271,6 +272,25 @@ async function makeRevokedOcsp(leafDer: ArrayBuffer, issuerDer: ArrayBuffer): Pr
   })
   return new Uint8Array(resp.toSchema().toBER(false))
 }
+
+describe('readCapped (P2-5 size cap)', () => {
+  it('returns the body when within the cap', async () => {
+    const out = await readCapped(new Response(new Uint8Array([1, 2, 3, 4])), 1024)
+    expect(out && Array.from(out)).toEqual([1, 2, 3, 4])
+  })
+
+  it('rejects (null) a body that exceeds the cap', async () => {
+    const out = await readCapped(new Response(new Uint8Array(2048)), 1024)
+    expect(out).toBeNull()
+  })
+
+  it('rejects up front on an oversized Content-Length', async () => {
+    const res = new Response(new Uint8Array([1, 2, 3]), {
+      headers: { 'content-length': '999999999' }
+    })
+    expect(await readCapped(res, 1024)).toBeNull()
+  })
+})
 
 describe('revoked-status detection (P1-4)', () => {
   it('crlRevokesCert matches a serial listed in the CRL, and ignores others', async () => {
