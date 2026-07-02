@@ -1,8 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { applyExternalDrop, type ExternalDropDeps } from './external-drop'
+import { applyExternalDrop } from './external-drop'
 import { importIntoDocs } from '../pdfx/source'
-import { findConverter } from '../pdfx/convert'
 import type { ImportedMirror } from '../pdfx/mirror'
 import type { DocEntry, PageEntry } from '../types'
 import type { IncomingFile } from './types'
@@ -30,11 +29,9 @@ const mirror = (): ImportedMirror => ({
 })
 const file = (name: string): IncomingFile => ({ name, data: new Uint8Array([1]) })
 
-function makeDeps(existing: DocEntry[]): ExternalDropDeps & {
-  insertPagesIntoDoc: ReturnType<typeof vi.fn>
-  spliceDocsAfter: ReturnType<typeof vi.fn>
-  addFiles: ReturnType<typeof vi.fn>
-} {
+// vi.fn() (Mock) is assignable to ExternalDropDeps' function fields; keep the inferred type so the
+// mocks stay callable AND expose the matcher methods (.toHaveBeenCalledWith).
+function makeDeps(existing: DocEntry[]) {
   return {
     docs: existing,
     addFiles: vi.fn(async () => {}),
