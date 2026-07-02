@@ -1,5 +1,5 @@
 import { useCallback, useRef } from 'react'
-import { insertPastedPage } from './doc-ops/pages'
+import { freshPageCopy, insertPastedPage } from './doc-ops/pages'
 import type { PageRef } from './types'
 import type { DocEntry, PageEntry } from '../types'
 
@@ -26,7 +26,9 @@ export function useClipboard(
   const pasteAfterSelected = useCallback(() => {
     const clip = clipboardRef.current
     if (!clip || !selected) return
-    const pasted: PageEntry = { ...clip, id: crypto.randomUUID() }
+    // freshPageCopy gives the paste an independent pageKey — otherwise it shares the original's key
+    // and edits/rotations/redactions apply to both (see freshPageCopy). Matches duplicatePage.
+    const pasted = freshPageCopy(clip)
     setDocs((prev) => insertPastedPage(prev, selected, pasted))
     setSelected({ docId: selected.docId, pageId: pasted.id })
   }, [selected, setDocs, setSelected])

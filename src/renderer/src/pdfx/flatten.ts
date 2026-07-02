@@ -2,10 +2,11 @@
 // shows them (PRD §4.4). Geometry is already in PDF points (origin bottom-left), so it
 // maps straight onto pdf-lib's draw API.
 //
-// `redaction` is NOT handled here: it is applied by the external PDFium pre-pass before
-// re-assembly (§4.5). `formValue` IS handled — the filled value is painted over its AcroForm
-// field rectangle (text, or an X for a checked box); the original interactive widget is left in
-// place underneath. flattenPageOverlays skips only redaction.
+// `redaction`: the SOURCE content underneath is removed by the external PDFium pre-pass (§4.5); here
+// we additionally paint the opaque box in z-order so it also covers any OVERLAY it sits above (so a
+// redacted overlay can't leak on export). `formValue` IS handled — the filled value is painted over
+// its AcroForm field rectangle (text, or an X for a checked box); the original interactive widget is
+// left in place underneath.
 
 import {
   PDFDocument,
@@ -290,7 +291,10 @@ export async function flattenPageOverlays(
         await drawFormValue(page, o, res)
         break
       case 'redaction':
-        // Applied by the external PDFium pre-pass, not the draw pass (see file header).
+        // The PDFium pre-pass already removed the SOURCE content under this rect. We also paint the
+        // opaque fill here, in z-order, so it covers any OVERLAY beneath it — matching the editor's
+        // WYSIWYG stack. Without this, an overlay redacted by the user would leak on export.
+        page.drawRectangle({ x, y, width: w, height: h, color: toColor(o.fill), opacity: 1 })
         break
     }
   }
