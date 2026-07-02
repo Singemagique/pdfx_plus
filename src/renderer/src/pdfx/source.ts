@@ -35,7 +35,10 @@ export async function loadSource(bytes: Uint8Array): Promise<LoadedSource> {
   for (let i = 1; i <= pdf.numPages; i++) {
     const page = await pdf.getPage(i)
     const viewport = page.getViewport({ scale: 1 })
-    sizes.push({ width: viewport.width, height: viewport.height })
+    // Clamp degenerate/non-finite page dimensions to ≥ 1 so pageScale (fit / width) stays finite —
+    // a MediaBox like [0 0 0 792] would otherwise give width 0 → ∞ scale → NaN overlay geometry.
+    const dim = (v: number): number => (Number.isFinite(v) && v > 0 ? v : 1)
+    sizes.push({ width: dim(viewport.width), height: dim(viewport.height) })
   }
   return { source, sizes }
 }

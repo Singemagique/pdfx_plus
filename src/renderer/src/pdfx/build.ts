@@ -312,8 +312,13 @@ export async function buildPdfx(
   }
 
   // pdfx-canon/1 tamper record over the assembled page content, computed BEFORE the manifest is
-  // attached so the manifest itself is excluded from the hash (PRD §4.6).
-  manifest.integrity = await computeIntegrity(output)
+  // attached so the manifest itself is excluded from the hash (PRD §4.6). Best-effort: the record is
+  // advisory, so a compute failure on an odd source skips it rather than failing the whole export.
+  try {
+    manifest.integrity = await computeIntegrity(output)
+  } catch (e) {
+    console.warn('pdfx: integrity record skipped', e)
+  }
 
   await output.attach(new TextEncoder().encode(JSON.stringify(manifest, null, 2)), MANIFEST_NAME, {
     mimeType: 'application/json',
