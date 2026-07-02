@@ -21,7 +21,7 @@
 
 <br>
 
-<img src="assets/pdfx.png" alt="PDFx viewer" width="820">
+<img src="assets/pdfx.png" alt="PDFx editor" width="820">
 
 </div>
 
@@ -29,11 +29,13 @@
 
 ## What it is
 
-PDFx is an open, backwards compatible extension of PDF that bundles many documents into a single file, plus a minimal desktop viewer for macOS and Windows.
+PDFx is an open, backwards compatible extension of PDF that bundles many documents into a single file, plus a lightweight desktop editor for macOS, Windows, and Linux.
 
 A `.pdfx` file is a fully valid PDF: open it anywhere and every page shows in sequence. Open it in PDFx and it splits back into the original documents. Plain single PDFs work as they are.
 
 Drag and drop `.pdf` or `.pdfx` files anywhere in the window. Each document renders as a horizontal strip of pages, and documents stack vertically. Reorder or remove them, then **Export .pdfx** to save the whole collection as one file.
+
+Beyond bundling, PDFx is a full editor: page transforms (rotate/crop), PNG stamps, annotations (text, ink, highlight, shapes), AcroForm form filling, **true** content redaction, and digital signatures — visual/ink plus cryptographic **PAdES** (baseline B-B through long-term **B-LT/B-LTA**) from a `.p12`/PFX file, a PKCS#11 smart card, or the Windows certificate store. Edits flatten into the PDF so any viewer sees them, and are mirrored in a backward-compatible manifest so a `.pdfx` reopens fully editable.
 
 See [SPEC.md](SPEC.md) for the format. It is short: the entire trick is one embedded JSON manifest.
 
