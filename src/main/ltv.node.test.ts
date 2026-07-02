@@ -105,6 +105,37 @@ const cannedFetcher: RevocationFetcher = {
   fetchCaIssuers: async () => null
 }
 
+// A signed OCSPResponse reporting `leaf` (issued by `issuer`) as REVOKED. The signature isn't
+// verified by the detector, so a throwaway key is fine.
+async function makeRevokedOcsp(leafDer: ArrayBuffer, issuerDer: ArrayBuffer): Promise<Uint8Array> {
+  const keys = (await webcrypto.subtle.generateKey(
+    { name: 'RSASSA-PKCS1-v1_5', modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256' }, // prettier-ignore
+    true,
+    ['sign', 'verify']
+  )) as CryptoKeyPair
+  const leaf = new pkijs.Certificate({ schema: asn1js.fromBER(leafDer).result })
+  const issuer = new pkijs.Certificate({ schema: asn1js.fromBER(issuerDer).result })
+  const single = new pkijs.SingleResponse()
+  await single.certID.createForCertificate(leaf, { hashAlgorithm: 'SHA-1', issuerCertificate: issuer }) // prettier-ignore
+  single.certStatus = new asn1js.Constructed({
+    idBlock: { tagClass: 3, tagNumber: 1 }, // [1] revoked
+    value: [new asn1js.GeneralizedTime({ valueDate: new Date() })]
+  })
+  single.thisUpdate = new Date()
+  const basic = new pkijs.BasicOCSPResponse()
+  basic.tbsResponseData.responses.push(single)
+  basic.tbsResponseData.responderID = issuer.subject
+  basic.tbsResponseData.producedAt = new Date()
+  await basic.sign(keys.privateKey, 'SHA-256')
+  const resp = new pkijs.OCSPResponse()
+  resp.responseStatus.valueBlock.valueDec = 0
+  resp.responseBytes = new pkijs.ResponseBytes({
+    responseType: '1.3.6.1.5.5.7.48.1.1',
+    response: new asn1js.OctetString({ valueHex: basic.toSchema().toBER(false) })
+  })
+  return new Uint8Array(resp.toSchema().toBER(false))
+}
+
 async function loadDss(pdf: Uint8Array): Promise<PDFDict> {
   const doc = await PDFDocument.load(pdf)
   const ref = doc.catalog.get(PDFName.of('DSS'))
@@ -133,6 +164,19 @@ describe('addLtv', () => {
     // Leaf is checked via OCSP (it advertises both, OCSP wins); CA is the root → no revocation.
     expect((dss.get(PDFName.of('OCSPs')) as PDFArray).size()).toBe(1)
     expect(dss.get(PDFName.of('CRLs'))).toBeUndefined()
+  })
+
+  it('aborts (throws) rather than embedding proof-of-revocation when the leaf is revoked', async () => {
+    const signed = await signPdf(await makePdf(), makeP12('pw'), { passphrase: 'pw' })
+    const ca = await makeCert({ subject: 'CA', issuer: 'CA' })
+    const leaf = await makeCert({ subject: 'Leaf', issuer: 'CA', ocsp: 'http://ocsp.test/' })
+    const revokedResp = await makeRevokedOcsp(leaf, ca)
+    const revokedFetcher: RevocationFetcher = {
+      fetchOcsp: async () => revokedResp,
+      fetchCrl: async () => null,
+      fetchCaIssuers: async () => null
+    }
+    await expect(addLtv(signed, leaf, [ca], revokedFetcher)).rejects.toThrow(/revoked/i)
   })
 })
 

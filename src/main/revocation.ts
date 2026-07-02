@@ -13,6 +13,9 @@ export interface RevocationData {
   ocsps: Uint8Array[]
   /** DER CRL blobs. */
   crls: Uint8Array[]
+  /** True if an authoritative OCSP/CRL response proves a chain cert is REVOKED — the caller must not
+   *  then claim LTV success (the embedded material would be proof-of-revocation, not validity). */
+  revoked: boolean
 }
 
 /** Fetches revocation material over the network. Injectable so tests don't hit real responders. */
@@ -53,6 +56,62 @@ export function isSuccessfulOcsp(der: Uint8Array): boolean {
     const ab = der.buffer.slice(der.byteOffset, der.byteOffset + der.byteLength) as ArrayBuffer
     const resp = new pkijs.OCSPResponse({ schema: asn1js.fromBER(ab).result })
     return resp.responseStatus.valueBlock.valueDec === 0
+  } catch {
+    return false
+  }
+}
+
+/** Extract the BasicOCSPResponse from a successful OCSPResponse, or null (error status / unparseable
+ *  / not id-pkix-ocsp-basic). */
+function basicOcspResponse(der: Uint8Array): pkijs.BasicOCSPResponse | null {
+  try {
+    const ab = der.buffer.slice(der.byteOffset, der.byteOffset + der.byteLength) as ArrayBuffer
+    const resp = new pkijs.OCSPResponse({ schema: asn1js.fromBER(ab).result })
+    if (resp.responseStatus.valueBlock.valueDec !== 0 || !resp.responseBytes) return null
+    const inner = resp.responseBytes.response.valueBlock.valueHexView
+    return new pkijs.BasicOCSPResponse({ schema: asn1js.fromBER(inner).result })
+  } catch {
+    return null
+  }
+}
+
+/** True if `respDer` (an OCSPResponse we fetched for `certDer`, issued by `issuerDer`) reports that
+ *  cert as REVOKED. Prefers pkijs's CertID-matched status; falls back to a direct scan of the
+ *  SingleResponses (safe because the request was POSTed for exactly this cert). Exported for tests. */
+export async function ocspResponseRevoked(
+  respDer: Uint8Array,
+  certDer: ArrayBuffer,
+  issuerDer: ArrayBuffer
+): Promise<boolean> {
+  const basic = basicOcspResponse(respDer)
+  if (!basic) return false
+  try {
+    const status = await basic.getCertificateStatus(parseCert(certDer), parseCert(issuerDer))
+    if (status.isForCertificate) return status.status === 1 // 0 good, 1 revoked, 2 unknown
+  } catch {
+    /* couldn't match by CertID — fall through to the raw scan */
+  }
+  try {
+    // certStatus is a context-tagged CHOICE: [0] good, [1] revoked (constructed), [2] unknown.
+    return basic.tbsResponseData.responses.some((r) => {
+      const cs = r.certStatus as { idBlock?: { isConstructed?: boolean; tagNumber?: number } }
+      return cs?.idBlock?.isConstructed === true && cs.idBlock.tagNumber === 1
+    })
+  } catch {
+    return false
+  }
+}
+
+/** True if a CRL lists `certDer`'s serial number in its revokedCertificates. Exported for tests. */
+export function crlRevokesCert(crlDer: Uint8Array, certDer: ArrayBuffer): boolean {
+  try {
+    const der = toDer(crlDer)
+    const ab = der.buffer.slice(der.byteOffset, der.byteOffset + der.byteLength) as ArrayBuffer
+    const crl = new pkijs.CertificateRevocationList({ schema: asn1js.fromBER(ab).result })
+    const serial = Buffer.from(parseCert(certDer).serialNumber.valueBlock.valueHexView).toString('hex') // prettier-ignore
+    return (crl.revokedCertificates ?? []).some(
+      (rc) => Buffer.from(rc.userCertificate.valueBlock.valueHexView).toString('hex') === serial
+    )
   } catch {
     return false
   }
@@ -154,6 +213,7 @@ export async function collectRevocation(
 ): Promise<RevocationData> {
   const ocsps: Uint8Array[] = []
   const crls: Uint8Array[] = []
+  let revoked = false
   for (let i = 0; i < chainDer.length - 1; i++) {
     const cert = chainDer[i]
     const issuer = chainDer[i + 1]
@@ -164,6 +224,7 @@ export async function collectRevocation(
       const resp = await fetcher.fetchOcsp(cert, issuer, url)
       if (resp) {
         ocsps.push(resp)
+        if (await ocspResponseRevoked(resp, cert, issuer)) revoked = true
         gotOcsp = true
         break
       }
@@ -174,9 +235,10 @@ export async function collectRevocation(
       const crl = await fetcher.fetchCrl(url)
       if (crl) {
         crls.push(crl)
+        if (crlRevokesCert(crl, cert)) revoked = true
         break
       }
     }
   }
-  return { ocsps, crls }
+  return { ocsps, crls, revoked }
 }

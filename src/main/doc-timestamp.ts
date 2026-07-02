@@ -11,8 +11,11 @@ import { SignPdf } from '@signpdf/signpdf'
 import { Signer } from '@signpdf/utils'
 import { type TokenIssuer } from './timestamp'
 
-// Room (bytes) for the RFC3161 token + the TSA's certificate chain in /Contents.
-const TOKEN_LENGTH = 16384
+// Room (bytes) for the RFC3161 token + the TSA's certificate chain in /Contents. Matches the B-T
+// signature-timestamp budget in sign.ts (placeAndSign uses 32768 when a TSA is configured): a TSA
+// whose token + cross-cert chain lands in the 16–26 KB band must not overflow a smaller placeholder
+// here and make the archive timestamp throw "Signature exceeds placeholder".
+const TOKEN_LENGTH = 32768
 // @signpdf's findByteRange recognizes the placeholder as [0 /********** /********** /**********].
 const BR = '/ByteRange [0 /********** /********** /**********]'
 

@@ -22,7 +22,14 @@ export async function addLtv(
 ): Promise<Uint8Array> {
   // Complete the chain via AIA caIssuers when it stops short (e.g. a card holding only the leaf).
   const chain = await completeChain(leafDer, chainCandidates, fetcher)
-  const { ocsps, crls } = await collectRevocation(chain, fetcher)
+  const { ocsps, crls, revoked } = await collectRevocation(chain, fetcher)
+  // An authoritative "revoked" response means the signature has no trust value; abort rather than
+  // embed proof-of-revocation in a DSS and report a misleading "LTV enabled" success (audit P1-4).
+  // Note: this fires only on a definite revoked status, never on a network/parse failure (those
+  // degrade to no-revocation, preserving the graceful-degradation contract).
+  if (revoked) {
+    throw new Error('Signing certificate is revoked (per OCSP/CRL); signing aborted.')
+  }
   return appendDss(signedPdf, {
     certs: chain.map((der) => new Uint8Array(der)),
     ocsps,
