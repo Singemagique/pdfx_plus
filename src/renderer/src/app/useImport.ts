@@ -2,11 +2,37 @@ import { useCallback, useEffect } from 'react'
 import { findConverter } from '../pdfx/convert'
 import { importIntoDocs, loadIncomingPages } from '../pdfx/source'
 import type { ImportedMirror } from '../pdfx/mirror'
+import type { IntegrityComparison } from '../pdfx/canonicalize'
 import { dedupeNames } from './names'
 import { applyExternalDrop } from './external-drop'
 import type { Collection } from './useCollection'
 import type { DropTarget } from '../canvas/layout'
 import type { IncomingFile } from './types'
+
+type GateDecision = 'cancel' | 'load' | 'skip'
+
+/**
+ * Tamper gate for a .pdfx's saved edits (shared by File→Open and drop). With no mirror there's
+ * nothing to load. If the content still matches the hash the edits were saved against, load them.
+ * If it changed, prompt: the user can load the (possibly stale/forged) edits anyway, open without
+ * them, or cancel the open entirely.
+ */
+async function tamperGate(
+  mirror: ImportedMirror | null,
+  integrity: IntegrityComparison
+): Promise<GateDecision> {
+  if (!mirror) return 'skip'
+  if (!integrity.tampered) return 'load'
+  const changed = integrity.changedPages
+  const detail =
+    changed.length === 0
+      ? 'The document content changed since these edits were saved.'
+      : changed.length > 10
+        ? `${changed.length} pages changed since these edits were saved.`
+        : `Page${changed.length > 1 ? 's' : ''} ${changed.join(', ')} changed since these edits were saved.`
+  const choice = await window.api.confirmIntegrity(detail)
+  return choice === 2 ? 'cancel' : choice === 1 ? 'load' : 'skip'
+}
 
 export function useImport(
   collection: Collection,
@@ -29,24 +55,10 @@ export function useImport(
             ? await conv.toPdf(file.name, file.data, undefined, file.path)
             : file.data
           const { docs: entries, mirror, integrity } = await importIntoDocs(name, data)
-          // Tamper gate: if the .pdfx content no longer matches the hash its edits were saved
-          // against, block auto-loading those (possibly stale/forged) edits — but let the user
-          // explicitly recover them or cancel the open. With no mirror there's nothing to gate.
-          let loadMirror = mirror != null
-          if (integrity.tampered && mirror) {
-            const changed = integrity.changedPages
-            const detail =
-              changed.length === 0
-                ? 'The document content changed since these edits were saved.'
-                : changed.length > 10
-                  ? `${changed.length} pages changed since these edits were saved.`
-                  : `Page${changed.length > 1 ? 's' : ''} ${changed.join(', ')} changed since these edits were saved.`
-            const choice = await window.api.confirmIntegrity(detail)
-            if (choice === 2) continue // Cancel → don't open this file at all
-            loadMirror = choice === 1 // Load edits anyway; otherwise open without the edits
-          }
+          const decision = await tamperGate(mirror, integrity)
+          if (decision === 'cancel') continue // Cancel → don't open this file at all
           setDocs((prev) => [...prev, ...dedupeNames(prev, entries)])
-          if (loadMirror && mirror) loadEditState(mirror)
+          if (decision === 'load' && mirror) loadEditState(mirror)
         } catch (error) {
           console.error(`Failed to import ${file.name}`, error)
           failed.push(file.name)
@@ -98,12 +110,17 @@ export function useImport(
       }
       setBusy(true)
       try {
-        await applyExternalDrop(files, target, {
+        const dropped = await applyExternalDrop(files, target, {
           docs: docsRef.current,
           addFiles,
           insertPagesIntoDoc,
           spliceDocsAfter
         })
+        // Load the saved edits carried by any dropped .pdfx (the pages are already placed, so a
+        // tamper "cancel" here just skips the edits rather than removing the pages).
+        for (const { mirror, integrity } of dropped) {
+          if ((await tamperGate(mirror, integrity)) === 'load' && mirror) loadEditState(mirror)
+        }
       } catch (error) {
         console.error('Drop failed', error)
         flash('Could not add files')
@@ -111,7 +128,7 @@ export function useImport(
         setBusy(false)
       }
     },
-    [addFiles, insertPagesIntoDoc, spliceDocsAfter, flash, setBusy, docsRef]
+    [addFiles, insertPagesIntoDoc, spliceDocsAfter, flash, setBusy, docsRef, loadEditState]
   )
 
   return { addFiles, openViaDialog, addPagesToDoc, handleExternalDropFiles }
