@@ -1,6 +1,7 @@
 import { basename, join } from 'path'
 import { existsSync } from 'fs'
 import { readFile, readdir, stat } from 'fs/promises'
+import { rememberOpened } from './opened-paths'
 
 export interface OpenedFile {
   name: string
@@ -15,6 +16,9 @@ export function collectFileArgs(argv: string[]): string[] {
 }
 
 export async function readFiles(paths: string[]): Promise<OpenedFile[]> {
+  // Every path that becomes an OpenedFile flows through here — record them so read-resource can
+  // later verify an HTML resource base is a file the user actually opened.
+  rememberOpened(paths)
   return Promise.all(
     paths.map(async (p) => ({
       name: basename(p),
