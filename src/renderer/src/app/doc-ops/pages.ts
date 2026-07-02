@@ -2,6 +2,16 @@ import { uniqueDocName } from '../names'
 import type { DocEntry, PageEntry } from '../../types'
 import type { PageRef } from '../types'
 
+/**
+ * An independent copy of a page: fresh page id AND fresh source id, so its edit key
+ * (`source.id#pageIndex`) can't collide with the original. Copies (paste / duplicate) must not share
+ * overlays, rotations, crops or redactions with the page they came from — a shared key means an edit
+ * to one silently mutates the other (worst case: redacting a copy destroys the original's content).
+ */
+export function freshPageCopy(page: PageEntry): PageEntry {
+  return { ...page, id: crypto.randomUUID(), source: { ...page.source, id: crypto.randomUUID() } }
+}
+
 export function insertPastedPage(
   docs: DocEntry[],
   selected: PageRef,

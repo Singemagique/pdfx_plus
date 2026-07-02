@@ -278,6 +278,34 @@ describe('buildPdf', () => {
     expect(types).toContain('/Sig')
   })
 
+  it('paints the redaction box in z-order so it covers overlays beneath it', async () => {
+    const bytes = await makeSourcePdf()
+    const pageKey = makePageKey('a', 0)
+    const redaction: Overlay = {
+      id: 'r',
+      pageKey,
+      z: 1,
+      createdAt: 1,
+      geom: { x: 5, y: 5, w: 50, h: 20, rotation: 0, opacity: 1 },
+      type: 'redaction',
+      fill: { r: 0, g: 0, b: 0 }
+    }
+    const editLayer: EditLayer = {
+      overlays: new Map([[pageKey, [HIGHLIGHT(pageKey), redaction]]]), // highlight z0, redaction z1
+      attachments: new Map(),
+      rotations: new Map(),
+      crops: new Map()
+    }
+    const content = pageContent(
+      await PDFDocument.load(await buildPdf([{ bytes, sourceKey: 'a', pageIndex: 0 }], editLayer)),
+      0
+    )
+    // The redaction now paints an opaque black box (previously it drew nothing → overlays leaked).
+    expect(content).toContain('0 0 0 rg')
+    // And it's drawn AFTER the lower-z highlight, so it covers it (matches the editor's WYSIWYG).
+    expect(content.indexOf('0 0 0 rg')).toBeGreaterThan(content.indexOf('1 0.9 0.2 rg'))
+  })
+
   it('applies a page crop as the /CropBox on export', async () => {
     const bytes = await makeSourcePdf() // 200×200
     const pageKey = makePageKey('a', 0)
