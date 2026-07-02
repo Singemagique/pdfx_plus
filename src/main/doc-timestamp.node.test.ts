@@ -6,7 +6,7 @@ import forge from 'node-forge'
 import { signPdf } from './sign'
 import { addDocTimeStamp } from './doc-timestamp'
 import { makeLocalTsa } from './tsa-local'
-import { verifyTimestampToken } from './timestamp'
+import { verifyTimestampToken, type TokenIssuer } from './timestamp'
 import { type RevocationFetcher } from './revocation'
 
 const cannedFetcher: RevocationFetcher = {
@@ -143,6 +143,29 @@ describe('addDocTimeStamp', () => {
     expect(firstByteRangeDigest(out)).toBe(firstCmsMessageDigest(out))
     const { token, content } = lastTimestamp(out)
     expect((await verifyTimestampToken(token, content)).imprintOk).toBe(true)
+  })
+
+  it('falls back to a valid B-LT when only the archive timestamp fails (P1-7)', async () => {
+    const good = await makeLocalTsa()
+    let calls = 0
+    // Succeed for the B-T signature timestamp (call 1), fail on the archive round-trip (call 2).
+    const flaky: TokenIssuer = async (digest) => {
+      calls++
+      if (calls >= 2) throw new Error('TSA offline on the archive round-trip')
+      return good(digest)
+    }
+    const out = await signPdf(
+      await makePdf(),
+      makeP12('pw'),
+      { passphrase: 'pw', ltv: true, tsaUrl: 'http://local-tsa' },
+      flaky,
+      cannedFetcher
+    )
+    const text = Buffer.from(out).toString('latin1')
+    expect(text).toContain('/DSS') // B-LT is intact...
+    expect(text).not.toContain('/Type /DocTimeStamp') // ...but the failed archive step is dropped
+    // The approval signature (with its B-T signature timestamp) is still valid.
+    expect(firstByteRangeDigest(out)).toBe(firstCmsMessageDigest(out))
   })
 
   it('gives each timestamp a unique field name when re-timestamping (archive refresh)', async () => {

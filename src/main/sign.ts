@@ -55,7 +55,16 @@ async function archiveTimestamp(
   opts: SignOptions,
   getToken?: TokenIssuer
 ): Promise<Uint8Array> {
-  return opts.tsaUrl ? addDocTimeStamp(ltvBytes, getToken ?? tsaIssuer(opts.tsaUrl)) : ltvBytes
+  if (!opts.tsaUrl) return ltvBytes
+  try {
+    return await addDocTimeStamp(ltvBytes, getToken ?? tsaIssuer(opts.tsaUrl))
+  } catch (e) {
+    // ltvBytes is already a complete, valid B-LT signature. If ONLY the archive step fails (a network
+    // flake on the second TSA round-trip, or a token larger than the placeholder), return the B-LT
+    // rather than discarding a good signature by letting the whole sign reject (audit P1-7).
+    console.warn('pdfx: archive timestamp (B-LTA) failed; returning B-LT', e)
+    return ltvBytes
+  }
 }
 
 /** Add the signing placeholder, then run @signpdf with `signer`, returning signed PDF bytes.

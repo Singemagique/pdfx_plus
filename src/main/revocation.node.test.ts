@@ -7,7 +7,9 @@ import {
   buildOcspRequest,
   certFromCaIssuers,
   collectRevocation,
+  crlRevokesCert,
   isSuccessfulOcsp,
+  ocspResponseRevoked,
   type RevocationFetcher
 } from './revocation'
 
@@ -201,6 +203,132 @@ describe('collectRevocation', () => {
     }
 
     const out = await collectRevocation([leaf, ca], failing)
-    expect(out).toEqual({ ocsps: [], crls: [] })
+    expect(out).toEqual({ ocsps: [], crls: [], revoked: false })
+  })
+
+  it('does not flag revoked when responders report good status', async () => {
+    const leaf = await makeCert({ subject: 'Leaf', issuer: 'CA', ocsp: 'http://ocsp.test/' }, 3)
+    const ca = await makeCert({ subject: 'CA', issuer: 'CA' }, 1)
+    const out = await collectRevocation([leaf, ca], recordingFetcher())
+    expect(out.revoked).toBe(false)
+  })
+})
+
+// A CRL/OCSP signature is not verified by our detectors (they read status/serials), so a
+// throwaway key suffices to produce parseable DER.
+async function genKeys(): Promise<CryptoKeyPair> {
+  return (await webcrypto.subtle.generateKey(
+    { name: 'RSASSA-PKCS1-v1_5', modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256' }, // prettier-ignore
+    true,
+    ['sign', 'verify']
+  )) as CryptoKeyPair
+}
+
+async function makeRevokedCrl(serials: number[], issuer = 'CA'): Promise<Uint8Array> {
+  const keys = await genKeys()
+  const crl = new pkijs.CertificateRevocationList()
+  crl.version = 1
+  crl.issuer.typesAndValues.push(
+    new pkijs.AttributeTypeAndValue({ type: '2.5.4.3', value: new asn1js.PrintableString({ value: issuer }) }) // prettier-ignore
+  )
+  crl.thisUpdate = new pkijs.Time({ type: 0, value: new Date() })
+  crl.revokedCertificates = serials.map(
+    (s) =>
+      new pkijs.RevokedCertificate({
+        userCertificate: new asn1js.Integer({ value: s }),
+        revocationDate: new pkijs.Time({ type: 0, value: new Date() })
+      })
+  )
+  await crl.sign(keys.privateKey, 'SHA-256')
+  return new Uint8Array(crl.toSchema().toBER(false))
+}
+
+async function makeRevokedOcsp(leafDer: ArrayBuffer, issuerDer: ArrayBuffer): Promise<Uint8Array> {
+  const keys = await genKeys()
+  const leaf = new pkijs.Certificate({ schema: asn1js.fromBER(leafDer).result })
+  const issuer = new pkijs.Certificate({ schema: asn1js.fromBER(issuerDer).result })
+  const single = new pkijs.SingleResponse()
+  await single.certID.createForCertificate(leaf, {
+    hashAlgorithm: 'SHA-1',
+    issuerCertificate: issuer
+  })
+  // certStatus CHOICE [1] revoked → RevokedInfo { revocationTime GeneralizedTime }
+  single.certStatus = new asn1js.Constructed({
+    idBlock: { tagClass: 3, tagNumber: 1 },
+    value: [new asn1js.GeneralizedTime({ valueDate: new Date() })]
+  })
+  single.thisUpdate = new Date()
+  const basic = new pkijs.BasicOCSPResponse()
+  basic.tbsResponseData.responses.push(single)
+  basic.tbsResponseData.responderID = issuer.subject
+  basic.tbsResponseData.producedAt = new Date()
+  await basic.sign(keys.privateKey, 'SHA-256')
+  const resp = new pkijs.OCSPResponse()
+  resp.responseStatus.valueBlock.valueDec = 0
+  resp.responseBytes = new pkijs.ResponseBytes({
+    responseType: '1.3.6.1.5.5.7.48.1.1',
+    response: new asn1js.OctetString({ valueHex: basic.toSchema().toBER(false) })
+  })
+  return new Uint8Array(resp.toSchema().toBER(false))
+}
+
+describe('revoked-status detection (P1-4)', () => {
+  it('crlRevokesCert matches a serial listed in the CRL, and ignores others', async () => {
+    const leaf = await makeCert({ subject: 'Leaf', issuer: 'CA' }, 42)
+    const other = await makeCert({ subject: 'Other', issuer: 'CA' }, 7)
+    const crl = await makeRevokedCrl([42])
+    expect(crlRevokesCert(crl, leaf)).toBe(true)
+    expect(crlRevokesCert(crl, other)).toBe(false)
+  })
+
+  it('crlRevokesCert does not match a same-serial cert from a DIFFERENT issuer', async () => {
+    // Serial 42 is revoked, but by EvilCA — our leaf (serial 42) was issued by CA.
+    const leaf = await makeCert({ subject: 'Leaf', issuer: 'CA' }, 42)
+    const evilCrl = await makeRevokedCrl([42], 'EvilCA')
+    expect(crlRevokesCert(evilCrl, leaf)).toBe(false)
+  })
+
+  it('ocspResponseRevoked reads a revoked CertStatus', async () => {
+    const issuer = await makeCert({ subject: 'CA', issuer: 'CA' }, 1)
+    const leaf = await makeCert({ subject: 'Leaf', issuer: 'CA' }, 42)
+    const revokedResp = await makeRevokedOcsp(leaf, issuer)
+    expect(await ocspResponseRevoked(revokedResp, leaf, issuer)).toBe(true)
+  })
+
+  it('ocspResponseRevoked ignores a revoked entry about a DIFFERENT cert', async () => {
+    // A shared/delegated responder's reply revokes a neighbor (serial 7); it says nothing about our
+    // leaf (serial 42). Must not be read as revoking the leaf.
+    const issuer = await makeCert({ subject: 'CA', issuer: 'CA' }, 1)
+    const neighbor = await makeCert({ subject: 'Neighbor', issuer: 'CA' }, 7)
+    const leaf = await makeCert({ subject: 'Leaf', issuer: 'CA' }, 42)
+    const respAboutNeighbor = await makeRevokedOcsp(neighbor, issuer)
+    expect(await ocspResponseRevoked(respAboutNeighbor, leaf, issuer)).toBe(false)
+  })
+
+  it('collectRevocation flags revoked when the OCSP responder says so', async () => {
+    const issuer = await makeCert({ subject: 'CA', issuer: 'CA' }, 1)
+    const leaf = await makeCert({ subject: 'Leaf', issuer: 'CA', ocsp: 'http://ocsp.test/' }, 42)
+    const revokedResp = await makeRevokedOcsp(leaf, issuer)
+    const fetcher: RevocationFetcher = {
+      fetchOcsp: async () => revokedResp,
+      fetchCrl: async () => null,
+      fetchCaIssuers: async () => null
+    }
+    const out = await collectRevocation([leaf, issuer], fetcher)
+    expect(out.revoked).toBe(true)
+    expect(out.ocsps.length).toBe(1) // the proof is still collected, the caller decides to abort
+  })
+
+  it('collectRevocation flags revoked via a CRL fallback', async () => {
+    const issuer = await makeCert({ subject: 'CA', issuer: 'CA' }, 1)
+    const leaf = await makeCert({ subject: 'Leaf', issuer: 'CA', crl: 'http://crl.test/x.crl' }, 42)
+    const crl = await makeRevokedCrl([42])
+    const fetcher: RevocationFetcher = {
+      fetchOcsp: async () => null,
+      fetchCrl: async () => crl,
+      fetchCaIssuers: async () => null
+    }
+    const out = await collectRevocation([leaf, issuer], fetcher)
+    expect(out.revoked).toBe(true)
   })
 })
