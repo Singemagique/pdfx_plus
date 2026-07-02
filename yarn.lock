@@ -257,11 +257,6 @@
     ajv "^6.12.0"
     ajv-keywords "^3.4.1"
 
-"@electron-toolkit/preload@3.0.2":
-  version "3.0.2"
-  resolved "https://registry.yarnpkg.com/@electron-toolkit/preload/-/preload-3.0.2.tgz#ee5bb33aba48741c5bc539a9a6faad0be455465e"
-  integrity sha512-TWWPToXd8qPRfSXwzf5KVhpXMfONaUuRAZJHsKthKgZR/+LqX1dZVSSClQ8OTAEduvLGdecljCsoT2jSshfoUg==
-
 "@electron-toolkit/tsconfig@1.0.1":
   version "1.0.1"
   resolved "https://registry.yarnpkg.com/@electron-toolkit/tsconfig/-/tsconfig-1.0.1.tgz#78048d3178dd7a6a573590e23240f0764b0c14af"
@@ -1156,13 +1151,6 @@
   integrity sha512-n7jt1Dzo3wocI64Pb8YhB+gvHAeaxweR7oHj5Xn3CyUVsP8LmXEWwJOUdWmtTrDfAupEiQtcro/EeskLiNy1vA==
   dependencies:
     "@signpdf/placeholder-pdfkit010" "^3.3.0"
-    "@signpdf/utils" "^3.3.0"
-
-"@signpdf/signer-p12@^3.3.0":
-  version "3.3.0"
-  resolved "https://registry.yarnpkg.com/@signpdf/signer-p12/-/signer-p12-3.3.0.tgz#e2771729698d2b406cc3e8feadef17ac9b35cb2f"
-  integrity sha512-MLynYKgUBu29ojIueIDV34sIOFDFpP0s1gQORxCc0zhs1jfy0juqU2xQpjUayMbhzB4L0zS9dPwgHtok1f89Cg==
-  dependencies:
     "@signpdf/utils" "^3.3.0"
 
 "@signpdf/signpdf@^3.3.0":
@@ -2305,10 +2293,10 @@ electron-vite@4.0.1:
     magic-string "^0.30.17"
     picocolors "^1.1.1"
 
-electron@38.4.0:
-  version "38.4.0"
-  resolved "https://registry.yarnpkg.com/electron/-/electron-38.4.0.tgz#8910dd5ff8f1d313a1e978589f5620b035c32091"
-  integrity sha512-9CsXKbGf2qpofVe2pQYSgom2E//zLDJO2rGLLbxgy9tkdTOs7000Gte+d/PUtzLjI/DS95jDK0ojYAeqjLvpYg==
+electron@38.8.6:
+  version "38.8.6"
+  resolved "https://registry.yarnpkg.com/electron/-/electron-38.8.6.tgz#887cd895eb66fd33c978f7225f83f29bdca72d0a"
+  integrity sha512-lyBhcVi9QYAZL6FO6r5twAWAjWnYomo3iVDvrb5SJZlq928BGemHOKG0tPIq41NOLaCu9f3XdEEjMkjQPjprRg==
   dependencies:
     "@electron/get" "^2.0.0"
     "@types/node" "^22.7.7"

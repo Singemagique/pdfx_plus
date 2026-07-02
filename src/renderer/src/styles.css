@@ -1583,7 +1583,9 @@ body {
   bottom: 24px;
   left: 50%;
   transform: translateX(-50%);
-  z-index: 20;
+  /* Above the Sign dialog (z 50) and its signature pad (z 60): a sign-failure toast is the only
+     error feedback and must not render behind the dialog scrim. */
+  z-index: 100;
   font-size: 13px;
   font-weight: 500;
   background: var(--accent);
