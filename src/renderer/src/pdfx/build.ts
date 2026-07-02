@@ -215,13 +215,25 @@ async function bakePage(
   const list = edits.overlays.get(key)
   if (res && list && list.length > 0) {
     const sorted = [...list].sort((a, b) => a.z - b.z || a.createdAt - b.createdAt)
-    // On a source page with intrinsic /Rotate, draw overlays through a transform that converts
-    // their visual-space coordinates to unrotated space; the page's /Rotate then shows them where
-    // the user placed them. This handles every overlay type (text angle, images, ink, shapes).
+    // Overlay coordinates are captured in the editor's VIEW-relative space (0-based over the view
+    // box). Two transforms reconcile that with pdf-lib's user space, innermost first:
+    //   1. intrinsicMatrix — on a source page with intrinsic /Rotate, convert visual → unrotated
+    //      (still 0-based); the page's /Rotate then displays them where the user placed them.
+    //   2. translate by the view-box origin — so a page whose MediaBox/CropBox doesn't start at
+    //      (0,0) draws overlays at the visible content, not offset by the origin. Mirrors the crop
+    //      path (setCropBox uses view0.x + u.x). Without it every flattened overlay — text, ink,
+    //      shapes, images, the signature appearance, formValue marks — is shifted on offset pages.
     const m = intrinsicMatrix(intrinsic, view0.width, view0.height)
-    if (m) page.pushOperators(pushGraphicsState(), concatTransformationMatrix(...m))
-    await flattenPageOverlays(page, sorted, res)
-    if (m) page.pushOperators(popGraphicsState())
+    const shift = view0.x !== 0 || view0.y !== 0
+    if (m || shift) {
+      page.pushOperators(pushGraphicsState())
+      if (shift) page.pushOperators(concatTransformationMatrix(1, 0, 0, 1, view0.x, view0.y))
+      if (m) page.pushOperators(concatTransformationMatrix(...m))
+      await flattenPageOverlays(page, sorted, res)
+      page.pushOperators(popGraphicsState())
+    } else {
+      await flattenPageOverlays(page, sorted, res)
+    }
   }
   // Form fill paints the value as page content; drop the matching interactive widget so its own
   // appearance (the original value) doesn't render on top of — and double with — the painted one.

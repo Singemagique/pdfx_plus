@@ -389,6 +389,22 @@ describe('buildPdf', () => {
     const content = pageContent(await PDFDocument.load(out), 0)
     expect(content).not.toContain('0 1 -1 0') // no intrinsic-rotation matrix emitted
   })
+
+  it('translates flattened overlays by the view-box origin on an offset-MediaBox page', async () => {
+    // A page whose MediaBox origin isn't (0,0): [100 100 300 300]. Overlay geometry is view-relative,
+    // so the flatten must shift it by the origin or it lands off the visible content.
+    const doc = await PDFDocument.create()
+    doc.addPage([200, 200]).setMediaBox(100, 100, 200, 200)
+    const bytes = await doc.save()
+    const pageKey = makePageKey('o', 0)
+    const editLayer: EditLayer = {
+      overlays: new Map([[pageKey, [HIGHLIGHT(pageKey)]]]),
+      attachments: new Map()
+    }
+    const out = await buildPdf([{ bytes, sourceKey: 'o', pageIndex: 0 }], editLayer)
+    const content = pageContent(await PDFDocument.load(out), 0)
+    expect(content).toContain('1 0 0 1 100 100 cm') // overlay draw translated to the box origin
+  })
 })
 
 describe('formValue flatten', () => {
