@@ -8,6 +8,13 @@ This PRD specifies the evolution of PDFx from a **structural-only** editor (reor
 
 This document is grounded in the real codebase at `I:/Claude/pdfx_plus`. Key existing modules: `src/main/{index,file-intake,markup,clipboard,menu,register-ipc,window}.ts`; `src/main/native/glass.ts`; `src/preload/index.ts`; `src/renderer/src/pdfx/{build,format,images,markup,...}.ts`; `src/renderer/src/app/doc-ops/{docs,move,pages}.ts` and hooks; `src/renderer/src/components/Toolbar.tsx`. External factual claims about third-party libraries below are cited; anything unverified is flagged explicitly.
 
+> **Implementation status (as of v1.0.0).** This PRD is the forward-looking design; the shipped app went further than several "v1 / later-phase / experimental" markers below. Where they differ, the shipped state is authoritative:
+>
+> - **Integrity hash is a HARD GATE, not advisory.** The determinism suite (T1–T4) passed and the `pdfx-canon/1` gate now quarantines the mirror on a definite mismatch (`compareIntegrity`/`checkIntegrity`). Passages that say it "ships advisory first" describe the original rollout plan only.
+> - **PAdES B-LTA shipped** (document timestamp over the DSS, `/Type /DocTimeStamp /SubFilter /ETSI.RFC3161`) — no longer out of scope. Setting an LTV toggle plus a TSA URL produces B-LTA automatically.
+> - **PKCS#11 smart-card signing shipped** (via `koffi` FFI, not `node-webcrypto-p11`) and the **Windows certificate store** path shipped (CNG via PowerShell) — both are production features, not v2/experimental sub-tracks.
+> - **Not implemented:** the §6 signed-file verification UI (diffing post-signature incremental updates) is not built; PDFx performs a post-sign DSS readout but no shadow-attack diff.
+
 ---
 
 ## 2. Goals / Non-goals

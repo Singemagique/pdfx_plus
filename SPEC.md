@@ -105,9 +105,12 @@ canonicalized, strings length-tagged, whitespace collapsed) — so it is invaria
 to compression, object numbering, whitespace, and date/`/ID` drift.
 `pageHashes[i] = SHA-256(page_i)` and
 `flattenedSha256 = SHA-256(domain + pageCount + concat(pageHashes))`. On open, a
-reader recomputes and compares: a mismatch means the flattened content was
-altered by another tool, so the mirror's edits may be stale. This ships
-**advisory** (warning only) and an unknown `canonAlg` is never enforced.
+reader recomputes and compares. This is a **hard gate**: on a definite mismatch
+the reader **quarantines** the editable mirror — the flattened page content is
+treated as authoritative and the (possibly stale or forged) `edits` are not
+auto-loaded, though the user may choose to recover them. An absent record or an
+unknown `canonAlg` cannot prove tampering and is treated as clean (never
+enforced).
 
 ## Reader behavior
 

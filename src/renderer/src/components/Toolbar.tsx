@@ -99,7 +99,7 @@ export function Toolbar({
         className="btn glass"
         onClick={onSign}
         disabled={busy || documentCount === 0}
-        title="Cryptographically sign a flattened copy (PAdES) with a .p12 certificate"
+        title="Cryptographically sign a flattened copy (PAdES) with a .p12/PFX file, a smart card (PKCS#11), or the Windows certificate store"
       >
         Sign
       </button>
