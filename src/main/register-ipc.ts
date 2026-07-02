@@ -84,6 +84,11 @@ export function registerIpc(getPending: () => string[], clearPending: () => void
   ipcMain.handle(
     'pdfx:markup-to-pdf',
     (_event, html: string, fitPageHeightPx?: number): Promise<Uint8Array> => {
+      // Bound the renderer-supplied HTML (parity with the other IPC guards) so a huge base64 data URL
+      // can't spike main-process memory. 64 MiB is far above any legitimate markup document.
+      if (typeof html !== 'string' || html.length > 64 * 1024 * 1024) {
+        throw new Error('markup-to-pdf: html too large')
+      }
       // Coerce to a finite positive number so the value can never be a string that
       // breaks out of the numeric context where markup.ts interpolates it into
       // executeJavaScript.

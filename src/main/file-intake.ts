@@ -38,6 +38,9 @@ export async function expandDropPaths(paths: string[]): Promise<string[]> {
   const out: string[] = []
   for (const p of paths) {
     if (out.length >= MAX_DROP_FILES) break
+    // Reject UNC roots (\\server\share, //server/share): walking one triggers outbound SMB and a
+    // compromised renderer could use it to enumerate network shares / leak an NTLM hash.
+    if (typeof p !== 'string' || !p || /^[\\/]{2}/.test(p)) continue
     try {
       const info = await stat(p)
       if (info.isDirectory()) {

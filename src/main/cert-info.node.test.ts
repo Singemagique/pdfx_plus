@@ -32,9 +32,14 @@ describe('certInfoFromDer', () => {
   it('formats the subject and issuer as DN strings', () => {
     const { der } = makeCred('pw')
     const info = certInfoFromDer(der)
-    expect(info.subject).toContain('CN=JARA.ADAM.1290104722')
-    expect(info.subject).toContain('OU=DoD')
-    expect(info.issuer).toContain('CN=DOD ID CA-59')
+    expect(info).not.toBeNull()
+    expect(info!.subject).toContain('CN=JARA.ADAM.1290104722')
+    expect(info!.subject).toContain('OU=DoD')
+    expect(info!.issuer).toContain('CN=DOD ID CA-59')
+  })
+
+  it('returns null on a malformed cert instead of throwing', () => {
+    expect(certInfoFromDer(new Uint8Array([1, 2, 3, 4, 5]))).toBeNull()
   })
 })
 

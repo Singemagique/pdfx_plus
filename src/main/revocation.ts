@@ -158,7 +158,45 @@ export function certFromCaIssuers(bytes: Uint8Array): Uint8Array | null {
   return null
 }
 
-/** The real HTTP fetcher. OCSP via POST application/ocsp-request; CRL via GET. Both time-bounded. */
+// Size caps on revocation responses. A hostile .p12 supplies the AIA/CDP URLs, and DoD CRLs already
+// run to tens of MB — an uncapped fetch is a main-process memory-spike vector and bloats the DSS.
+const MAX_OCSP_BYTES = 512 * 1024 // OCSP responses are small
+const MAX_CRL_BYTES = 16 * 1024 * 1024 // real CRLs can be large, but not unbounded
+const MAX_AIA_BYTES = 1024 * 1024 // a single issuer cert / small bundle
+
+/** Read a response body, streaming, and reject (null) once it exceeds `maxBytes` — so an oversized
+ *  or lying Content-Length can't force a huge allocation. Exported for tests. */
+export async function readCapped(res: Response, maxBytes: number): Promise<Uint8Array | null> {
+  const declared = Number(res.headers.get('content-length'))
+  if (Number.isFinite(declared) && declared > maxBytes) return null
+  if (!res.body) {
+    const buf = new Uint8Array(await res.arrayBuffer())
+    return buf.byteLength > maxBytes ? null : buf
+  }
+  const reader = res.body.getReader()
+  const chunks: Uint8Array[] = []
+  let total = 0
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    total += value.byteLength
+    if (total > maxBytes) {
+      await reader.cancel()
+      return null
+    }
+    chunks.push(value)
+  }
+  const out = new Uint8Array(total)
+  let offset = 0
+  for (const c of chunks) {
+    out.set(c, offset)
+    offset += c.byteLength
+  }
+  return out
+}
+
+/** The real HTTP fetcher. OCSP via POST application/ocsp-request; CRL via GET. Both time- and
+ *  size-bounded. */
 export function httpRevocationFetcher(timeoutMs = 15000): RevocationFetcher {
   return {
     async fetchOcsp(cert, issuer, url) {
@@ -170,9 +208,9 @@ export function httpRevocationFetcher(timeoutMs = 15000): RevocationFetcher {
           signal: AbortSignal.timeout(timeoutMs)
         })
         if (!res.ok) return null
-        const buf = new Uint8Array(await res.arrayBuffer())
+        const buf = await readCapped(res, MAX_OCSP_BYTES)
         // Only keep a genuinely successful response; an error OCSPResponse has no revocation value.
-        return buf.length && isSuccessfulOcsp(buf) ? buf : null
+        return buf && buf.length && isSuccessfulOcsp(buf) ? buf : null
       } catch {
         return null
       }
@@ -181,8 +219,8 @@ export function httpRevocationFetcher(timeoutMs = 15000): RevocationFetcher {
       try {
         const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) })
         if (!res.ok) return null
-        const buf = new Uint8Array(await res.arrayBuffer())
-        return buf.length ? toDer(buf) : null
+        const buf = await readCapped(res, MAX_CRL_BYTES)
+        return buf && buf.length ? toDer(buf) : null
       } catch {
         return null
       }
@@ -191,8 +229,8 @@ export function httpRevocationFetcher(timeoutMs = 15000): RevocationFetcher {
       try {
         const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) })
         if (!res.ok) return null
-        const buf = new Uint8Array(await res.arrayBuffer())
-        return buf.length ? certFromCaIssuers(buf) : null
+        const buf = await readCapped(res, MAX_AIA_BYTES)
+        return buf && buf.length ? certFromCaIssuers(buf) : null
       } catch {
         return null
       }

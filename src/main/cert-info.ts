@@ -36,9 +36,15 @@ const fromDer = (bytes: string): forge.asn1.Asn1 =>
     ) => forge.asn1.Asn1
   )(forge.util.createBuffer(bytes), { parseAllBytes: false })
 
-/** Subject + issuer of a DER-encoded X.509 certificate (e.g. read off a PKCS#11 token). */
-export function certInfoFromDer(der: Uint8Array): SignerInfo {
-  return infoFromCert(forge.pki.certificateFromAsn1(fromDer(Buffer.from(der).toString('binary'))))
+/** Subject + issuer of a DER-encoded X.509 certificate (e.g. read off a PKCS#11 token), or null if
+ *  it can't be parsed — matching certInfoFromP12, so the card-cert-info IPC returns the documented
+ *  null instead of rejecting on a malformed cert (the appearance then falls back to its generic form). */
+export function certInfoFromDer(der: Uint8Array): SignerInfo | null {
+  try {
+    return infoFromCert(forge.pki.certificateFromAsn1(fromDer(Buffer.from(der).toString('binary'))))
+  } catch {
+    return null
+  }
 }
 
 function isCa(cert: forge.pki.Certificate): boolean {
