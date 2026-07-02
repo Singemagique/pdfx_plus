@@ -118,3 +118,109 @@ describe('mirror round-trip', () => {
     ).toBeNull()
   })
 })
+
+describe('mirror import validation (crafted/corrupt .pdfx)', () => {
+  const freshPage = (): DocEntry[] => [
+    {
+      id: 'd1',
+      name: 'A',
+      pages: [
+        {
+          id: 'p1',
+          source: { id: 'newsrc', bytes: new Uint8Array(), pdf: null as never },
+          pageIndex: 0,
+          width: 612,
+          height: 792
+        }
+      ]
+    }
+  ]
+  const manifestWith = (edit: object): PdfxManifest =>
+    ({
+      pdfx: '1.1',
+      documents: [{ name: 'A', pages: 1 }],
+      edits: [{ doc: 0, page: 0, ...edit }],
+      attachments: []
+    }) as unknown as PdfxManifest
+
+  it('drops overlays with non-finite geometry', () => {
+    const bad = {
+      id: 'x',
+      pageKey: 'k',
+      z: 0,
+      createdAt: 0,
+      type: 'highlight',
+      color: { r: 1, g: 1, b: 0 },
+      geom: { x: Infinity, y: 0, w: 10, h: 10, rotation: 0, opacity: 1 }
+    }
+    const imported = deserializeMirror(manifestWith({ overlays: [bad] }), freshPage())
+    expect(imported!.overlays).toHaveLength(0)
+  })
+
+  it('rejects injected redaction overlays (would destroy content on re-export)', () => {
+    const redaction = {
+      id: 'r',
+      pageKey: 'k',
+      z: 0,
+      createdAt: 0,
+      type: 'redaction',
+      fill: { r: 0, g: 0, b: 0 },
+      geom: { x: 0, y: 0, w: 100, h: 100, rotation: 0, opacity: 1 }
+    }
+    const imported = deserializeMirror(manifestWith({ overlays: [redaction] }), freshPage())
+    expect(imported!.overlays).toHaveLength(0)
+  })
+
+  it('drops overlays of unknown type', () => {
+    const evil = {
+      id: 'e',
+      pageKey: 'k',
+      z: 0,
+      createdAt: 0,
+      type: 'exec',
+      geom: { x: 0, y: 0, w: 10, h: 10, rotation: 0, opacity: 1 }
+    }
+    const imported = deserializeMirror(manifestWith({ overlays: [evil] }), freshPage())
+    expect(imported!.overlays).toHaveLength(0)
+  })
+
+  it('rejects non-quarter rotations and keeps 90/180/270', () => {
+    expect(deserializeMirror(manifestWith({ rotation: 45 }), freshPage())!.rotations).toEqual([])
+    expect(deserializeMirror(manifestWith({ rotation: Infinity }), freshPage())!.rotations).toEqual(
+      []
+    )
+    const ok = deserializeMirror(manifestWith({ rotation: 180 }), freshPage())!
+    expect(ok.rotations).toEqual([[makePageKey('newsrc', 0), 180]])
+  })
+
+  it('rejects crops with non-finite or non-positive dimensions', () => {
+    expect(
+      deserializeMirror(manifestWith({ crop: { x: 0, y: 0, w: Infinity, h: 10 } }), freshPage())!
+        .crops
+    ).toEqual([])
+    expect(
+      deserializeMirror(manifestWith({ crop: { x: 0, y: 0, w: 0, h: 10 } }), freshPage())!.crops
+    ).toEqual([])
+    const ok = deserializeMirror(
+      manifestWith({ crop: { x: 1, y: 2, w: 30, h: 40 } }),
+      freshPage()
+    )!.crops
+    expect(ok).toEqual([[makePageKey('newsrc', 0), { x: 1, y: 2, w: 30, h: 40 }]])
+  })
+
+  it('keeps valid overlays alongside rejected ones', () => {
+    const good = {
+      id: 'g',
+      pageKey: 'k',
+      z: 0,
+      createdAt: 0,
+      type: 'highlight',
+      color: { r: 1, g: 1, b: 0 },
+      geom: { x: 10, y: 20, w: 30, h: 40, rotation: 0, opacity: 0.4 }
+    }
+    const bad = { ...good, id: 'b', geom: { ...good.geom, w: NaN } }
+    const imported = deserializeMirror(manifestWith({ overlays: [good, bad] }), freshPage())
+    expect(imported!.overlays).toHaveLength(1)
+    expect(imported!.overlays[0].type).toBe('highlight')
+  })
+})

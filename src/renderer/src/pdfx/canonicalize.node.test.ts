@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { PDFDocument, StandardFonts } from 'pdf-lib'
+import { PDFDocument, PDFName, PDFRawStream, StandardFonts } from 'pdf-lib'
 
 import {
   CANON_ALG,
@@ -67,6 +67,28 @@ describe('pdfx-canon/1 integrity', () => {
     // Both pages carry the changed text, so both page hashes differ; the per-page hashes localize it.
     expect(b.pageHashes[0]).not.toBe(a.pageHashes[0])
     expect(b.pageHashes.length).toBe(a.pageHashes.length)
+  })
+
+  it('T4: never throws on a filter-chain or corrupt Flate content stream', async () => {
+    const doc = await PDFDocument.create()
+    const ctx = doc.context
+    // Page 1: a stream that ADVERTISES a [/ASCII85Decode /FlateDecode] chain — unzlibSync alone can't
+    // decode it, and the old `String(filter).includes('FlateDecode')` path threw. Now: raw passthrough.
+    const chained = PDFRawStream.of(
+      ctx.obj({ Filter: [PDFName.of('ASCII85Decode'), PDFName.of('FlateDecode')], Length: 5 }),
+      new Uint8Array([1, 2, 3, 4, 5])
+    )
+    doc.addPage([200, 200]).node.set(PDFName.of('Contents'), ctx.register(chained))
+    // Page 2: sole /FlateDecode but the bytes are not valid zlib — the try/catch must swallow it.
+    const corrupt = PDFRawStream.of(
+      ctx.obj({ Filter: PDFName.of('FlateDecode'), Length: 4 }),
+      new Uint8Array([9, 9, 9, 9])
+    )
+    doc.addPage([200, 200]).node.set(PDFName.of('Contents'), ctx.register(corrupt))
+
+    const bytes = await doc.save()
+    const rec = await integrityOf(bytes)
+    expect(rec.pageHashes).toHaveLength(2) // both pages hashed, no throw
   })
 
   it('records the algorithm tag and one hash per page', async () => {

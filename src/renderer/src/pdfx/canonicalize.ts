@@ -113,7 +113,10 @@ function canonTokens(bytes: Uint8Array, out: number[]): void {
     let j = i
     while (j < n && !isWS(bytes[j]) && !isDelim(bytes[j]) && bytes[j] !== 0x25) j++
     const tok = bytes.subarray(i, j)
-    const str = String.fromCharCode(...tok)
+    // A number/keyword token is short; guard the spread against a pathological multi-KB token
+    // (String.fromCharCode(...huge) throws RangeError). An oversized token is never a number/keyword,
+    // so '' falls through to the raw-bytes emit below.
+    const str = j - i <= 64 ? String.fromCharCode(...tok) : ''
     if (/^[+-]?(?:\d+\.?\d*|\.\d+)$/.test(str)) {
       push(canonicalNumber(parseFloat(str)) + ' ')
     } else if (str === 'ID') {
@@ -158,7 +161,16 @@ function decodedContent(page: PDFStream | PDFArray | undefined, doc: PDFDocument
   return streams.map((s) => {
     const raw = (s as PDFRawStream).getContents()
     const filter = s.dict.lookup(PDFName.of('Filter'))
-    return filter && String(filter).includes('FlateDecode') ? unzlibSync(raw) : raw
+    // Only inflate a stream whose SOLE filter is FlateDecode. A filter chain (e.g.
+    // [/ASCII85Decode /FlateDecode]) can't be inflated by unzlibSync alone; pass such streams
+    // through raw — still fully deterministic, which is all the canonical hash needs. And never
+    // throw: a corrupt/truncated Flate stream must not break the integrity recompute or .pdfx export.
+    if (filter !== PDFName.of('FlateDecode')) return raw
+    try {
+      return unzlibSync(raw)
+    } catch {
+      return raw
+    }
   })
 }
 

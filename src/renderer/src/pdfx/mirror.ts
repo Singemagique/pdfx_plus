@@ -3,7 +3,13 @@
 // are keyed by page key (sourceId#pageIndex), which is regenerated each load; the mirror keys
 // by (document index, page-within-document) instead, and we translate on both ends.
 
-import { makePageKey, newOverlayId, type CropBox, type Overlay } from '../edit/model'
+import {
+  DRAWABLE_TYPES,
+  makePageKey,
+  newOverlayId,
+  type CropBox,
+  type Overlay
+} from '../edit/model'
 import type { DocEntry } from '../types'
 import type { Attachment } from './flatten'
 import type { EditLayer } from './build'
@@ -84,6 +90,26 @@ export interface ImportedMirror {
   attachments: Array<[string, Attachment]>
 }
 
+// The manifest is JSON — its numbers/types are untrusted (the tamper gate deliberately excludes the
+// mirror from its hash). Validate before feeding values into pdf-lib, or a crafted/corrupt .pdfx can
+// produce an unopenable file (Infinity geometry → literal `Infinity` in the output), fail every
+// export (a non-90° rotation trips pdf-lib's assertion), or inject a `redaction` overlay that a later
+// re-export silently applies. Reject anything that isn't well-formed.
+const DRAWABLE = new Set<string>(DRAWABLE_TYPES)
+const finite = (n: unknown): n is number => typeof n === 'number' && Number.isFinite(n)
+
+function validGeom(g: unknown): boolean {
+  if (!g || typeof g !== 'object') return false
+  const o = g as Record<string, unknown>
+  return finite(o.x) && finite(o.y) && finite(o.w) && finite(o.h) && finite(o.rotation) && finite(o.opacity) // prettier-ignore
+}
+
+function validCrop(c: unknown): c is CropBox {
+  if (!c || typeof c !== 'object') return false
+  const o = c as Record<string, unknown>
+  return finite(o.x) && finite(o.y) && finite(o.w) && finite(o.h) && o.w > 0 && o.h > 0
+}
+
 /** Reconstruct overlays/rotations/crops/attachments from a manifest, keyed to the freshly-loaded docs. */
 export function deserializeMirror(manifest: PdfxManifest, docs: DocEntry[]): ImportedMirror | null {
   if (!manifest.edits || manifest.edits.length === 0) return null
@@ -95,9 +121,14 @@ export function deserializeMirror(manifest: PdfxManifest, docs: DocEntry[]): Imp
     const page = docs[edit.doc]?.pages[edit.page]
     if (!page) continue
     const key = makePageKey(page.source.id, page.pageIndex)
-    if (edit.rotation) rotations.push([key, edit.rotation])
-    if (edit.crop) crops.push([key, edit.crop])
+    if (edit.rotation === 90 || edit.rotation === 180 || edit.rotation === 270) {
+      rotations.push([key, edit.rotation])
+    }
+    if (edit.crop && validCrop(edit.crop)) crops.push([key, edit.crop])
     for (const o of edit.overlays ?? []) {
+      if (!o || !DRAWABLE.has((o as Overlay).type) || !validGeom((o as { geom?: unknown }).geom)) {
+        continue // drop unknown/redaction types and non-finite geometry
+      }
       overlays.push({ ...o, id: newOverlayId(), pageKey: key })
     }
   }
