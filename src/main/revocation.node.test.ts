@@ -224,12 +224,12 @@ async function genKeys(): Promise<CryptoKeyPair> {
   )) as CryptoKeyPair
 }
 
-async function makeRevokedCrl(serials: number[]): Promise<Uint8Array> {
+async function makeRevokedCrl(serials: number[], issuer = 'CA'): Promise<Uint8Array> {
   const keys = await genKeys()
   const crl = new pkijs.CertificateRevocationList()
   crl.version = 1
   crl.issuer.typesAndValues.push(
-    new pkijs.AttributeTypeAndValue({ type: '2.5.4.3', value: new asn1js.PrintableString({ value: 'CA' }) }) // prettier-ignore
+    new pkijs.AttributeTypeAndValue({ type: '2.5.4.3', value: new asn1js.PrintableString({ value: issuer }) }) // prettier-ignore
   )
   crl.thisUpdate = new pkijs.Time({ type: 0, value: new Date() })
   crl.revokedCertificates = serials.map(
@@ -281,11 +281,28 @@ describe('revoked-status detection (P1-4)', () => {
     expect(crlRevokesCert(crl, other)).toBe(false)
   })
 
+  it('crlRevokesCert does not match a same-serial cert from a DIFFERENT issuer', async () => {
+    // Serial 42 is revoked, but by EvilCA — our leaf (serial 42) was issued by CA.
+    const leaf = await makeCert({ subject: 'Leaf', issuer: 'CA' }, 42)
+    const evilCrl = await makeRevokedCrl([42], 'EvilCA')
+    expect(crlRevokesCert(evilCrl, leaf)).toBe(false)
+  })
+
   it('ocspResponseRevoked reads a revoked CertStatus', async () => {
     const issuer = await makeCert({ subject: 'CA', issuer: 'CA' }, 1)
     const leaf = await makeCert({ subject: 'Leaf', issuer: 'CA' }, 42)
     const revokedResp = await makeRevokedOcsp(leaf, issuer)
     expect(await ocspResponseRevoked(revokedResp, leaf, issuer)).toBe(true)
+  })
+
+  it('ocspResponseRevoked ignores a revoked entry about a DIFFERENT cert', async () => {
+    // A shared/delegated responder's reply revokes a neighbor (serial 7); it says nothing about our
+    // leaf (serial 42). Must not be read as revoking the leaf.
+    const issuer = await makeCert({ subject: 'CA', issuer: 'CA' }, 1)
+    const neighbor = await makeCert({ subject: 'Neighbor', issuer: 'CA' }, 7)
+    const leaf = await makeCert({ subject: 'Leaf', issuer: 'CA' }, 42)
+    const respAboutNeighbor = await makeRevokedOcsp(neighbor, issuer)
+    expect(await ocspResponseRevoked(respAboutNeighbor, leaf, issuer)).toBe(false)
   })
 
   it('collectRevocation flags revoked when the OCSP responder says so', async () => {

@@ -75,9 +75,11 @@ function basicOcspResponse(der: Uint8Array): pkijs.BasicOCSPResponse | null {
   }
 }
 
-/** True if `respDer` (an OCSPResponse we fetched for `certDer`, issued by `issuerDer`) reports that
- *  cert as REVOKED. Prefers pkijs's CertID-matched status; falls back to a direct scan of the
- *  SingleResponses (safe because the request was POSTed for exactly this cert). Exported for tests. */
+/** True if `respDer` (an OCSPResponse we fetched for `certDer`, issued by `issuerDer`) reports THIS
+ *  cert as REVOKED. Uses pkijs's CertID-matched status only: a response that doesn't provably concern
+ *  our cert can't mark it revoked (a shared/delegated responder may carry a `[1] revoked` entry about
+ *  a DIFFERENT cert — scanning those blindly would falsely abort a valid signature). Exported for
+ *  tests. */
 export async function ocspResponseRevoked(
   respDer: Uint8Array,
   certDer: ArrayBuffer,
@@ -86,29 +88,26 @@ export async function ocspResponseRevoked(
   const basic = basicOcspResponse(respDer)
   if (!basic) return false
   try {
+    // getCertificateStatus recomputes the CertID (with the response's own hash) and matches; status:
+    // 0 good, 1 revoked, 2 unknown. isForCertificate is false when no entry concerns our cert.
     const status = await basic.getCertificateStatus(parseCert(certDer), parseCert(issuerDer))
-    if (status.isForCertificate) return status.status === 1 // 0 good, 1 revoked, 2 unknown
+    return status.isForCertificate && status.status === 1
   } catch {
-    /* couldn't match by CertID — fall through to the raw scan */
-  }
-  try {
-    // certStatus is a context-tagged CHOICE: [0] good, [1] revoked (constructed), [2] unknown.
-    return basic.tbsResponseData.responses.some((r) => {
-      const cs = r.certStatus as { idBlock?: { isConstructed?: boolean; tagNumber?: number } }
-      return cs?.idBlock?.isConstructed === true && cs.idBlock.tagNumber === 1
-    })
-  } catch {
-    return false
+    return false // can't determine → not revoked (fail-open, matching graceful degradation)
   }
 }
 
-/** True if a CRL lists `certDer`'s serial number in its revokedCertificates. Exported for tests. */
+/** True if a CRL revokes `certDer` — same issuer AND its serial listed. The issuer check matters:
+ *  serial numbers are unique only per issuer, so a CRL for a different CA scope that happens to list
+ *  the same serial must NOT be read as revoking this cert. Exported for tests. */
 export function crlRevokesCert(crlDer: Uint8Array, certDer: ArrayBuffer): boolean {
   try {
     const der = toDer(crlDer)
     const ab = der.buffer.slice(der.byteOffset, der.byteOffset + der.byteLength) as ArrayBuffer
     const crl = new pkijs.CertificateRevocationList({ schema: asn1js.fromBER(ab).result })
-    const serial = Buffer.from(parseCert(certDer).serialNumber.valueBlock.valueHexView).toString('hex') // prettier-ignore
+    const cert = parseCert(certDer)
+    if (!crl.issuer.isEqual(cert.issuer)) return false
+    const serial = Buffer.from(cert.serialNumber.valueBlock.valueHexView).toString('hex')
     return (crl.revokedCertificates ?? []).some(
       (rc) => Buffer.from(rc.userCertificate.valueBlock.valueHexView).toString('hex') === serial
     )
