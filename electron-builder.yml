@@ -17,6 +17,13 @@ files:
   - '!.github/**'
   - '!coverage/**'
   - '!**/*.test.{ts,tsx}'
+  # electron-builder does NOT honour .gitignore, so name the strays explicitly: the 2.2 MB source
+  # icon (the packaged icon comes from buildResources/), TS incremental caches, and any local scratch
+  # PDFs a build might otherwise sweep into the asar.
+  - '!assets/**'
+  - '!**/*.tsbuildinfo'
+  - '!.gitignore'
+  - '!*.pdf'
   # Ship only the compiled native addon, not its sources or build tree.
   - '!native/**'
   - 'native/build/Release/*.node'

@@ -26,11 +26,9 @@
     "test:coverage": "vitest run --coverage"
   },
   "dependencies": {
-    "@electron-toolkit/preload": "3.0.2",
     "@electron-toolkit/utils": "4.0.0",
     "@embedpdf/pdfium": "^2.14.4",
     "@signpdf/placeholder-plain": "^3.3.0",
-    "@signpdf/signer-p12": "^3.3.0",
     "@signpdf/signpdf": "^3.3.0",
     "@signpdf/utils": "^3.3.0",
     "asn1js": "3.0.10",
@@ -50,7 +48,7 @@
     "@vitest/coverage-v8": "4.1.9",
     "d3-selection": "3.0.0",
     "d3-zoom": "3.0.0",
-    "electron": "38.4.0",
+    "electron": "38.8.6",
     "electron-builder": "25.1.8",
     "electron-vite": "4.0.1",
     "fflate": "0.8.3",
