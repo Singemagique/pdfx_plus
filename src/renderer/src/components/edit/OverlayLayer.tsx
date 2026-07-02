@@ -219,9 +219,13 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
       .getPage(page.pageIndex + 1)
       .then(async (p) => {
         const anns = (await p.getAnnotations({ intent: 'display' })) as PdfAnnotation[]
-        // pdf.js returns annotation rects in UNROTATED user space; map them into the same
-        // visual space the rest of the overlay model uses (page.width/height bake in /Rotate).
+        // pdf.js returns annotation rects in UNROTATED user space (absolute, origin-inclusive); map
+        // them into the same VIEW-relative visual space the rest of the overlay model uses. p.view is
+        // [x0,y0,x1,y1] of the view box (CropBox ∩ MediaBox) — subtract its origin so fields on a page
+        // whose box doesn't start at (0,0) aren't shifted, then rectToVisual bakes in /Rotate
+        // (page.width/height are the visual dims). On origin-(0,0) pages this is a no-op.
         const rotate = (((p.rotate ?? 0) % 360) + 360) % 360
+        const [ox, oy] = [p.view?.[0] ?? 0, p.view?.[1] ?? 0]
         const fields: FormField[] = []
         const sigs: SigField[] = []
         const radios = new Map<string, RadioGroup>()
@@ -233,8 +237,8 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
           const r = a.rect
           if (a.readOnly || a.hidden || !r || r.length < 4) continue
           const rect = {
-            x: Math.min(r[0], r[2]),
-            y: Math.min(r[1], r[3]),
+            x: Math.min(r[0], r[2]) - ox,
+            y: Math.min(r[1], r[3]) - oy,
             w: Math.abs(r[2] - r[0]),
             h: Math.abs(r[3] - r[1])
           }
