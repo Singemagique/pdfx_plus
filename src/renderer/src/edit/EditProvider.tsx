@@ -7,6 +7,13 @@
 import { createContext, useCallback, useContext, useMemo, useState } from 'react'
 import { apply, canRedo, canUndo, initHistory, redo, undo, type History } from './history'
 import {
+  emptyEditState,
+  loadIntoHistory,
+  rotateInHistory,
+  setCropInHistory,
+  type EditState
+} from './edit-history'
+import {
   groupByPage,
   newOverlayId,
   type CropBox,
@@ -99,10 +106,6 @@ export interface EditStore {
   editLayer: EditLayer
 }
 
-interface EditState {
-  overlays: Overlay[]
-}
-
 export interface NamedColor {
   name: string
   rgb: RGB
@@ -124,7 +127,7 @@ const STROKE_WIDTHS = [1.5, 3, 6]
 const SHAPE_WIDTH = 2
 
 export function useEditStore(): EditStore {
-  const [history, setHistory] = useState<History<EditState>>(() => initHistory({ overlays: [] }))
+  const [history, setHistory] = useState<History<EditState>>(() => initHistory(emptyEditState()))
   const [tool, setToolState] = useState<ToolKind>('browse')
   const [highlightColor, setHighlightColor] = useState<RGB>(HIGHLIGHT_PALETTE[0].rgb)
   const [inkColor, setInkColor] = useState<RGB>(STROKE_PALETTE[1].rgb) // black
@@ -132,12 +135,11 @@ export function useEditStore(): EditStore {
   const [shapeKind, setShapeKind] = useState<ShapeKind>('rect')
   const [shapeColor, setShapeColor] = useState<RGB>(STROKE_PALETTE[0].rgb) // red
   const [selectedId, setSelectedId] = useState<string | null>(null)
-  // Image/stamp bytes, embedded as PDF file streams on export and referenced by overlays.
+  // Image/stamp bytes, embedded as PDF file streams on export and referenced by overlays. Kept
+  // outside the undo history (binary blobs, GC'd separately); overlays reference them by id.
   const [attachments, setAttachments] = useState<Map<string, Attachment>>(() => new Map())
   const [currentPage, setCurrentPage] = useState<CurrentPage | null>(null)
 
-  const [rotations, setRotations] = useState<Map<string, number>>(() => new Map())
-  const [crops, setCrops] = useState<Map<string, CropBox>>(() => new Map())
   const [savedSignature, setSavedSignature] = useState<Uint8Array | null>(null)
   const [signaturePlacement, setSignaturePlacement] = useState<SignaturePlacement | null>(null)
 
@@ -145,23 +147,13 @@ export function useEditStore(): EditStore {
     setAttachments((m) => new Map(m).set(id, { bytes, mime }))
   }, [])
 
+  // Rotations and crops are undoable content edits — they run through the same history as overlays.
   const rotatePage = useCallback((pageKey: string, delta: number) => {
-    setRotations((m) => {
-      const next = ((((m.get(pageKey) ?? 0) + delta) % 360) + 360) % 360
-      const n = new Map(m)
-      if (next === 0) n.delete(pageKey)
-      else n.set(pageKey, next)
-      return n
-    })
+    setHistory((h) => rotateInHistory(h, pageKey, delta))
   }, [])
 
   const setCrop = useCallback((pageKey: string, box: CropBox | null) => {
-    setCrops((m) => {
-      const n = new Map(m)
-      if (box) n.set(pageKey, box)
-      else n.delete(pageKey)
-      return n
-    })
+    setHistory((h) => setCropInHistory(h, pageKey, box))
   }, [])
 
   const setFormValue = useCallback(
@@ -208,27 +200,8 @@ export function useEditStore(): EditStore {
       crops: Array<[string, CropBox]>
       attachments: Array<[string, Attachment]>
     }) => {
-      if (s.overlays.length) {
-        setHistory((h) =>
-          apply(h, (d) => {
-            for (const o of s.overlays) d.overlays.push(o)
-          })
-        )
-      }
-      if (s.rotations.length) {
-        setRotations((m) => {
-          const n = new Map(m)
-          for (const [k, v] of s.rotations) n.set(k, v)
-          return n
-        })
-      }
-      if (s.crops.length) {
-        setCrops((m) => {
-          const n = new Map(m)
-          for (const [k, v] of s.crops) n.set(k, v)
-          return n
-        })
-      }
+      // Loading a saved .pdfx is a checkpoint, not an undoable edit (see loadIntoHistory).
+      setHistory((h) => loadIntoHistory(h, s))
       if (s.attachments.length) {
         setAttachments((m) => {
           const n = new Map(m)
@@ -240,7 +213,13 @@ export function useEditStore(): EditStore {
     []
   )
 
-  const overlays = history.present.overlays
+  const present = history.present
+  const overlays = present.overlays
+  // Public Map view of the Record-backed history state. Memoized on the underlying reference, which
+  // Immer keeps stable across edits that don't touch rotations/crops — so consumers (e.g. the layout
+  // memo) don't recompute on unrelated overlay edits.
+  const rotations = useMemo(() => new Map(Object.entries(present.rotations)), [present.rotations])
+  const crops = useMemo(() => new Map(Object.entries(present.crops)), [present.crops])
 
   // Selection is only meaningful in Browse; switching to a drawing tool clears it.
   const setTool = useCallback((t: ToolKind) => {
