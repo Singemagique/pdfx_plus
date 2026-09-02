@@ -315,6 +315,19 @@ describe('serializeMirror drops overlays a redaction covers', () => {
       expect(countRedactedOverlays(byPage)).toBe(1)
     })
 
+    it('ignores pages that are no longer in the collection when given the live page keys', () => {
+      // Overlays are never pruned on page delete (undo can restore them), but a save only visits
+      // live pages — so a covered overlay on a deleted page must not be reported as "removed".
+      const deleted = makePageKey('s1', 7)
+      const byPage = new Map([
+        [key, [textAt(0, 'UNDER', geom(10, 10, 50, 20)), redaction(1)]],
+        [deleted, [textAt(0, 'GONE', geom(10, 10, 50, 20)), redaction(1)]]
+      ])
+      expect(countRedactedOverlays(byPage)).toBe(2) // no filter: every page counts
+      expect(countRedactedOverlays(byPage, new Set([key]))).toBe(1) // only the live page
+      expect(countRedactedOverlays(byPage, new Set())).toBe(0)
+    })
+
     it('is zero when no overlay is covered', () => {
       const untouched = new Map([[key, [textAt(0, 'ELSEWHERE', geom(300, 300, 50, 20)), redaction(1)]]]) // prettier-ignore
       expect(countRedactedOverlays(untouched)).toBe(0)

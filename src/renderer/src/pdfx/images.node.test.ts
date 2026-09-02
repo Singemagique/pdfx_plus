@@ -58,10 +58,11 @@ describe('imageToPdf PNG branch (the older half of the pixel cap)', () => {
     await expect(imageToPdf(pngWithIHDR(30000, 30000))).rejects.toThrow(/too large/)
   })
 
-  it('accepts a PNG just under the cap without decoding it', async () => {
-    // 10000 × 10000 = 100 MP exactly, which the `>` cap allows; embedPng then rejects the truncated
-    // bytes, so reaching ANY other error proves the size guard let this one through.
-    await expect(imageToPdf(pngWithIHDR(10000, 10000))).rejects.not.toThrow(/too large/)
+  it('accepts a PNG exactly AT the cap without decoding it', async () => {
+    // 10240 × 10240 = 100 × 1024 × 1024 px, MAX_IMAGE_PIXELS exactly — the `>` cap must allow it
+    // (a `>=` regression would reject it). embedPng then rejects the truncated bytes, so reaching
+    // ANY other error proves the size guard let this one through.
+    await expect(imageToPdf(pngWithIHDR(10240, 10240))).rejects.not.toThrow(/too large/)
   })
 
   it('turns a small PNG into a one-page PDF', async () => {

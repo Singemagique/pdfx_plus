@@ -146,10 +146,18 @@ export function stripRedactedOverlays(
  * covers), so useExport reports the number in its "Saved …" flash rather than losing a partially
  * covered highlight without a word. It runs the SAME function that does the dropping, so the number
  * can never disagree with what actually happens — a change to the coverage rules moves both at once.
+ *
+ * `livePageKeys` restricts the count to pages that are still in the collection: overlays are never
+ * pruned when a page/document is deleted (so undo can bring them back), but a save only ever visits
+ * live pages, so counting a deleted page's overlays would report a removal that did not happen.
  */
-export function countRedactedOverlays(overlaysByPage: Map<string, Overlay[]>): number {
+export function countRedactedOverlays(
+  overlaysByPage: Map<string, Overlay[]>,
+  livePageKeys?: ReadonlySet<string>
+): number {
   let dropped = 0
-  for (const overlays of overlaysByPage.values()) {
+  for (const [pageKey, overlays] of overlaysByPage) {
+    if (livePageKeys && !livePageKeys.has(pageKey)) continue
     // stripRedactedOverlays also drops the redactions themselves; only the others are "lost".
     const drawable = overlays.filter((o) => o.type !== 'redaction').length
     dropped += drawable - stripRedactedOverlays(overlays).length

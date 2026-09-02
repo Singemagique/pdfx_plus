@@ -7,7 +7,7 @@ import { applyRedactedBytes, buildRedactedSources } from '../pdfx/redact-export'
 import { countRedactedOverlays } from '../pdfx/mirror'
 import { withSignatureAppearance, type AppearanceOptions } from '../pdfx/signature-appearance'
 import { summarizeDss, dssNote } from '../pdfx/dss-info'
-import type { SignaturePlacement } from '../edit/model'
+import { makePageKey, type SignaturePlacement } from '../edit/model'
 import type { DocEntry } from '../types'
 
 const PDFX_FILTER = { name: 'PDFX', extensions: ['pdfx'] }
@@ -26,10 +26,15 @@ const flatExportPages = (docs: DocEntry[], redacted: RedactedSources): ExportPag
     redacted
   )
 
+/** Page keys of every page still in the collection — the only pages a save/export visits. */
+const livePageKeys = (docs: DocEntry[]): Set<string> =>
+  new Set(docs.flatMap((doc) => doc.pages.map((p) => makePageKey(p.source.id, p.pageIndex))))
+
 /**
- * Both save paths drop every overlay a redaction covers (mirror.ts's stripRedactedOverlays) — from
- * the .pdfx mirror and from the flattened PDF alike. That is deliberate, but silently losing a
- * highlight that merely clipped a black box is not: say how many went, appended to "Saved …".
+ * Every save path drops the overlays a redaction covers (mirror.ts's stripRedactedOverlays) — the
+ * .pdfx mirror, the flattened PDF, and the zip alike (the signing path drops them the same way but
+ * reports the DSS note instead). That is deliberate, but silently losing a highlight that merely
+ * clipped a black box is not: say how many went, appended to "Saved …".
  */
 const redactedNote = (n: number): string =>
   n > 0
@@ -71,8 +76,10 @@ export function useExport(
         const redacted = await buildRedactedSources(editLayer, docs)
         const bytes = await build(redacted, filename)
         const saved = await window.api.writeFile(path, bytes)
-        // Overlays a redaction covered are gone from the saved file — tell the user how many.
-        flash(`Saved ${saved}${redactedNote(countRedactedOverlays(editLayer.overlays))}`)
+        // Overlays a redaction covered are gone from the saved file — tell the user how many. Only
+        // live pages count: a deleted page's overlays linger for undo but were never saved.
+        const removed = countRedactedOverlays(editLayer.overlays, livePageKeys(docs))
+        flash(`Saved ${saved}${redactedNote(removed)}`)
       } catch (error) {
         console.error('Export failed', error)
         flash(`Export failed: ${error instanceof Error ? error.message : String(error)}`)
