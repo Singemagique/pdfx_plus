@@ -3,8 +3,9 @@
 // maps straight onto pdf-lib's draw API.
 //
 // `redaction`: the SOURCE content underneath is removed by the external PDFium pre-pass (§4.5); here
-// we additionally paint the opaque box in z-order so it also covers any OVERLAY it sits above (so a
-// redacted overlay can't leak on export). `formValue` IS handled — the filled value is painted over
+// we paint the opaque box over the hole that leaves. Covered OVERLAYS are not our problem: the
+// caller (build.ts's bakePage) strips them before handing us the list, because painting a box over
+// a baked overlay would not remove its operators. `formValue` IS handled — the filled value is painted over
 // its AcroForm field rectangle (text, or an X for a checked box); the original interactive widget is
 // left in place underneath.
 
@@ -291,9 +292,12 @@ export async function flattenPageOverlays(
         await drawFormValue(page, o, res)
         break
       case 'redaction':
-        // The PDFium pre-pass already removed the SOURCE content under this rect. We also paint the
-        // opaque fill here, in z-order, so it covers any OVERLAY beneath it — matching the editor's
-        // WYSIWYG stack. Without this, an overlay redacted by the user would leak on export.
+        // The PDFium pre-pass already removed the SOURCE content under this rect; the opaque fill
+        // covers the hole it left, in z-order, matching the editor's WYSIWYG stack. Painting it is
+        // NOT what keeps a redacted overlay out of the export — an overlay baked underneath still
+        // emits its own operators (a text overlay's Tj stays copy-pasteable through the box), so
+        // build.ts drops every covered overlay (mirror.ts's stripRedactedOverlays) before calling
+        // us and nothing hidden ever reaches this content stream.
         page.drawRectangle({ x, y, width: w, height: h, color: toColor(o.fill), opacity: 1 })
         break
     }

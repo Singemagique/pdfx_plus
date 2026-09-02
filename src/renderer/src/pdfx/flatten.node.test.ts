@@ -83,8 +83,10 @@ describe('flatten on export', () => {
         align: 'center',
         z: 3
       }),
-      // redaction is handled by the external pre-pass, so the draw pass must skip it.
-      base({ type: 'redaction', fill: { r: 0, g: 0, b: 0 }, z: 4 })
+      // Redaction: the source content under it is removed by the external pre-pass; the draw pass
+      // paints the box. Kept clear of the other overlays' box on purpose — anything a redaction
+      // covers is dropped before flatten (build.ts), and this fixture is about baking every type.
+      base({ type: 'redaction', fill: { r: 0, g: 0, b: 0 }, geom: geom({ x: 200, y: 200 }), z: 4 })
     ])
     const attachments = new Map<string, Attachment>([
       ['png1', { bytes: PNG_1x1, mime: 'image/png' }]
