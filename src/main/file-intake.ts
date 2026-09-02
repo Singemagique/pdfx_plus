@@ -16,10 +16,6 @@ export function collectFileArgs(argv: string[]): string[] {
 }
 
 export async function readFiles(paths: string[]): Promise<OpenedFile[]> {
-  // Every path that becomes an OpenedFile flows through here — record them so read-resource can
-  // later verify an HTML resource base is a file the user actually opened. Must stay ahead of the
-  // reads: a path is remembered whether or not its bytes turn out to be readable.
-  rememberOpened(paths)
   // Per-file tolerant: one unreadable path (locked file, a directory named x.pdf, a TOCTOU delete)
   // must not sink the whole batch — callers include fire-and-forget open-file/second-instance
   // handlers, where an all-or-nothing rejection silently drops every other file.
@@ -31,10 +27,19 @@ export async function readFiles(paths: string[]): Promise<OpenedFile[]> {
     }))
   )
   const opened: OpenedFile[] = []
+  const read: string[] = []
   results.forEach((result, i) => {
-    if (result.status === 'fulfilled') opened.push(result.value)
-    else console.warn(`pdfx: skipping unreadable file ${String(paths[i])}:`, result.reason)
+    if (result.status === 'fulfilled') {
+      opened.push(result.value)
+      read.push(result.value.path)
+    } else console.warn(`pdfx: skipping unreadable file ${String(paths[i])}:`, result.reason)
   })
+  // Every path that becomes an OpenedFile flows through here — record them so read-resource can
+  // later verify an HTML resource base is a file the user actually opened. Only the paths whose
+  // bytes were actually delivered to the renderer are remembered: `paths` is untrusted input on
+  // the clipboard/drop routes, so remembering ahead of the reads would let a renderer poison the
+  // allowlist with any path it likes (nonexistent or unreadable) and unlock read-resource for it.
+  rememberOpened(read)
   return opened
 }
 

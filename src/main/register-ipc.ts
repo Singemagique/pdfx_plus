@@ -73,7 +73,8 @@ export function registerIpc(getPending: () => string[], clearPending: () => void
   ipcMain.handle('pdfx:read-clipboard-files', async (): Promise<OpenedFile[]> => {
     // Hold clipboard paths to the same standards as the drop route: no UNC roots (outbound SMB /
     // NTLM leak) and `importable` rather than a bare IMPORTABLE.test, so dotfiles are excluded too.
-    // No existsSync pre-check — readFiles skips unreadable paths on its own.
+    // No existsSync pre-check — readFiles skips unreadable paths on its own and only records the
+    // ones it actually read, so a bogus path can neither fail the batch nor enter the allowlist.
     const paths = clipboardFilePaths().filter((p) => !isUncPath(p) && importable(p))
     return readFiles(paths)
   })

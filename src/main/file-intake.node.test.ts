@@ -18,6 +18,7 @@ vi.mock('fs/promises', async (importOriginal) => {
 import { readFile, readdir, stat } from 'fs/promises'
 
 import { IMPORTABLE, collectFileArgs, expandDropPaths, importable, readFiles } from './file-intake'
+import { _resetOpenedPaths, isOpenedPath } from './opened-paths'
 
 beforeEach(() => {
   vi.mocked(stat).mockClear()
@@ -127,5 +128,32 @@ describe('readFiles', () => {
     writeFileSync(second, '%PDF-1.7\n2\n')
     const out = await readFiles([good, second])
     expect(out.map((f) => f.path)).toEqual([good, second])
+  })
+
+  // The opened-paths set gates read-resource (a compromised renderer that can get an arbitrary
+  // path remembered turns read-resource into an arbitrary-file-read / outbound-SMB primitive).
+  // readFiles takes renderer-supplied clipboard/drop paths, so it must remember ONLY what it read.
+  describe('opened-paths bookkeeping', () => {
+    beforeEach(() => {
+      _resetOpenedPaths()
+    })
+
+    it('does not remember a path it could not read', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+      const missing = join(dir, 'never-existed.pdf')
+      expect(await readFiles([missing])).toEqual([])
+      expect(isOpenedPath(missing)).toBe(false)
+      warn.mockRestore()
+    })
+
+    it('remembers only the readable paths of a partially failing batch', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+      const missing = join(dir, 'also-never-existed.pdf')
+      const out = await readFiles([good, missing])
+      expect(out.map((f) => f.path)).toEqual([good])
+      expect(isOpenedPath(good)).toBe(true)
+      expect(isOpenedPath(missing)).toBe(false)
+      warn.mockRestore()
+    })
   })
 })
