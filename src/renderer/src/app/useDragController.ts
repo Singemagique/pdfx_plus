@@ -12,6 +12,7 @@ interface DragControllerDeps {
   movePageInto: (source: PageRef, targetDocId: string, index: number) => void
   movePageToNewDoc: (source: PageRef, docIndex: number) => void
   onExternalDrop: (files: IncomingFile[], target: DropTarget | null) => void
+  onDropError: (message: string) => void
 }
 
 export function useDragController(deps: DragControllerDeps) {
@@ -98,7 +99,8 @@ export function useDragController(deps: DragControllerDeps) {
     updateDropTarget,
     movePageInto: deps.movePageInto,
     movePageToNewDoc: deps.movePageToNewDoc,
-    onExternalDrop: deps.onExternalDrop
+    onExternalDrop: deps.onExternalDrop,
+    onDropError: deps.onDropError
   })
 
   return {

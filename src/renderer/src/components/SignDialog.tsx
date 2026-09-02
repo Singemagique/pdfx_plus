@@ -31,6 +31,13 @@ interface SignAppearanceOpts {
 
 interface SignDialogProps {
   busy: boolean
+  /**
+   * Render the dialog but keep it out of the way (display:none) instead of unmounting it, so the
+   * "Place on page…" round-trip preserves everything the user typed (mode, cert, passphrase, PIN,
+   * reason, TSA URL, LTV, selections). While hidden the overlay is `display:none`, so it cannot
+   * intercept the pointer events the placement drag needs.
+   */
+  hidden?: boolean
   /** Sign with a PKCS#12 (.p12) file. */
   onSign: (cert: Uint8Array, opts: SignAppearanceOpts & { passphrase: string }) => Promise<boolean>
   /** Sign with a smart card / HSM via PKCS#11. */
@@ -86,6 +93,7 @@ const MODULE_HINT =
 /** Pick a credential — a PKCS#12 file or a smart card (PKCS#11) — and sign a flattened copy (PAdES). */
 export function SignDialog({
   busy,
+  hidden = false,
   onSign,
   onSignCard,
   listTokens,
@@ -135,6 +143,10 @@ export function SignDialog({
 
   // Load the Windows store certs when that tab is shown (refresh each open so an inserted/removed
   // card is reflected). Done once per dialog mount via the guard.
+  // NOTE: the "Place on page…" round-trip now HIDES this dialog instead of unmounting it, so this
+  // guard (and `autoProbed` below) survives it — the certs/module aren't re-probed on the way back.
+  // That's deliberate: it's the same session seconds apart, and it's what keeps the typed-in fields
+  // alive. A real close still unmounts, so the next open probes afresh.
   const winLoaded = useRef(false)
   useEffect(() => {
     if (mode !== 'wincert' || winLoaded.current) return
@@ -222,10 +234,15 @@ export function SignDialog({
   // `busy` only engages once the export/signing IPC starts — on the card path that's after a
   // multi-second cert-info round-trip, so guarding on `busy` alone lets a second click start a whole
   // second sign flow (two PIN prompts). This ref latches synchronously on the first click. (P2-3)
+  // The ref alone is invisible: a dropped second click looked like a dead button until `busy`
+  // engaged (seconds later on the card path). Mirror the latch into state so the button can
+  // immediately show it is working.
   const submitting = useRef(false)
+  const [submitPending, setSubmitPending] = useState(false)
   const submit = async (): Promise<void> => {
     if (busy || submitting.current) return
     submitting.current = true
+    setSubmitPending(true)
     try {
       let ok = false
       if (mode === 'wincert') {
@@ -251,6 +268,7 @@ export function SignDialog({
       }
     } finally {
       submitting.current = false
+      setSubmitPending(false)
     }
   }
 
@@ -258,7 +276,7 @@ export function SignDialog({
     mode === 'wincert' ? !!selectedThumb : mode === 'file' ? !!cert : !!modulePath.trim() && !!pin
 
   return (
-    <div className="sign-overlay" onPointerDown={onClose}>
+    <div className={`sign-overlay${hidden ? ' hidden' : ''}`} onPointerDown={onClose}>
       <div className="sign-dialog" onPointerDown={(e) => e.stopPropagation()}>
         <h2>Sign PDF</h2>
         <p className="sign-hint">
@@ -476,9 +494,9 @@ export function SignDialog({
           <button
             className="btn glass primary"
             onClick={() => void submit()}
-            disabled={!canSign || busy}
+            disabled={!canSign || busy || submitPending}
           >
-            {busy ? 'Signing…' : 'Sign & Save'}
+            {busy || submitPending ? 'Signing…' : 'Sign & Save'}
           </button>
         </div>
       </div>

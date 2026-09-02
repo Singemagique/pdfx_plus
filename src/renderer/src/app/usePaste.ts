@@ -41,6 +41,10 @@ export function usePaste(
 
   const pasteImage = useCallback(
     async (png: Uint8Array) => {
+      // Rasterizing + embedding a clipboard image is just as slow as pasteFiles, and it runs on
+      // EVERY clipboard-image paste (the selected-page path routes here too) — so hold `busy` for
+      // it as well, instead of leaving the toolbar live mid-work.
+      setBusy(true)
       try {
         const target = findSelectedTarget(docs, selected)
         if (target) {
@@ -55,9 +59,11 @@ export function usePaste(
       } catch (error) {
         console.error('Image paste failed', error)
         flash('Could not paste image')
+      } finally {
+        setBusy(false)
       }
     },
-    [docs, selected, insertPagesAfter, setDocs, flash]
+    [docs, selected, insertPagesAfter, setDocs, flash, setBusy]
   )
 
   const handlePaste = useCallback(async () => {

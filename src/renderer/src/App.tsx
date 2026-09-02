@@ -31,9 +31,14 @@ export default function App(): React.JSX.Element {
     []
   )
   const [signOpen, setSignOpen] = useState(false)
+  // The Sign dialog stays MOUNTED while the user places a signature box — it's only hidden.
+  // Unmounting it would destroy every useState field inside (mode, cert, passphrase, reason, TSA
+  // URL, LTV, PIN, cert/token selection), so the auto-reopen used to hand back a blank dialog and
+  // the user had to retype everything.
+  const [placing, setPlacing] = useState(false)
   const [padOpen, setPadOpen] = useState(false)
-  // True while the Sign dialog is waiting for the user to place a box on the page (it closed itself
-  // to let them); when the placement lands we reopen the dialog so they never hunt for a 2nd button.
+  // True while the Sign dialog is waiting for the user to place a box on the page (it hid itself
+  // to let them); when the placement lands we reveal the dialog so they never hunt for a 2nd button.
   const awaitingPlacement = useRef(false)
   const [scale, setScale] = useState(1)
   const [renderVersion, setRenderVersion] = useState(0)
@@ -50,6 +55,7 @@ export default function App(): React.JSX.Element {
   const collection = useCollection(flash)
   const fullViewState = useFullView()
   const editStore = useEditStore()
+  const { fullView } = fullViewState
   const docs = collection.docs
   const layout = useMemo(
     () => computeLayout(docs, editStore.rotations),
@@ -68,30 +74,58 @@ export default function App(): React.JSX.Element {
   }, [docs, signaturePlacement, setSignaturePlacement])
 
   // "Place on page" from the Sign dialog: switch to the signature tool, open the first page if we're
-  // in the collection view (placement needs the editor canvas), and close the dialog so the user can
-  // drag a box. The effect below reopens it once they do.
+  // in the collection view (placement needs the editor canvas), and hide the dialog so the user can
+  // drag a box. The effect below reveals it — with all its fields intact — once they do.
   const requestPlacement = useCallback(() => {
+    // Never enter placing mode without the editor canvas being up: `placing` hides the dialog, and
+    // the abandon effect below would immediately (and confusingly) close it again.
+    if (!fullViewState.fullView) {
+      const first = docs[0]?.pages[0]
+      if (!first) return
+      fullViewState.openPage(docs[0].id, first.id)
+    }
     awaitingPlacement.current = true
     editStore.setTool('signature')
-    if (!fullViewState.fullView && docs[0]?.pages[0]) {
-      fullViewState.openPage(docs[0].id, docs[0].pages[0].id)
-    }
-    setSignOpen(false)
+    setPlacing(true)
   }, [editStore, fullViewState, docs])
 
   useEffect(() => {
     if (awaitingPlacement.current && signaturePlacement) {
       awaitingPlacement.current = false
+      setPlacing(false)
       setSignOpen(true)
     }
   }, [signaturePlacement])
 
   // If the user abandons "Place on page" by switching away from the signature tool, drop the pending
   // reopen latch — otherwise a later, unrelated signature placement would unexpectedly reopen the
-  // Sign dialog (the dialog closed via setSignOpen(false), which never runs onClose). (P2-4)
+  // Sign dialog (the dialog hid itself, which never runs onClose). (P2-4) The abandoned dialog is
+  // also fully closed, so a hidden-but-mounted dialog can never linger invisibly.
   useEffect(() => {
-    if (editStore.tool !== 'signature') awaitingPlacement.current = false
+    if (editStore.tool === 'signature' || !awaitingPlacement.current) return
+    awaitingPlacement.current = false
+    setPlacing(false)
+    setSignOpen(false)
   }, [editStore.tool])
+
+  // The OTHER way to abandon a placement is to close full view (Escape, handled window-level in
+  // use-full-view-input, or the close button) — and that leaves `editStore.tool` on 'signature', so
+  // the effect above never fires for it. Without this, Escape during "Place on page…" left
+  // signOpen=true + placing=true: an invisible display:none dialog, and a Toolbar Sign button that
+  // was a silent no-op forever after (setSignOpen(true) on already-true state changes nothing).
+  //
+  // It cannot mis-fire on the OPENING transition. requestPlacement calls openPage() and
+  // setPlacing(true) from one React event handler, so React batches them into a single commit: the
+  // first render this effect ever sees with `placing === true` already has a non-null `fullView`.
+  // And requestPlacement refuses to set `placing` at all when there is no page to open, so `placing`
+  // is never true with full view legitimately closed. Composes with the tool-switch abandon above —
+  // both do the same three idempotent resets, so firing both is harmless.
+  useEffect(() => {
+    if (!placing || fullView) return
+    awaitingPlacement.current = false
+    setPlacing(false)
+    setSignOpen(false)
+  }, [placing, fullView])
 
   const {
     exportCollection,
@@ -120,7 +154,8 @@ export default function App(): React.JSX.Element {
     canvasRef,
     movePageInto: collection.movePageInto,
     movePageToNewDoc: collection.movePageToNewDoc,
-    onExternalDrop: handleExternalDropFiles
+    onExternalDrop: handleExternalDropFiles,
+    onDropError: flash
   })
 
   const onPaste = useCallback(() => void handlePaste(), [handlePaste])
@@ -157,7 +192,6 @@ export default function App(): React.JSX.Element {
   }, [openViaDialog, exportCollection, exportZip])
 
   const totalPages = docs.reduce((sum, d) => sum + d.pages.length, 0)
-  const { fullView } = fullViewState
   const fullViewDoc = fullView ? docs.find((d) => d.id === fullView.docId) : undefined
 
   return (
@@ -231,6 +265,7 @@ export default function App(): React.JSX.Element {
         {signOpen && (
           <SignDialog
             busy={busy}
+            hidden={placing}
             onSign={signAndExport}
             onSignCard={signWithCardAndExport}
             listTokens={(modulePath) => window.api.listCardTokens(modulePath)}
@@ -246,6 +281,7 @@ export default function App(): React.JSX.Element {
             onDrawSignature={() => setPadOpen(true)}
             onClose={() => {
               awaitingPlacement.current = false
+              setPlacing(false)
               setSignOpen(false)
             }}
           />

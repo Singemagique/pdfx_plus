@@ -980,6 +980,11 @@ body {
   background: rgba(8, 9, 12, 0.55);
   backdrop-filter: blur(2px);
 }
+/* Kept MOUNTED (so every typed field survives) but out of the way while the user places the
+   signature box — display:none also stops the overlay swallowing the placement drag. */
+.sign-overlay.hidden {
+  display: none;
+}
 .sign-dialog {
   width: 360px;
   max-width: 92vw;

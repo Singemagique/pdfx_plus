@@ -1,15 +1,15 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { applyExternalDrop } from './external-drop'
-import { importIntoDocs } from '../pdfx/source'
+import { importIntoDocs, loadIncomingPages } from '../pdfx/source'
+import { findConverter } from '../pdfx/convert'
 import type { ImportedMirror } from '../pdfx/mirror'
 import type { DocEntry, PageEntry } from '../types'
 import type { IncomingFile } from './types'
 
 vi.mock('../pdfx/source', () => ({
   importIntoDocs: vi.fn(),
-  loadSource: vi.fn(),
-  pagesFromSource: vi.fn()
+  loadIncomingPages: vi.fn()
 }))
 vi.mock('../pdfx/convert', () => ({ findConverter: vi.fn(() => null) }))
 
@@ -40,7 +40,12 @@ function makeDeps(existing: DocEntry[]) {
   }
 }
 
-beforeEach(() => vi.clearAllMocks())
+beforeEach(() => {
+  vi.clearAllMocks()
+  // clearAllMocks keeps implementations, so put the default "not convertible" answer back for
+  // every test — only the converter case below opts out.
+  vi.mocked(findConverter).mockReturnValue(null)
+})
 
 describe('applyExternalDrop threads the .pdfx mirror instead of discarding it', () => {
   it('single .pdfx dropped INTO an existing doc inserts its pages AND returns the mirror', async () => {
@@ -105,5 +110,30 @@ describe('applyExternalDrop threads the .pdfx mirror instead of discarding it', 
     expect(result).toHaveLength(2)
     expect(result[0].mirror).not.toBeNull()
     expect(result[1].mirror).toBeNull()
+  })
+})
+
+describe('a convertible file dropped INTO a doc goes through the shared page loader', () => {
+  it('calls loadIncomingPages sized to the neighbouring page and inserts what it returns', async () => {
+    vi.mocked(findConverter).mockReturnValue({
+      rename: (n: string) => n,
+      toPdf: vi.fn()
+    } as never)
+    const converted = [page('converted')]
+    vi.mocked(loadIncomingPages).mockResolvedValue(converted)
+    const existing = docEntry('existing')
+    const deps = makeDeps([existing])
+    const target = { kind: 'into', docId: 'existing', index: 0 } as const
+    const dropped = file('photo.png')
+
+    const result = await applyExternalDrop([dropped], target, deps)
+
+    expect(loadIncomingPages).toHaveBeenCalledWith([dropped], {
+      width: existing.pages[0].width,
+      height: existing.pages[0].height
+    })
+    expect(deps.insertPagesIntoDoc).toHaveBeenCalledWith('existing', 0, converted)
+    expect(importIntoDocs).not.toHaveBeenCalled()
+    expect(result).toEqual([]) // a converted file carries no editable mirror
   })
 })

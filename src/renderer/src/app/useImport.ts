@@ -9,7 +9,14 @@ import type { Collection } from './useCollection'
 import type { DropTarget } from '../canvas/layout'
 import type { IncomingFile } from './types'
 
-type GateDecision = 'cancel' | 'load' | 'skip'
+export type GateDecision = 'cancel' | 'load' | 'skip'
+
+/**
+ * Asks the user what to do about tampered edits and resolves to the index of the button they chose:
+ * 0 = open without the edits, 1 = load them anyway, 2 = cancel the open. Injected so the mapping can
+ * be tested without a `window.api` stub — the button order itself lives in the main process.
+ */
+export type ConfirmIntegrity = (detail: string) => Promise<number>
 
 /**
  * Tamper gate for a .pdfx's saved edits (shared by File→Open and drop). With no mirror there's
@@ -17,9 +24,10 @@ type GateDecision = 'cancel' | 'load' | 'skip'
  * If it changed, prompt: the user can load the (possibly stale/forged) edits anyway, open without
  * them, or cancel the open entirely.
  */
-async function tamperGate(
+export async function tamperGate(
   mirror: ImportedMirror | null,
-  integrity: IntegrityComparison
+  integrity: IntegrityComparison,
+  confirm: ConfirmIntegrity
 ): Promise<GateDecision> {
   if (!mirror) return 'skip'
   if (!integrity.tampered) return 'load'
@@ -30,9 +38,16 @@ async function tamperGate(
       : changed.length > 10
         ? `${changed.length} pages changed since these edits were saved.`
         : `Page${changed.length > 1 ? 's' : ''} ${changed.join(', ')} changed since these edits were saved.`
-  const choice = await window.api.confirmIntegrity(detail)
+  const choice = await confirm(detail)
   return choice === 2 ? 'cancel' : choice === 1 ? 'load' : 'skip'
 }
+
+/** `tamperGate` bound to the real dialog. */
+const gate = (
+  mirror: ImportedMirror | null,
+  integrity: IntegrityComparison
+): Promise<GateDecision> =>
+  tamperGate(mirror, integrity, (detail) => window.api.confirmIntegrity(detail))
 
 export function useImport(
   collection: Collection,
@@ -55,7 +70,7 @@ export function useImport(
             ? await conv.toPdf(file.name, file.data, undefined, file.path)
             : file.data
           const { docs: entries, mirror, integrity } = await importIntoDocs(name, data)
-          const decision = await tamperGate(mirror, integrity)
+          const decision = await gate(mirror, integrity)
           if (decision === 'cancel') continue // Cancel → don't open this file at all
           setDocs((prev) => [...prev, ...dedupeNames(prev, entries)])
           if (decision === 'load' && mirror) loadEditState(mirror)
@@ -119,7 +134,7 @@ export function useImport(
         // Load the saved edits carried by any dropped .pdfx (the pages are already placed, so a
         // tamper "cancel" here just skips the edits rather than removing the pages).
         for (const { mirror, integrity } of dropped) {
-          if ((await tamperGate(mirror, integrity)) === 'load' && mirror) loadEditState(mirror)
+          if ((await gate(mirror, integrity)) === 'load' && mirror) loadEditState(mirror)
         }
       } catch (error) {
         console.error('Drop failed', error)

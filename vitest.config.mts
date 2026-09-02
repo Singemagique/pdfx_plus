@@ -13,8 +13,10 @@ export default defineConfig({
     coverage: {
       provider: 'v8',
       reporter: ['text', 'html'],
-      include: ['src/**/*.ts'],
-      exclude: ['src/**/*.d.ts', 'src/**/*.test.ts']
+      // .tsx too: components are most of the renderer, and excluding them made the headline
+      // number describe only the non-component half of the codebase.
+      include: ['src/**/*.{ts,tsx}'],
+      exclude: ['src/**/*.d.ts', 'src/**/*.test.ts', 'src/**/*.test.tsx']
     },
     projects: [
       {
