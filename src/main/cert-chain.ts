@@ -73,6 +73,22 @@ function isSelfIssued(cert: pkijs.Certificate): boolean {
   return cert.subject.isEqual(cert.issuer)
 }
 
+/** True if the DER certificate `der` is self-issued (subject === issuer) — a trust anchor, which
+ *  needs no revocation check. Unparseable bytes count as self-issued: nothing can be read from them,
+ *  so there is nothing to check either. Never throws. */
+export function isSelfIssuedDer(der: ArrayBuffer): boolean {
+  try {
+    return isSelfIssued(parseCert(der))
+  } catch {
+    return true
+  }
+}
+
+/** Copy a byte view into a standalone ArrayBuffer. Views into a larger pooled Buffer (which is what
+ *  Node hands back) would otherwise carry their neighbours' bytes into an ASN.1 parse. */
+export const toArrayBuffer = (u8: Uint8Array): ArrayBuffer =>
+  u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength) as ArrayBuffer
+
 /**
  * Order `candidateDers` into the issuer chain above `leafDer`: [leaf, issuer, issuer-of-issuer, …],
  * stopping at a self-signed root or when no issuer is found among the candidates. Deduplicates and is
@@ -108,9 +124,6 @@ export function buildChain(leafDer: ArrayBuffer, candidateDers: ArrayBuffer[]): 
   }
   return chain
 }
-
-const toArrayBuffer = (u8: Uint8Array): ArrayBuffer =>
-  u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength) as ArrayBuffer
 
 // Subject DN of a cert, as a stable string for cycle detection (null if unparseable).
 function subjectKey(der: ArrayBuffer): string | null {

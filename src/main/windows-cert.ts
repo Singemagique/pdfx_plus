@@ -9,6 +9,14 @@ import type { RawSigner } from './sign-pkcs11'
 
 const PS_ARGS = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command']
 
+/** Fail fast off Windows instead of spawning a powershell.exe that isn't there (which surfaces as an
+ *  opaque ENOENT). Each entry point self-guards rather than trusting callers to check the platform. */
+function requireWindows(): void {
+  if (process.platform !== 'win32') {
+    throw new Error('Windows certificate store is only available on Windows')
+  }
+}
+
 /** Run a PowerShell script (optionally feeding `stdin`), returning stdout. Console window hidden;
  *  the card PIN dialog is a separate OS dialog and still appears. */
 function runPowerShell(script: string, stdin?: string): Promise<string> {
@@ -53,6 +61,7 @@ ConvertTo-Json @($list) -Compress
 /** List signing-capable certificates in the user's Windows store (CAC/PIV certs appear here when the
  *  card is inserted). Signing certs (key usage includes Digital Signature) are returned first. */
 export async function listWindowsCerts(): Promise<WindowsCert[]> {
+  requireWindows()
   const out = (await runPowerShell(LIST_SCRIPT)).trim()
   if (!out) return []
   const parsed = JSON.parse(out) as WindowsCert | WindowsCert[]
@@ -73,6 +82,7 @@ const THUMB_RE = /^[0-9A-Fa-f]{40}$/
  * so discovery isn't blocked. Returns [] if nothing can be read (LTV then falls back to leaf-only).
  */
 export async function windowsCertChain(thumbprint: string): Promise<ArrayBuffer[]> {
+  requireWindows()
   if (!THUMB_RE.test(thumbprint)) throw new Error('Invalid certificate thumbprint')
   const script = `
 $ErrorActionPreference='Stop'
@@ -99,6 +109,7 @@ $ch.ChainElements | ForEach-Object { [Convert]::ToBase64String($_.Certificate.Ra
 export async function windowsCertCredential(
   thumbprint: string
 ): Promise<{ certDer: ArrayBuffer; rawSign: RawSigner }> {
+  requireWindows()
   if (!THUMB_RE.test(thumbprint)) throw new Error('Invalid certificate thumbprint')
   const certB64 = (
     await runPowerShell(
