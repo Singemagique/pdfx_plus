@@ -1,6 +1,7 @@
+import { PDFDocument } from 'pdf-lib'
 import { describe, expect, it } from 'vitest'
 
-import { jpegSize } from './images'
+import { imageToPdf, jpegSize } from './images'
 
 // Minimal JPEG: SOI, optional segments, then an SOF0 frame header carrying [precision, H(2), W(2)].
 function jpegWithSof(width: number, height: number, lead: number[] = []): Uint8Array {
@@ -27,5 +28,54 @@ describe('jpegSize (P2-6 pre-decode bomb guard)', () => {
 
   it('returns null for non-JPEG bytes', () => {
     expect(jpegSize(new Uint8Array([0x89, 0x50, 0x4e, 0x47]))).toBeNull() // PNG signature
+  })
+})
+
+// PNG signature + an IHDR chunk carrying only the dimensions. imageToPdf's PNG branch reads IHDR
+// (offsets 16/20) and throws BEFORE embedPng or any DOM API, so the bomb path is testable in node.
+function pngWithIHDR(width: number, height: number): Uint8Array {
+  const bytes = new Uint8Array(24)
+  bytes.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]) // \x89PNG\r\n\x1a\n
+  bytes.set([0x49, 0x48, 0x44, 0x52], 12) // 'IHDR'
+  const dv = new DataView(bytes.buffer)
+  dv.setUint32(8, 13) // IHDR chunk length
+  dv.setUint32(16, width)
+  dv.setUint32(20, height)
+  return bytes
+}
+
+// A real (opaque, single-pixel) PNG — the smallest input the embed path will actually accept.
+const ONE_PIXEL_PNG = Uint8Array.from(
+  atob(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='
+  ),
+  (c) => c.charCodeAt(0)
+)
+
+describe('imageToPdf PNG branch (the older half of the pixel cap)', () => {
+  it('rejects a decompression-bomb PNG on its IHDR dimensions alone', async () => {
+    // 30000² = 900 MP, nine times the 100 MP cap — and ~3.6 GB if it were ever decoded.
+    await expect(imageToPdf(pngWithIHDR(30000, 30000))).rejects.toThrow(/too large/)
+  })
+
+  it('accepts a PNG just under the cap without decoding it', async () => {
+    // 10000 × 10000 = 100 MP exactly, which the `>` cap allows; embedPng then rejects the truncated
+    // bytes, so reaching ANY other error proves the size guard let this one through.
+    await expect(imageToPdf(pngWithIHDR(10000, 10000))).rejects.not.toThrow(/too large/)
+  })
+
+  it('turns a small PNG into a one-page PDF', async () => {
+    const pdf = await imageToPdf(ONE_PIXEL_PNG)
+    const doc = await PDFDocument.load(pdf)
+    expect(doc.getPageCount()).toBe(1)
+    const { width, height } = doc.getPage(0).getSize()
+    expect([width, height]).toEqual([1, 1]) // page defaults to the image's own dimensions
+  })
+
+  it('honours an explicit page size, fitting the image inside it', async () => {
+    const pdf = await imageToPdf(ONE_PIXEL_PNG, { width: 612, height: 792 })
+    const doc = await PDFDocument.load(pdf)
+    expect(doc.getPageCount()).toBe(1)
+    expect(doc.getPage(0).getSize()).toMatchObject({ width: 612, height: 792 })
   })
 })

@@ -140,6 +140,23 @@ export function stripRedactedOverlays(
   )
 }
 
+/**
+ * How many non-redaction overlays stripRedactedOverlays would drop, across every page of the edit
+ * layer. Saving or exporting removes those annotations for good (they are the ones a redaction
+ * covers), so useExport reports the number in its "Saved …" flash rather than losing a partially
+ * covered highlight without a word. It runs the SAME function that does the dropping, so the number
+ * can never disagree with what actually happens — a change to the coverage rules moves both at once.
+ */
+export function countRedactedOverlays(overlaysByPage: Map<string, Overlay[]>): number {
+  let dropped = 0
+  for (const overlays of overlaysByPage.values()) {
+    // stripRedactedOverlays also drops the redactions themselves; only the others are "lost".
+    const drawable = overlays.filter((o) => o.type !== 'redaction').length
+    dropped += drawable - stripRedactedOverlays(overlays).length
+  }
+  return dropped
+}
+
 /** Build the manifest `edits` + `attachments` from the edit layer, or null if there's nothing. */
 export function serializeMirror(
   documents: ExportDocument[],
