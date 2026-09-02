@@ -25,13 +25,19 @@ jobs:
     env:
       # Unsigned build — no code-signing secrets, matching the local and CI builds.
       CSC_IDENTITY_AUTO_DISCOVERY: false
-      # Keep the download caches OUT of the workspace: electron-builder packs the project directory
-      # with `files: '**/*'`, so caches restored under the workspace were packed into
-      # resources/app.asar — that is how v1.1.0's installer grew by 136 MB.
-      ELECTRON_CACHE: ${{ runner.temp }}/electron-cache/electron
-      ELECTRON_BUILDER_CACHE: ${{ runner.temp }}/electron-cache/electron-builder
     steps:
       - uses: actions/checkout@v4
+
+      # Keep the download caches OUT of the workspace: electron-builder packs the project directory
+      # with `files: '**/*'`, so caches restored under the workspace were packed into
+      # resources/app.asar — that is how v1.1.0's installer grew by 136 MB. `runner.temp` is not
+      # available in job-level `env` (workflow parse error), so export from a step; this must run
+      # before Install dependencies (its postinstall downloads Electron).
+      - name: Keep Electron caches out of the workspace
+        shell: bash
+        run: |
+          echo "ELECTRON_CACHE=$RUNNER_TEMP/electron-cache/electron" >> "$GITHUB_ENV"
+          echo "ELECTRON_BUILDER_CACHE=$RUNNER_TEMP/electron-cache/electron-builder" >> "$GITHUB_ENV"
 
       - uses: actions/setup-node@v4
         with:

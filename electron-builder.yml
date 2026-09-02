@@ -19,6 +19,11 @@ files:
   # (or a stray `dist/`) ever lands in the project directory again.
   - '!.cache/**'
   - '!dist/**'
+  # Local-only trees that a `yarn build:win` from a developer checkout would otherwise sweep in
+  # (electron-builder ignores .gitignore): Claude Code worktrees (each with a full node_modules)
+  # and smoke-test scratch output.
+  - '!.claude/**'
+  - '!.smoke/**'
   - '!electron.vite.config.{js,ts,mjs,cjs}'
   - '!{.prettierignore,.prettierrc.yaml,.editorconfig,dev-app-update.yml,README.md,SPEC.md}'
   - '!{.env,.env.*,.npmrc,pnpm-lock.yaml,yarn.lock}'
