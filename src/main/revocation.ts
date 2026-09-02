@@ -5,7 +5,7 @@
 import * as pkijs from 'pkijs'
 import * as asn1js from 'asn1js'
 import './pkijs-engine'
-import { revocationPointers } from './cert-chain'
+import { isSelfIssuedDer, revocationPointers, toArrayBuffer } from './cert-chain'
 
 /** DER revocation material to feed into the DSS writer. */
 export interface RevocationData {
@@ -14,7 +14,12 @@ export interface RevocationData {
   /** DER CRL blobs. */
   crls: Uint8Array[]
   /** True if an authoritative OCSP/CRL response proves a chain cert is REVOKED — the caller must not
-   *  then claim LTV success (the embedded material would be proof-of-revocation, not validity). */
+   *  then claim LTV success (the embedded material would be proof-of-revocation, not validity).
+   *  Every cert in the chain is covered except a self-issued (self-signed) root, which is a trust
+   *  anchor with nothing to revoke it. A chain that stops short of a root (e.g. a card holding only
+   *  the leaf) still has its top cert checked — via CRL, the only mechanism that needs no issuer
+   *  certificate. Known gap: if that top cert advertises OCSP but no CRL distribution point, it goes
+   *  unchecked and `revoked` stays false (see collectRevocation). */
   revoked: boolean
 }
 
@@ -53,8 +58,7 @@ export async function buildOcspRequest(
  *  unauthorized, …) carry no revocation info, so we must not embed them in the DSS. */
 export function isSuccessfulOcsp(der: Uint8Array): boolean {
   try {
-    const ab = der.buffer.slice(der.byteOffset, der.byteOffset + der.byteLength) as ArrayBuffer
-    const resp = new pkijs.OCSPResponse({ schema: asn1js.fromBER(ab).result })
+    const resp = new pkijs.OCSPResponse({ schema: asn1js.fromBER(toArrayBuffer(der)).result })
     return resp.responseStatus.valueBlock.valueDec === 0
   } catch {
     return false
@@ -65,8 +69,7 @@ export function isSuccessfulOcsp(der: Uint8Array): boolean {
  *  / not id-pkix-ocsp-basic). */
 function basicOcspResponse(der: Uint8Array): pkijs.BasicOCSPResponse | null {
   try {
-    const ab = der.buffer.slice(der.byteOffset, der.byteOffset + der.byteLength) as ArrayBuffer
-    const resp = new pkijs.OCSPResponse({ schema: asn1js.fromBER(ab).result })
+    const resp = new pkijs.OCSPResponse({ schema: asn1js.fromBER(toArrayBuffer(der)).result })
     if (resp.responseStatus.valueBlock.valueDec !== 0 || !resp.responseBytes) return null
     const inner = resp.responseBytes.response.valueBlock.valueHexView
     return new pkijs.BasicOCSPResponse({ schema: asn1js.fromBER(inner).result })
@@ -102,9 +105,9 @@ export async function ocspResponseRevoked(
  *  the same serial must NOT be read as revoking this cert. Exported for tests. */
 export function crlRevokesCert(crlDer: Uint8Array, certDer: ArrayBuffer): boolean {
   try {
-    const der = toDer(crlDer)
-    const ab = der.buffer.slice(der.byteOffset, der.byteOffset + der.byteLength) as ArrayBuffer
-    const crl = new pkijs.CertificateRevocationList({ schema: asn1js.fromBER(ab).result })
+    const crl = new pkijs.CertificateRevocationList({
+      schema: asn1js.fromBER(toArrayBuffer(toDer(crlDer))).result
+    })
     const cert = parseCert(certDer)
     if (!crl.issuer.isEqual(cert.issuer)) return false
     const serial = Buffer.from(cert.serialNumber.valueBlock.valueHexView).toString('hex')
@@ -137,8 +140,7 @@ function toDer(bytes: Uint8Array): Uint8Array {
 // (or PEM) cert; some serve a PKCS#7 "certs-only" bundle (.p7c) — take its first certificate. Returns
 // null if no certificate can be recovered.
 export function certFromCaIssuers(bytes: Uint8Array): Uint8Array | null {
-  const der = toDer(bytes)
-  const ab = der.buffer.slice(der.byteOffset, der.byteOffset + der.byteLength) as ArrayBuffer
+  const ab = toArrayBuffer(toDer(bytes))
   // (1) a single X.509 certificate.
   try {
     const cert = new pkijs.Certificate({ schema: asn1js.fromBER(ab).result })
@@ -239,10 +241,19 @@ export function httpRevocationFetcher(timeoutMs = 15000): RevocationFetcher {
 }
 
 /**
- * Collect revocation data for an ordered chain ([leaf, issuer, …, root]). For each non-root cert, try
- * its OCSP responders first (via the issuer above it in the chain) and fall back to its CRLs. The
- * root needs no revocation (it's the trust anchor). Failures are skipped — a partial result is fine;
- * the caller decides whether it's complete enough to claim LTV.
+ * Collect revocation data for an ordered chain ([leaf, issuer, …, root]). For each cert that HAS an
+ * issuer above it in the chain, try its OCSP responders first (an OCSP request needs the issuer
+ * certificate) and fall back to its CRLs.
+ *
+ * The chain's top cert is handled separately: a self-issued root is the trust anchor and needs no
+ * revocation, but the chain does not always reach one — completeChain returns [leaf] when no issuer
+ * is fetchable (a smart card that holds only the leaf, or a single-cert .p12). Skipping that cert
+ * would leave a leaf-only chain with ZERO revocation checks, so a revoked certificate would sign
+ * "successfully" with LTV claimed. It is therefore CRL-checked here; OCSP is not possible for it
+ * (no issuer certificate to build the CertID against).
+ *
+ * Failures are skipped — a partial result is fine; the caller decides whether it's complete enough
+ * to claim LTV.
  */
 export async function collectRevocation(
   chainDer: ArrayBuffer[],
@@ -251,6 +262,20 @@ export async function collectRevocation(
   const ocsps: Uint8Array[] = []
   const crls: Uint8Array[] = []
   let revoked = false
+
+  // Store the first usable CRL for `cert` and fold its verdict in; a cert with no reachable CRL is
+  // simply left uncovered (graceful degradation).
+  const tryCrl = async (cert: ArrayBuffer, urls: string[]): Promise<void> => {
+    for (const url of urls) {
+      const crl = await fetcher.fetchCrl(url)
+      if (crl) {
+        crls.push(crl)
+        if (crlRevokesCert(crl, cert)) revoked = true
+        return
+      }
+    }
+  }
+
   for (let i = 0; i < chainDer.length - 1; i++) {
     const cert = chainDer[i]
     const issuer = chainDer[i + 1]
@@ -268,14 +293,22 @@ export async function collectRevocation(
     }
     if (gotOcsp) continue
 
-    for (const url of ptrs.crl) {
-      const crl = await fetcher.fetchCrl(url)
-      if (crl) {
-        crls.push(crl)
-        if (crlRevokesCert(crl, cert)) revoked = true
-        break
-      }
-    }
+    await tryCrl(cert, ptrs.crl)
   }
+
+  // The chain's top cert: no issuer above it, so the loop skipped it. A self-issued root is rightly
+  // skipped (a trust anchor has nothing to revoke it), but a chain that never reached a root must
+  // still be checked — otherwise a leaf-only chain gets no revocation check at all.
+  //
+  // CRL ONLY, and that leaves a KNOWN GAP: an OCSPRequest's CertID hashes the issuer's name and
+  // public key, so OCSP is impossible without the issuer certificate — which is exactly what we do
+  // not have here. A top cert that advertises OCSP but publishes no CDP therefore still gets zero
+  // revocation checks, and the caller still claims LTV. Accepted for now; the honest fixes are to
+  // stop claiming LTV in that case, or to surface "revocation unchecked" to the user.
+  const top = chainDer[chainDer.length - 1]
+  if (top !== undefined && !isSelfIssuedDer(top)) {
+    await tryCrl(top, revocationPointers(top).crl)
+  }
+
   return { ocsps, crls, revoked }
 }

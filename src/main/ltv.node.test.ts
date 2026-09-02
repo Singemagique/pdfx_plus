@@ -136,6 +136,31 @@ async function makeRevokedOcsp(leafDer: ArrayBuffer, issuerDer: ArrayBuffer): Pr
   return new Uint8Array(resp.toSchema().toBER(false))
 }
 
+// A CRL (issued by `issuer`) listing `serials` as revoked. Its signature isn't verified by the
+// detector, so a throwaway key is fine.
+async function makeRevokedCrl(serials: number[], issuer: string): Promise<Uint8Array> {
+  const keys = (await webcrypto.subtle.generateKey(
+    { name: 'RSASSA-PKCS1-v1_5', modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256' }, // prettier-ignore
+    true,
+    ['sign', 'verify']
+  )) as CryptoKeyPair
+  const crl = new pkijs.CertificateRevocationList()
+  crl.version = 1
+  crl.issuer.typesAndValues.push(
+    new pkijs.AttributeTypeAndValue({ type: '2.5.4.3', value: new asn1js.PrintableString({ value: issuer }) }) // prettier-ignore
+  )
+  crl.thisUpdate = new pkijs.Time({ type: 0, value: new Date() })
+  crl.revokedCertificates = serials.map(
+    (s) =>
+      new pkijs.RevokedCertificate({
+        userCertificate: new asn1js.Integer({ value: s }),
+        revocationDate: new pkijs.Time({ type: 0, value: new Date() })
+      })
+  )
+  await crl.sign(keys.privateKey, 'SHA-256')
+  return new Uint8Array(crl.toSchema().toBER(false))
+}
+
 async function loadDss(pdf: Uint8Array): Promise<PDFDict> {
   const doc = await PDFDocument.load(pdf)
   const ref = doc.catalog.get(PDFName.of('DSS'))
@@ -177,6 +202,20 @@ describe('addLtv', () => {
       fetchCaIssuers: async () => null
     }
     await expect(addLtv(signed, leaf, [ca], revokedFetcher)).rejects.toThrow(/revoked/i)
+  })
+
+  it('aborts when a LEAF-ONLY chain is revoked by its CRL', async () => {
+    // No chain candidates and no fetchable issuer, so completeChain returns just [leaf] — the case
+    // that previously got no revocation check at all (card path, single-cert .p12).
+    const signed = await signPdf(await makePdf(), makeP12('pw'), { passphrase: 'pw' })
+    const leaf = await makeCert({ subject: 'Leaf', issuer: 'CA', crl: 'http://crl.test/x.crl' })
+    const crl = await makeRevokedCrl([7], 'CA') // makeCert issues serial 7 under CN=CA
+    const fetcher: RevocationFetcher = {
+      fetchOcsp: async () => null,
+      fetchCrl: async () => crl,
+      fetchCaIssuers: async () => null
+    }
+    await expect(addLtv(signed, leaf, [], fetcher)).rejects.toThrow(/revoked/i)
   })
 })
 

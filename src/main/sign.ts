@@ -21,7 +21,6 @@ export interface SignOptions {
   reason?: string
   name?: string
   location?: string
-  contactInfo?: string
   /** RFC3161 Timestamp Authority URL. When set, the signature is upgraded to PAdES B-T. */
   tsaUrl?: string
   /** When true, embed a DSS (cert chain + OCSP/CRL) for long-term validation (PAdES B-LT). */
@@ -86,7 +85,7 @@ async function placeAndSign(
   const withPlaceholder = plainAddPlaceholder({
     pdfBuffer: Buffer.from(flat),
     reason: opts.reason ?? 'Signed with PDFx',
-    contactInfo: opts.contactInfo ?? '',
+    contactInfo: '', // no UI collects one; @signpdf requires the field, so it stays empty
     name: opts.name ?? '',
     location: opts.location ?? '',
     subFilter: SUBFILTER_ETSI_CADES_DETACHED,

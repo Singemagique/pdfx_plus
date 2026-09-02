@@ -6,6 +6,7 @@
 // trailer chained via /Prev. Runs in the MAIN process. (Per-signature /VRI is a follow-up; Adobe
 // recognizes LTV from the document-level /DSS arrays.)
 import { PDFDocument, PDFRef, PDFName, PDFDict, PDFArray } from 'pdf-lib'
+import { appendIncrementalUpdate, latin1, maxDeclaredSize } from './incremental-update'
 
 export interface DssMaterial {
   /** DER certificates: the signer leaf + its chain. */
@@ -14,39 +15,6 @@ export interface DssMaterial {
   ocsps?: Uint8Array[]
   /** DER CRLs. */
   crls?: Uint8Array[]
-}
-
-const latin1 = (s: string): Buffer => Buffer.from(s, 'latin1')
-
-// Byte offset of the most recent cross-reference section (the value after the final `startxref`).
-// Becomes the new section's /Prev so the xref chain stays intact. Anchored at the last %%EOF so
-// trailing junk after it can't redirect /Prev to a bogus offset.
-function lastStartxref(pdf: Uint8Array): number {
-  const s = Buffer.from(pdf).toString('latin1')
-  const eof = s.lastIndexOf('%%EOF')
-  const i = s.lastIndexOf('startxref', eof === -1 ? s.length : eof)
-  if (i === -1) throw new Error('DSS: no startxref (not an incrementally-updatable PDF)')
-  const m = /startxref\s+(\d+)/.exec(s.slice(i))
-  if (!m) throw new Error('DSS: malformed startxref')
-  return parseInt(m[1], 10)
-}
-
-// Largest /Size declared by the file's trailers / xref-stream dicts. The true next-free object
-// number is >= this, so allocating new objects below it could collide with a free/reserved slot and
-// a smaller /Size would shrink the table. Only /Size adjacent to a `trailer` keyword or an
-// `/Type /XRef` dict counts — never a stray "/Size N" inside a content stream or string, which could
-// otherwise inflate the allocated numbers. Over-estimating from a legitimate trailer is harmless.
-function maxDeclaredSize(pdf: Uint8Array): number {
-  const s = Buffer.from(pdf).toString('latin1')
-  let max = 0
-  const anchors = [...s.matchAll(/\btrailer\b/g), ...s.matchAll(/\/Type\s*\/XRef\b/g)].map(
-    (m) => m.index ?? 0
-  )
-  for (const a of anchors) {
-    const m = /\/Size\s+(\d+)/.exec(s.slice(Math.max(0, a - 300), a + 600))
-    if (m) max = Math.max(max, parseInt(m[1], 10))
-  }
-  return max
 }
 
 /**
@@ -73,7 +41,6 @@ export async function appendDss(pdf: Uint8Array, material: DssMaterial): Promise
   // Allocate new objects above BOTH the largest used number and the declared /Size, so they can't
   // collide with a free/deleted slot the existing xref chain still reserves.
   const firstNew = Math.max(largest, maxDeclaredSize(pdf) - 1) + 1
-  const prev = lastStartxref(pdf)
 
   // Catalog entries to carry forward (drop the old /DSS pointer — we replace it with a merged one).
   const catalogEntries = doc.catalog
@@ -132,45 +99,23 @@ export async function appendDss(pdf: Uint8Array, material: DssMaterial): Promise
     `${rootNum} 0 obj\n<<\n${catalogEntries.join('\n')}\n/DSS ${dssNum} 0 R\n>>\nendobj\n`
   )
 
-  // Lay out the appended objects, recording each one's absolute byte offset from the file start.
-  const objects: { num: number; buf: Buffer }[] = [
-    { num: rootNum, buf: catalogBuf },
-    ...certObjs,
-    ...ocspObjs,
-    ...crlObjs,
-    { num: dssNum, buf: dssBuf }
-  ]
-  // A newline separates the prior %%EOF (which @signpdf writes with no trailing EOL) from the first
-  // appended object, so a sequential lexer can't fold "%%EOF" + "N 0 obj" into one comment line.
-  const offsets = new Map<number, number>()
-  const body: Buffer[] = []
-  let cursor = pdf.length + 1
-  for (const o of objects) {
-    offsets.set(o.num, cursor)
-    body.push(o.buf)
-    cursor += o.buf.length
-  }
-  const xrefOffset = cursor
-
-  // Cross-reference table, subsections in ascending object-number order: the rewritten catalog
-  // (rootNum) sits below the contiguous block of new objects (firstNew .. dssNum).
-  const row = (off: number): string => `${`${off}`.padStart(10, '0')} 00000 n \n`
-  const newNums: number[] = []
-  for (let n = firstNew; n <= dssNum; n++) newNums.push(n)
-  const xref =
-    'xref\n' +
-    `${rootNum} 1\n${row(offsets.get(rootNum)!)}` +
-    `${firstNew} ${newNums.length}\n${newNums.map((n) => row(offsets.get(n)!)).join('')}`
-
-  const trailer =
-    'trailer\n<<\n' +
-    `/Size ${dssNum + 1}\n` +
-    `/Root ${rootNum} 0 R\n` +
-    (infoRef instanceof PDFRef ? `/Info ${infoRef.objectNumber} 0 R\n` : '') +
-    `/Prev ${prev}\n>>\n` +
-    `startxref\n${xrefOffset}\n%%EOF\n`
-
+  // Append the rewritten catalog (rootNum) plus the contiguous block of new objects
+  // (firstNew .. dssNum) as an incremental update; /Size lands at dssNum + 1.
   return new Uint8Array(
-    Buffer.concat([Buffer.from(pdf), latin1('\n'), ...body, latin1(xref), latin1(trailer)])
+    appendIncrementalUpdate(
+      pdf,
+      [
+        { num: rootNum, buf: catalogBuf },
+        ...certObjs,
+        ...ocspObjs,
+        ...crlObjs,
+        { num: dssNum, buf: dssBuf }
+      ],
+      {
+        rootNum,
+        infoNum: infoRef instanceof PDFRef ? infoRef.objectNumber : undefined,
+        label: 'DSS'
+      }
+    )
   )
 }

@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { webcrypto } from 'node:crypto'
 import * as pkijs from 'pkijs'
 import * as asn1js from 'asn1js'
@@ -8,6 +8,7 @@ import {
   certFromCaIssuers,
   collectRevocation,
   crlRevokesCert,
+  httpRevocationFetcher,
   isSuccessfulOcsp,
   ocspResponseRevoked,
   readCapped,
@@ -213,6 +214,55 @@ describe('collectRevocation', () => {
     const out = await collectRevocation([leaf, ca], recordingFetcher())
     expect(out.revoked).toBe(false)
   })
+
+  // The chain's TOP cert has no issuer above it, so the pairwise loop can't cover it. Skipping it
+  // outright left a chain that never reached a root (a card holding only the leaf, a single-cert
+  // .p12) with zero revocation checks — a revoked cert would then sign with LTV claimed.
+  it('CRL-checks a leaf-only chain, whose leaf is not a self-signed root', async () => {
+    const leaf = await makeCert({ subject: 'Leaf', issuer: 'CA', crl: 'http://crl.test/x.crl' }, 42)
+    const crl = await makeRevokedCrl([42])
+    const fetcher: RevocationFetcher = {
+      fetchOcsp: async () => null,
+      fetchCrl: async () => crl,
+      fetchCaIssuers: async () => null
+    }
+
+    const out = await collectRevocation([leaf], fetcher)
+    expect(out.revoked).toBe(true)
+    expect(out.crls.length).toBe(1)
+  })
+
+  it('CRL-checks a top intermediate when the chain stops short of a root', async () => {
+    const leaf = await makeCert({ subject: 'Leaf', issuer: 'Int' }, 3)
+    const int = await makeCert({ subject: 'Int', issuer: 'Root', crl: 'http://crl.test/i.crl' }, 9)
+    const crl = await makeRevokedCrl([9], 'Root') // the CRL that Int's own issuer publishes
+    const fetcher: RevocationFetcher = {
+      fetchOcsp: async () => null,
+      fetchCrl: async () => crl,
+      fetchCaIssuers: async () => null
+    }
+
+    const out = await collectRevocation([leaf, int], fetcher)
+    expect(out.revoked).toBe(true)
+  })
+
+  it('never fetches revocation for a self-signed root, even when it advertises a CDP', async () => {
+    const leaf = await makeCert({ subject: 'Leaf', issuer: 'Root', crl: 'http://leaf.crl/' }, 3)
+    const root = await makeCert({ subject: 'Root', issuer: 'Root', crl: 'http://root.crl/' }, 1)
+    const fetcher = recordingFetcher()
+
+    await collectRevocation([leaf, root], fetcher)
+    expect(fetcher.crlUrls).toEqual(['http://leaf.crl/']) // the root's CDP is never touched
+  })
+
+  it('fetches nothing for a lone self-signed certificate (a self-issued .p12 leaf)', async () => {
+    const self = await makeCert({ subject: 'Solo', issuer: 'Solo', crl: 'http://solo.crl/' }, 1)
+    const fetcher = recordingFetcher()
+
+    const out = await collectRevocation([self], fetcher)
+    expect(fetcher.crlUrls).toEqual([])
+    expect(out).toEqual({ ocsps: [], crls: [], revoked: false })
+  })
 })
 
 // A CRL/OCSP signature is not verified by our detectors (they read status/serials), so a
@@ -289,6 +339,104 @@ describe('readCapped (P2-5 size cap)', () => {
       headers: { 'content-length': '999999999' }
     })
     expect(await readCapped(res, 1024)).toBeNull()
+  })
+})
+
+describe('httpRevocationFetcher', () => {
+  afterEach(() => vi.unstubAllGlobals())
+
+  // Answer every fetch with one canned Response; returns the URLs that were requested.
+  function stubFetch(make: () => Response): string[] {
+    const urls: string[] = []
+    vi.stubGlobal('fetch', async (url: string) => {
+      urls.push(url)
+      return make()
+    })
+    return urls
+  }
+
+  const OCSP_OK = new Uint8Array([0x30, 0x03, 0x0a, 0x01, 0x00]) // responseStatus successful
+  const OCSP_TRY_LATER = new Uint8Array([0x30, 0x03, 0x0a, 0x01, 0x03])
+
+  async function ocspPair(): Promise<{ cert: ArrayBuffer; issuer: ArrayBuffer }> {
+    const issuer = await makeCert({ subject: 'CA', issuer: 'CA' }, 1)
+    const cert = await makeCert({ subject: 'Leaf', issuer: 'CA' }, 42)
+    return { cert, issuer }
+  }
+
+  it('fetchOcsp POSTs the OCSP request and keeps a successful response', async () => {
+    const { cert, issuer } = await ocspPair()
+    const urls = stubFetch(() => new Response(OCSP_OK))
+    const out = await httpRevocationFetcher().fetchOcsp(cert, issuer, 'http://ocsp.test/')
+    expect(out && Array.from(out)).toEqual(Array.from(OCSP_OK))
+    expect(urls).toEqual(['http://ocsp.test/'])
+  })
+
+  it('fetchOcsp returns null on a non-OK HTTP status', async () => {
+    const { cert, issuer } = await ocspPair()
+    stubFetch(() => new Response(OCSP_OK, { status: 500 }))
+    expect(await httpRevocationFetcher().fetchOcsp(cert, issuer, 'http://ocsp.test/')).toBeNull()
+  })
+
+  it('fetchOcsp discards a parseable but UNSUCCESSFUL OCSPResponse (tryLater)', async () => {
+    // An error OCSPResponse carries no revocation information — embedding it in the DSS would claim
+    // validation data we never obtained.
+    const { cert, issuer } = await ocspPair()
+    stubFetch(() => new Response(OCSP_TRY_LATER))
+    expect(await httpRevocationFetcher().fetchOcsp(cert, issuer, 'http://ocsp.test/')).toBeNull()
+  })
+
+  it('fetchCrl decodes a PEM-wrapped CRL to DER', async () => {
+    const der = await makeRevokedCrl([42])
+    const pem = `-----BEGIN X509 CRL-----\n${Buffer.from(der).toString('base64').replace(/(.{64})/g, '$1\n')}\n-----END X509 CRL-----\n` // prettier-ignore
+    stubFetch(() => new Response(Buffer.from(pem, 'latin1')))
+
+    const out = await httpRevocationFetcher().fetchCrl('http://crl.test/x.crl')
+    expect(out).not.toBeNull()
+    expect(Buffer.from(out!).equals(Buffer.from(der))).toBe(true)
+  })
+
+  it('fetchCrl returns null on a non-OK HTTP status', async () => {
+    stubFetch(() => new Response(new Uint8Array([0x30, 0x00]), { status: 404 }))
+    expect(await httpRevocationFetcher().fetchCrl('http://crl.test/x.crl')).toBeNull()
+  })
+
+  it('caps OCSP well below CRL: a 600 KiB body is refused as OCSP but accepted as a CRL', async () => {
+    // Trailing zeros after the DER value still parse as a successful OCSPResponse, so only the size
+    // cap can reject this body.
+    const { cert, issuer } = await ocspPair()
+    const big = Buffer.concat([Buffer.from(OCSP_OK), Buffer.alloc(600 * 1024)])
+    stubFetch(() => new Response(new Uint8Array(big)))
+
+    expect(await httpRevocationFetcher().fetchOcsp(cert, issuer, 'http://ocsp.test/')).toBeNull()
+    expect(await httpRevocationFetcher().fetchCrl('http://crl.test/x.crl')).not.toBeNull()
+  })
+
+  it('fetchCrl refuses a body whose declared size exceeds the CRL cap', async () => {
+    const der = await makeRevokedCrl([42])
+    const oversized = { headers: { 'content-length': '20000000' } } // 20 MB; the CRL cap is 16 MiB
+    stubFetch(() => new Response(new Uint8Array(der), oversized))
+    expect(await httpRevocationFetcher().fetchCrl('http://crl.test/x.crl')).toBeNull()
+  })
+
+  it('fetchCaIssuers returns the certificate, but refuses one over the AIA cap', async () => {
+    const cert = await makeCert({ subject: 'Issuing CA', issuer: 'Issuing CA' })
+    stubFetch(() => new Response(cert))
+    expect(await httpRevocationFetcher().fetchCaIssuers('http://aia.test/ca.cer')).not.toBeNull()
+
+    stubFetch(() => new Response(cert, { headers: { 'content-length': '2000000' } })) // > 1 MiB
+    expect(await httpRevocationFetcher().fetchCaIssuers('http://aia.test/ca.cer')).toBeNull()
+  })
+
+  it('returns null instead of throwing when the request itself fails', async () => {
+    const { cert, issuer } = await ocspPair()
+    vi.stubGlobal('fetch', async () => {
+      throw new Error('network down')
+    })
+    const f = httpRevocationFetcher()
+    expect(await f.fetchOcsp(cert, issuer, 'http://ocsp.test/')).toBeNull()
+    expect(await f.fetchCrl('http://crl.test/x.crl')).toBeNull()
+    expect(await f.fetchCaIssuers('http://aia.test/ca.cer')).toBeNull()
   })
 })
 
