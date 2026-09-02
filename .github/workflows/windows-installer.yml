@@ -25,8 +25,11 @@ jobs:
     env:
       # Unsigned build — no code-signing secrets, matching the local and CI builds.
       CSC_IDENTITY_AUTO_DISCOVERY: false
-      ELECTRON_CACHE: ${{ github.workspace }}/.cache/electron
-      ELECTRON_BUILDER_CACHE: ${{ github.workspace }}/.cache/electron-builder
+      # Keep the download caches OUT of the workspace: electron-builder packs the project directory
+      # with `files: '**/*'`, so caches restored under the workspace were packed into
+      # resources/app.asar — that is how v1.1.0's installer grew by 136 MB.
+      ELECTRON_CACHE: ${{ runner.temp }}/electron-cache/electron
+      ELECTRON_BUILDER_CACHE: ${{ runner.temp }}/electron-cache/electron-builder
     steps:
       - uses: actions/checkout@v4
 
@@ -39,8 +42,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            ${{ github.workspace }}/.cache/electron
-            ${{ github.workspace }}/.cache/electron-builder
+            ${{ runner.temp }}/electron-cache/electron
+            ${{ runner.temp }}/electron-cache/electron-builder
           key: ${{ runner.os }}-electron-${{ hashFiles('yarn.lock') }}
           restore-keys: ${{ runner.os }}-electron-
 

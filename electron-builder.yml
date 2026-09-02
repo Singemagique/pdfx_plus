@@ -5,7 +5,20 @@ directories:
 files:
   - '**/*'
   - '!**/.vscode/*'
-  - '!src/*'
+  # The app runs entirely from out/ (package.json main is ./out/main/index.js, and the preload and
+  # renderer bundles live beside it); the only runtime file outside out/ is the native addon
+  # explicitly re-included below. So no TypeScript source needs to ship. '!src/*' only excluded the
+  # direct children of src/, which is a trap waiting to spring — exclude the whole tree.
+  - '!src/**'
+  # Never pack build caches or previous build output. The release workflows used to point
+  # ELECTRON_CACHE / ELECTRON_BUILDER_CACHE (and their actions/cache paths) at .cache/ inside the
+  # workspace, so `**/*` swept the restored Electron zips straight into the asar: every shipped
+  # installer through v1.1.1 carried ~167 MB of cache, and v1.1.0 carried 136 MB more still because
+  # its restored cache also held the stale electron-v38.4.0-win32-x64.zip. The workflows now keep
+  # those caches under RUNNER_TEMP; these exclusions make it impossible to regress even if a cache
+  # (or a stray `dist/`) ever lands in the project directory again.
+  - '!.cache/**'
+  - '!dist/**'
   - '!electron.vite.config.{js,ts,mjs,cjs}'
   - '!{.prettierignore,.prettierrc.yaml,.editorconfig,dev-app-update.yml,README.md,SPEC.md}'
   - '!{.env,.env.*,.npmrc,pnpm-lock.yaml,yarn.lock}'

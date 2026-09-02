@@ -50,8 +50,10 @@ jobs:
     env:
       # Build forks without signing/notarization secrets.
       CSC_IDENTITY_AUTO_DISCOVERY: false
-      ELECTRON_CACHE: ${{ github.workspace }}/.cache/electron
-      ELECTRON_BUILDER_CACHE: ${{ github.workspace }}/.cache/electron-builder
+      # Caches live under RUNNER_TEMP, never in the workspace: electron-builder packs the project
+      # directory with `files: '**/*'`, so a cache restored inside it ends up inside the app's asar.
+      ELECTRON_CACHE: ${{ runner.temp }}/electron-cache/electron
+      ELECTRON_BUILDER_CACHE: ${{ runner.temp }}/electron-cache/electron-builder
     steps:
       - uses: actions/checkout@v4
 
@@ -64,8 +66,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            ${{ github.workspace }}/.cache/electron
-            ${{ github.workspace }}/.cache/electron-builder
+            ${{ runner.temp }}/electron-cache/electron
+            ${{ runner.temp }}/electron-cache/electron-builder
           key: ${{ runner.os }}-electron-${{ hashFiles('yarn.lock') }}
           restore-keys: ${{ runner.os }}-electron-
 
