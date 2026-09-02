@@ -40,44 +40,103 @@ export interface SerializedMirror {
   attachments: Record<string, ManifestAttachment>
 }
 
-/** Normalized axis-aligned bounds of a geom (tolerates negative w/h). */
-const bounds = (g: Geom): { x0: number; y0: number; x1: number; y1: number } => ({
+interface Rect {
+  x0: number
+  y0: number
+  x1: number
+  y1: number
+}
+
+/** Normalized axis-aligned bounds of a geom, ignoring rotation (tolerates negative w/h). */
+const bounds = (g: Geom): Rect => ({
   x0: Math.min(g.x, g.x + g.w),
   y0: Math.min(g.y, g.y + g.h),
   x1: Math.max(g.x, g.x + g.w),
   y1: Math.max(g.y, g.y + g.h)
 })
 
-/** Do two overlay bounding boxes overlap at all? Per-overlay `rotation` is ignored (fail-safe). */
+/**
+ * The area an overlay's box can occupy, as one axis-aligned rectangle: the union of its unrotated
+ * bounds and the AABB of its four corners rotated by `geom.rotation`.
+ *
+ * flatten.ts passes `rotation` to pdf-lib as `degrees(rotation)`, and pdf-lib rotates about the
+ * box's (x, y) origin with the matrix [cos, sin, -sin, cos] — i.e. by +rotation in this y-up user
+ * space (verified against pdf-lib's drawImage/drawText operator sequence: translate(x, y) then
+ * rotateRadians). It applies that only to the types that take a `rotate` option (image,
+ * signatureVisual, text); highlight / ink / shape / formValue / redaction rectangles are drawn
+ * unrotated. The union covers both cases at once, so a rotated redaction — only reachable from a
+ * hand-edited .pdfx, since the UI never sets one — can neither hide content outside its unrotated
+ * box unnoticed nor stop covering the box it actually paints. Fail-safe by construction: the union
+ * is never smaller than the old bbox (rotation can only ever drop MORE), and `rotation === 0`
+ * reduces to exactly the old bbox, so the normal path is unchanged.
+ */
+function footprint(g: Geom): Rect {
+  const box = bounds(g)
+  if (!g.rotation || !Number.isFinite(g.rotation)) return box
+  const rad = (g.rotation * Math.PI) / 180
+  const cos = Math.cos(rad)
+  const sin = Math.sin(rad)
+  const xs = [box.x0, box.x1]
+  const ys = [box.y0, box.y1]
+  for (const [dx, dy] of [
+    [0, 0],
+    [g.w, 0],
+    [0, g.h],
+    [g.w, g.h]
+  ]) {
+    xs.push(g.x + dx * cos - dy * sin)
+    ys.push(g.y + dx * sin + dy * cos)
+  }
+  return { x0: Math.min(...xs), y0: Math.min(...ys), x1: Math.max(...xs), y1: Math.max(...ys) }
+}
+
+/** Do two overlays' (rotation-aware) footprints overlap at all? */
 function bboxesIntersect(a: Geom, b: Geom): boolean {
-  const p = bounds(a)
-  const q = bounds(b)
+  const p = footprint(a)
+  const q = footprint(b)
   return p.x0 < q.x1 && q.x0 < p.x1 && p.y0 < q.y1 && q.y0 < p.y1
 }
 
-/** Is `a` painted after `b`? Mirrors flatten's draw order: z ascending, then createdAt ascending. */
+/**
+ * Is `a` painted after `b`? Mirrors flatten's draw order: z ascending, then createdAt ascending.
+ * An exact tie (same z AND same createdAt) counts as "after": the two orders are indistinguishable
+ * to the sort, so the only safe reading of a tie between a redaction and an overlay is that the
+ * redaction wins. Ties are reachable — `z` is handed out as `pageOverlays.length`, which reuses a
+ * value after a delete — and a strict `>` there would keep (and thus leak) the covered overlay.
+ */
 const drawnAbove = (a: Overlay, b: Overlay): boolean =>
-  a.z > b.z || (a.z === b.z && a.createdAt > b.createdAt)
+  a.z > b.z || (a.z === b.z && a.createdAt >= b.createdAt)
 
 /**
- * Drop every overlay that a redaction on the same page hides, so redacted content can't survive in
- * the PLAINTEXT manifest mirror. The destructive PDFium pre-pass only rewrites SOURCE bytes, so a
- * text/ink/image/formValue overlay sitting under a black box would otherwise be written verbatim
- * into pdfx-manifest.json and come back fully visible on reopen.
+ * Drop every overlay that a redaction on the same page hides, so redacted content can't survive
+ * anywhere it stays readable: the PLAINTEXT manifest mirror (serializeMirror) and the flattened
+ * content stream (build.ts's bakePage). The destructive PDFium pre-pass only rewrites SOURCE bytes,
+ * so a text/ink/image/formValue overlay sitting under a black box would otherwise be written
+ * verbatim into pdfx-manifest.json, and baked into the exported page as its own operators — a text
+ * overlay's `Tj` survives under the box and comes straight back out of copy-paste or pdftotext.
  *
- * "Hidden" = a redaction that flatten draws AFTER the overlay (higher z, or equal z and later
- * createdAt — see flattenPageOverlays) whose bounding box touches the overlay's. Overlays drawn
- * ABOVE a redaction survive: they paint on top of the black box in the exported PDF too, so keeping
- * them is WYSIWYG parity with flatten.ts. PARTIAL overlap drops the whole overlay: the mirror stores
- * an overlay atomically (there is no way to persist "half a text run"), so anything the user covered
- * even in part is treated as secret. Fail-safe by design — it can over-drop, never under-drop.
+ * "Hidden" = a redaction that flatten draws AFTER the overlay (higher z, or equal z and equal-or-
+ * later createdAt — see drawnAbove / flattenPageOverlays) whose footprint touches the overlay's.
+ * Overlays drawn ABOVE a redaction survive: they paint on top of the black box in the exported PDF
+ * too, so keeping them is WYSIWYG parity with flatten.ts. PARTIAL overlap drops the whole overlay:
+ * the mirror stores an overlay atomically (there is no way to persist "half a text run"), so
+ * anything the user covered even in part is treated as secret. Fail-safe by design — it can
+ * over-drop, never under-drop.
+ *
+ * Redaction overlays themselves are dropped by default (the mirror must never carry them: they are
+ * applied destructively on export). Pass `keepRedactions` on the flatten path, where the box still
+ * has to be painted over the hole the destructive pass left in the source content.
  */
-export function stripRedactedOverlays(all: Overlay[]): Overlay[] {
+export function stripRedactedOverlays(
+  all: Overlay[],
+  options?: { keepRedactions?: boolean }
+): Overlay[] {
+  const keepRedactions = options?.keepRedactions ?? false
   const redactions = all.filter((o) => o.type === 'redaction')
-  return all.filter(
-    (o) =>
-      o.type !== 'redaction' &&
-      !redactions.some((r) => drawnAbove(r, o) && bboxesIntersect(r.geom, o.geom))
+  return all.filter((o) =>
+    o.type === 'redaction'
+      ? keepRedactions
+      : !redactions.some((r) => drawnAbove(r, o) && bboxesIntersect(r.geom, o.geom))
   )
 }
 

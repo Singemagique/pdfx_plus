@@ -109,6 +109,42 @@ const HIGHLIGHT = (pageKey: string): Overlay => ({
   color: { r: 1, g: 0.9, b: 0.2 }
 })
 
+const REDACTION = (pageKey: string, z: number): Overlay => ({
+  id: `r${z}`,
+  pageKey,
+  z,
+  createdAt: z,
+  geom: { x: 5, y: 5, w: 50, h: 20, rotation: 0, opacity: 1 },
+  type: 'redaction',
+  fill: { r: 0, g: 0, b: 0 }
+})
+
+const TEXT = (
+  pageKey: string,
+  text: string,
+  box: { x: number; y: number; w: number; h: number },
+  z: number
+): Overlay => ({
+  id: `t-${text}`,
+  pageKey,
+  z,
+  createdAt: z,
+  geom: { ...box, rotation: 0, opacity: 1 },
+  type: 'text',
+  text,
+  fontSize: 10,
+  color: { r: 0, g: 0, b: 0 },
+  font: 'Helvetica',
+  align: 'left'
+})
+
+// The show-text operator pdf-lib emits for `text` in a standard font: a hex string, two uppercase
+// hex digits per glyph code (StandardFontEmbedder.encodeText), followed by Tj.
+const showText = (text: string): string =>
+  `<${Array.from(text)
+    .map((c) => c.charCodeAt(0).toString(16).padStart(2, '0').toUpperCase())
+    .join('')}> Tj`
+
 // Recover the embedded 'pdfx-manifest.json' bytes from saved PDFX bytes by walking the
 // catalog's EmbeddedFiles name tree (Names -> EmbeddedFiles -> Names = [name, filespec, ...]).
 // Typed lookups resolve indirect references; robust unlike a raw byte-substring search.
@@ -290,20 +326,12 @@ describe('buildPdf', () => {
     expect(types).toContain('/Sig')
   })
 
-  it('paints the redaction box in z-order so it covers overlays beneath it', async () => {
+  it('never bakes an overlay a redaction covers — it is dropped, not painted over', async () => {
     const bytes = await makeSourcePdf()
     const pageKey = makePageKey('a', 0)
-    const redaction: Overlay = {
-      id: 'r',
-      pageKey,
-      z: 1,
-      createdAt: 1,
-      geom: { x: 5, y: 5, w: 50, h: 20, rotation: 0, opacity: 1 },
-      type: 'redaction',
-      fill: { r: 0, g: 0, b: 0 }
-    }
     const editLayer: EditLayer = {
-      overlays: new Map([[pageKey, [HIGHLIGHT(pageKey), redaction]]]), // highlight z0, redaction z1
+      // highlight z0 (10,20)-(40,60), redaction z1 (5,5)-(55,25) — they overlap.
+      overlays: new Map([[pageKey, [HIGHLIGHT(pageKey), REDACTION(pageKey, 1)]]]),
       attachments: new Map(),
       rotations: new Map(),
       crops: new Map()
@@ -312,13 +340,51 @@ describe('buildPdf', () => {
       await PDFDocument.load(await buildPdf([{ bytes, sourceKey: 'a', pageIndex: 0 }], editLayer)),
       0
     )
-    // The redaction now paints an opaque black box (previously it drew nothing → overlays leaked).
+    // The redaction still paints its opaque box (it covers the hole the destructive pass leaves)...
     expect(content).toContain('0 0 0 rg')
-    // Anchor both operators first: without this the indexOf comparison below passes vacuously
-    // (a missing highlight yields -1, which any real index beats).
+    // ...but the covered highlight is not baked at all. Painting a box over it would leave its
+    // operators — and, for a text overlay, its extractable glyphs — in the exported content stream.
+    expect(content).not.toContain('1 0.9 0.2 rg')
+  })
+
+  it('still bakes an overlay drawn ABOVE the redaction (WYSIWYG parity)', async () => {
+    const bytes = await makeSourcePdf()
+    const pageKey = makePageKey('a', 0)
+    const above: Overlay = { ...HIGHLIGHT(pageKey), z: 2, createdAt: 2 } // higher z than the box
+    const editLayer: EditLayer = {
+      overlays: new Map([[pageKey, [REDACTION(pageKey, 1), above]]]),
+      attachments: new Map(),
+      rotations: new Map(),
+      crops: new Map()
+    }
+    const content = pageContent(
+      await PDFDocument.load(await buildPdf([{ bytes, sourceKey: 'a', pageIndex: 0 }], editLayer)),
+      0
+    )
+    expect(content).toContain('0 0 0 rg')
     expect(content).toContain('1 0.9 0.2 rg')
-    // And it's drawn AFTER the lower-z highlight, so it covers it (matches the editor's WYSIWYG).
-    expect(content.indexOf('0 0 0 rg')).toBeGreaterThan(content.indexOf('1 0.9 0.2 rg'))
+    // Drawn AFTER the box, exactly as the editor stacks it.
+    expect(content.indexOf('1 0.9 0.2 rg')).toBeGreaterThan(content.indexOf('0 0 0 rg'))
+  })
+
+  it('keeps a redacted text overlay out of the content stream entirely', async () => {
+    const bytes = await makeSourcePdf()
+    const pageKey = makePageKey('a', 0)
+    const secret = TEXT(pageKey, 'SECRET', { x: 10, y: 8, w: 40, h: 12 }, 0) // under the box
+    const shown = TEXT(pageKey, 'PUBLIC', { x: 100, y: 100, w: 40, h: 12 }, 0) // nowhere near it
+    const editLayer: EditLayer = {
+      overlays: new Map([[pageKey, [secret, shown, REDACTION(pageKey, 1)]]]),
+      attachments: new Map(),
+      rotations: new Map(),
+      crops: new Map()
+    }
+    const content = pageContent(
+      await PDFDocument.load(await buildPdf([{ bytes, sourceKey: 'a', pageIndex: 0 }], editLayer)),
+      0
+    )
+    // A show-text operator under an opaque box is still fully recoverable via copy-paste/pdftotext.
+    expect(content).not.toContain(showText('SECRET'))
+    expect(content).toContain(showText('PUBLIC'))
   })
 
   it('applies a page crop as the /CropBox on export', async () => {

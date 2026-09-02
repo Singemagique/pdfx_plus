@@ -22,7 +22,7 @@ import {
   type Attachment,
   type FlattenResources
 } from './flatten'
-import { serializeMirror } from './mirror'
+import { serializeMirror, stripRedactedOverlays } from './mirror'
 import { computeIntegrity } from './canonicalize'
 
 /**
@@ -213,8 +213,15 @@ async function bakePage(
     page.setCropBox(view0.x + u.x, view0.y + u.y, u.w, u.h)
   }
   const list = edits.overlays.get(key)
-  if (res && list && list.length > 0) {
-    const sorted = [...list].sort((a, b) => a.z - b.z || a.createdAt - b.createdAt)
+  // Drop every overlay a redaction covers BEFORE flattening — the exact rule the .pdfx mirror uses
+  // (mirror.ts's stripRedactedOverlays). The redaction box only PAINTS over what sits beneath it:
+  // an overlay baked underneath still emits its own operators, so a covered text overlay's `Tj`
+  // stays in the content stream and comes back out of copy-paste / pdftotext. Redactions are kept
+  // here (unlike in the mirror) because the box must still cover the hole the destructive PDFium
+  // pass left in the SOURCE content. This also makes .pdf and .pdfx exports agree on what survives.
+  const visible = list ? stripRedactedOverlays(list, { keepRedactions: true }) : undefined
+  if (res && visible && visible.length > 0) {
+    const sorted = [...visible].sort((a, b) => a.z - b.z || a.createdAt - b.createdAt)
     // Overlay coordinates are captured in the editor's VIEW-relative space (0-based over the view
     // box). Two transforms reconcile that with pdf-lib's user space, innermost first:
     //   1. intrinsicMatrix — on a source page with intrinsic /Rotate, convert visual → unrotated
@@ -237,6 +244,9 @@ async function bakePage(
   }
   // Form fill paints the value as page content; drop the matching interactive widget so its own
   // appearance (the original value) doesn't render on top of — and double with — the painted one.
+  // Deliberately computed from the FULL list, not `visible`: a formValue overlay a redaction covers
+  // still needs its widget gone, or the widget's appearance stream would paint the original value
+  // over the black box (annotations render above page content).
   if (list) {
     const filled = new Set(
       list

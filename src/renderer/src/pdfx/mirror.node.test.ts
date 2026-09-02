@@ -228,6 +228,53 @@ describe('serializeMirror drops overlays a redaction covers', () => {
     expect(json).not.toContain(toBase64(new Uint8Array([1, 2, 3, 4]))) // no redacted image bytes
   })
 
+  it('treats an exact z + createdAt tie as covered (the draw order is a coin flip)', () => {
+    // `z` is handed out as pageOverlays.length, so a delete makes the next overlay reuse a value —
+    // an exact tie is reachable, and the sort leaves the two in an arbitrary order.
+    const tied = serializeMirror(
+      exportDocs,
+      layer([{ ...textAt(1, 'SECRET-9X42', geom(10, 10, 50, 20)), createdAt: 5 }, { ...redaction(1), createdAt: 5 }]) // prettier-ignore
+    )
+    expect(JSON.stringify(tied)).not.toContain('SECRET-9X42')
+
+    // But a redaction that is unambiguously EARLIER at the same z still leaves the overlay alone.
+    const earlier = serializeMirror(
+      exportDocs,
+      layer([{ ...textAt(1, 'ON-TOP', geom(10, 10, 50, 20)), createdAt: 5 }, { ...redaction(1), createdAt: 4 }]) // prettier-ignore
+    )
+    expect(JSON.stringify(earlier)).toContain('ON-TOP')
+  })
+
+  it('uses the ROTATED footprint of a redaction, not just its unrotated box', () => {
+    // A 200×20 bar rotated 90° about its (100,100) origin sweeps up to (80..100, 100..300) —
+    // nowhere near the (100..300, 100..120) its unrotated box claims. Only a hand-edited .pdfx can
+    // carry a rotated redaction, so this is the crafted-input path.
+    const rotated = redaction(1, { ...geom(100, 100, 200, 20), rotation: 90 })
+    const covered = textAt(0, 'SECRET-9X42', geom(85, 200, 10, 10)) // inside the swept area only
+
+    expect(JSON.stringify(serializeMirror(exportDocs, layer([covered, rotated])))).not.toContain(
+      'SECRET-9X42'
+    )
+    // Control: with rotation 0 the same box misses the overlay entirely, so it is kept.
+    const unrotated = redaction(1, geom(100, 100, 200, 20))
+    expect(JSON.stringify(serializeMirror(exportDocs, layer([covered, unrotated])))).toContain(
+      'SECRET-9X42'
+    )
+  })
+
+  it('uses the ROTATED footprint of the covered overlay too', () => {
+    // A tall box at x=150 that is rotated flat across the page and into the redaction at (0,0).
+    const swung = textAt(0, 'SECRET-9X42', { ...geom(150, 50, 10, 200), rotation: 90 })
+    expect(JSON.stringify(serializeMirror(exportDocs, layer([swung, redaction(1)])))).not.toContain(
+      'SECRET-9X42'
+    )
+    // Control: unrotated, that box is far to the right of the redaction and survives.
+    const upright = textAt(0, 'SECRET-9X42', geom(150, 50, 10, 200))
+    expect(JSON.stringify(serializeMirror(exportDocs, layer([upright, redaction(1)])))).toContain(
+      'SECRET-9X42'
+    )
+  })
+
   it('does not mirror the redaction overlays themselves', () => {
     const mirror = serializeMirror(exportDocs, layer([textAt(2, 'TOP', geom(10, 10, 5, 5)), redaction(1)])) // prettier-ignore
     expect(mirror!.edits[0].overlays!.every((o) => o.type !== 'redaction')).toBe(true)
