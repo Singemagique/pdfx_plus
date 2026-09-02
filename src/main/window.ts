@@ -3,6 +3,7 @@ import { join } from 'path'
 import { is } from '@electron-toolkit/utils'
 import { GLASS_CONFIG, FALLBACK_BG, applyNativeGlass } from './native/glass'
 import { readFiles } from './file-intake'
+import { destroyRenderWindow } from './markup'
 
 let mainWindow: BrowserWindow | null = null
 let rendererReady = false
@@ -56,6 +57,12 @@ export function createWindow(): void {
   mainWindow.on('closed', () => {
     mainWindow = null
     rendererReady = false
+    // The markup renderer keeps a hidden BrowserWindow cached forever. Electron counts it, so
+    // unless it dies with the main window, `window-all-closed` never fires (the app lingers
+    // invisibly holding the single-instance lock) and macOS `activate` sees a non-empty window
+    // list. This is the one place that always runs when the main window goes away — the app can
+    // be quit from the menu, the window chrome, or an OS shutdown — so the teardown belongs here.
+    destroyRenderWindow()
   })
 
   mainWindow.webContents.setWindowOpenHandler((details) => {

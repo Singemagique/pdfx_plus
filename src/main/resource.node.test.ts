@@ -1,5 +1,19 @@
-import { afterAll, beforeEach, describe, expect, it } from 'vitest'
-import { mkdtemp, writeFile, rm } from 'fs/promises'
+import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest'
+
+// Spy on the real fs/promises (call-through) so tests can assert the UNC guard returns BEFORE any
+// filesystem call — realpath()ing a UNC path already triggers the outbound SMB resolution (and the
+// NTLM-hash leak) the guard exists to prevent, even when it ultimately fails and yields null.
+vi.mock('fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('fs/promises')>()
+  return {
+    ...actual,
+    realpath: vi.fn(actual.realpath),
+    stat: vi.fn(actual.stat),
+    readFile: vi.fn(actual.readFile)
+  }
+})
+
+import { mkdtemp, writeFile, rm, realpath, stat, readFile } from 'fs/promises'
 import { tmpdir } from 'os'
 import { join } from 'path'
 
@@ -18,6 +32,9 @@ beforeEach(async () => {
   await writeFile(htmlPath, '<html></html>')
   await writeFile(join(dir, 'style.css'), 'body{color:red}')
   await writeFile(secretPath, 'TOP SECRET')
+  vi.mocked(realpath).mockClear()
+  vi.mocked(stat).mockClear()
+  vi.mocked(readFile).mockClear()
 })
 
 afterAll(async () => {
@@ -51,6 +68,8 @@ describe('readResource opened-path gate (P1-3)', () => {
   })
 
   it('rejects UNC bases and non-string / null-byte input', async () => {
+    // Remember the UNC bases first: without that, the opened-path gate would reject them anyway and
+    // the assertions below would pass with the UNC guard deleted.
     rememberOpened(['\\\\server\\share\\page.html', '//server/share/page.html'])
     expect(await readResource('\\\\server\\share\\page.html', 'style.css')).toBeNull()
     expect(await readResource('//server/share/page.html', 'style.css')).toBeNull()
@@ -58,5 +77,10 @@ describe('readResource opened-path gate (P1-3)', () => {
     expect(await readResource(htmlPath, '')).toBeNull()
     // @ts-expect-error exercising the non-string guard
     expect(await readResource(123, 'style.css')).toBeNull()
+    // Returning null is not enough: every one of these must be refused with NO filesystem access at
+    // all, so a UNC base never reaches realpath() and never sends an SMB request.
+    expect(vi.mocked(realpath)).not.toHaveBeenCalled()
+    expect(vi.mocked(stat)).not.toHaveBeenCalled()
+    expect(vi.mocked(readFile)).not.toHaveBeenCalled()
   })
 })

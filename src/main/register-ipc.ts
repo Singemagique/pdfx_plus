@@ -1,13 +1,19 @@
 import { ipcMain, dialog, clipboard } from 'electron'
 import { basename, isAbsolute } from 'path'
-import { existsSync } from 'fs'
 import { writeFile } from 'fs/promises'
 import { markupToPdf } from './markup'
 import { signPdf, signPdfWithCard, signPdfWithWindowsCert } from './sign'
 import { listTokens, findModules, cardCertDer } from './pkcs11'
 import { certInfoFromDer, certInfoFromP12, type SignerInfo } from './cert-info'
 import { listWindowsCerts } from './windows-cert'
-import { OpenedFile, IMPORTABLE, readFiles, expandDropPaths } from './file-intake'
+import {
+  OpenedFile,
+  MAX_DROP_FILES,
+  importable,
+  isUncPath,
+  readFiles,
+  expandDropPaths
+} from './file-intake'
 import { clipboardFilePaths } from './clipboard'
 import { readResource } from './resource'
 import { getMainWindow, setRendererReady, sendOpenPaths } from './window'
@@ -65,7 +71,10 @@ export function registerIpc(getPending: () => string[], clearPending: () => void
   })
 
   ipcMain.handle('pdfx:read-clipboard-files', async (): Promise<OpenedFile[]> => {
-    const paths = clipboardFilePaths().filter((p) => IMPORTABLE.test(p) && existsSync(p))
+    // Hold clipboard paths to the same standards as the drop route: no UNC roots (outbound SMB /
+    // NTLM leak) and `importable` rather than a bare IMPORTABLE.test, so dotfiles are excluded too.
+    // No existsSync pre-check — readFiles skips unreadable paths on its own.
+    const paths = clipboardFilePaths().filter((p) => !isUncPath(p) && importable(p))
     return readFiles(paths)
   })
 
@@ -73,8 +82,16 @@ export function registerIpc(getPending: () => string[], clearPending: () => void
 
   ipcMain.handle(
     'pdfx:expand-drop-paths',
-    async (_event, paths: string[]): Promise<OpenedFile[]> =>
-      readFiles(await expandDropPaths(paths))
+    async (_event, paths: unknown): Promise<OpenedFile[]> => {
+      // Validate the renderer-supplied list (parity with the other IPC guards): an array of
+      // strings, capped on INPUT as well — expandDropPaths only bounds what it returns, so an
+      // unbounded list of directories could still drive an unbounded number of stat/readdir calls.
+      if (!Array.isArray(paths)) return []
+      const requested = paths
+        .filter((p): p is string => typeof p === 'string')
+        .slice(0, MAX_DROP_FILES)
+      return readFiles(await expandDropPaths(requested))
+    }
   )
 
   ipcMain.handle('pdfx:read-resource', (_event, htmlPath: string, ref: string) =>

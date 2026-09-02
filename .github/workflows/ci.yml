@@ -22,7 +22,7 @@ jobs:
           node-version: 24
           cache: yarn
 
-      # The check job only typechecks, lints, and runs pure-node unit tests, so it
+      # The check job only typechecks, checks formatting, and runs unit tests, so it
       # skips lifecycle scripts: no Electron binary download and no native build
       # (the mac-only glass addon, which self-skips off macOS anyway). Faster and
       # more robust than a full install. The build matrix below does a full install.
@@ -92,9 +92,18 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: yarn build:linux --publish never
 
+      # Installers/packages only. Uploading all of dist/ shipped the full unpacked app trees
+      # (hundreds of MB per OS, on every push and PR). `error` so a build that produced no
+      # package fails loudly instead of silently uploading nothing.
       - name: Upload packaged artifacts
         uses: actions/upload-artifact@v4
         with:
           name: pdfx-${{ matrix.os }}
-          path: dist/
-          if-no-files-found: ignore
+          path: |
+            dist/*.exe
+            dist/*.dmg
+            dist/*.zip
+            dist/*.AppImage
+            dist/*.deb
+            dist/*.rpm
+          if-no-files-found: error

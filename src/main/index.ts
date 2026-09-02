@@ -1,4 +1,4 @@
-import { app, nativeTheme, BrowserWindow } from 'electron'
+import { app, nativeTheme } from 'electron'
 import { join } from 'path'
 import { existsSync } from 'fs'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
@@ -19,7 +19,9 @@ let pendingOpenPaths: string[] = []
 app.on('open-file', (event, path) => {
   event.preventDefault()
   if (getRendererReady()) {
-    void sendOpenPaths([path])
+    // Fire-and-forget, but never as an unhandled rejection: readFiles tolerates a bad path, yet
+    // the IPC send itself can still fail (window torn down mid-flight).
+    sendOpenPaths([path]).catch(console.error)
   } else {
     pendingOpenPaths.push(path)
   }
@@ -35,7 +37,7 @@ if (!gotLock) {
       if (mainWindow.isMinimized()) mainWindow.restore()
       mainWindow.focus()
     }
-    void sendOpenPaths(collectFileArgs(argv.slice(1)))
+    sendOpenPaths(collectFileArgs(argv.slice(1))).catch(console.error)
   })
 
   app.whenReady().then(() => {
@@ -73,7 +75,10 @@ if (!gotLock) {
     }
 
     app.on('activate', () => {
-      if (BrowserWindow.getAllWindows().length === 0) createWindow()
+      // Key off our own main window rather than the raw window count: hidden helper windows
+      // (e.g. the markup renderer) also show up in getAllWindows(), and any that outlive the
+      // main window would make the dock click a no-op.
+      if (!getMainWindow()) createWindow()
     })
   })
 }
