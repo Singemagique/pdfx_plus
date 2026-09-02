@@ -1,5 +1,4 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { webcrypto } from 'node:crypto'
 import * as pkijs from 'pkijs'
 import * as asn1js from 'asn1js'
 
@@ -14,74 +13,7 @@ import {
   readCapped,
   type RevocationFetcher
 } from './revocation'
-
-interface CertOpts {
-  subject: string
-  issuer: string
-  ocsp?: string
-  crl?: string
-}
-
-// Build a DER X.509 cert (RSA, self-signed) with optional AIA(OCSP) + CDP extensions, via pkijs.
-async function makeCert(opts: CertOpts, serial = 1): Promise<ArrayBuffer> {
-  const keys = (await webcrypto.subtle.generateKey(
-    {
-      name: 'RSASSA-PKCS1-v1_5',
-      modulusLength: 2048,
-      publicExponent: new Uint8Array([1, 0, 1]),
-      hash: 'SHA-256'
-    },
-    true,
-    ['sign', 'verify']
-  )) as CryptoKeyPair
-  const cert = new pkijs.Certificate()
-  cert.version = 2
-  cert.serialNumber = new asn1js.Integer({ value: serial })
-  cert.subject.typesAndValues.push(
-    new pkijs.AttributeTypeAndValue({
-      type: '2.5.4.3',
-      value: new asn1js.PrintableString({ value: opts.subject })
-    })
-  )
-  cert.issuer.typesAndValues.push(
-    new pkijs.AttributeTypeAndValue({
-      type: '2.5.4.3',
-      value: new asn1js.PrintableString({ value: opts.issuer })
-    })
-  )
-  cert.notBefore.value = new Date(Date.now() - 3600_000)
-  cert.notAfter.value = new Date(Date.now() + 365 * 24 * 3600_000)
-  await cert.subjectPublicKeyInfo.importKey(keys.publicKey)
-
-  cert.extensions = []
-  if (opts.ocsp) {
-    const aia = new pkijs.InfoAccess({
-      accessDescriptions: [
-        new pkijs.AccessDescription({
-          accessMethod: '1.3.6.1.5.5.7.48.1',
-          accessLocation: new pkijs.GeneralName({ type: 6, value: opts.ocsp })
-        })
-      ]
-    })
-    cert.extensions.push(
-      new pkijs.Extension({ extnID: '1.3.6.1.5.5.7.1.1', extnValue: aia.toSchema().toBER(false) })
-    )
-  }
-  if (opts.crl) {
-    const cdp = new pkijs.CRLDistributionPoints({
-      distributionPoints: [
-        new pkijs.DistributionPoint({
-          distributionPoint: [new pkijs.GeneralName({ type: 6, value: opts.crl })]
-        })
-      ]
-    })
-    cert.extensions.push(
-      new pkijs.Extension({ extnID: '2.5.29.31', extnValue: cdp.toSchema().toBER(false) })
-    )
-  }
-  await cert.sign(keys.privateKey, 'SHA-256')
-  return cert.toSchema().toBER(false)
-}
+import { makeCert, makeRevokedCrl, makeRevokedOcsp } from './test-utils/fixtures'
 
 describe('buildOcspRequest', () => {
   it('produces a parseable OCSPRequest whose CertID targets the cert serial', async () => {
@@ -264,64 +196,6 @@ describe('collectRevocation', () => {
     expect(out).toEqual({ ocsps: [], crls: [], revoked: false })
   })
 })
-
-// A CRL/OCSP signature is not verified by our detectors (they read status/serials), so a
-// throwaway key suffices to produce parseable DER.
-async function genKeys(): Promise<CryptoKeyPair> {
-  return (await webcrypto.subtle.generateKey(
-    { name: 'RSASSA-PKCS1-v1_5', modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256' }, // prettier-ignore
-    true,
-    ['sign', 'verify']
-  )) as CryptoKeyPair
-}
-
-async function makeRevokedCrl(serials: number[], issuer = 'CA'): Promise<Uint8Array> {
-  const keys = await genKeys()
-  const crl = new pkijs.CertificateRevocationList()
-  crl.version = 1
-  crl.issuer.typesAndValues.push(
-    new pkijs.AttributeTypeAndValue({ type: '2.5.4.3', value: new asn1js.PrintableString({ value: issuer }) }) // prettier-ignore
-  )
-  crl.thisUpdate = new pkijs.Time({ type: 0, value: new Date() })
-  crl.revokedCertificates = serials.map(
-    (s) =>
-      new pkijs.RevokedCertificate({
-        userCertificate: new asn1js.Integer({ value: s }),
-        revocationDate: new pkijs.Time({ type: 0, value: new Date() })
-      })
-  )
-  await crl.sign(keys.privateKey, 'SHA-256')
-  return new Uint8Array(crl.toSchema().toBER(false))
-}
-
-async function makeRevokedOcsp(leafDer: ArrayBuffer, issuerDer: ArrayBuffer): Promise<Uint8Array> {
-  const keys = await genKeys()
-  const leaf = new pkijs.Certificate({ schema: asn1js.fromBER(leafDer).result })
-  const issuer = new pkijs.Certificate({ schema: asn1js.fromBER(issuerDer).result })
-  const single = new pkijs.SingleResponse()
-  await single.certID.createForCertificate(leaf, {
-    hashAlgorithm: 'SHA-1',
-    issuerCertificate: issuer
-  })
-  // certStatus CHOICE [1] revoked → RevokedInfo { revocationTime GeneralizedTime }
-  single.certStatus = new asn1js.Constructed({
-    idBlock: { tagClass: 3, tagNumber: 1 },
-    value: [new asn1js.GeneralizedTime({ valueDate: new Date() })]
-  })
-  single.thisUpdate = new Date()
-  const basic = new pkijs.BasicOCSPResponse()
-  basic.tbsResponseData.responses.push(single)
-  basic.tbsResponseData.responderID = issuer.subject
-  basic.tbsResponseData.producedAt = new Date()
-  await basic.sign(keys.privateKey, 'SHA-256')
-  const resp = new pkijs.OCSPResponse()
-  resp.responseStatus.valueBlock.valueDec = 0
-  resp.responseBytes = new pkijs.ResponseBytes({
-    responseType: '1.3.6.1.5.5.7.48.1.1',
-    response: new asn1js.OctetString({ valueHex: basic.toSchema().toBER(false) })
-  })
-  return new Uint8Array(resp.toSchema().toBER(false))
-}
 
 describe('readCapped (P2-5 size cap)', () => {
   it('returns the body when within the cap', async () => {

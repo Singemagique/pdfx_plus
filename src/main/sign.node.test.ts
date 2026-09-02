@@ -1,32 +1,28 @@
 import { describe, expect, it } from 'vitest'
-import { createHash } from 'node:crypto'
-import { PDFDocument, StandardFonts } from 'pdf-lib'
 import forge from 'node-forge'
 import * as pkijs from 'pkijs'
 import * as asn1js from 'asn1js'
 
 import { signPdf } from './sign'
 import { makeLocalTsa } from './tsa-local'
+import {
+  byteRangeContent,
+  byteRangeDigest,
+  makeP12 as makeCredential,
+  makePdf as makeTestPdf
+} from './test-utils/fixtures'
 
 // A self-signed test credential as PKCS#12 bytes + its expected common name.
 function makeP12(passphrase: string): { p12: Uint8Array; cn: string } {
-  const keys = forge.pki.rsa.generateKeyPair(2048)
-  const cert = forge.pki.createCertificate()
-  cert.publicKey = keys.publicKey
-  cert.serialNumber = '01'
-  cert.validity.notBefore = new Date()
-  cert.validity.notAfter = new Date(Date.now() + 365 * 24 * 3600 * 1000)
   const cn = 'PDFx Test Signer'
-  const attrs = [
-    { name: 'commonName', value: cn },
-    { name: 'organizationName', value: 'PDFx' }
-  ]
-  cert.setSubject(attrs)
-  cert.setIssuer(attrs)
-  cert.sign(keys.privateKey, forge.md.sha256.create())
-  const asn1 = forge.pkcs12.toPkcs12Asn1(keys.privateKey, [cert], passphrase, { algorithm: '3des' })
-  const der = forge.asn1.toDer(asn1).getBytes()
-  return { p12: new Uint8Array(Buffer.from(der, 'binary')), cn }
+  const { p12 } = makeCredential(passphrase, {
+    subject: [
+      { name: 'commonName', value: cn },
+      { name: 'organizationName', value: 'PDFx' }
+    ],
+    algorithm: '3des'
+  })
+  return { p12, cn }
 }
 
 // A test credential whose .p12 bundles a CA + a leaf signed by it (to exercise chain inclusion).
@@ -63,26 +59,14 @@ function makeP12WithChain(passphrase: string): { p12: Uint8Array; leafCN: string
   return { p12: new Uint8Array(Buffer.from(der, 'binary')), leafCN, caCN }
 }
 
-async function makePdf(): Promise<Uint8Array> {
-  const doc = await PDFDocument.create()
-  const page = doc.addPage([400, 300])
-  const font = await doc.embedFont(StandardFonts.Helvetica)
-  page.drawText('Contract to be signed', { x: 40, y: 240, size: 18, font })
-  return doc.save()
-}
+const makePdf = (): Promise<Uint8Array> => makeTestPdf('Contract to be signed', 18)
 
 // Verify a detached signature: the messageDigest signed attribute must equal sha256 of the
 // ByteRange-covered content, and the embedded signer cert must match.
 function verify(signed: Uint8Array): { pades: boolean; digestMatches: boolean; signerCN?: string } {
   const s = Buffer.from(signed).toString('latin1')
   const pades = s.includes('/ETSI.CAdES.detached')
-  const br = s.match(/\/ByteRange\s*\[\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s*\]/)!
-  const [a, b, c, d] = [br[1], br[2], br[3], br[4]].map(Number)
-  const content = Buffer.concat([
-    Buffer.from(signed).subarray(a, a + b),
-    Buffer.from(signed).subarray(c, c + d)
-  ])
-  const sha = createHash('sha256').update(content).digest('hex')
+  const sha = byteRangeDigest(signed)
   const cmsHex = s.match(/\/Contents\s*<([0-9A-Fa-f]+)>/)![1]
   // node-forge's bundled types are outdated; cast around them. /Contents is zero-padded to the
   // placeholder length, so parse the CMS prefix only (parseAllBytes: false).
@@ -118,17 +102,6 @@ function parseCms(signed: Uint8Array): pkijs.SignedData {
     schema: asn1js.fromBER(der.buffer.slice(der.byteOffset, der.byteOffset + der.byteLength)).result
   })
   return new pkijs.SignedData({ schema: ci.content })
-}
-
-// The exact bytes the signature covers (the two /ByteRange segments around the /Contents gap).
-function byteRangeContent(signed: Uint8Array): Buffer {
-  const s = Buffer.from(signed).toString('latin1')
-  const br = s.match(/\/ByteRange\s*\[\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s*\]/)!
-  const [a, b, c, d] = [br[1], br[2], br[3], br[4]].map(Number)
-  return Buffer.concat([
-    Buffer.from(signed).subarray(a, a + b),
-    Buffer.from(signed).subarray(c, c + d)
-  ])
 }
 
 // CommonName (2.5.4.3) of a pkijs certificate's subject, if present.

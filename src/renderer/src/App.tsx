@@ -182,6 +182,13 @@ export default function App(): React.JSX.Element {
     })
   }, [fullViewRef])
 
+  // Notices raised by the main process — today, the files an open/drop/paste batch could not read.
+  // Optional-called because `window.api` is injected by the preload bridge: a partial stand-in (or
+  // an older preload next to a newer renderer) must not take the whole app down at mount.
+  useEffect(() => {
+    return window.api.onNotice?.((message) => flash(message))
+  }, [flash])
+
   useEffect(() => {
     return window.api.onMenu((action) => {
       if (action === 'open') void openViaDialog()
