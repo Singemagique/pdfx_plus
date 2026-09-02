@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import type { PageEntry } from '../../types'
 import {
   cssColor,
@@ -160,7 +160,7 @@ const geomEq = (a: Overlay['geom'], b: Overlay['geom']): boolean =>
 
 export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): React.JSX.Element {
   const edits = useEdits()
-  const { selectedId, select, setCurrentPage } = edits
+  const { selectedId, select, setCurrentPage, removeOverlay } = edits
   const layerRef = useRef<HTMLDivElement>(null)
   const urlCache = useRef<Map<string, string>>(new Map())
   const [draft, setDraft] = useState<Draft | null>(null)
@@ -186,7 +186,12 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
   const [sigFields, setSigFields] = useState<SigField[]>([])
 
   const pageKey = makePageKey(page.source.id, page.pageIndex)
-  const pageOverlays = overlaysForPage(edits.overlays, pageKey)
+  // Filtering + sorting the whole document's overlays is O(n log n) on every render (and this
+  // layer re-renders on every pointermove while drafting), so key it on the only two inputs.
+  const pageOverlays = useMemo(
+    () => overlaysForPage(edits.overlays, pageKey),
+    [edits.overlays, pageKey]
+  )
   const drawing =
     active &&
     (edits.tool === 'highlight' ||
@@ -377,7 +382,9 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
     return url
   }
 
-  // Delete / deselect via keyboard while this page is focused.
+  // Delete / deselect via keyboard while this page is focused. The deps are exactly what `onKey`
+  // reads — listing the whole `edits` object tore the listener down and re-subscribed it on every
+  // unrelated store change (ink colour, current page, any overlay edit anywhere).
   useEffect(() => {
     if (!active) return
     const onKey = (e: KeyboardEvent): void => {
@@ -386,12 +393,12 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
       if (e.key === 'Escape') return select(null)
       if ((e.key === 'Delete' || e.key === 'Backspace') && selectedId) {
         e.preventDefault()
-        edits.removeOverlay(selectedId)
+        removeOverlay(selectedId)
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [active, selectedId, edits, select])
+  }, [active, selectedId, select, removeOverlay])
 
   // ---- Drawing (highlight / ink) ----
   const onDrawDown = (e: React.PointerEvent): void => {

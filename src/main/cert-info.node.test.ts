@@ -1,32 +1,21 @@
 import { describe, expect, it } from 'vitest'
-import forge from 'node-forge'
 import { certInfoFromDer, certInfoFromP12 } from './cert-info'
+import { makeP12 } from './test-utils/fixtures'
 
 // A self-signed test credential: returns its PKCS#12 bytes and the leaf cert's DER.
-function makeCred(passphrase: string): { p12: Uint8Array; der: Uint8Array } {
-  const keys = forge.pki.rsa.generateKeyPair(2048)
-  const cert = forge.pki.createCertificate()
-  cert.publicKey = keys.publicKey
-  cert.serialNumber = '01'
-  cert.validity.notBefore = new Date()
-  cert.validity.notAfter = new Date(Date.now() + 365 * 24 * 3600 * 1000)
-  cert.setSubject([
-    { name: 'commonName', value: 'JARA.ADAM.1290104722' },
-    { shortName: 'OU', value: 'DoD' },
-    { name: 'organizationName', value: 'U.S. Government' }
-  ])
-  cert.setIssuer([
-    { name: 'commonName', value: 'DOD ID CA-59' },
-    { name: 'organizationName', value: 'U.S. Government' }
-  ])
-  cert.sign(keys.privateKey, forge.md.sha256.create())
-  const asn1 = forge.pkcs12.toPkcs12Asn1(keys.privateKey, [cert], passphrase, { algorithm: '3des' })
-  const p12 = new Uint8Array(Buffer.from(forge.asn1.toDer(asn1).getBytes(), 'binary'))
-  const der = new Uint8Array(
-    Buffer.from(forge.asn1.toDer(forge.pki.certificateToAsn1(cert)).getBytes(), 'binary')
-  )
-  return { p12, der }
-}
+const makeCred = (passphrase: string): { p12: Uint8Array; der: Uint8Array } =>
+  makeP12(passphrase, {
+    subject: [
+      { name: 'commonName', value: 'JARA.ADAM.1290104722' },
+      { shortName: 'OU', value: 'DoD' },
+      { name: 'organizationName', value: 'U.S. Government' }
+    ],
+    issuer: [
+      { name: 'commonName', value: 'DOD ID CA-59' },
+      { name: 'organizationName', value: 'U.S. Government' }
+    ],
+    algorithm: '3des'
+  })
 
 describe('certInfoFromDer', () => {
   it('formats the subject and issuer as DN strings', () => {

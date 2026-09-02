@@ -1,65 +1,25 @@
 import { describe, expect, it, beforeAll } from 'vitest'
-import { readFileSync } from 'node:fs'
-import { fileURLToPath } from 'node:url'
 import { PDFDocument, StandardFonts, degrees } from 'pdf-lib'
-import { init } from '@embedpdf/pdfium'
 import type { PDFDocumentProxy } from 'pdfjs-dist'
 
 import { applyRedactedBytes, buildRedactedSources } from './redact-export'
 import { makePageKey, type Overlay } from '../edit/model'
 import type { EditLayer } from './build'
 import type { DocEntry, PageEntry } from '../types'
-import type { PdfiumModule } from './redact'
+import {
+  extractText as extractTextWith,
+  loadTestPdfium,
+  makeTextPdf,
+  type TextPdfium
+} from '../test-utils/pdfium'
 
-type TestPdfium = PdfiumModule & {
-  FPDFText_LoadPage(page: number): number
-  FPDFText_CountChars(tp: number): number
-  FPDFText_GetText(tp: number, start: number, count: number, buffer: number): number
-  FPDFText_ClosePage(tp: number): void
-  pdfium: PdfiumModule['pdfium'] & { UTF16ToString(ptr: number): string }
-}
-
-let pdfium: TestPdfium
+let pdfium: TextPdfium
 
 beforeAll(async () => {
-  const wasmBinary = readFileSync(
-    fileURLToPath(
-      new URL('../../../../node_modules/@embedpdf/pdfium/dist/pdfium.wasm', import.meta.url)
-    )
-  )
-  const mod = await init({ wasmBinary })
-  mod.PDFiumExt_Init()
-  pdfium = mod as unknown as TestPdfium
+  pdfium = await loadTestPdfium()
 })
 
-async function makeTextPdf(): Promise<Uint8Array> {
-  const doc = await PDFDocument.create()
-  const page = doc.addPage([400, 800])
-  const font = await doc.embedFont(StandardFonts.Helvetica)
-  page.drawText('PUBLIC line one', { x: 50, y: 750, size: 18, font })
-  page.drawText('SECRET-9X42 confidential', { x: 50, y: 700, size: 18, font })
-  page.drawText('PUBLIC line three', { x: 50, y: 650, size: 18, font })
-  return doc.save()
-}
-
-function extractText(bytes: Uint8Array): string {
-  const rt = pdfium.pdfium
-  const ptr = rt.wasmExports.malloc(bytes.length)
-  rt.HEAPU8.set(bytes, ptr)
-  const doc = pdfium.FPDF_LoadMemDocument(ptr, bytes.length, '')
-  const page = pdfium.FPDF_LoadPage(doc, 0)
-  const tp = pdfium.FPDFText_LoadPage(page)
-  const n = pdfium.FPDFText_CountChars(tp)
-  const buf = rt.wasmExports.malloc((n + 1) * 2)
-  pdfium.FPDFText_GetText(tp, 0, n, buf)
-  const text = rt.UTF16ToString(buf)
-  rt.wasmExports.free(buf)
-  pdfium.FPDFText_ClosePage(tp)
-  pdfium.FPDF_ClosePage(page)
-  pdfium.FPDF_CloseDocument(doc)
-  rt.wasmExports.free(ptr)
-  return text.replace(/\s+/g, ' ').trim()
-}
+const extractText = (bytes: Uint8Array): string => extractTextWith(pdfium, bytes)
 
 // A one-page DocEntry whose source proxy reports a given /Rotate and view box (CropBox∩MediaBox
 // in user space) — enough for the wiring under test.
@@ -167,7 +127,7 @@ describe('buildRedactedSources', () => {
     // Record the rect handed to the engine: redactPdf paints the black box with the very rect it
     // redacts, so intercepting FPDFPageObj_CreateNewRect observes it exactly.
     const painted: number[][] = []
-    const spy = Object.create(pdfium) as TestPdfium
+    const spy = Object.create(pdfium) as TextPdfium
     spy.FPDFPageObj_CreateNewRect = (x, y, w, h) => {
       painted.push([x, y, w, h])
       return pdfium.FPDFPageObj_CreateNewRect(x, y, w, h)

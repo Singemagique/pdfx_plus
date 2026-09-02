@@ -16,7 +16,8 @@ export default defineConfig({
       // .tsx too: components are most of the renderer, and excluding them made the headline
       // number describe only the non-component half of the codebase.
       include: ['src/**/*.{ts,tsx}'],
-      exclude: ['src/**/*.d.ts', 'src/**/*.test.ts', 'src/**/*.test.tsx']
+      // test-utils/ holds fixtures shared between suites — test code, not production source.
+      exclude: ['src/**/*.d.ts', 'src/**/*.test.ts', 'src/**/*.test.tsx', '**/test-utils/**']
     },
     projects: [
       {

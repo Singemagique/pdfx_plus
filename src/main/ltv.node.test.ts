@@ -1,165 +1,26 @@
 import { describe, expect, it } from 'vitest'
-import { webcrypto } from 'node:crypto'
-import { PDFDocument, PDFName, PDFRef, PDFDict, PDFArray, StandardFonts } from 'pdf-lib'
-import forge from 'node-forge'
-import * as pkijs from 'pkijs'
-import * as asn1js from 'asn1js'
+import { PDFDocument, PDFName, PDFRef, PDFDict, PDFArray } from 'pdf-lib'
 
 import { signPdf } from './sign'
 import { addLtv } from './ltv'
 import { type RevocationFetcher } from './revocation'
+import {
+  cannedFetcher,
+  makeCert as makeTestCert,
+  makeP12 as makeCredential,
+  makePdf as makeTestPdf,
+  makeRevokedCrl,
+  makeRevokedOcsp,
+  type CertOpts
+} from './test-utils/fixtures'
 
-function makeP12(passphrase: string): Uint8Array {
-  const keys = forge.pki.rsa.generateKeyPair(2048)
-  const cert = forge.pki.createCertificate()
-  cert.publicKey = keys.publicKey
-  cert.serialNumber = '01'
-  cert.validity.notBefore = new Date()
-  cert.validity.notAfter = new Date(Date.now() + 365 * 24 * 3600 * 1000)
-  const attrs = [{ name: 'commonName', value: 'LTV Signer' }]
-  cert.setSubject(attrs)
-  cert.setIssuer(attrs)
-  cert.sign(keys.privateKey, forge.md.sha256.create())
-  const der = forge.asn1
-    .toDer(forge.pkcs12.toPkcs12Asn1(keys.privateKey, [cert], passphrase))
-    .getBytes()
-  return new Uint8Array(Buffer.from(der, 'binary'))
-}
+const makeP12 = (passphrase: string): Uint8Array =>
+  makeCredential(passphrase, { cn: 'LTV Signer' }).p12
 
-async function makePdf(): Promise<Uint8Array> {
-  const doc = await PDFDocument.create()
-  const page = doc.addPage([400, 300])
-  const font = await doc.embedFont(StandardFonts.Helvetica)
-  page.drawText('LTV document', { x: 40, y: 240, size: 16, font })
-  return doc.save()
-}
+const makePdf = (): Promise<Uint8Array> => makeTestPdf('LTV document')
 
-// A DER X.509 cert (RSA, self-signed) with optional AIA(OCSP) + CDP extensions.
-async function makeCert(opts: {
-  subject: string
-  issuer: string
-  ocsp?: string
-  crl?: string
-}): Promise<ArrayBuffer> {
-  const keys = (await webcrypto.subtle.generateKey(
-    {
-      name: 'RSASSA-PKCS1-v1_5',
-      modulusLength: 2048,
-      publicExponent: new Uint8Array([1, 0, 1]),
-      hash: 'SHA-256'
-    },
-    true,
-    ['sign', 'verify']
-  )) as CryptoKeyPair
-  const cert = new pkijs.Certificate()
-  cert.version = 2
-  cert.serialNumber = new asn1js.Integer({ value: 7 })
-  cert.subject.typesAndValues.push(
-    new pkijs.AttributeTypeAndValue({
-      type: '2.5.4.3',
-      value: new asn1js.PrintableString({ value: opts.subject })
-    })
-  )
-  cert.issuer.typesAndValues.push(
-    new pkijs.AttributeTypeAndValue({
-      type: '2.5.4.3',
-      value: new asn1js.PrintableString({ value: opts.issuer })
-    })
-  )
-  cert.notBefore.value = new Date(Date.now() - 3600_000)
-  cert.notAfter.value = new Date(Date.now() + 365 * 24 * 3600_000)
-  await cert.subjectPublicKeyInfo.importKey(keys.publicKey)
-  cert.extensions = []
-  if (opts.ocsp) {
-    const aia = new pkijs.InfoAccess({
-      accessDescriptions: [
-        new pkijs.AccessDescription({
-          accessMethod: '1.3.6.1.5.5.7.48.1',
-          accessLocation: new pkijs.GeneralName({ type: 6, value: opts.ocsp })
-        })
-      ]
-    })
-    cert.extensions.push(
-      new pkijs.Extension({ extnID: '1.3.6.1.5.5.7.1.1', extnValue: aia.toSchema().toBER(false) })
-    )
-  }
-  if (opts.crl) {
-    const cdp = new pkijs.CRLDistributionPoints({
-      distributionPoints: [
-        new pkijs.DistributionPoint({
-          distributionPoint: [new pkijs.GeneralName({ type: 6, value: opts.crl })]
-        })
-      ]
-    })
-    cert.extensions.push(
-      new pkijs.Extension({ extnID: '2.5.29.31', extnValue: cdp.toSchema().toBER(false) })
-    )
-  }
-  await cert.sign(keys.privateKey, 'SHA-256')
-  return cert.toSchema().toBER(false)
-}
-
-const cannedFetcher: RevocationFetcher = {
-  fetchOcsp: async () => new Uint8Array([0x30, 0x03, 0x0a, 0x01, 0x00]),
-  fetchCrl: async () => new Uint8Array([0x30, 0x02, 0x05, 0x00]),
-  fetchCaIssuers: async () => null
-}
-
-// A signed OCSPResponse reporting `leaf` (issued by `issuer`) as REVOKED. The signature isn't
-// verified by the detector, so a throwaway key is fine.
-async function makeRevokedOcsp(leafDer: ArrayBuffer, issuerDer: ArrayBuffer): Promise<Uint8Array> {
-  const keys = (await webcrypto.subtle.generateKey(
-    { name: 'RSASSA-PKCS1-v1_5', modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256' }, // prettier-ignore
-    true,
-    ['sign', 'verify']
-  )) as CryptoKeyPair
-  const leaf = new pkijs.Certificate({ schema: asn1js.fromBER(leafDer).result })
-  const issuer = new pkijs.Certificate({ schema: asn1js.fromBER(issuerDer).result })
-  const single = new pkijs.SingleResponse()
-  await single.certID.createForCertificate(leaf, { hashAlgorithm: 'SHA-1', issuerCertificate: issuer }) // prettier-ignore
-  single.certStatus = new asn1js.Constructed({
-    idBlock: { tagClass: 3, tagNumber: 1 }, // [1] revoked
-    value: [new asn1js.GeneralizedTime({ valueDate: new Date() })]
-  })
-  single.thisUpdate = new Date()
-  const basic = new pkijs.BasicOCSPResponse()
-  basic.tbsResponseData.responses.push(single)
-  basic.tbsResponseData.responderID = issuer.subject
-  basic.tbsResponseData.producedAt = new Date()
-  await basic.sign(keys.privateKey, 'SHA-256')
-  const resp = new pkijs.OCSPResponse()
-  resp.responseStatus.valueBlock.valueDec = 0
-  resp.responseBytes = new pkijs.ResponseBytes({
-    responseType: '1.3.6.1.5.5.7.48.1.1',
-    response: new asn1js.OctetString({ valueHex: basic.toSchema().toBER(false) })
-  })
-  return new Uint8Array(resp.toSchema().toBER(false))
-}
-
-// A CRL (issued by `issuer`) listing `serials` as revoked. Its signature isn't verified by the
-// detector, so a throwaway key is fine.
-async function makeRevokedCrl(serials: number[], issuer: string): Promise<Uint8Array> {
-  const keys = (await webcrypto.subtle.generateKey(
-    { name: 'RSASSA-PKCS1-v1_5', modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256' }, // prettier-ignore
-    true,
-    ['sign', 'verify']
-  )) as CryptoKeyPair
-  const crl = new pkijs.CertificateRevocationList()
-  crl.version = 1
-  crl.issuer.typesAndValues.push(
-    new pkijs.AttributeTypeAndValue({ type: '2.5.4.3', value: new asn1js.PrintableString({ value: issuer }) }) // prettier-ignore
-  )
-  crl.thisUpdate = new pkijs.Time({ type: 0, value: new Date() })
-  crl.revokedCertificates = serials.map(
-    (s) =>
-      new pkijs.RevokedCertificate({
-        userCertificate: new asn1js.Integer({ value: s }),
-        revocationDate: new pkijs.Time({ type: 0, value: new Date() })
-      })
-  )
-  await crl.sign(keys.privateKey, 'SHA-256')
-  return new Uint8Array(crl.toSchema().toBER(false))
-}
+// Every cert in this suite is issued with serial 7 (the leaf-only CRL case relies on it).
+const makeCert = (opts: CertOpts): Promise<ArrayBuffer> => makeTestCert(opts, 7)
 
 async function loadDss(pdf: Uint8Array): Promise<PDFDict> {
   const doc = await PDFDocument.load(pdf)

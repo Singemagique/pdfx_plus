@@ -17,7 +17,15 @@ vi.mock('fs/promises', async (importOriginal) => {
 
 import { readFile, readdir, stat } from 'fs/promises'
 
-import { IMPORTABLE, collectFileArgs, expandDropPaths, importable, readFiles } from './file-intake'
+import {
+  IMPORTABLE,
+  collectFileArgs,
+  expandDropPaths,
+  importable,
+  readFiles,
+  readFilesReport,
+  skippedNotice
+} from './file-intake'
 import { _resetOpenedPaths, isOpenedPath } from './opened-paths'
 
 beforeEach(() => {
@@ -96,6 +104,20 @@ describe('expandDropPaths', () => {
   })
 })
 
+describe('skippedNotice', () => {
+  it('names the files, singular or plural, without their directories', () => {
+    expect(skippedNotice(['/x/y/a.pdf'])).toBe('Could not read 1 file: a.pdf')
+    expect(skippedNotice(['/x/a.pdf', '/y/b.pdf'])).toBe('Could not read 2 files: a.pdf, b.pdf')
+  })
+
+  it('collapses a long list so a 300-file drop cannot produce a 300-name toast', () => {
+    const many = Array.from({ length: 8 }, (_, i) => `/x/f${i}.pdf`)
+    expect(skippedNotice(many)).toBe(
+      'Could not read 8 files: f0.pdf, f1.pdf, f2.pdf, f3.pdf, f4.pdf +3 more'
+    )
+  })
+})
+
 describe('readFiles', () => {
   let dir: string
   let good: string
@@ -128,6 +150,29 @@ describe('readFiles', () => {
     writeFileSync(second, '%PDF-1.7\n2\n')
     const out = await readFiles([good, second])
     expect(out.map((f) => f.path)).toEqual([good, second])
+  })
+
+  // The silent-skip complaint: readFiles alone gives the caller no way to distinguish "you dropped
+  // three files" from "you dropped five and two were unreadable", so the UI could not say anything.
+  describe('readFilesReport', () => {
+    it('reports the unreadable paths alongside the files it read', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+      const missing = join(dir, 'report-gone.pdf')
+      const report = await readFilesReport([good, missing, dir])
+      expect(report.files.map((f) => f.path)).toEqual([good])
+      expect(report.skipped).toEqual([missing, dir])
+      warn.mockRestore()
+    })
+
+    it('reports nothing skipped when every path reads', async () => {
+      expect((await readFilesReport([good])).skipped).toEqual([])
+    })
+
+    it('still returns only the files through the readFiles wrapper', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+      expect((await readFiles([good, join(dir, 'nope.pdf')])).map((f) => f.path)).toEqual([good])
+      warn.mockRestore()
+    })
   })
 
   // The opened-paths set gates read-resource (a compromised renderer that can get an arbitrary

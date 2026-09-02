@@ -51,18 +51,24 @@ vi.mock('./native/glass', () => ({
   applyNativeGlass: vi.fn()
 }))
 vi.mock('./markup', () => ({ destroyRenderWindow: vi.fn(), markupToPdf: vi.fn() }))
-vi.mock('./file-intake', () => ({ readFiles: vi.fn(async () => []) }))
+vi.mock('./file-intake', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./file-intake')>()
+  return {
+    ...actual,
+    readFilesReport: vi.fn(async () => ({ files: [], skipped: [] }))
+  }
+})
 
 import { destroyRenderWindow } from './markup'
-import { readFiles } from './file-intake'
+import { readFilesReport } from './file-intake'
 
 let win: typeof import('./window')
 
 beforeEach(async () => {
   vi.resetModules()
   vi.mocked(destroyRenderWindow).mockClear()
-  vi.mocked(readFiles).mockReset()
-  vi.mocked(readFiles).mockResolvedValue([])
+  vi.mocked(readFilesReport).mockReset()
+  vi.mocked(readFilesReport).mockResolvedValue({ files: [], skipped: [] })
   h.windows.length = 0
   win = await import('./window')
 })
@@ -88,18 +94,36 @@ describe('sendOpenPaths', () => {
   it('sends the files it read to a live window', async () => {
     win.createWindow()
     const files = [{ name: 'a.pdf', data: new Uint8Array([1]), path: '/x/a.pdf' }]
-    vi.mocked(readFiles).mockResolvedValue(files)
+    vi.mocked(readFilesReport).mockResolvedValue({ files, skipped: [] })
 
     await win.sendOpenPaths(['/x/a.pdf'])
 
     expect(h.windows[0].send).toHaveBeenCalledWith('pdfx:files-opened', files)
+    expect(h.windows[0].send).toHaveBeenCalledTimes(1) // nothing skipped → no notice
+  })
+
+  it('tells the renderer about the paths it could not read', async () => {
+    win.createWindow()
+    vi.mocked(readFilesReport).mockResolvedValue({
+      files: [{ name: 'a.pdf', data: new Uint8Array([1]), path: '/x/a.pdf' }],
+      skipped: ['/x/gone.pdf', '/x/locked.pdf']
+    })
+
+    await win.sendOpenPaths(['/x/a.pdf', '/x/gone.pdf', '/x/locked.pdf'])
+
+    // Explorer double-click / open-file / second-instance return nothing to a caller, so without
+    // this the two unreadable files vanish with only a main-process console.warn.
+    expect(h.windows[0].send).toHaveBeenCalledWith(
+      'pdfx:notice',
+      'Could not read 2 files: gone.pdf, locked.pdf'
+    )
   })
 
   it('does not send when the window closes mid-read', async () => {
     win.createWindow()
     let finishRead = (): void => {}
-    vi.mocked(readFiles).mockImplementation(
-      () => new Promise((resolve) => (finishRead = () => resolve([])))
+    vi.mocked(readFilesReport).mockImplementation(
+      () => new Promise((resolve) => (finishRead = () => resolve({ files: [], skipped: [] })))
     )
 
     const pending = win.sendOpenPaths(['/x/a.pdf'])
@@ -117,8 +141,8 @@ describe('sendOpenPaths', () => {
   it('does not send when the window is destroyed but not yet cleared', async () => {
     win.createWindow()
     let finishRead = (): void => {}
-    vi.mocked(readFiles).mockImplementation(
-      () => new Promise((resolve) => (finishRead = () => resolve([])))
+    vi.mocked(readFilesReport).mockImplementation(
+      () => new Promise((resolve) => (finishRead = () => resolve({ files: [], skipped: [] })))
     )
 
     const pending = win.sendOpenPaths(['/x/a.pdf'])
