@@ -98,22 +98,27 @@ export function createRootDragHandlers(deps: RootDragDeps): RootDragHandlers {
     // Both intake paths can reject (an unreadable path / directory expansion in main, a revoked
     // File handle in the browser fallback). Without a catch the drop was a silent no-op: no pages,
     // no toast, nothing in the console.
+    //
+    // The rejection handler is passed as `then`'s SECOND argument rather than chained as `.catch`:
+    // a trailing `.catch` also sees anything `onExternalDrop` throws, which would flash "Could not
+    // add files" for a failure that happened well past intake and reports itself (contradicting
+    // `onDropError`'s contract). Two-argument `then` scopes this to the intake step only.
     const failed = (error: unknown): void => {
       console.error('Drop failed', error)
       deps.onDropError('Could not add files')
     }
+    const deliver = (files: IncomingFile[]): void => {
+      // Deliberately not returned into the chain either: `onExternalDrop` reports its own failures,
+      // and adopting its promise would put them back under `failed`.
+      deps.onExternalDrop(files, target)
+    }
     if (paths.length > 0 && paths.every(Boolean)) {
-      void window.api
-        .expandDropPaths(paths)
-        .then((files) => deps.onExternalDrop(files, target))
-        .catch(failed)
+      void window.api.expandDropPaths(paths).then(deliver, failed)
     } else {
       const supported = dropped.filter((f) => isDroppableFile(f.name, f.type))
       void Promise.all(
         supported.map(async (f) => ({ name: f.name, data: new Uint8Array(await f.arrayBuffer()) }))
-      )
-        .then((files) => deps.onExternalDrop(files, target))
-        .catch(failed)
+      ).then(deliver, failed)
     }
   }
 

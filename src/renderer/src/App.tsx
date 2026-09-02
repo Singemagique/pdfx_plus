@@ -55,6 +55,7 @@ export default function App(): React.JSX.Element {
   const collection = useCollection(flash)
   const fullViewState = useFullView()
   const editStore = useEditStore()
+  const { fullView } = fullViewState
   const docs = collection.docs
   const layout = useMemo(
     () => computeLayout(docs, editStore.rotations),
@@ -76,11 +77,15 @@ export default function App(): React.JSX.Element {
   // in the collection view (placement needs the editor canvas), and hide the dialog so the user can
   // drag a box. The effect below reveals it — with all its fields intact — once they do.
   const requestPlacement = useCallback(() => {
+    // Never enter placing mode without the editor canvas being up: `placing` hides the dialog, and
+    // the abandon effect below would immediately (and confusingly) close it again.
+    if (!fullViewState.fullView) {
+      const first = docs[0]?.pages[0]
+      if (!first) return
+      fullViewState.openPage(docs[0].id, first.id)
+    }
     awaitingPlacement.current = true
     editStore.setTool('signature')
-    if (!fullViewState.fullView && docs[0]?.pages[0]) {
-      fullViewState.openPage(docs[0].id, docs[0].pages[0].id)
-    }
     setPlacing(true)
   }, [editStore, fullViewState, docs])
 
@@ -102,6 +107,25 @@ export default function App(): React.JSX.Element {
     setPlacing(false)
     setSignOpen(false)
   }, [editStore.tool])
+
+  // The OTHER way to abandon a placement is to close full view (Escape, handled window-level in
+  // use-full-view-input, or the close button) — and that leaves `editStore.tool` on 'signature', so
+  // the effect above never fires for it. Without this, Escape during "Place on page…" left
+  // signOpen=true + placing=true: an invisible display:none dialog, and a Toolbar Sign button that
+  // was a silent no-op forever after (setSignOpen(true) on already-true state changes nothing).
+  //
+  // It cannot mis-fire on the OPENING transition. requestPlacement calls openPage() and
+  // setPlacing(true) from one React event handler, so React batches them into a single commit: the
+  // first render this effect ever sees with `placing === true` already has a non-null `fullView`.
+  // And requestPlacement refuses to set `placing` at all when there is no page to open, so `placing`
+  // is never true with full view legitimately closed. Composes with the tool-switch abandon above —
+  // both do the same three idempotent resets, so firing both is harmless.
+  useEffect(() => {
+    if (!placing || fullView) return
+    awaitingPlacement.current = false
+    setPlacing(false)
+    setSignOpen(false)
+  }, [placing, fullView])
 
   const {
     exportCollection,
@@ -168,7 +192,6 @@ export default function App(): React.JSX.Element {
   }, [openViaDialog, exportCollection, exportZip])
 
   const totalPages = docs.reduce((sum, d) => sum + d.pages.length, 0)
-  const { fullView } = fullViewState
   const fullViewDoc = fullView ? docs.find((d) => d.id === fullView.docId) : undefined
 
   return (

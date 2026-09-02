@@ -100,6 +100,31 @@ describe('onDrop reports a failed external drop instead of doing nothing', () =>
     expect(deps.onExternalDrop).not.toHaveBeenCalled()
   })
 
+  it('does not blame the intake step for a failure inside onExternalDrop', async () => {
+    // `onDropError`'s contract is "the drop failed BEFORE any file reached onExternalDrop" — that
+    // one reports its own errors. A trailing `.catch` after `.then(deliver)` would also swallow
+    // this rejection and flash a second, wrong message.
+    const late = Promise.reject(new Error('import blew up after intake'))
+    late.catch(() => {}) // the handler must not adopt this promise, so keep it handled here
+    stubApi({
+      getPathForFile: () => 'C:\\docs\\a.pdf',
+      expandDropPaths: () => Promise.resolve([{ name: 'a.pdf', data: new Uint8Array([1]) }])
+    })
+    const deps = makeDeps({
+      onExternalDrop: vi.fn(() => late) as unknown as RootDragDeps['onExternalDrop']
+    })
+
+    createRootDragHandlers(deps).onDrop(
+      dropEvent([droppedFile('a.pdf', async () => new ArrayBuffer(1))])
+    )
+
+    await vi.waitFor(() => expect(deps.onExternalDrop).toHaveBeenCalled())
+    // Drain the microtask queue so a (wrongly) chained rejection handler would have run by now.
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(deps.onDropError).not.toHaveBeenCalled()
+    expect(consoleError).not.toHaveBeenCalled()
+  })
+
   it('still forwards a successful drop without reporting an error', async () => {
     const files = [{ name: 'a.pdf', data: new Uint8Array([1]) }]
     stubApi({

@@ -71,23 +71,28 @@ const byText = (re: RegExp): HTMLButtonElement => {
 
 const submitButton = (): HTMLButtonElement => byText(/Sign & Save|Signing/)
 
+/**
+ * Submit via Enter on the TSA field. Unlike the button that input is never disabled, so the event
+ * really reaches `submit()` — only the latch can stop it. That keeps the latch tests honest once
+ * the pending state disables the button.
+ */
+async function submitViaEnter(times = 1): Promise<void> {
+  const tsa = container.querySelector<HTMLInputElement>('input[placeholder^="Timestamp authority"]')
+  expect(tsa).not.toBeNull()
+  await act(async () => {
+    for (let i = 0; i < times; i++) {
+      tsa!.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
+    }
+  })
+}
+
 describe('SignDialog submit latch', () => {
   it('runs a single sign for two rapid submits (P2-3)', async () => {
     const props = makeProps()
     await mount(props)
     expect(props.listWindowsCerts).toHaveBeenCalled()
 
-    // Submit via Enter on the TSA field: unlike the button it is never disabled, so both events
-    // really reach `submit()` and only the latch can stop the second one.
-    const tsa = container.querySelector<HTMLInputElement>(
-      'input[placeholder^="Timestamp authority"]'
-    )
-    expect(tsa).not.toBeNull()
-    await act(async () => {
-      for (let i = 0; i < 2; i++) {
-        tsa!.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
-      }
-    })
+    await submitViaEnter(2)
 
     expect(props.onSignWindowsCert).toHaveBeenCalledTimes(1)
     expect(props.onSignWindowsCert).toHaveBeenCalledWith(
@@ -108,12 +113,17 @@ describe('SignDialog submit latch', () => {
       button.dispatchEvent(new MouseEvent('click', { bubbles: true }))
     })
 
-    // `busy` is still false — the export/signing IPC has not started — yet the button must already
-    // read as working, or the dropped second click looks like a dead button.
-    expect(props.busy).toBe(false)
+    // The dialog was never re-rendered with `busy: true` — the export/signing IPC has not started —
+    // yet the button must already read as working, or the dropped second submit looks like a dead
+    // button. Only the local pending state can be producing this.
     expect(submitButton().disabled).toBe(true)
     expect(submitButton().textContent).toContain('Signing…')
+
+    // And a submit that bypasses the disabled button entirely (Enter on the never-disabled TSA
+    // field) is still swallowed while the first sign promise is pending.
+    await submitViaEnter()
     expect(props.onSignWindowsCert).toHaveBeenCalledTimes(1)
+    expect(submitButton().disabled).toBe(true)
   })
 })
 
