@@ -63,6 +63,12 @@ export function setCropInHistory(
  *     and a retained step's inverse patch targets one of those keys. Every import mints fresh
  *     source UUIDs (loadSource in ../pdfx/source.ts), and makePageKey derives from the source id,
  *     so a loaded page's key is always new. Never reuse a source id across imports.
+ *  3. THE LOAD IS A COALESCE BOUNDARY. history.apply folds a new step into the top of `past` when
+ *     the two share a coalesceKey, so a retained top step would keep absorbing post-load edits to
+ *     the same target (e.g. the same form field on a page that survived the load): one Ctrl+Z
+ *     would then revert across the import, undoing pre- and post-load typing together. The top
+ *     retained step therefore has its coalesceKey stripped below — nothing after the load can
+ *     merge into anything recorded before it.
  */
 export function loadIntoHistory(
   h: History<EditState>,
@@ -73,7 +79,11 @@ export function loadIntoHistory(
     rotations: { ...h.present.rotations, ...Object.fromEntries(s.rotations) },
     crops: { ...h.present.crops, ...Object.fromEntries(s.crops) }
   }
-  return { ...h, present: merged, future: [] }
+  // invariant 3: close the top retained step so no post-load edit coalesces into a pre-load one.
+  const past = h.past.length
+    ? [...h.past.slice(0, -1), { ...h.past[h.past.length - 1], coalesceKey: undefined }]
+    : h.past
+  return { ...h, present: merged, past, future: [] }
 }
 
 /**

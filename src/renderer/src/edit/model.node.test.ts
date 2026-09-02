@@ -71,10 +71,21 @@ describe('nextZ', () => {
     expect(nextZ(overlays, 'untouched')).toBe(0)
   })
 
-  it('is strictly above every existing z on the page', () => {
+  it('is strictly above every existing z while the page holds the contiguous run it produces', () => {
+    // nextZ is a COUNT, not max+1, so "on top" holds exactly while every overlay on the page was
+    // itself numbered by nextZ — i.e. the z values are the contiguous 0..n-1 run.
     const overlays = [img('k1', 0), img('k1', 1), img('k1', 2)]
     const z = nextZ(overlays, 'k1')
     expect(overlays.every((o) => o.z < z)).toBe(true)
+  })
+
+  it('is only a count, so a non-contiguous page can hand back a z that ties or sits below', () => {
+    // Reachable today: setFormValueInHistory numbers formValue overlays by the GLOBAL overlay
+    // count, so a page can carry a z above its own overlay count. Pinning the real contract here
+    // rather than the stronger "always on top" claim.
+    const overlays = [img('k1', 0), img('k1', 5)]
+    expect(nextZ(overlays, 'k1')).toBe(2) // count of the page's overlays, not 6
+    expect(overlays.every((o) => o.z < 2)).toBe(false)
   })
 })
 

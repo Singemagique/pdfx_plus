@@ -156,9 +156,16 @@ export function overlaysForPage(overlays: Overlay[], pageKey: string): Overlay[]
 }
 
 /**
- * The `z` to give the next overlay added to a page — the single definition of the stacking
- * rule (new content goes on top of what's already on that page). Every insertion site must
- * go through this so the rule can't drift between the overlay layer and the tool palette.
+ * The `z` to give the next overlay drawn or stamped onto a page — the single definition of the
+ * stacking rule for those sites (new content goes on top of what's already on that page). The
+ * three that must go through it, so the rule can't drift between the overlay layer and the tool
+ * palette, are OverlayLayer's pointer-drag commit and its image drop, and EditTools' stamp.
+ *
+ * NOT used by setFormValueInHistory (../edit-history.ts), which has always assigned the GLOBAL
+ * overlay count (`d.overlays.length`) instead. Filled form values are page-anchored to their
+ * AcroForm widget rect and don't overlap other content, so the difference has no visible effect;
+ * switching it to this per-page count would renumber form overlays and is a behavior change
+ * outside the scope of the cleanup that introduced this helper.
  */
 export const nextZ = (overlays: Overlay[], pageKey: string): number =>
   overlaysForPage(overlays, pageKey).length

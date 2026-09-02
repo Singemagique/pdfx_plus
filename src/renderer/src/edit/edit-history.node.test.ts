@@ -176,6 +176,31 @@ describe('loadIntoHistory (P2-7 checkpoint, not a lossy undo step)', () => {
     expect(canRedo(h)).toBe(false)
   })
 
+  it('is a coalesce boundary: a post-load edit never folds into a pre-load step', () => {
+    // Same page, same field on both sides of the load — the coalesce key is identical, so without
+    // closing the top retained step the second burst would merge into the first.
+    let h = setFormValueInHistory(start(), 'p1', 'name', 'Ada', geom(0))
+    expect(h.past).toHaveLength(1)
+    h = loadIntoHistory(h, { overlays: [highlight('imported')], rotations: [], crops: [] })
+    h = setFormValueInHistory(h, 'p1', 'name', 'Grace', geom(0))
+    expect(h.past).toHaveLength(2) // two steps, not one merged step
+    expect(formValues(h)).toEqual([['name', 'Grace']])
+
+    h = undo(h) // reverts only the post-load edit
+    expect(formValues(h)).toEqual([['name', 'Ada']])
+    expect(h.present.overlays.map((o) => o.id)).toContain('imported') // the import is untouched
+    h = undo(h) // now the pre-load edit
+    expect(formValues(h)).toEqual([])
+    expect(canUndo(h)).toBe(false)
+  })
+
+  it('still coalesces edits made entirely after the load', () => {
+    let h = loadIntoHistory(start(), { overlays: [], rotations: [], crops: [] })
+    h = setFormValueInHistory(h, 'p1', 'name', 'A', geom(0))
+    h = setFormValueInHistory(h, 'p1', 'name', 'Ad', geom(0))
+    expect(h.past).toHaveLength(1) // the boundary closes the old step, it does not disable coalescing
+  })
+
   it('a post-load edit is undoable but stops at the loaded baseline', () => {
     let h = loadIntoHistory(start(), {
       overlays: [highlight('imported')],

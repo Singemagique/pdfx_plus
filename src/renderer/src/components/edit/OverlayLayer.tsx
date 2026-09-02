@@ -426,12 +426,14 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
   const onDrawUp = (e: React.PointerEvent): void => {
     // Commit from the ref: pointerup does not flush a pending continuous move, so the render
     // closure can still hold the pre-move draft.
-    const draft = draftRef.current
-    if (!draft) return
+    // Named apart from the `draft` state variable this handler closes over, so a later edit can't
+    // silently read the stale render-closure value where the ref is meant.
+    const committedDraft = draftRef.current
+    if (!committedDraft) return
     e.stopPropagation()
     layerRef.current?.releasePointerCapture(e.pointerId)
-    if (draft.kind === 'crop') {
-      const g = rectGeom(draft.start, draft.current, 1)
+    if (committedDraft.kind === 'crop') {
+      const g = rectGeom(committedDraft.start, committedDraft.current, 1)
       // Clamp to the page; ignore an accidental tiny drag.
       const x = Math.max(0, g.x)
       const y = Math.max(0, g.y)
@@ -441,8 +443,8 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
       setDraftSynced(null)
       return
     }
-    if (draft.kind === 'signature') {
-      const geom = rectGeom(draft.start, draft.current, 1)
+    if (committedDraft.kind === 'signature') {
+      const geom = rectGeom(committedDraft.start, committedDraft.current, 1)
       if (geom.w > 8 && geom.h > 8)
         edits.setSignaturePlacement({
           pageKey,
@@ -458,16 +460,16 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
       z: nextZ(edits.overlays, pageKey),
       createdAt: Date.now()
     }
-    if (draft.kind === 'highlight') {
-      const geom = rectGeom(draft.start, draft.current, 0.4)
+    if (committedDraft.kind === 'highlight') {
+      const geom = rectGeom(committedDraft.start, committedDraft.current, 0.4)
       if (geom.w > 2 && geom.h > 2)
         edits.addOverlay({ ...base, geom, type: 'highlight', color: edits.highlightColor })
-    } else if (draft.kind === 'redaction') {
-      const geom = rectGeom(draft.start, draft.current, 1)
+    } else if (committedDraft.kind === 'redaction') {
+      const geom = rectGeom(committedDraft.start, committedDraft.current, 1)
       if (geom.w > 2 && geom.h > 2)
         edits.addOverlay({ ...base, geom, type: 'redaction', fill: { r: 0, g: 0, b: 0 } })
-    } else if (draft.kind === 'shape') {
-      const geom = rectGeom(draft.start, draft.current, 1)
+    } else if (committedDraft.kind === 'shape') {
+      const geom = rectGeom(committedDraft.start, committedDraft.current, 1)
       const isLine = edits.shapeKind === 'line' || edits.shapeKind === 'arrow'
       if (geom.w > 2 || geom.h > 2) {
         edits.addOverlay({
@@ -478,16 +480,23 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
           color: edits.shapeColor,
           strokeWidth: edits.shapeWidth,
           ...(isLine
-            ? { points: [draft.start.x, draft.start.y, draft.current.x, draft.current.y] }
+            ? {
+                points: [
+                  committedDraft.start.x,
+                  committedDraft.start.y,
+                  committedDraft.current.x,
+                  committedDraft.current.y
+                ]
+              }
             : {})
         })
       }
-    } else if (draft.kind === 'ink' && draft.pts.length >= 4) {
+    } else if (committedDraft.kind === 'ink' && committedDraft.pts.length >= 4) {
       edits.addOverlay({
         ...base,
-        geom: boundsOfPath(draft.pts, 1),
+        geom: boundsOfPath(committedDraft.pts, 1),
         type: 'ink',
-        paths: [draft.pts],
+        paths: [committedDraft.pts],
         strokeWidth: edits.inkWidth,
         color: edits.inkColor
       })
