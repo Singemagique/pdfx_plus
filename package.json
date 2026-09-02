@@ -1,7 +1,7 @@
 {
   "name": "pdfx",
   "productName": "PDFx",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "PDFX — a backwards-compatible PDF extension for multi-document files, with a lightweight cross-platform editor and PAdES signing",
   "main": "./out/main/index.js",
   "author": "Alex Gounis",
