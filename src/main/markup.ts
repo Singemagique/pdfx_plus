@@ -53,13 +53,35 @@ function getRenderWindow(): BrowserWindow {
   return win
 }
 
+/**
+ * Tear down the cached hidden render window.
+ *
+ * Electron counts this window in `getAllWindows()`, so leaving it alive after the main window is
+ * gone keeps `window-all-closed` from ever firing (the app lingers invisibly, still holding the
+ * single-instance lock, so a relaunch is silently dead) and makes the macOS dock `activate` check
+ * see a non-empty window list. `getRenderWindow()` re-creates lazily, so destroying it here never
+ * breaks a later markupToPdf.
+ */
+export function destroyRenderWindow(): void {
+  const win = renderWin
+  renderWin = null
+  if (win && !win.isDestroyed()) win.destroy()
+}
+
 function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
   return Promise.race([
     p,
-    new Promise<T>((_, reject) =>
-      setTimeout(() => reject(new Error('markup render timed out')), ms)
-    )
-  ])
+    new Promise<T>((_, reject) => {
+      timer = setTimeout(() => {
+        // Rejecting only unblocks the wrapper: the timed-out render keeps driving the SHARED
+        // window, so the next job in the chain would race it (blank PDF or spurious failure).
+        // Destroy the window BEFORE the chain advances so the next job gets a fresh one.
+        destroyRenderWindow()
+        reject(new Error('markup render timed out'))
+      }, ms)
+    })
+  ]).finally(() => clearTimeout(timer))
 }
 
 async function renderOnce(html: string, fitPageHeightPx?: number): Promise<Uint8Array> {

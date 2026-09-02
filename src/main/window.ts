@@ -3,6 +3,7 @@ import { join } from 'path'
 import { is } from '@electron-toolkit/utils'
 import { GLASS_CONFIG, FALLBACK_BG, applyNativeGlass } from './native/glass'
 import { readFiles } from './file-intake'
+import { destroyRenderWindow } from './markup'
 
 let mainWindow: BrowserWindow | null = null
 let rendererReady = false
@@ -28,7 +29,12 @@ export function toggleDevTools(): void {
 
 export async function sendOpenPaths(paths: string[]): Promise<void> {
   if (!mainWindow || paths.length === 0) return
-  mainWindow.webContents.send('pdfx:files-opened', await readFiles(paths))
+  const files = await readFiles(paths)
+  // Re-check after the await: the window can be torn down mid-read (the user closes it while a
+  // large batch is loading), and sending on a destroyed webContents throws — which would surface
+  // as a rejection out of the pdfx:renderer-ready handler / the fire-and-forget open-file paths.
+  if (!mainWindow || mainWindow.isDestroyed()) return
+  mainWindow.webContents.send('pdfx:files-opened', files)
 }
 
 export function createWindow(): void {
@@ -56,6 +62,12 @@ export function createWindow(): void {
   mainWindow.on('closed', () => {
     mainWindow = null
     rendererReady = false
+    // The markup renderer keeps a hidden BrowserWindow cached forever. Electron counts it, so
+    // unless it dies with the main window, `window-all-closed` never fires (the app lingers
+    // invisibly holding the single-instance lock) and macOS `activate` sees a non-empty window
+    // list. This is the one place that always runs when the main window goes away — the app can
+    // be quit from the menu, the window chrome, or an OS shutdown — so the teardown belongs here.
+    destroyRenderWindow()
   })
 
   mainWindow.webContents.setWindowOpenHandler((details) => {
