@@ -5,17 +5,20 @@
 // component chain. App also reads `editLayer` to bake overlays on export.
 
 import { createContext, useCallback, useContext, useMemo, useState } from 'react'
-import { apply, canRedo, canUndo, initHistory, redo, undo, type History } from './history'
+import { canRedo, canUndo, initHistory, redo, undo, type History } from './history'
 import {
+  addOverlayInHistory,
   emptyEditState,
   loadIntoHistory,
+  removeOverlayInHistory,
+  replaceOverlayInHistory,
   rotateInHistory,
   setCropInHistory,
+  setFormValueInHistory,
   type EditState
 } from './edit-history'
 import {
   groupByPage,
-  newOverlayId,
   type CropBox,
   type Geom,
   type Overlay,
@@ -158,37 +161,7 @@ export function useEditStore(): EditStore {
 
   const setFormValue = useCallback(
     (pageKey: string, field: string, value: string | boolean, geom: Geom, control?: 'radio') => {
-      // Always upsert (never auto-remove) so a cleared/unchecked field stays cleared in the editor.
-      // Flatten draws only non-empty values; '' and false paint nothing. Consecutive edits to the
-      // same field coalesce into one undo step (so typing doesn't flood/evict the undo stack).
-      setHistory((h) =>
-        apply(
-          h,
-          (d) => {
-            const i = d.overlays.findIndex(
-              (o) => o.type === 'formValue' && o.pageKey === pageKey && o.field === field
-            )
-            if (i >= 0) {
-              const o = d.overlays[i] as Extract<Overlay, { type: 'formValue' }>
-              o.value = value
-              o.geom = geom // a radio moves the dot to the newly-picked option's rect
-              o.control = control
-            } else
-              d.overlays.push({
-                id: newOverlayId(),
-                pageKey,
-                z: d.overlays.length,
-                createdAt: Date.now(),
-                geom,
-                type: 'formValue',
-                field,
-                value,
-                ...(control ? { control } : {})
-              })
-          },
-          `formValue:${pageKey}:${field}`
-        )
-      )
+      setHistory((h) => setFormValueInHistory(h, pageKey, field, value, geom, control))
     },
     []
   )
@@ -228,29 +201,15 @@ export function useEditStore(): EditStore {
   }, [])
 
   const addOverlay = useCallback((o: Overlay) => {
-    setHistory((h) =>
-      apply(h, (d) => {
-        d.overlays.push(o)
-      })
-    )
+    setHistory((h) => addOverlayInHistory(h, o))
   }, [])
 
   const replaceOverlay = useCallback((next: Overlay) => {
-    setHistory((h) =>
-      apply(h, (d) => {
-        const i = d.overlays.findIndex((o) => o.id === next.id)
-        if (i >= 0) d.overlays[i] = next
-      })
-    )
+    setHistory((h) => replaceOverlayInHistory(h, next))
   }, [])
 
   const removeOverlay = useCallback((id: string) => {
-    setHistory((h) =>
-      apply(h, (d) => {
-        const i = d.overlays.findIndex((o) => o.id === id)
-        if (i >= 0) d.overlays.splice(i, 1)
-      })
-    )
+    setHistory((h) => removeOverlayInHistory(h, id))
     setSelectedId((cur) => (cur === id ? null : cur))
   }, [])
 

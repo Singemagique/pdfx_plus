@@ -1,6 +1,6 @@
 import { useEffect, useRef } from 'react'
 import { useEdits, type ToolKind } from '../../edit/EditProvider'
-import { newOverlayId, type RGB, type ShapeKind } from '../../edit/model'
+import { cssColor, newOverlayId, nextZ, type RGB, type ShapeKind } from '../../edit/model'
 
 const SHAPE_KINDS: { kind: ShapeKind; label: string; icon: React.JSX.Element }[] = [
   { kind: 'rect', label: 'Rectangle', icon: <rect x="3" y="5" width="18" height="14" rx="1" /> },
@@ -38,8 +38,6 @@ const SHAPE_KINDS: { kind: ShapeKind; label: string; icon: React.JSX.Element }[]
   }
 ]
 
-const cssColor = (c: RGB): string =>
-  `rgb(${Math.round(c.r * 255)}, ${Math.round(c.g * 255)}, ${Math.round(c.b * 255)})`
 const rgbEq = (a: RGB, b: RGB): boolean => a.r === b.r && a.g === b.g && a.b === b.b
 
 function ToolIcon({ kind }: { kind: ToolKind }): React.JSX.Element {
@@ -160,11 +158,10 @@ export function EditTools(): React.JSX.Element {
     const attachmentId = newOverlayId()
     addAttachment(attachmentId, bytes, mime)
     const id = newOverlayId()
-    const z = overlays.filter((o) => o.pageKey === currentPage.pageKey).length
     addOverlay({
       id,
       pageKey: currentPage.pageKey,
-      z,
+      z: nextZ(overlays, currentPage.pageKey),
       createdAt: Date.now(),
       geom: {
         x: (currentPage.width - targetW) / 2,

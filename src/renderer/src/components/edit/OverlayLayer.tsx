@@ -1,8 +1,10 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import type { PageEntry } from '../../types'
 import {
+  cssColor,
   makePageKey,
   newOverlayId,
+  nextZ,
   overlaysForPage,
   type Geom,
   type Overlay,
@@ -119,8 +121,6 @@ const fontCss = (f: StandardFontName): string =>
       ? '"Courier New", monospace'
       : 'Helvetica, Arial, sans-serif'
 
-const cssColor = (c: RGB): string =>
-  `rgb(${Math.round(c.r * 255)}, ${Math.round(c.g * 255)}, ${Math.round(c.b * 255)})`
 const cssRgba = (c: RGB, a: number): string =>
   `rgba(${Math.round(c.r * 255)}, ${Math.round(c.g * 255)}, ${Math.round(c.b * 255)}, ${a})`
 
@@ -164,6 +164,20 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
   const layerRef = useRef<HTMLDivElement>(null)
   const urlCache = useRef<Map<string, string>>(new Map())
   const [draft, setDraft] = useState<Draft | null>(null)
+  // The draft mirrored outside React state. Pointer MOVE runs at ContinuousEventPriority, so its
+  // setState is scheduled rather than flushed: a second move (or the pointerup) in the same batch
+  // would otherwise read the previous render's `draft` — dropping ink points, and discarding a
+  // whole fast flick because the stale two-point draft fails the >= 4 guard below. Every write to
+  // `draft` goes through setDraftSynced so this stays the authoritative, always-current value.
+  const draftRef = useRef<Draft | null>(null)
+  const setDraftSynced = useCallback(
+    (next: Draft | null | ((current: Draft | null) => Draft | null)): void => {
+      const value = typeof next === 'function' ? next(draftRef.current) : next
+      draftRef.current = value
+      setDraft(value)
+    },
+    []
+  )
   const [drag, setDrag] = useState<Drag | null>(null)
   const [textEdit, setTextEdit] = useState<TextEdit | null>(null)
   const [formFields, setFormFields] = useState<FormField[]>([])
@@ -198,9 +212,16 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
     return clientToPdfRotated(clientX, clientY, rect, fit, page, rot)
   }
 
-  // Report this page as the placement target for palette actions (e.g. stamping).
+  // Report this page as the placement target for palette actions (e.g. stamping). The cleanup
+  // matters as much as the set: FullViewPage mounts this layer only for the current page, so
+  // without it `currentPage` outlives full view and a SECOND session's open animation (~340ms,
+  // during which `active` is false) would let EditTools' rotate / reset-crop hit the page focused
+  // in the PREVIOUS session. Clearing it makes those buttons' `!currentPage` disabled state cover
+  // the animation window. Ordering is safe on a page swap: React runs the outgoing layer's effect
+  // cleanup before the incoming layer's effect, so the null can't clobber the new page.
   useEffect(() => {
     if (active) setCurrentPage({ pageKey, width: page.width, height: page.height })
+    return () => setCurrentPage(null)
   }, [active, pageKey, page.width, page.height, setCurrentPage])
 
   // Detect fillable AcroForm fields (text, checkbox, radio, dropdown, list box) via pdf.js.
@@ -378,7 +399,7 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
     e.stopPropagation()
     e.preventDefault()
     const p = toPdf(e.clientX, e.clientY)
-    setDraft(
+    setDraftSynced(
       signing
         ? { kind: 'signature', start: p, current: p }
         : cropping
@@ -394,16 +415,18 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
     layerRef.current?.setPointerCapture(e.pointerId)
   }
   const onDrawMove = (e: React.PointerEvent): void => {
-    if (!draft) return
+    if (!draftRef.current) return
     e.stopPropagation()
     const p = toPdf(e.clientX, e.clientY)
-    setDraft(
-      draft.kind === 'ink'
-        ? { kind: 'ink', pts: [...draft.pts, p.x, p.y] }
-        : { ...draft, current: p }
+    // Extend the LATEST draft, not this render's: consecutive moves must accumulate.
+    setDraftSynced((d) =>
+      !d ? d : d.kind === 'ink' ? { kind: 'ink', pts: [...d.pts, p.x, p.y] } : { ...d, current: p }
     )
   }
   const onDrawUp = (e: React.PointerEvent): void => {
+    // Commit from the ref: pointerup does not flush a pending continuous move, so the render
+    // closure can still hold the pre-move draft.
+    const draft = draftRef.current
     if (!draft) return
     e.stopPropagation()
     layerRef.current?.releasePointerCapture(e.pointerId)
@@ -415,7 +438,7 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
       const w = Math.min(page.width, g.x + g.w) - x
       const h = Math.min(page.height, g.y + g.h) - y
       if (w > 8 && h > 8) edits.setCrop(pageKey, { x, y, w, h })
-      setDraft(null)
+      setDraftSynced(null)
       return
     }
     if (draft.kind === 'signature') {
@@ -426,10 +449,15 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
           geom,
           label: `drawn box · page ${page.pageIndex + 1}`
         })
-      setDraft(null)
+      setDraftSynced(null)
       return
     }
-    const base = { id: newOverlayId(), pageKey, z: pageOverlays.length, createdAt: Date.now() }
+    const base = {
+      id: newOverlayId(),
+      pageKey,
+      z: nextZ(edits.overlays, pageKey),
+      createdAt: Date.now()
+    }
     if (draft.kind === 'highlight') {
       const geom = rectGeom(draft.start, draft.current, 0.4)
       if (geom.w > 2 && geom.h > 2)
@@ -464,7 +492,7 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
         color: edits.inkColor
       })
     }
-    setDraft(null)
+    setDraftSynced(null)
   }
 
   // ---- Text ----
@@ -513,7 +541,7 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
       edits.addOverlay({
         id,
         pageKey,
-        z: pageOverlays.length,
+        z: nextZ(edits.overlays, pageKey),
         createdAt: Date.now(),
         geom,
         ...fields

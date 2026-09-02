@@ -106,7 +106,15 @@ export type Overlay =
 
 export type OverlayType = Overlay['type']
 
-/** Overlay types that ./pdfx/flatten.ts bakes by drawing onto the page. */
+/**
+ * Overlay types that ./pdfx/flatten.ts bakes by drawing onto the page. Everything else is
+ * handled elsewhere: `redaction` is applied by the external PDFium pre-pass (PRD §4.5) before
+ * re-assembly, never drawn.
+ *
+ * `formValue` IS drawn — the filled value is painted over its AcroForm field rectangle on
+ * flatten (the underlying interactive widget is left untouched), and the value round-trips
+ * through the PDFX mirror so the field stays editable on reopen.
+ */
 export const DRAWABLE_TYPES = [
   'image',
   'ink',
@@ -118,32 +126,18 @@ export const DRAWABLE_TYPES = [
 ] as const
 
 /**
- * Overlay types NOT drawn by the pdf-lib flatten pass:
- *  - `redaction` is applied by the external PDFium pre-pass (PRD §4.5) before re-assembly.
- *
- * `formValue` IS drawn — the filled value is painted over its AcroForm field rectangle on
- * flatten (the underlying interactive widget is left untouched), and the value round-trips
- * through the PDFX mirror so the field stays editable on reopen.
- */
-export const NON_DRAWN_TYPES = ['redaction'] as const
-
-export const isDrawable = (o: Overlay): boolean =>
-  (DRAWABLE_TYPES as readonly string[]).includes(o.type)
-
-/**
  * A page's stable identity for binding overlays. Pages key on the export source
  * (`sourceKey`) plus the source `pageIndex`, which is what the export pipeline already
- * uses (src/renderer/src/pdfx/build.ts). NOTE: a duplicated page initially shares this
- * key with its origin; remapDuplicatedPage() gives the copy an independent key so edits
- * to one do not leak into the other (PRD §4.1).
+ * uses (src/renderer/src/pdfx/build.ts). Keys never collide across pages: duplicating a
+ * page mints a fresh source id (freshPageCopy in ../app/doc-ops/pages.ts), so the copy is
+ * independently addressable from the moment it exists (PRD §4.1).
  */
 export const makePageKey = (sourceKey: string, pageIndex: number): string =>
   `${sourceKey}#${pageIndex}`
 
-export const parsePageKey = (pageKey: string): { sourceKey: string; pageIndex: number } => {
-  const at = pageKey.lastIndexOf('#')
-  return { sourceKey: pageKey.slice(0, at), pageIndex: Number(pageKey.slice(at + 1)) }
-}
+/** An overlay colour → a CSS `rgb()` string, for the editor's live preview chrome. */
+export const cssColor = (c: RGB): string =>
+  `rgb(${Math.round(c.r * 255)}, ${Math.round(c.g * 255)}, ${Math.round(c.b * 255)})`
 
 let counter = 0
 /** Monotonic id; uses crypto.randomUUID when available, with a deterministic fallback. */
@@ -161,6 +155,14 @@ export function overlaysForPage(overlays: Overlay[], pageKey: string): Overlay[]
     .sort((a, b) => a.z - b.z || a.createdAt - b.createdAt)
 }
 
+/**
+ * The `z` to give the next overlay added to a page — the single definition of the stacking
+ * rule (new content goes on top of what's already on that page). Every insertion site must
+ * go through this so the rule can't drift between the overlay layer and the tool palette.
+ */
+export const nextZ = (overlays: Overlay[], pageKey: string): number =>
+  overlaysForPage(overlays, pageKey).length
+
 /** Index overlays by page key, each list pre-sorted in draw order. */
 export function groupByPage(overlays: Overlay[]): Map<string, Overlay[]> {
   const out = new Map<string, Overlay[]>()
@@ -171,18 +173,4 @@ export function groupByPage(overlays: Overlay[]): Map<string, Overlay[]> {
   }
   for (const list of out.values()) list.sort((a, b) => a.z - b.z || a.createdAt - b.createdAt)
   return out
-}
-
-/**
- * Copy every overlay bound to `fromKey` onto `toKey` with fresh ids, returning the new
- * overlays only. Used when a page is duplicated so the copy gets independent edits.
- */
-export function remapDuplicatedPage(
-  overlays: Overlay[],
-  fromKey: string,
-  toKey: string
-): Overlay[] {
-  return overlays
-    .filter((o) => o.pageKey === fromKey)
-    .map((o) => ({ ...o, id: newOverlayId(), pageKey: toKey }))
 }

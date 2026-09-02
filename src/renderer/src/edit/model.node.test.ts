@@ -1,13 +1,12 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  cssColor,
   groupByPage,
-  isDrawable,
   makePageKey,
   newOverlayId,
+  nextZ,
   overlaysForPage,
-  parsePageKey,
-  remapDuplicatedPage,
   type Overlay
 } from './model'
 
@@ -25,9 +24,10 @@ function img(pageKey: string, z = 0, createdAt = 0): Overlay {
 }
 
 describe('page keys', () => {
-  it('round-trips sourceKey + pageIndex, even when the source key contains separators', () => {
-    const key = makePageKey('doc#weird:key', 4)
-    expect(parsePageKey(key)).toEqual({ sourceKey: 'doc#weird:key', pageIndex: 4 })
+  it('is injective in both components, so no two pages can share a key', () => {
+    expect(makePageKey('doc', 4)).toBe('doc#4')
+    expect(makePageKey('doc', 4)).not.toBe(makePageKey('doc', 40))
+    expect(makePageKey('doc', 4)).not.toBe(makePageKey('other', 4))
   })
 })
 
@@ -63,41 +63,25 @@ describe('groupByPage', () => {
   })
 })
 
-describe('remapDuplicatedPage', () => {
-  it('copies a page’s overlays onto a new key with fresh ids and no shared references', () => {
-    const original = [img('src', 0), img('src', 1), img('other', 0)]
-    const copies = remapDuplicatedPage(original, 'src', 'dup')
-    expect(copies).toHaveLength(2)
-    expect(copies.every((o) => o.pageKey === 'dup')).toBe(true)
-    // Fresh ids — editing the copy can never alias the original.
-    const originalIds = new Set(original.map((o) => o.id))
-    expect(copies.some((o) => originalIds.has(o.id))).toBe(false)
+describe('nextZ', () => {
+  it('counts only the target page, so new content lands on top of that page alone', () => {
+    const overlays = [img('k1', 0), img('k2', 0), img('k2', 1), img('k1', 1)]
+    expect(nextZ(overlays, 'k1')).toBe(2)
+    expect(nextZ(overlays, 'k2')).toBe(2)
+    expect(nextZ(overlays, 'untouched')).toBe(0)
+  })
+
+  it('is strictly above every existing z on the page', () => {
+    const overlays = [img('k1', 0), img('k1', 1), img('k1', 2)]
+    const z = nextZ(overlays, 'k1')
+    expect(overlays.every((o) => o.z < z)).toBe(true)
   })
 })
 
-describe('isDrawable', () => {
-  it('marks draw-pass types (incl. form values) but excludes redaction', () => {
-    expect(isDrawable(img('k'))).toBe(true)
-    const formValue: Overlay = {
-      id: newOverlayId(),
-      pageKey: 'k',
-      z: 0,
-      createdAt: 0,
-      geom: { x: 0, y: 0, w: 10, h: 4, rotation: 0, opacity: 1 },
-      type: 'formValue',
-      field: 'name',
-      value: 'Ada'
-    }
-    expect(isDrawable(formValue)).toBe(true)
-    const redaction: Overlay = {
-      id: newOverlayId(),
-      pageKey: 'k',
-      z: 0,
-      createdAt: 0,
-      geom: { x: 0, y: 0, w: 1, h: 1, rotation: 0, opacity: 1 },
-      type: 'redaction',
-      fill: { r: 0, g: 0, b: 0 }
-    }
-    expect(isDrawable(redaction)).toBe(false)
+describe('cssColor', () => {
+  it('maps 0..1 channels onto rounded 0..255 rgb()', () => {
+    expect(cssColor({ r: 0, g: 0, b: 0 })).toBe('rgb(0, 0, 0)')
+    expect(cssColor({ r: 1, g: 1, b: 1 })).toBe('rgb(255, 255, 255)')
+    expect(cssColor({ r: 0.85, g: 0.15, b: 0.18 })).toBe('rgb(217, 38, 46)')
   })
 })
