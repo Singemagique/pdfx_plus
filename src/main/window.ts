@@ -2,7 +2,7 @@ import { shell, BrowserWindow, nativeTheme } from 'electron'
 import { join } from 'path'
 import { is } from '@electron-toolkit/utils'
 import { GLASS_CONFIG, FALLBACK_BG, applyNativeGlass } from './native/glass'
-import { readFiles } from './file-intake'
+import { readFilesReport, skippedNotice } from './file-intake'
 import { destroyRenderWindow } from './markup'
 
 let mainWindow: BrowserWindow | null = null
@@ -29,12 +29,16 @@ export function toggleDevTools(): void {
 
 export async function sendOpenPaths(paths: string[]): Promise<void> {
   if (!mainWindow || paths.length === 0) return
-  const files = await readFiles(paths)
+  const { files, skipped } = await readFilesReport(paths)
   // Re-check after the await: the window can be torn down mid-read (the user closes it while a
   // large batch is loading), and sending on a destroyed webContents throws — which would surface
   // as a rejection out of the pdfx:renderer-ready handler / the fire-and-forget open-file paths.
   if (!mainWindow || mainWindow.isDestroyed()) return
   mainWindow.webContents.send('pdfx:files-opened', files)
+  // These routes (Explorer double-click, macOS open-file, a second instance) have no return value
+  // the caller can inspect, so an unreadable path would otherwise vanish with only a main-process
+  // console.warn to show for it.
+  if (skipped.length > 0) mainWindow.webContents.send('pdfx:notice', skippedNotice(skipped))
 }
 
 export function createWindow(): void {
