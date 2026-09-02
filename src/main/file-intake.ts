@@ -15,7 +15,13 @@ export function collectFileArgs(argv: string[]): string[] {
   return argv.filter((arg) => /\.(pdf|pdfx)$/i.test(arg) && existsSync(arg))
 }
 
-export async function readFiles(paths: string[]): Promise<OpenedFile[]> {
+export interface ReadFilesReport {
+  files: OpenedFile[]
+  /** The paths that could not be read, so the caller can tell the user rather than silently drop. */
+  skipped: string[]
+}
+
+export async function readFilesReport(paths: string[]): Promise<ReadFilesReport> {
   // Per-file tolerant: one unreadable path (locked file, a directory named x.pdf, a TOCTOU delete)
   // must not sink the whole batch — callers include fire-and-forget open-file/second-instance
   // handlers, where an all-or-nothing rejection silently drops every other file.
@@ -28,11 +34,17 @@ export async function readFiles(paths: string[]): Promise<OpenedFile[]> {
   )
   const opened: OpenedFile[] = []
   const read: string[] = []
+  const skipped: string[] = []
   results.forEach((result, i) => {
     if (result.status === 'fulfilled') {
       opened.push(result.value)
       read.push(result.value.path)
-    } else console.warn(`pdfx: skipping unreadable file ${String(paths[i])}:`, result.reason)
+    } else {
+      // Reported to the caller as well as the console: a user who drops five files and gets three
+      // back has no way to tell the two silent skips from files PDFx simply refused to show.
+      skipped.push(String(paths[i]))
+      console.warn(`pdfx: skipping unreadable file ${String(paths[i])}:`, result.reason)
+    }
   })
   // Every path that becomes an OpenedFile flows through here — record them so read-resource can
   // later verify an HTML resource base is a file the user actually opened. Only the paths whose
@@ -40,7 +52,24 @@ export async function readFiles(paths: string[]): Promise<OpenedFile[]> {
   // the clipboard/drop routes, so remembering ahead of the reads would let a renderer poison the
   // allowlist with any path it likes (nonexistent or unreadable) and unlock read-resource for it.
   rememberOpened(read)
-  return opened
+  return { files: opened, skipped }
+}
+
+/** Files-only view of {@link readFilesReport}, for callers with nowhere to show a notice. */
+export async function readFiles(paths: string[]): Promise<OpenedFile[]> {
+  return (await readFilesReport(paths)).files
+}
+
+/** How many skipped names a notice spells out before collapsing the rest into "+N more". */
+const MAX_LISTED_SKIPPED = 5
+
+/** One-line, user-facing summary of the paths readFiles could not read. */
+export function skippedNotice(skipped: string[]): string {
+  const names = skipped.map((p) => basename(p))
+  const listed = names.slice(0, MAX_LISTED_SKIPPED)
+  const extra = names.length - listed.length
+  const tail = extra > 0 ? `${listed.join(', ')} +${extra} more` : listed.join(', ')
+  return `Could not read ${names.length} file${names.length === 1 ? '' : 's'}: ${tail}`
 }
 
 export const importable = (p: string): boolean => IMPORTABLE.test(p) && !basename(p).startsWith('.')

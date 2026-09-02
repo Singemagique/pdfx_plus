@@ -119,6 +119,12 @@ const api = {
     ipcRenderer.on('pdfx:files-opened', listener)
     return () => ipcRenderer.removeListener('pdfx:files-opened', listener)
   },
+  /** Short main-process messages for the toast (e.g. files that could not be read on open/drop). */
+  onNotice: (callback: (message: string) => void): (() => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, message: string): void => callback(message)
+    ipcRenderer.on('pdfx:notice', listener)
+    return () => ipcRenderer.removeListener('pdfx:notice', listener)
+  },
   onZoom: (callback: (action: ZoomAction) => void): (() => void) => {
     const listener = (_event: Electron.IpcRendererEvent, action: ZoomAction): void =>
       callback(action)

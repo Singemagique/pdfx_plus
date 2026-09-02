@@ -11,7 +11,8 @@ import {
   MAX_DROP_FILES,
   importable,
   isUncPath,
-  readFiles,
+  readFilesReport,
+  skippedNotice,
   expandDropPaths
 } from './file-intake'
 import { clipboardFilePaths } from './clipboard'
@@ -19,6 +20,24 @@ import { readResource } from './resource'
 import { getMainWindow, setRendererReady, sendOpenPaths } from './window'
 
 const MAX_WRITE_BYTES = 1024 * 1024 * 1024 // 1 GiB cap on a single IPC write
+
+/** Push a short user-facing message to the renderer's toast. No window → nothing to tell. */
+function sendNotice(message: string): void {
+  const mainWindow = getMainWindow()
+  if (!mainWindow || mainWindow.isDestroyed()) return
+  mainWindow.webContents.send('pdfx:notice', message)
+}
+
+/**
+ * readFiles for the routes that hand files to the renderer. The renderer only sees the files that
+ * survived, so anything readFiles had to skip is announced here — otherwise dropping five files and
+ * getting three back looks like PDFx silently ignoring two of them.
+ */
+async function readFilesNotifying(paths: string[]): Promise<OpenedFile[]> {
+  const { files, skipped } = await readFilesReport(paths)
+  if (skipped.length > 0) sendNotice(skippedNotice(skipped))
+  return files
+}
 
 export function registerIpc(getPending: () => string[], clearPending: () => void): void {
   ipcMain.handle('pdfx:renderer-ready', async () => {
@@ -76,7 +95,7 @@ export function registerIpc(getPending: () => string[], clearPending: () => void
     // No existsSync pre-check — readFiles skips unreadable paths on its own and only records the
     // ones it actually read, so a bogus path can neither fail the batch nor enter the allowlist.
     const paths = clipboardFilePaths().filter((p) => !isUncPath(p) && importable(p))
-    return readFiles(paths)
+    return readFilesNotifying(paths)
   })
 
   ipcMain.handle('pdfx:clipboard-clear', () => clipboard.clear())
@@ -91,7 +110,7 @@ export function registerIpc(getPending: () => string[], clearPending: () => void
       const requested = paths
         .filter((p): p is string => typeof p === 'string')
         .slice(0, MAX_DROP_FILES)
-      return readFiles(await expandDropPaths(requested))
+      return readFilesNotifying(await expandDropPaths(requested))
     }
   )
 
@@ -356,6 +375,6 @@ export function registerIpc(getPending: () => string[], clearPending: () => void
       ]
     })
     if (result.canceled) return []
-    return readFiles(result.filePaths)
+    return readFilesNotifying(result.filePaths)
   })
 }
