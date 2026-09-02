@@ -1,18 +1,18 @@
 import { describe, expect, it, beforeAll } from 'vitest'
-import { readFileSync } from 'node:fs'
-import { fileURLToPath } from 'node:url'
 import { PDFDocument, PDFName, PDFString, StandardFonts } from 'pdf-lib'
-import { init } from '@embedpdf/pdfium'
 
-import { redactPdf, type PdfiumModule } from './redact'
+import { redactPdf } from './redact'
+import {
+  extractText as extractTextWith,
+  loadTestPdfium,
+  makeTextPdf,
+  withDoc as withDocOn,
+  type TextPdfium
+} from '../test-utils/pdfium'
 
-// The engine only needs the calls in PdfiumModule; the test additionally extracts text, counts
-// annotations, and renders to a bitmap to PROVE removal/coverage, so it uses the wider runtime.
-interface TestModule extends PdfiumModule {
-  FPDFText_LoadPage(page: number): number
-  FPDFText_CountChars(textPage: number): number
-  FPDFText_GetText(textPage: number, start: number, count: number, buffer: number): number
-  FPDFText_ClosePage(textPage: number): void
+// Beyond text extraction (TextPdfium), this suite counts annotations and renders to a bitmap to
+// PROVE removal/coverage, so it uses a still wider view of the runtime.
+interface TestModule extends TextPdfium {
   FPDFBitmap_Create(width: number, height: number, alpha: number): number
   FPDFBitmap_FillRect(
     bmp: number,
@@ -35,31 +35,13 @@ interface TestModule extends PdfiumModule {
     rotate: number,
     flags: number
   ): void
-  pdfium: PdfiumModule['pdfium'] & { UTF16ToString(ptr: number): string }
 }
 
 let pdfium: TestModule
 
 beforeAll(async () => {
-  const wasmBinary = readFileSync(
-    fileURLToPath(
-      new URL('../../../../node_modules/@embedpdf/pdfium/dist/pdfium.wasm', import.meta.url)
-    )
-  )
-  const mod = await init({ wasmBinary })
-  mod.PDFiumExt_Init()
-  pdfium = mod as unknown as TestModule
+  pdfium = await loadTestPdfium<TestModule>()
 })
-
-async function makeTextPdf(): Promise<Uint8Array> {
-  const doc = await PDFDocument.create()
-  const page = doc.addPage([400, 800])
-  const font = await doc.embedFont(StandardFonts.Helvetica)
-  page.drawText('PUBLIC line one', { x: 50, y: 750, size: 18, font })
-  page.drawText('SECRET-9X42 confidential', { x: 50, y: 700, size: 18, font })
-  page.drawText('PUBLIC line three', { x: 50, y: 650, size: 18, font })
-  return doc.save()
-}
 
 // A PDF whose secret lives ONLY inside a FreeText annotation (not in the content stream).
 async function makeAnnotPdf(): Promise<Uint8Array> {
@@ -78,33 +60,9 @@ async function makeAnnotPdf(): Promise<Uint8Array> {
   return doc.save()
 }
 
-const withDoc = <T>(bytes: Uint8Array, fn: (doc: number) => T): T => {
-  const rt = pdfium.pdfium
-  const ptr = rt.wasmExports.malloc(bytes.length)
-  rt.HEAPU8.set(bytes, ptr)
-  const doc = pdfium.FPDF_LoadMemDocument(ptr, bytes.length, '')
-  try {
-    return fn(doc)
-  } finally {
-    pdfium.FPDF_CloseDocument(doc)
-    rt.wasmExports.free(ptr)
-  }
-}
+const withDoc = <T>(bytes: Uint8Array, fn: (doc: number) => T): T => withDocOn(pdfium, bytes, fn)
 
-const extractText = (bytes: Uint8Array): string =>
-  withDoc(bytes, (doc) => {
-    const rt = pdfium.pdfium
-    const page = pdfium.FPDF_LoadPage(doc, 0)
-    const tp = pdfium.FPDFText_LoadPage(page)
-    const n = pdfium.FPDFText_CountChars(tp)
-    const buf = rt.wasmExports.malloc((n + 1) * 2)
-    pdfium.FPDFText_GetText(tp, 0, n, buf)
-    const text = rt.UTF16ToString(buf)
-    rt.wasmExports.free(buf)
-    pdfium.FPDFText_ClosePage(tp)
-    pdfium.FPDF_ClosePage(page)
-    return text.replace(/\s+/g, ' ').trim()
-  })
+const extractText = (bytes: Uint8Array): string => extractTextWith(pdfium, bytes)
 
 const annotCount = (bytes: Uint8Array): number =>
   withDoc(bytes, (doc) => {
