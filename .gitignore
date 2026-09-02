@@ -26,3 +26,6 @@ native/build/
 *.keystore
 *.mobileprovision
 test-document-to-sign.pdf
+
+# Cygwin/MSYS crash dumps (e.g. du.exe.stackdump from a shell tool)
+*.stackdump
