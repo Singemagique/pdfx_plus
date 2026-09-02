@@ -99,6 +99,16 @@ afterEach(async () => {
 const inkOverlays = (): Extract<EditStore['overlays'][number], { type: 'ink' }>[] =>
   store.overlays.filter((o): o is Extract<typeof o, { type: 'ink' }> => o.type === 'ink')
 
+const highlight = (id: string): EditStore['overlays'][number] => ({
+  id,
+  pageKey: 'src-1#0',
+  z: 0,
+  createdAt: 0,
+  geom: { x: 10, y: 10, w: 40, h: 20, rotation: 0, opacity: 1 },
+  type: 'highlight',
+  color: { r: 1, g: 0.9, b: 0.2 }
+})
+
 describe('OverlayLayer ink drafting under batched pointer events', () => {
   beforeEach(async () => {
     await act(async () => {
@@ -149,6 +159,83 @@ describe('OverlayLayer ink drafting under batched pointer events', () => {
       el.dispatchEvent(pointer('pointerup', 10, 10))
     })
     expect(inkOverlays()).toHaveLength(0)
+  })
+})
+
+// Counts window keydown (un)subscriptions while the spy is installed, passing everything through
+// to the real implementation so the listener still works.
+type ListenerFn = (type: string, ...rest: unknown[]) => void
+
+describe('OverlayLayer keyboard handling', () => {
+  let counts: { added: number; removed: number }
+  let origAdd: typeof window.addEventListener
+  let origRemove: typeof window.removeEventListener
+
+  beforeEach(() => {
+    counts = { added: 0, removed: 0 }
+    origAdd = window.addEventListener
+    origRemove = window.removeEventListener
+    const passAdd = origAdd.bind(window) as unknown as ListenerFn
+    const passRemove = origRemove.bind(window) as unknown as ListenerFn
+    window.addEventListener = ((type: string, ...rest: unknown[]) => {
+      if (type === 'keydown') counts.added++
+      passAdd(type, ...rest)
+    }) as unknown as typeof window.addEventListener
+    window.removeEventListener = ((type: string, ...rest: unknown[]) => {
+      if (type === 'keydown') counts.removed++
+      passRemove(type, ...rest)
+    }) as unknown as typeof window.removeEventListener
+  })
+
+  afterEach(() => {
+    window.addEventListener = origAdd
+    window.removeEventListener = origRemove
+  })
+
+  it('does not re-subscribe the keydown listener when unrelated store state changes', async () => {
+    // Changing the pen colour re-renders the layer but touches nothing the handler reads. Listing
+    // the whole `edits` object in the effect deps tore the listener down and re-added it here.
+    await act(async () => {
+      store.setInkColor({ r: 1, g: 0, b: 0 })
+    })
+    expect(store.inkColor).toEqual({ r: 1, g: 0, b: 0 })
+    expect(counts).toEqual({ added: 0, removed: 0 })
+
+    // Adding an overlay elsewhere in the document is just as unrelated to the handler.
+    await act(async () => {
+      store.addOverlay(highlight('ov-keep'))
+    })
+    expect(counts).toEqual({ added: 0, removed: 0 })
+  })
+
+  it('still deletes the selected overlay on Delete', async () => {
+    await act(async () => {
+      store.addOverlay(highlight('ov-del'))
+    })
+    await act(async () => {
+      store.select('ov-del')
+    })
+    expect(store.selectedId).toBe('ov-del')
+
+    await act(async () => {
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Delete', bubbles: true }))
+    })
+    expect(store.overlays).toHaveLength(0)
+    expect(store.selectedId).toBeNull()
+  })
+
+  it('clears the selection on Escape', async () => {
+    await act(async () => {
+      store.addOverlay(highlight('ov-esc'))
+    })
+    await act(async () => {
+      store.select('ov-esc')
+    })
+    await act(async () => {
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+    })
+    expect(store.selectedId).toBeNull()
+    expect(store.overlays).toHaveLength(1)
   })
 })
 
