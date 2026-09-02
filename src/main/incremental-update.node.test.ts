@@ -85,6 +85,15 @@ describe('appendIncrementalUpdate', () => {
     expect(text.slice(startxref, startxref + 4)).toBe('xref')
   })
 
+  it('refuses an empty object list instead of writing a corrupt "/Size NaN" trailer', () => {
+    // nums[nums.length - 1] + 1 is NaN with no objects, which would silently produce an unusable
+    // file; the caller must hear about it.
+    expect(() => appendIncrementalUpdate(BASE, [], { rootNum: 1, label: 'DSS' })).toThrow(
+      /DSS: no objects to append \(empty incremental update\)/
+    )
+    expect(() => appendIncrementalUpdate(BASE, [], { rootNum: 1 })).toThrow(/^PDF: no objects/)
+  })
+
   it('omits /Info when the source file has none', () => {
     const out = appendIncrementalUpdate(BASE, objects, { rootNum: 1 })
     expect(out.toString('latin1')).not.toContain('/Info')

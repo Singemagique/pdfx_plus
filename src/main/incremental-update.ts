@@ -58,12 +58,18 @@ export interface AppendedObject {
  * here allocates its new objects above the file's declared /Size, so that also stays >= the old
  * /Size). A newline separates the prior %%EOF (which @signpdf writes with no trailing EOL) from the
  * first appended object, so a sequential lexer can't fold "%%EOF" + "N 0 obj" into one comment line.
+ *
+ * Throws on an empty `objects`: there is nothing to append, and the /Size computed from the highest
+ * appended number would be NaN — writing a silently corrupt "/Size NaN" trailer instead of failing.
  */
 export function appendIncrementalUpdate(
   pdf: Uint8Array,
   objects: AppendedObject[],
   trailer: { rootNum: number; infoNum?: number; label?: string }
 ): Buffer {
+  if (!objects.length)
+    throw new Error(`${trailer.label ?? 'PDF'}: no objects to append (empty incremental update)`)
+
   const prev = lastStartxref(pdf, trailer.label)
 
   // Lay out the appended objects, recording each one's absolute byte offset from the file start.

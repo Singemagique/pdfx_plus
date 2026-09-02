@@ -18,7 +18,8 @@ export interface RevocationData {
    *  Every cert in the chain is covered except a self-issued (self-signed) root, which is a trust
    *  anchor with nothing to revoke it. A chain that stops short of a root (e.g. a card holding only
    *  the leaf) still has its top cert checked — via CRL, the only mechanism that needs no issuer
-   *  certificate. */
+   *  certificate. Known gap: if that top cert advertises OCSP but no CRL distribution point, it goes
+   *  unchecked and `revoked` stays false (see collectRevocation). */
   revoked: boolean
 }
 
@@ -262,17 +263,17 @@ export async function collectRevocation(
   const crls: Uint8Array[] = []
   let revoked = false
 
-  // Fetch the first usable CRL for `cert` and fold its verdict in. Returns true if one was stored.
-  const tryCrl = async (cert: ArrayBuffer, urls: string[]): Promise<boolean> => {
+  // Store the first usable CRL for `cert` and fold its verdict in; a cert with no reachable CRL is
+  // simply left uncovered (graceful degradation).
+  const tryCrl = async (cert: ArrayBuffer, urls: string[]): Promise<void> => {
     for (const url of urls) {
       const crl = await fetcher.fetchCrl(url)
       if (crl) {
         crls.push(crl)
         if (crlRevokesCert(crl, cert)) revoked = true
-        return true
+        return
       }
     }
-    return false
   }
 
   for (let i = 0; i < chainDer.length - 1; i++) {
@@ -297,8 +298,13 @@ export async function collectRevocation(
 
   // The chain's top cert: no issuer above it, so the loop skipped it. A self-issued root is rightly
   // skipped (a trust anchor has nothing to revoke it), but a chain that never reached a root must
-  // still be checked — otherwise a leaf-only chain gets no revocation check at all. CRL only: OCSP
-  // needs the issuer certificate we don't have.
+  // still be checked — otherwise a leaf-only chain gets no revocation check at all.
+  //
+  // CRL ONLY, and that leaves a KNOWN GAP: an OCSPRequest's CertID hashes the issuer's name and
+  // public key, so OCSP is impossible without the issuer certificate — which is exactly what we do
+  // not have here. A top cert that advertises OCSP but publishes no CDP therefore still gets zero
+  // revocation checks, and the caller still claims LTV. Accepted for now; the honest fixes are to
+  // stop claiming LTV in that case, or to surface "revocation unchecked" to the user.
   const top = chainDer[chainDer.length - 1]
   if (top !== undefined && !isSelfIssuedDer(top)) {
     await tryCrl(top, revocationPointers(top).crl)
