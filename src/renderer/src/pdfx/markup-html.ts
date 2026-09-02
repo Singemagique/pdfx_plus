@@ -1,14 +1,9 @@
 import { PageSize, widthPx, pageCss, FONT } from './markup-units'
+import { toBase64 } from './mirror'
 
 export type ReadResource = (ref: string) => Promise<{ data: Uint8Array; mime: string } | null>
 
 const isLocalRef = (url: string): boolean => !!url && !/^(?:[a-z][a-z\d+.-]*:|\/\/|#)/i.test(url)
-
-const toBase64 = (data: Uint8Array): string => {
-  let s = ''
-  for (const b of data) s += String.fromCharCode(b)
-  return btoa(s)
-}
 
 const inlineResources = async (doc: Document, read: ReadResource): Promise<void> => {
   for (const link of Array.from(doc.querySelectorAll('link[rel~="stylesheet"]'))) {

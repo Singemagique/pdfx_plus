@@ -109,13 +109,14 @@ function intrinsicMatrix(
   }
 }
 
-/** Fully-qualified AcroForm field name of a widget annotation (walks the /Parent chain). */
-function widgetFieldName(ctx: PDFDocument['context'], dict: PDFDict): string | undefined {
-  const parts: string[] = []
+/**
+ * The annotation dict plus its /Parent chain (an AcroForm field can inherit /T and /FT from
+ * ancestors), bounded so a cyclic /Parent can't hang the export.
+ */
+function* fieldChain(ctx: PDFDocument['context'], dict: PDFDict): Generator<PDFDict> {
   let d: PDFDict | undefined = dict
   for (let guard = 0; d && guard < 32; guard++) {
-    const t = d.get(PDFName.of('T'))
-    if (t instanceof PDFString || t instanceof PDFHexString) parts.unshift(t.decodeText())
+    yield d
     const parent = d.get(PDFName.of('Parent'))
     d =
       parent instanceof PDFRef
@@ -124,7 +125,43 @@ function widgetFieldName(ctx: PDFDocument['context'], dict: PDFDict): string | u
           ? parent
           : undefined
   }
+}
+
+/** Fully-qualified AcroForm field name of a widget annotation (walks the /Parent chain). */
+function widgetFieldName(ctx: PDFDocument['context'], dict: PDFDict): string | undefined {
+  const parts: string[] = []
+  for (const d of fieldChain(ctx, dict)) {
+    const t = d.get(PDFName.of('T'))
+    if (t instanceof PDFString || t instanceof PDFHexString) parts.unshift(t.decodeText())
+  }
   return parts.length ? parts.join('.') : undefined
+}
+
+/** A widget annotation whose field type is /Sig (directly or inherited via the /Parent chain). */
+function isSignatureWidget(ctx: PDFDocument['context'], dict: PDFDict): boolean {
+  if (dict.get(PDFName.of('Subtype')) !== PDFName.of('Widget')) return false
+  for (const d of fieldChain(ctx, dict)) {
+    if (d.get(PDFName.of('FT')) === PDFName.of('Sig')) return true
+  }
+  return false
+}
+
+/** Rewrite a page's /Annots, dropping every resolvable annotation the predicate selects. */
+function dropAnnots(
+  page: PDFPage,
+  drop: (dict: PDFDict, ctx: PDFDocument['context']) => boolean
+): void {
+  const annots = page.node.Annots()
+  if (!annots) return
+  const ctx = page.doc.context
+  const keep: Array<ReturnType<typeof annots.get>> = []
+  for (let i = 0; i < annots.size(); i++) {
+    const ref = annots.get(i)
+    const dict = ref instanceof PDFRef ? ctx.lookupMaybe(ref, PDFDict) : ref instanceof PDFDict ? ref : undefined // prettier-ignore
+    if (dict && drop(dict, ctx)) continue
+    keep.push(ref)
+  }
+  page.node.set(PDFName.of('Annots'), ctx.obj(keep))
 }
 
 /**
@@ -133,38 +170,11 @@ function widgetFieldName(ctx: PDFDocument['context'], dict: PDFDict): string | u
  * doesn't keep showing its old value. Untouched fields keep their widgets (and pre-filled values).
  */
 function removeFilledWidgets(page: PDFPage, filled: Set<string>): void {
-  const annots = page.node.Annots()
-  if (!annots) return
-  const ctx = page.doc.context
-  const keep: Array<ReturnType<typeof annots.get>> = []
-  for (let i = 0; i < annots.size(); i++) {
-    const ref = annots.get(i)
-    const dict = ref instanceof PDFRef ? ctx.lookupMaybe(ref, PDFDict) : ref instanceof PDFDict ? ref : undefined // prettier-ignore
-    const isWidget = !!dict && dict.get(PDFName.of('Subtype')) === PDFName.of('Widget')
-    if (isWidget) {
-      const name = widgetFieldName(ctx, dict)
-      if (name && filled.has(name)) continue // drop this widget
-    }
-    keep.push(ref)
-  }
-  page.node.set(PDFName.of('Annots'), ctx.obj(keep))
-}
-
-/** A widget annotation whose field type is /Sig (directly or inherited via the /Parent chain). */
-function isSignatureWidget(ctx: PDFDocument['context'], dict: PDFDict): boolean {
-  if (dict.get(PDFName.of('Subtype')) !== PDFName.of('Widget')) return false
-  let d: PDFDict | undefined = dict
-  for (let guard = 0; d && guard < 32; guard++) {
-    if (d.get(PDFName.of('FT')) === PDFName.of('Sig')) return true
-    const parent = d.get(PDFName.of('Parent'))
-    d =
-      parent instanceof PDFRef
-        ? ctx.lookupMaybe(parent, PDFDict)
-        : parent instanceof PDFDict
-          ? parent
-          : undefined
-  }
-  return false
+  dropAnnots(page, (dict, ctx) => {
+    if (dict.get(PDFName.of('Subtype')) !== PDFName.of('Widget')) return false
+    const name = widgetFieldName(ctx, dict)
+    return !!name && filled.has(name)
+  })
 }
 
 /**
@@ -175,17 +185,7 @@ function isSignatureWidget(ctx: PDFDocument['context'], dict: PDFDict): boolean 
  * added separately by the signer.
  */
 function removeSignatureWidgets(page: PDFPage): void {
-  const annots = page.node.Annots()
-  if (!annots) return
-  const ctx = page.doc.context
-  const keep: Array<ReturnType<typeof annots.get>> = []
-  for (let i = 0; i < annots.size(); i++) {
-    const ref = annots.get(i)
-    const dict = ref instanceof PDFRef ? ctx.lookupMaybe(ref, PDFDict) : ref instanceof PDFDict ? ref : undefined // prettier-ignore
-    if (dict && isSignatureWidget(ctx, dict)) continue // drop the signature widget
-    keep.push(ref)
-  }
-  page.node.set(PDFName.of('Annots'), ctx.obj(keep))
+  dropAnnots(page, (dict, ctx) => isSignatureWidget(ctx, dict))
 }
 
 async function bakePage(
@@ -300,16 +300,26 @@ export async function buildPdfx(
   // .pdfx keeps pages CLEAN — overlays/rotation are stored in the manifest mirror instead of
   // baked in, so the file reopens fully editable. Export PDF produces the flattened, shareable
   // copy (any viewer sees the annotations there).
+  let ordinal = 0
   for (const doc of documents) {
     if (doc.pages.length === 0) continue
     for (const page of doc.pages) {
-      let source = sources.get(page.sourceKey)
-      if (!source) {
-        source = await PDFDocument.load(page.bytes, { ignoreEncryption: true })
-        sources.set(page.sourceKey, source)
+      ordinal++
+      // Same contextualization as buildPdf: name the failing page so one bad source is identifiable
+      // instead of surfacing as a bare "Export failed".
+      try {
+        let source = sources.get(page.sourceKey)
+        if (!source) {
+          source = await PDFDocument.load(page.bytes, { ignoreEncryption: true })
+          sources.set(page.sourceKey, source)
+        }
+        const [copied] = await output.copyPages(source, [page.pageIndex])
+        output.addPage(copied)
+      } catch (e) {
+        throw new Error(
+          `Export failed on page ${ordinal} (source page ${page.pageIndex + 1}): ${e instanceof Error ? e.message : String(e)}`
+        )
       }
-      const [copied] = await output.copyPages(source, [page.pageIndex])
-      output.addPage(copied)
     }
     manifest.documents.push({ name: doc.name, pages: doc.pages.length })
   }
@@ -343,5 +353,11 @@ export async function buildPdfx(
   output.setProducer(`PDFX ${manifest.pdfx}`)
   output.setKeywords(['PDFX'])
 
-  return output.save()
+  try {
+    return await output.save()
+  } catch (e) {
+    throw new Error(
+      `Export failed while writing the combined PDF: ${e instanceof Error ? e.message : String(e)}`
+    )
+  }
 }

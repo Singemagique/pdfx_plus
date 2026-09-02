@@ -183,6 +183,18 @@ describe('buildPdfx', () => {
     expect(actual.flattenedSha256).toBe(manifest.integrity?.flattenedSha256)
   })
 
+  it('names the failing page when a source cannot be loaded (as buildPdf does)', async () => {
+    const good = await makeSourcePdf()
+    const documents: ExportDocument[] = [
+      { name: 'A', pages: [{ bytes: good, sourceKey: 'a', pageIndex: 0 }] },
+      { name: 'B', pages: [{ bytes: new Uint8Array([1, 2, 3]), sourceKey: 'bad', pageIndex: 4 }] }
+    ]
+    // Ordinal counts across documents; the source page number is 1-based — same shape as buildPdf's.
+    await expect(buildPdfx(documents, 'X')).rejects.toThrow(
+      /Export failed on page 2 \(source page 5\)/
+    )
+  })
+
   it('skips documents with no pages', async () => {
     const bytes = await makeSourcePdf()
     const documents: ExportDocument[] = [
@@ -302,6 +314,9 @@ describe('buildPdf', () => {
     )
     // The redaction now paints an opaque black box (previously it drew nothing → overlays leaked).
     expect(content).toContain('0 0 0 rg')
+    // Anchor both operators first: without this the indexOf comparison below passes vacuously
+    // (a missing highlight yields -1, which any real index beats).
+    expect(content).toContain('1 0.9 0.2 rg')
     // And it's drawn AFTER the lower-z highlight, so it covers it (matches the editor's WYSIWYG).
     expect(content.indexOf('0 0 0 rg')).toBeGreaterThan(content.indexOf('1 0.9 0.2 rg'))
   })
@@ -442,6 +457,10 @@ describe('formValue flatten', () => {
   it('paints a checkbox mark only when checked', async () => {
     const checked = await flattenWith(formValue(makePageKey('a', 0), 'agree', true))
     const unchecked = await flattenWith(formValue(makePageKey('a', 0), 'agree', false))
+    // Anchor the actual mark (the X's stroke colour) rather than relying on length alone, which
+    // would still "pass" if the checked case stopped drawing the mark but emitted other operators.
+    expect(checked).toContain('0.1 0.1 0.12 RG')
+    expect(unchecked).not.toContain('0.1 0.1 0.12 RG')
     expect(checked.length).toBeGreaterThan(unchecked.length) // the X adds stroke operators
   })
 

@@ -8,6 +8,7 @@ import {
   makePageKey,
   newOverlayId,
   type CropBox,
+  type Geom,
   type Overlay
 } from '../edit/model'
 import type { DocEntry } from '../types'
@@ -39,6 +40,47 @@ export interface SerializedMirror {
   attachments: Record<string, ManifestAttachment>
 }
 
+/** Normalized axis-aligned bounds of a geom (tolerates negative w/h). */
+const bounds = (g: Geom): { x0: number; y0: number; x1: number; y1: number } => ({
+  x0: Math.min(g.x, g.x + g.w),
+  y0: Math.min(g.y, g.y + g.h),
+  x1: Math.max(g.x, g.x + g.w),
+  y1: Math.max(g.y, g.y + g.h)
+})
+
+/** Do two overlay bounding boxes overlap at all? Per-overlay `rotation` is ignored (fail-safe). */
+function bboxesIntersect(a: Geom, b: Geom): boolean {
+  const p = bounds(a)
+  const q = bounds(b)
+  return p.x0 < q.x1 && q.x0 < p.x1 && p.y0 < q.y1 && q.y0 < p.y1
+}
+
+/** Is `a` painted after `b`? Mirrors flatten's draw order: z ascending, then createdAt ascending. */
+const drawnAbove = (a: Overlay, b: Overlay): boolean =>
+  a.z > b.z || (a.z === b.z && a.createdAt > b.createdAt)
+
+/**
+ * Drop every overlay that a redaction on the same page hides, so redacted content can't survive in
+ * the PLAINTEXT manifest mirror. The destructive PDFium pre-pass only rewrites SOURCE bytes, so a
+ * text/ink/image/formValue overlay sitting under a black box would otherwise be written verbatim
+ * into pdfx-manifest.json and come back fully visible on reopen.
+ *
+ * "Hidden" = a redaction that flatten draws AFTER the overlay (higher z, or equal z and later
+ * createdAt — see flattenPageOverlays) whose bounding box touches the overlay's. Overlays drawn
+ * ABOVE a redaction survive: they paint on top of the black box in the exported PDF too, so keeping
+ * them is WYSIWYG parity with flatten.ts. PARTIAL overlap drops the whole overlay: the mirror stores
+ * an overlay atomically (there is no way to persist "half a text run"), so anything the user covered
+ * even in part is treated as secret. Fail-safe by design — it can over-drop, never under-drop.
+ */
+export function stripRedactedOverlays(all: Overlay[]): Overlay[] {
+  const redactions = all.filter((o) => o.type === 'redaction')
+  return all.filter(
+    (o) =>
+      o.type !== 'redaction' &&
+      !redactions.some((r) => drawnAbove(r, o) && bboxesIntersect(r.geom, o.geom))
+  )
+}
+
 /** Build the manifest `edits` + `attachments` from the edit layer, or null if there's nothing. */
 export function serializeMirror(
   documents: ExportDocument[],
@@ -54,7 +96,9 @@ export function serializeMirror(
       const key = makePageKey(page.sourceKey, page.pageIndex)
       // Redaction overlays are applied destructively on export (see redact-export.ts), so they are
       // never written to the editable mirror — a reopened .pdfx must not carry the redacted content.
-      const overlays = (edits.overlays.get(key) ?? []).filter((o) => o.type !== 'redaction')
+      // Overlays the redaction covers go with them (see stripRedactedOverlays); this runs BEFORE the
+      // usedAttachments scan below, so a redacted image's bytes are never embedded either.
+      const overlays = stripRedactedOverlays(edits.overlays.get(key) ?? [])
       const rotation = edits.rotations?.get(key) ?? 0
       const crop = edits.crops?.get(key)
       if (overlays.length === 0 && !rotation && !crop) return
@@ -110,14 +154,99 @@ function validCrop(c: unknown): c is CropBox {
   return finite(o.x) && finite(o.y) && finite(o.w) && finite(o.h) && o.w > 0 && o.h > 0
 }
 
+function validColor(c: unknown): boolean {
+  if (!c || typeof c !== 'object') return false
+  const o = c as Record<string, unknown>
+  return finite(o.r) && finite(o.g) && finite(o.b)
+}
+
+/** Ink/signature strokes: an array of flat [x0,y0,x1,y1,…] polylines of finite numbers. */
+const validPaths = (p: unknown): boolean =>
+  Array.isArray(p) && p.every((stroke) => Array.isArray(stroke) && stroke.every(finite))
+
+const FONTS = new Set(['Helvetica', 'Times', 'Courier'])
+const ALIGNS = new Set(['left', 'center', 'right'])
+const SHAPES = new Set(['rect', 'ellipse', 'line', 'arrow', 'underline', 'strike'])
+
+/**
+ * Per-type payload check, the companion to validGeom. Geometry alone isn't enough: an overlay with a
+ * well-formed geom but a malformed body (color: null, ink without paths, an image whose attachment
+ * failed to decode) imports fine and then throws deep inside pdf-lib on EVERY later export, leaving
+ * the document permanently un-exportable. Drop such overlays at import instead, exactly as bad
+ * geometry is dropped. `hasAttachment` reports ids that actually decoded above.
+ */
+function validPayload(o: Record<string, unknown>, hasAttachment: (id: string) => boolean): boolean {
+  switch (o.type) {
+    case 'highlight':
+      return validColor(o.color)
+    case 'ink':
+      return validColor(o.color) && validPaths(o.paths) && finite(o.strokeWidth)
+    case 'text':
+      return (
+        typeof o.text === 'string' &&
+        finite(o.fontSize) &&
+        validColor(o.color) &&
+        FONTS.has(o.font as string) &&
+        ALIGNS.has(o.align as string)
+      )
+    case 'shape':
+      return (
+        validColor(o.color) &&
+        SHAPES.has(o.shape as string) &&
+        finite(o.strokeWidth) &&
+        (o.points === undefined || (Array.isArray(o.points) && o.points.every(finite)))
+      )
+    case 'image':
+      return typeof o.attachmentId === 'string' && hasAttachment(o.attachmentId)
+    case 'signatureVisual':
+      // Either an image attachment or hand-drawn strokes; whichever it carries must be usable.
+      return o.attachmentId !== undefined
+        ? typeof o.attachmentId === 'string' && hasAttachment(o.attachmentId)
+        : validPaths(o.paths)
+    case 'formValue':
+      return typeof o.field === 'string' && (typeof o.value === 'string' || typeof o.value === 'boolean') // prettier-ignore
+    default:
+      return false
+  }
+}
+
+/**
+ * Decode the manifest's attachment table, skipping anything malformed. The container, each entry and
+ * each base64 payload are untrusted: a non-object table, a missing/non-string `data`, or bytes atob
+ * rejects must not throw, or one crafted attachment takes down the whole document load.
+ */
+function decodeAttachments(manifest: PdfxManifest): Array<[string, Attachment]> {
+  const table = manifest.attachments
+  if (!table || typeof table !== 'object') return []
+  const out: Array<[string, Attachment]> = []
+  for (const [id, a] of Object.entries(table)) {
+    if (!a || typeof a !== 'object') continue
+    const { data, mime } = a as { data?: unknown; mime?: unknown }
+    if (typeof data !== 'string' || typeof mime !== 'string') continue
+    try {
+      out.push([id, { bytes: fromBase64(data), mime }])
+    } catch {
+      continue // not valid base64 — drop this attachment rather than fail the load
+    }
+  }
+  return out
+}
+
 /** Reconstruct overlays/rotations/crops/attachments from a manifest, keyed to the freshly-loaded docs. */
 export function deserializeMirror(manifest: PdfxManifest, docs: DocEntry[]): ImportedMirror | null {
-  if (!manifest.edits || manifest.edits.length === 0) return null
+  // `edits` is JSON: a truthy non-array (5, true, {length: 2}) passes a bare `.length` check and
+  // then explodes in the for..of below, killing the load of an otherwise-readable document.
+  if (!Array.isArray(manifest.edits) || manifest.edits.length === 0) return null
   const overlays: Overlay[] = []
   const rotations: Array<[string, number]> = []
   const crops: Array<[string, CropBox]> = []
+  // Decoded first: overlays that reference an attachment are only kept if it actually decoded.
+  const attachments = decodeAttachments(manifest)
+  const decodedIds = new Set(attachments.map(([id]) => id))
+  const hasAttachment = (id: string): boolean => decodedIds.has(id)
 
   for (const edit of manifest.edits) {
+    if (!edit || typeof edit !== 'object') continue
     const page = docs[edit.doc]?.pages[edit.page]
     if (!page) continue
     const key = makePageKey(page.source.id, page.pageIndex)
@@ -125,16 +254,19 @@ export function deserializeMirror(manifest: PdfxManifest, docs: DocEntry[]): Imp
       rotations.push([key, edit.rotation])
     }
     if (edit.crop && validCrop(edit.crop)) crops.push([key, edit.crop])
-    for (const o of edit.overlays ?? []) {
-      if (!o || !DRAWABLE.has((o as Overlay).type) || !validGeom((o as { geom?: unknown }).geom)) {
-        continue // drop unknown/redaction types and non-finite geometry
+    for (const o of Array.isArray(edit.overlays) ? edit.overlays : []) {
+      if (!o || typeof o !== 'object') continue
+      const raw = o as unknown as Record<string, unknown>
+      if (
+        !DRAWABLE.has((o as Overlay).type) ||
+        !validGeom(raw.geom) ||
+        !validPayload(raw, hasAttachment)
+      ) {
+        continue // drop unknown/redaction types, non-finite geometry and malformed payloads
       }
       overlays.push({ ...o, id: newOverlayId(), pageKey: key })
     }
   }
 
-  const attachments: Array<[string, Attachment]> = Object.entries(manifest.attachments ?? {}).map(
-    ([id, a]) => [id, { bytes: fromBase64(a.data), mime: a.mime }]
-  )
   return { overlays, rotations, crops, attachments }
 }

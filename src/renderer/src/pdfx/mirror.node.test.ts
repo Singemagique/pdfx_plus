@@ -119,6 +119,121 @@ describe('mirror round-trip', () => {
   })
 })
 
+describe('serializeMirror drops overlays a redaction covers', () => {
+  const key = makePageKey('s1', 0)
+  const exportDocs: ExportDocument[] = [
+    { name: 'A', pages: [{ bytes: new Uint8Array(), sourceKey: 's1', pageIndex: 0 }] }
+  ]
+  const base = { id: 'x', pageKey: key, z: 0, createdAt: 0 }
+  const geom = (x: number, y: number, w: number, h: number): Overlay['geom'] => ({
+    x,
+    y,
+    w,
+    h,
+    rotation: 0,
+    opacity: 1
+  })
+  const redaction = (z: number, g = geom(0, 0, 100, 100)): Overlay => ({
+    ...base,
+    id: `red-${z}`,
+    z,
+    createdAt: z,
+    geom: g,
+    type: 'redaction',
+    fill: { r: 0, g: 0, b: 0 }
+  })
+  const textAt = (z: number, text: string, g: Overlay['geom']): Overlay => ({
+    ...base,
+    id: `t-${z}`,
+    z,
+    createdAt: z,
+    geom: g,
+    type: 'text',
+    text,
+    fontSize: 12,
+    color: { r: 0, g: 0, b: 0 },
+    font: 'Helvetica',
+    align: 'left'
+  })
+  const image = (z: number, attachmentId: string, g: Overlay['geom']): Overlay => ({
+    ...base,
+    id: `i-${z}`,
+    z,
+    createdAt: z,
+    geom: g,
+    type: 'image',
+    attachmentId,
+    mime: 'image/png'
+  })
+  const layer = (overlays: Overlay[], attachments = new Map()): EditLayer => ({
+    overlays: new Map([[key, overlays]]),
+    attachments,
+    rotations: new Map(),
+    crops: new Map()
+  })
+
+  it('never writes a covered overlay into the plaintext manifest, but keeps ones drawn above', () => {
+    const mirror = serializeMirror(
+      exportDocs,
+      layer([
+        textAt(0, 'SECRET-9X42', geom(10, 10, 50, 20)), // under the box
+        redaction(1),
+        textAt(2, 'VISIBLE-ON-TOP', geom(10, 10, 50, 20)) // painted over the box
+      ])
+    )
+    const json = JSON.stringify(mirror)
+    expect(json).not.toContain('SECRET-9X42') // would leak verbatim into pdfx-manifest.json
+    expect(json).toContain('VISIBLE-ON-TOP') // WYSIWYG parity with flatten's z-order
+    expect(mirror!.edits[0].overlays).toHaveLength(1)
+  })
+
+  it('drops an overlay the redaction only partially overlaps (fail-safe)', () => {
+    const mirror = serializeMirror(
+      exportDocs,
+      layer([
+        textAt(0, 'SECRET-9X42', geom(90, 90, 200, 200)), // one corner under the box
+        redaction(1)
+      ])
+    )
+    expect(JSON.stringify(mirror)).not.toContain('SECRET-9X42')
+  })
+
+  it('keeps an overlay that no redaction touches', () => {
+    const mirror = serializeMirror(
+      exportDocs,
+      layer([textAt(0, 'ELSEWHERE', geom(300, 300, 50, 20)), redaction(1)])
+    )
+    expect(JSON.stringify(mirror)).toContain('ELSEWHERE')
+  })
+
+  it('does not embed the attachment of a redacted image overlay', () => {
+    const attachments = new Map([
+      ['hidden', { bytes: new Uint8Array([1, 2, 3, 4]), mime: 'image/png' }],
+      ['kept', { bytes: new Uint8Array([5, 6, 7, 8]), mime: 'image/png' }]
+    ])
+    const mirror = serializeMirror(
+      exportDocs,
+      layer(
+        [
+          image(0, 'hidden', geom(10, 10, 50, 50)), // under the box
+          redaction(1),
+          image(2, 'kept', geom(10, 10, 50, 50)) // above it
+        ],
+        attachments
+      )
+    )
+    expect(Object.keys(mirror!.attachments)).toEqual(['kept'])
+    const json = JSON.stringify(mirror)
+    expect(json).not.toContain('hidden')
+    expect(json).not.toContain(toBase64(new Uint8Array([1, 2, 3, 4]))) // no redacted image bytes
+  })
+
+  it('does not mirror the redaction overlays themselves', () => {
+    const mirror = serializeMirror(exportDocs, layer([textAt(2, 'TOP', geom(10, 10, 5, 5)), redaction(1)])) // prettier-ignore
+    expect(mirror!.edits[0].overlays!.every((o) => o.type !== 'redaction')).toBe(true)
+  })
+})
+
 describe('mirror import validation (crafted/corrupt .pdfx)', () => {
   const freshPage = (): DocEntry[] => [
     {
@@ -222,5 +337,167 @@ describe('mirror import validation (crafted/corrupt .pdfx)', () => {
     const imported = deserializeMirror(manifestWith({ overlays: [good, bad] }), freshPage())
     expect(imported!.overlays).toHaveLength(1)
     expect(imported!.overlays[0].type).toBe('highlight')
+  })
+})
+
+// A hostile manifest must never take down the whole document load — pages included.
+describe('mirror import hardening (hostile manifest shapes)', () => {
+  const freshPage = (): DocEntry[] => [
+    {
+      id: 'd1',
+      name: 'A',
+      pages: [
+        {
+          id: 'p1',
+          source: { id: 'newsrc', bytes: new Uint8Array(), pdf: null as never },
+          pageIndex: 0,
+          width: 612,
+          height: 792
+        }
+      ]
+    }
+  ]
+  const manifest = (m: object): PdfxManifest =>
+    ({ pdfx: '1.1', documents: [{ name: 'A', pages: 1 }], ...m }) as unknown as PdfxManifest
+
+  it('treats a truthy non-array `edits` as absent instead of throwing', () => {
+    for (const edits of [5, true, { length: 2 }, 'edits']) {
+      expect(() => deserializeMirror(manifest({ edits }), freshPage())).not.toThrow()
+      expect(deserializeMirror(manifest({ edits }), freshPage())).toBeNull()
+    }
+  })
+
+  it('ignores a non-array `overlays` on an edit entry', () => {
+    const m = manifest({ edits: [{ doc: 0, page: 0, rotation: 90, overlays: { length: 1 } }] })
+    const imported = deserializeMirror(m, freshPage())!
+    expect(imported.overlays).toEqual([])
+    expect(imported.rotations).toEqual([[makePageKey('newsrc', 0), 90]]) // the rest still loads
+  })
+
+  it('skips malformed attachments instead of failing the load', () => {
+    const m = manifest({
+      edits: [{ doc: 0, page: 0, rotation: 90 }],
+      attachments: {
+        notBase64: { mime: 'image/png', data: '!!!' },
+        noData: { mime: 'image/png' },
+        nonStringData: { mime: 'image/png', data: 42 },
+        noMime: { data: toBase64(new Uint8Array([1])) },
+        nul: null,
+        ok: { mime: 'image/png', data: toBase64(new Uint8Array([1, 2, 3])) }
+      }
+    })
+    expect(() => deserializeMirror(m, freshPage())).not.toThrow()
+    const imported = deserializeMirror(m, freshPage())!
+    expect(imported.attachments.map(([id]) => id)).toEqual(['ok'])
+    expect(Array.from(imported.attachments[0][1].bytes)).toEqual([1, 2, 3])
+  })
+
+  it('tolerates a non-object attachments container', () => {
+    for (const attachments of ['nope', 7, true]) {
+      const m = manifest({ edits: [{ doc: 0, page: 0, rotation: 90 }], attachments })
+      expect(deserializeMirror(m, freshPage())!.attachments).toEqual([])
+    }
+  })
+})
+
+// Geometry alone isn't enough: a malformed per-type payload imports fine and then throws inside
+// pdf-lib on EVERY export, so the document can never be exported again.
+describe('mirror import validation (per-type payloads)', () => {
+  const freshPage = (): DocEntry[] => [
+    {
+      id: 'd1',
+      name: 'A',
+      pages: [
+        {
+          id: 'p1',
+          source: { id: 'newsrc', bytes: new Uint8Array(), pdf: null as never },
+          pageIndex: 0,
+          width: 612,
+          height: 792
+        }
+      ]
+    }
+  ]
+  const G = { x: 10, y: 20, w: 30, h: 40, rotation: 0, opacity: 1 }
+  const importOverlays = (overlays: object[], attachments: object = {}): Overlay[] =>
+    deserializeMirror(
+      {
+        pdfx: '1.1',
+        documents: [{ name: 'A', pages: 1 }],
+        edits: [{ doc: 0, page: 0, overlays }],
+        attachments
+      } as unknown as PdfxManifest,
+      freshPage()
+    )!.overlays
+  const base = { id: 'x', pageKey: 'k', z: 0, createdAt: 0, geom: G }
+  const PNG = { mime: 'image/png', data: toBase64(new Uint8Array([1, 2, 3])) }
+
+  const valid: Record<string, object> = {
+    highlight: { ...base, type: 'highlight', color: { r: 1, g: 1, b: 0 } },
+    ink: {
+      ...base,
+      type: 'ink',
+      paths: [[0, 0, 1, 1]],
+      strokeWidth: 2,
+      color: { r: 0, g: 0, b: 0 }
+    },
+    text: { ...base, type: 'text', text: 'hi', fontSize: 12, color: { r: 0, g: 0, b: 0 }, font: 'Helvetica', align: 'left' }, // prettier-ignore
+    shape: { ...base, type: 'shape', shape: 'rect', strokeWidth: 1, color: { r: 0, g: 0, b: 0 } },
+    image: { ...base, type: 'image', attachmentId: 'a1', mime: 'image/png' },
+    signatureVisual: { ...base, type: 'signatureVisual', paths: [[0, 0, 1, 1]] },
+    formValue: { ...base, type: 'formValue', field: 'name', value: 'Ada' }
+  }
+
+  it('keeps a well-formed overlay of every drawable type', () => {
+    const imported = importOverlays(Object.values(valid), { a1: PNG })
+    expect(imported.map((o) => o.type).sort()).toEqual(Object.keys(valid).sort())
+  })
+
+  it('drops a highlight whose color is not an RGB object', () => {
+    expect(importOverlays([{ ...valid.highlight, color: null }])).toHaveLength(0)
+    expect(importOverlays([{ ...valid.highlight, color: { r: 1, g: NaN, b: 0 } }])).toHaveLength(0)
+  })
+
+  it('drops ink without usable paths or stroke width', () => {
+    expect(importOverlays([{ ...valid.ink, paths: undefined }])).toHaveLength(0)
+    expect(importOverlays([{ ...valid.ink, paths: [['a']] }])).toHaveLength(0)
+    expect(importOverlays([{ ...valid.ink, strokeWidth: 'thick' }])).toHaveLength(0)
+  })
+
+  it('drops text with a bad font, align, size or body', () => {
+    expect(importOverlays([{ ...valid.text, font: 'Comic' }])).toHaveLength(0)
+    expect(importOverlays([{ ...valid.text, align: 'justify' }])).toHaveLength(0)
+    expect(importOverlays([{ ...valid.text, fontSize: null }])).toHaveLength(0)
+    expect(importOverlays([{ ...valid.text, text: 42 }])).toHaveLength(0)
+  })
+
+  it('drops a shape of unknown kind or with non-finite stroke width', () => {
+    expect(importOverlays([{ ...valid.shape, shape: 'spiral' }])).toHaveLength(0)
+    expect(importOverlays([{ ...valid.shape, strokeWidth: Infinity }])).toHaveLength(0)
+  })
+
+  it('drops an image overlay whose attachment is missing or failed to decode', () => {
+    expect(importOverlays([valid.image], {})).toHaveLength(0) // no such attachment
+    expect(importOverlays([valid.image], { a1: { mime: 'image/png', data: '!!!' } })).toHaveLength(
+      0
+    )
+    expect(importOverlays([{ ...valid.image, attachmentId: 7 }], { a1: PNG })).toHaveLength(0)
+    expect(importOverlays([valid.image], { a1: PNG })).toHaveLength(1) // resolvable → kept
+  })
+
+  it('drops a signatureVisual with neither a resolvable attachment nor valid paths', () => {
+    expect(importOverlays([{ ...base, type: 'signatureVisual' }])).toHaveLength(0)
+    expect(
+      importOverlays([{ ...base, type: 'signatureVisual', attachmentId: 'missing' }], { a1: PNG })
+    ).toHaveLength(0)
+    expect(
+      importOverlays([{ ...base, type: 'signatureVisual', attachmentId: 'a1' }], { a1: PNG })
+    ).toHaveLength(1)
+  })
+
+  it('drops a formValue with a non-string field or a non-primitive value', () => {
+    expect(importOverlays([{ ...valid.formValue, field: null }])).toHaveLength(0)
+    expect(importOverlays([{ ...valid.formValue, value: { a: 1 } }])).toHaveLength(0)
+    expect(importOverlays([{ ...valid.formValue, value: true }])).toHaveLength(1) // checkbox
   })
 })
