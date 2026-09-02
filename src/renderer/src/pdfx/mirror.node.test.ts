@@ -1,6 +1,13 @@
 import { describe, expect, it } from 'vitest'
 
-import { deserializeMirror, fromBase64, serializeMirror, toBase64 } from './mirror'
+import {
+  countRedactedOverlays,
+  deserializeMirror,
+  fromBase64,
+  serializeMirror,
+  stripRedactedOverlays,
+  toBase64
+} from './mirror'
 import { makePageKey, type Overlay } from '../edit/model'
 import type { EditLayer } from './build'
 import type { ExportDocument, PdfxManifest } from './format'
@@ -278,6 +285,57 @@ describe('serializeMirror drops overlays a redaction covers', () => {
   it('does not mirror the redaction overlays themselves', () => {
     const mirror = serializeMirror(exportDocs, layer([textAt(2, 'TOP', geom(10, 10, 5, 5)), redaction(1)])) // prettier-ignore
     expect(mirror!.edits[0].overlays!.every((o) => o.type !== 'redaction')).toBe(true)
+  })
+
+  // What the "Saved …" flash reports. It must equal what the strip above actually removes, or the
+  // user is told a number that has nothing to do with the annotations they lost.
+  describe('countRedactedOverlays', () => {
+    it('counts the covered overlays, not the ones drawn above and not the redactions', () => {
+      const overlays = [
+        textAt(0, 'UNDER-A', geom(10, 10, 50, 20)),
+        textAt(0, 'UNDER-B', geom(20, 20, 10, 10)),
+        redaction(1),
+        textAt(2, 'ON-TOP', geom(10, 10, 50, 20)) // painted over the box, so it survives
+      ]
+      expect(countRedactedOverlays(new Map([[key, overlays]]))).toBe(2)
+      // Agrees with the strip by construction: kept + counted === every non-redaction overlay.
+      const kept = stripRedactedOverlays(overlays)
+      expect(kept).toHaveLength(1)
+      expect(kept.length + countRedactedOverlays(new Map([[key, overlays]]))).toBe(3)
+    })
+
+    it('sums pages independently — a redaction never reaches another page', () => {
+      const other = makePageKey('s1', 1)
+      const covered = textAt(0, 'UNDER', geom(10, 10, 50, 20))
+      const byPage = new Map([
+        [key, [covered, redaction(1)]],
+        // Same geometry, but this page has no redaction of its own: nothing is dropped here.
+        [other, [{ ...covered, pageKey: other }]]
+      ])
+      expect(countRedactedOverlays(byPage)).toBe(1)
+    })
+
+    it('ignores pages that are no longer in the collection when given the live page keys', () => {
+      // Overlays are never pruned on page delete (undo can restore them), but a save only visits
+      // live pages — so a covered overlay on a deleted page must not be reported as "removed".
+      const deleted = makePageKey('s1', 7)
+      const byPage = new Map([
+        [key, [textAt(0, 'UNDER', geom(10, 10, 50, 20)), redaction(1)]],
+        [deleted, [textAt(0, 'GONE', geom(10, 10, 50, 20)), redaction(1)]]
+      ])
+      expect(countRedactedOverlays(byPage)).toBe(2) // no filter: every page counts
+      expect(countRedactedOverlays(byPage, new Set([key]))).toBe(1) // only the live page
+      expect(countRedactedOverlays(byPage, new Set())).toBe(0)
+    })
+
+    it('is zero when no overlay is covered', () => {
+      const untouched = new Map([[key, [textAt(0, 'ELSEWHERE', geom(300, 300, 50, 20)), redaction(1)]]]) // prettier-ignore
+      expect(countRedactedOverlays(untouched)).toBe(0)
+      expect(
+        countRedactedOverlays(new Map([[key, [textAt(0, 'ALONE', geom(10, 10, 5, 5))]]]))
+      ).toBe(0)
+      expect(countRedactedOverlays(new Map())).toBe(0)
+    })
   })
 })
 
