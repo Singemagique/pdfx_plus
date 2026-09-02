@@ -25,6 +25,8 @@ export interface RootDragDeps {
   movePageInto: (source: PageRef, targetDocId: string, index: number) => void
   movePageToNewDoc: (source: PageRef, docIndex: number) => void
   onExternalDrop: (files: IncomingFile[], target: DropTarget | null) => void
+  /** Surface a drop that failed before any file reached `onExternalDrop` (which reports its own). */
+  onDropError: (message: string) => void
 }
 
 export interface RootDragHandlers {
@@ -93,13 +95,25 @@ export function createRootDragHandlers(deps: RootDragDeps): RootDragHandlers {
       ? computeDropTarget(deps.layout, w.x, w.y, w.k, null, dropped.length <= 1)
       : deps.dropTarget
     deps.clearDrag()
+    // Both intake paths can reject (an unreadable path / directory expansion in main, a revoked
+    // File handle in the browser fallback). Without a catch the drop was a silent no-op: no pages,
+    // no toast, nothing in the console.
+    const failed = (error: unknown): void => {
+      console.error('Drop failed', error)
+      deps.onDropError('Could not add files')
+    }
     if (paths.length > 0 && paths.every(Boolean)) {
-      void window.api.expandDropPaths(paths).then((files) => deps.onExternalDrop(files, target))
+      void window.api
+        .expandDropPaths(paths)
+        .then((files) => deps.onExternalDrop(files, target))
+        .catch(failed)
     } else {
       const supported = dropped.filter((f) => isDroppableFile(f.name, f.type))
       void Promise.all(
         supported.map(async (f) => ({ name: f.name, data: new Uint8Array(await f.arrayBuffer()) }))
-      ).then((files) => deps.onExternalDrop(files, target))
+      )
+        .then((files) => deps.onExternalDrop(files, target))
+        .catch(failed)
     }
   }
 

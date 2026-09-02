@@ -31,9 +31,14 @@ export default function App(): React.JSX.Element {
     []
   )
   const [signOpen, setSignOpen] = useState(false)
+  // The Sign dialog stays MOUNTED while the user places a signature box — it's only hidden.
+  // Unmounting it would destroy every useState field inside (mode, cert, passphrase, reason, TSA
+  // URL, LTV, PIN, cert/token selection), so the auto-reopen used to hand back a blank dialog and
+  // the user had to retype everything.
+  const [placing, setPlacing] = useState(false)
   const [padOpen, setPadOpen] = useState(false)
-  // True while the Sign dialog is waiting for the user to place a box on the page (it closed itself
-  // to let them); when the placement lands we reopen the dialog so they never hunt for a 2nd button.
+  // True while the Sign dialog is waiting for the user to place a box on the page (it hid itself
+  // to let them); when the placement lands we reveal the dialog so they never hunt for a 2nd button.
   const awaitingPlacement = useRef(false)
   const [scale, setScale] = useState(1)
   const [renderVersion, setRenderVersion] = useState(0)
@@ -68,29 +73,34 @@ export default function App(): React.JSX.Element {
   }, [docs, signaturePlacement, setSignaturePlacement])
 
   // "Place on page" from the Sign dialog: switch to the signature tool, open the first page if we're
-  // in the collection view (placement needs the editor canvas), and close the dialog so the user can
-  // drag a box. The effect below reopens it once they do.
+  // in the collection view (placement needs the editor canvas), and hide the dialog so the user can
+  // drag a box. The effect below reveals it — with all its fields intact — once they do.
   const requestPlacement = useCallback(() => {
     awaitingPlacement.current = true
     editStore.setTool('signature')
     if (!fullViewState.fullView && docs[0]?.pages[0]) {
       fullViewState.openPage(docs[0].id, docs[0].pages[0].id)
     }
-    setSignOpen(false)
+    setPlacing(true)
   }, [editStore, fullViewState, docs])
 
   useEffect(() => {
     if (awaitingPlacement.current && signaturePlacement) {
       awaitingPlacement.current = false
+      setPlacing(false)
       setSignOpen(true)
     }
   }, [signaturePlacement])
 
   // If the user abandons "Place on page" by switching away from the signature tool, drop the pending
   // reopen latch — otherwise a later, unrelated signature placement would unexpectedly reopen the
-  // Sign dialog (the dialog closed via setSignOpen(false), which never runs onClose). (P2-4)
+  // Sign dialog (the dialog hid itself, which never runs onClose). (P2-4) The abandoned dialog is
+  // also fully closed, so a hidden-but-mounted dialog can never linger invisibly.
   useEffect(() => {
-    if (editStore.tool !== 'signature') awaitingPlacement.current = false
+    if (editStore.tool === 'signature' || !awaitingPlacement.current) return
+    awaitingPlacement.current = false
+    setPlacing(false)
+    setSignOpen(false)
   }, [editStore.tool])
 
   const {
@@ -120,7 +130,8 @@ export default function App(): React.JSX.Element {
     canvasRef,
     movePageInto: collection.movePageInto,
     movePageToNewDoc: collection.movePageToNewDoc,
-    onExternalDrop: handleExternalDropFiles
+    onExternalDrop: handleExternalDropFiles,
+    onDropError: flash
   })
 
   const onPaste = useCallback(() => void handlePaste(), [handlePaste])
@@ -231,6 +242,7 @@ export default function App(): React.JSX.Element {
         {signOpen && (
           <SignDialog
             busy={busy}
+            hidden={placing}
             onSign={signAndExport}
             onSignCard={signWithCardAndExport}
             listTokens={(modulePath) => window.api.listCardTokens(modulePath)}
@@ -246,6 +258,7 @@ export default function App(): React.JSX.Element {
             onDrawSignature={() => setPadOpen(true)}
             onClose={() => {
               awaitingPlacement.current = false
+              setPlacing(false)
               setSignOpen(false)
             }}
           />

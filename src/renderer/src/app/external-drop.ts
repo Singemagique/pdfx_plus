@@ -1,5 +1,5 @@
 import { findConverter } from '../pdfx/convert'
-import { importIntoDocs, loadSource, pagesFromSource } from '../pdfx/source'
+import { importIntoDocs, loadIncomingPages } from '../pdfx/source'
 import type { ImportedMirror } from '../pdfx/mirror'
 import type { IntegrityComparison } from '../pdfx/canonicalize'
 import type { DocEntry, PageEntry } from '../types'
@@ -34,21 +34,11 @@ async function dropSingleFileInto(
     await deps.addFiles([file]) // addFiles runs its own mirror + tamper gate
     return []
   }
-  const conv = findConverter(file.name, file.data)
-  if (conv) {
+  if (findConverter(file.name, file.data)) {
+    // Convert + load sized to the neighbouring page. That is exactly loadIncomingPages, so use it
+    // rather than keeping a second copy of the convert → loadSource → pagesFromSource sequence.
     const ref = doc.pages[Math.min(target.index, doc.pages.length - 1)]
-    const bytes = await conv.toPdf(
-      file.name,
-      file.data,
-      { width: ref.width, height: ref.height },
-      file.path
-    )
-    const { source, sizes } = await loadSource(bytes)
-    const pages = pagesFromSource(
-      source,
-      sizes,
-      sizes.map((_, i) => i)
-    )
+    const pages = await loadIncomingPages([file], { width: ref.width, height: ref.height })
     deps.insertPagesIntoDoc(target.docId, target.index, pages)
     return [] // a converted image/office file has no editable mirror
   }
