@@ -1,6 +1,7 @@
 import { getDocument } from 'pdfjs-dist'
 import { partitionPages, readManifest, stripExtension } from './format'
 import { findConverter } from './convert'
+import { rendererPdfjsAssetOptions } from './pdfjs-assets'
 import { deserializeMirror, type ImportedMirror } from './mirror'
 import { CANON_ALG, compareIntegrity, integrityOf, type IntegrityComparison } from './canonicalize'
 import type { DocEntry, PageEntry, PdfSource } from '../types'
@@ -26,7 +27,9 @@ export interface ExportPageRef {
 const MAX_PAGES = 10_000
 
 export async function loadSource(bytes: Uint8Array): Promise<LoadedSource> {
-  const pdf = await getDocument({ data: bytes.slice() }).promise
+  // The asset options carry pdf.js's wasm decoders (CCITT/JBIG2/JPX scans render blank without
+  // them), standard font data and CJK CMaps — see ./pdfjs-assets.
+  const pdf = await getDocument({ data: bytes.slice(), ...rendererPdfjsAssetOptions() }).promise
   if (pdf.numPages > MAX_PAGES) {
     throw new Error(`PDF declares ${pdf.numPages} pages; refusing to load more than ${MAX_PAGES}`)
   }
