@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { computeDragView, type DragViewInput } from './drag-view'
-import { deriveDropGhosts } from './ghost-size'
+import { deriveDropGhosts, deriveDropView } from './ghost-size'
 import {
   BETWEEN_GHOST_SHIFT,
   computeDropTarget,
@@ -92,6 +92,44 @@ describe('computeDragView', () => {
       const y = item.y + v.shifts[i + 1] + item.height / 2
       expect(at(item.gridX + 1, y)).toMatchObject({ kind: 'into', docId: item.doc.id })
     })
+  })
+
+  it('an external drop on a grown row settles inside the card it sees drawn', () => {
+    // An external ghost borrows the width of the page at its index: landscape mid-document, portrait
+    // at the end. Drawn at a landscape page, it wraps d0 onto a 4th row; the hit test used to move
+    // it to the end on that row, where a portrait ghost fits row 3, so d0 shrank back and the next
+    // dragover landed in d1 — the flicker the extended geometry was meant to remove.
+    const d0 = {
+      id: 'd0',
+      name: 'd0.pdf',
+      pages: [...'PLLLLLPLP'].map((c, i) => page(`d0-${i}`, c === 'L' ? LANDSCAPE : undefined))
+    }
+    const mixed = computeLayout([d0, doc('d1', 4)], undefined, WRAP_5)
+    const [a] = mixed.items
+    const x = 100
+    const y = a.y + a.height + 150
+    for (let start = 0; start <= a.pages.length; start++) {
+      let t: DropTarget = { kind: 'into', docId: 'd0', index: start }
+      const view = (): DropView => deriveDropView(mixed, null, t, 'external')
+      const g = deriveDropGhosts(mixed, null, t, 'external', 1)
+      const drawn = computeDragView(mixed, {
+        ...idle,
+        intoDocId: g.intoDocId,
+        intoIndex: g.intoIndex,
+        intoGhostWidth: g.ghostSize.width
+      })
+      // Only starts whose drawn ghost reaches down under the pointer.
+      if (a.y + (drawn.reflows.get('d0')?.height ?? 0) < y) continue
+      const seen: string[] = []
+      for (let i = 0; i < 4; i++) {
+        const next = computeDropTarget(mixed, x, y, 1, null, true, view())
+        seen.push(JSON.stringify(next))
+        if (JSON.stringify(next) === JSON.stringify(t)) break
+        t = next as typeof t
+      }
+      expect(seen, `start ${start}`).toHaveLength(1)
+      expect(t, `start ${start}`).toMatchObject({ kind: 'into', docId: 'd0' })
+    }
   })
 
   it('collapses the dragged page out of its own document only', () => {

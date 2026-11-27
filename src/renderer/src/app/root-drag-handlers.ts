@@ -1,5 +1,5 @@
 import { computeDropTarget } from '../canvas/layout'
-import { deriveDropGhosts } from '../components/collection/ghost-size'
+import { deriveDropView } from '../components/collection/ghost-size'
 import { countDroppableItems, isDroppableFile } from './drop-items'
 import type { CanvasLayout, DropTarget, DropView } from '../canvas/layout'
 import type { CanvasHandle } from '../components/Canvas'
@@ -40,16 +40,8 @@ export interface RootDragHandlers {
 export function createRootDragHandlers(deps: RootDragDeps): RootDragHandlers {
   // The preview on screen, sized exactly as CollectionCanvas sizes it, so hit tests see the card
   // heights the into-ghost drew (see computeDropTarget).
-  const view = (): DropView => ({
-    target: deps.dropTarget,
-    ghostWidth: deriveDropGhosts(
-      deps.layout,
-      deps.draggingPage,
-      deps.dropTarget,
-      deps.dragKind,
-      deps.externalCount
-    ).ghostSize.width
-  })
+  const view = (): DropView =>
+    deriveDropView(deps.layout, deps.draggingPage, deps.dropTarget, deps.dragKind)
 
   const onDragEnter = (event: React.DragEvent): void => {
     if (event.dataTransfer.types.includes(PAGE_MIME)) return

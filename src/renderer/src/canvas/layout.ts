@@ -228,20 +228,20 @@ function flowDocument(doc: DocEntry, wrapWidth: number, rotations?: Rotations): 
 /** Place a flowed document as a card `cardWidth` wide at `y`. */
 function placeDoc(f: DocFlow, y: number, cardWidth: number, wrapWidth: number): DocPlacement {
   const span = cardWidth - CARD_PAD_X * 2
-  // Centre the pages in whatever the shared width leaves over. Where an add-page cell could fit at
-  // the end of the last row, centre only so far right that it still does.
-  const centre = Math.max(0, Math.floor((span - f.flow.extent) / 2))
-  const room = span - f.addX - ADD_PAGE_MIN_WIDTH
-  const offset = room >= 0 ? Math.min(centre, room) : centre
+  // Centre the pages in whatever the shared width leaves over — always fully, so every card in the
+  // column reads as centred. The add-page slot takes what is left after the last row's last page:
+  // a cell up to a page wide, or the round edge button when that is narrower than a usable cell.
+  const offset = Math.max(0, Math.floor((span - f.flow.extent) / 2))
   const gridX = CARD_PAD_X + offset
   const cells = placeCells(f.flow, f.widths, gridX, y)
   const rowY = rowTop(y, f.flow.positions.at(-1)?.row ?? 0)
+  const room = span - offset - f.addX
   const addPage: AddPageSlot =
-    room >= 0
+    room >= ADD_PAGE_MIN_WIDTH
       ? {
           x: gridX + f.addX,
           y: rowY,
-          w: Math.min(ADD_PAGE_WIDTH, span - offset - f.addX),
+          w: Math.min(ADD_PAGE_WIDTH, room),
           h: BASE_PAGE_HEIGHT,
           edge: false
         }

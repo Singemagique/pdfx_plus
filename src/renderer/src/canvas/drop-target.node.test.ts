@@ -200,8 +200,57 @@ describe('computeDropTarget against an into-ghost that grew its card by a row', 
       docId: 'q',
       index: 0
     })
-    expect(hit(100, q.y + ROW_PITCH - DOC_GAP_Y / 2)).toEqual({ kind: 'between', docIndex: 1 })
-    expect(hit(100, r.y + ROW_PITCH - DOC_GAP_Y / 2)).toEqual({ kind: 'between', docIndex: 2 })
+  })
+
+  it('in a gap the growth opened, resolves to the undrawn target instead of flashing "between"', () => {
+    // The gap just below the grown p, and the one between the pushed-down q and r. "Between" there
+    // undid the growth, so the next dragover found the point inside q's (or r's) undrawn card.
+    for (const y of [q.y + ROW_PITCH - DOC_GAP_Y / 2, r.y + ROW_PITCH - DOC_GAP_Y / 2]) {
+      const t = hit(100, y)
+      expect(t).toEqual(computeDropTarget(grown, 100, y, 1, null, true))
+      expect(t.kind).toBe('into')
+      // …and that is a fixed point.
+      expect(
+        computeDropTarget(grown, 100, y, 1, null, true, { target: t, ghostWidth: 362 })
+      ).toEqual(t)
+    }
+    // Below every card, "between" after the last stays.
+    expect(hit(100, grown.contentHeight + ROW_PITCH)).toEqual({ kind: 'between', docIndex: 3 })
+  })
+
+  it('moves a ghost to the end only if the ghost drawn there would open the row too', () => {
+    // An external drop borrows the width of the page at its index: landscape at index 1 of
+    // P L L L L L P L P wraps it onto a 4th row; at the end it would be portrait and fit row 3.
+    const ext = computeLayout(
+      [
+        {
+          id: 'd0',
+          name: 'd0.pdf',
+          pages: [...'PLLLLLPLP'].map((c, i) => page(`d0-${i}`, c === 'L' ? LANDSCAPE : undefined))
+        },
+        doc('d1', 4)
+      ],
+      undefined,
+      WRAP_5
+    )
+    const d0 = ext.items[0]
+    const widthAt = (i: number): number => d0.pages[Math.min(i, d0.pages.length - 1)].w
+    const drawn: DropView = {
+      target: { kind: 'into', docId: 'd0', index: 1 },
+      ghostWidth: widthAt(1),
+      ghostWidthAt: widthAt
+    }
+    const y = d0.y + d0.height + 150
+    // Retargeting to the end (index 9) expected a grown row there; there is none, so the next
+    // dragover fell into d1. Now the drawn target holds…
+    expect(computeDropTarget(ext, 100, y, 1, null, true, drawn)).toEqual(drawn.target)
+    // …whereas assuming the drawn width everywhere would still move it.
+    const { ghostWidthAt: _, ...flat } = drawn
+    expect(computeDropTarget(ext, 100, y, 1, null, true, flat)).toEqual({
+      kind: 'into',
+      docId: 'd0',
+      index: 9
+    })
   })
 
   it('a ghost that opens no row leaves the geometry alone', () => {
@@ -227,8 +276,11 @@ describe('computeDropTarget against an into-ghost that grew its card by a row', 
     for (const { layout: l, exclude, ghostWidth } of cases) {
       const bottom = l.contentHeight + 2 * ROW_PITCH
       for (let y = -20; y < bottom; y += 7) {
-        for (const x of [5, centreX(1), centreX(4), WRAP_5 - 3]) {
-          let t: DropTarget | null = null
+        // From no preview, and from a drag already settled on p's grown end (leaving it downward).
+        for (const [x, start] of [5, centreX(1), centreX(4), WRAP_5 - 3].flatMap((x) =>
+          [null, target].map((s) => [x, s] as const)
+        )) {
+          let t: DropTarget | null = start
           const seen: string[] = []
           for (let i = 0; i < 6; i++) {
             const next = computeDropTarget(l, x, y, 1, exclude, true, { target: t, ghostWidth })
@@ -237,6 +289,9 @@ describe('computeDropTarget against an into-ghost that grew its card by a row', 
             t = next
           }
           expect(seen.length, `x=${x} y=${y}: ${seen.join(' → ')}`).toBeLessThan(6)
+          // A "between" that the next dragover abandons is a one-frame flash of its ghost row.
+          const flash = seen.some((t) => t.includes('between') && t !== seen.at(-1))
+          expect(flash, `x=${x} y=${y}: ${seen.join(' → ')}`).toBe(false)
         }
       }
     }

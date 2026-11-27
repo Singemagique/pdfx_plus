@@ -89,15 +89,16 @@ describe('DocumentRow add-page slot', () => {
   )
 
   it('a shortened cell beside a nearly full row drops its label', async () => {
-    // Three letter pages and a landscape one leave 70 px of a five-letter row.
+    // Two landscape pages and a letter one, centred in a five-letter card, leave 70 px after it.
     const d = {
       id: 'm',
       name: 'm.pdf',
-      pages: [page('a'), page('b'), page('c'), page('d', LANDSCAPE)]
+      pages: [page('a', LANDSCAPE), page('b', LANDSCAPE), page('c')]
     }
     const item = computeLayout([d, doc('w', 12)], undefined, WRAP_5).items[0]
     await draw(item)
-    expect(item.addPage.w).toBe(ADD_PAGE_MIN_WIDTH)
+    expect(item.addPage.w).toBe(70)
+    expect(item.addPage.w).toBeGreaterThanOrEqual(ADD_PAGE_MIN_WIDTH)
     expect(addPage().classList.contains('narrow')).toBe(true)
     expect(addPage().classList.contains('edge')).toBe(false)
   })

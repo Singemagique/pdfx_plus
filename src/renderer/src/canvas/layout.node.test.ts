@@ -224,6 +224,38 @@ describe('computeLayout wrapping', () => {
     expect(w.gridX).toBe(CARD_PAD_X)
   })
 
+  it('centres every card fully, even one with too little slack for an add-page cell', () => {
+    // A single 728 px page sets a 772 px card width at the narrowest wrap. Beside it, a landscape +
+    // letter card has 132 px of slack: centring used to stop 22 px short so a 48 px add cell still
+    // fitted after the letter page, which left it visibly off-centre beside its centred neighbours.
+    const wide = { id: 'w', name: 'w.pdf', pages: [page('w0', { width: 728, height: 280 })] }
+    const land = { id: 'l', name: 'l.pdf', pages: [page('l0', LANDSCAPE), page('l1')] }
+    const layout = computeLayout([wide, land, doc('p', 2), doc('t', 3)], undefined, MIN_DOC_WIDTH)
+    expect(layout.contentWidth).toBe(728 + 2 * CARD_PAD_X)
+    for (const item of layout.items) {
+      const end = Math.max(...item.pages.map((p) => p.x + p.w))
+      const left = item.pages[0].x - item.x
+      const right = item.x + item.width - end
+      expect(Math.abs(left - right), item.doc.id).toBeLessThanOrEqual(1)
+      // The add-page slot stays a usable cell inside the card, or becomes the edge button.
+      const a = item.addPage
+      if (a.edge) expect(a.x, item.doc.id).toBe(item.width - ADD_PAGE_EDGE_SIZE / 2)
+      else {
+        expect(a.w, item.doc.id).toBeGreaterThanOrEqual(ADD_PAGE_MIN_WIDTH)
+        expect(a.x + a.w, item.doc.id).toBeLessThanOrEqual(item.width - CARD_PAD_X)
+      }
+    }
+    const [w, l, p, t] = layout.items
+    expect(w.addPage.edge).toBe(true)
+    // 66 px each side leaves exactly a minimum cell after the letter page.
+    expect(l.gridX).toBe(CARD_PAD_X + 66)
+    expect(l.addPage).toMatchObject({ w: ADD_PAGE_MIN_WIDTH, edge: false })
+    expect(p.addPage).toMatchObject({ w: 121, edge: false })
+    // 22 px each side is too little for a cell after the gap: the edge button, grid still centred.
+    expect(t.gridX).toBe(CARD_PAD_X + 22)
+    expect(t.addPage.edge).toBe(true)
+  })
+
   it('centres each card on its widest row; shorter rows below stay left-aligned under it', () => {
     // At a 2000 px wrap: 8 letter pages per row (1854 px) beside 5 landscape ones (1882 px).
     const layout = computeLayout([doc('s', 10), doc('x', 5, LANDSCAPE)], undefined, 2000)

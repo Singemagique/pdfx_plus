@@ -16,6 +16,12 @@ export type DropTarget =
 export interface DropView {
   target: DropTarget | null
   ghostWidth: number
+  /**
+   * The width the into-ghost would be drawn with at visible `index` of the target's document. An
+   * external drop borrows the size of the page at its index, so it differs from `ghostWidth` once
+   * the index moves (see components/collection/ghost-size.ts). Omitted: `ghostWidth` everywhere.
+   */
+  ghostWidthAt?: (index: number) => number
 }
 
 /** Below this on-screen height of a one-row card, every drop targets the gaps between documents. */
@@ -102,11 +108,15 @@ function onGrownRows(
   excludeId: string | null,
   drawn: IntoTarget,
   depth: number,
-  ghostWidth: number
+  view: DropView
 ): DropTarget {
   const end = item.pages.length - (excludedFrom(item, excludeId) ? 1 : 0)
   if (end === drawn.index) return drawn
-  return growthAt(item, excludeId, end, ghostWidth) >= depth
+  // The ghost an append would draw, which need not be the one on screen: an external drop's ghost
+  // takes the size of the page at its index, so a landscape ghost mid-row can become a portrait
+  // one at the end that fits the last row and opens nothing under the pointer.
+  const endWidth = view.ghostWidthAt?.(end) ?? view.ghostWidth
+  return growthAt(item, excludeId, end, endWidth) >= depth
     ? { kind: 'into', docId: item.doc.id, index: end }
     : drawn
 }
@@ -118,7 +128,8 @@ function onGrownRows(
  * hit-testing uses that drawn geometry — the card reaches down over the ghost's row and later
  * cards sit lower — so moving onto the ghost does not flip the target to "between documents" and
  * back. A point on that added row is not matched against the pages the ghost displaced onto it
- * (they only sit there because of the current target); see onGrownRows.
+ * (they only sit there because of the current target); see onGrownRows. A point off every card
+ * while the growth is drawn resolves against the undrawn layout, so it never flashes "between".
  */
 export function computeDropTarget(
   layout: CanvasLayout,
@@ -141,7 +152,7 @@ export function computeDropTarget(
       if (worldY < y0 || worldY > y0 + height(i)) continue
       const depth = worldY - (y0 + item.height)
       if (i === at && drawn && view && depth > 0) {
-        return onGrownRows(item, excludeId, drawn, depth, view.ghostWidth)
+        return onGrownRows(item, excludeId, drawn, depth, view)
       }
       return {
         kind: 'into',
@@ -150,6 +161,12 @@ export function computeDropTarget(
       }
     }
   }
+  // Off every card while a grown card is drawn: in a gap below it, or between the cards it pushed
+  // down. Choosing "between" here would undo the growth, putting the point back inside a card's
+  // undrawn span, so the next dragover would flip to that card — a one-frame flash of the
+  // between-documents ghost. Resolve straight to what the undrawn geometry gives instead: that
+  // target draws no growth above the point, so re-testing it gives the same answer.
+  if (at >= 0) return computeDropTarget(layout, worldX, worldY, scale, excludeId, allowInto, null)
   let docIndex = 0
   for (let i = 0; i < items.length; i++) {
     if (top(i) + height(i) / 2 < worldY) docIndex++
