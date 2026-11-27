@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, type RefObject } from 'react'
 import { select } from 'd3-selection'
-import { zoomTransform, type ZoomBehavior, type ZoomTransform } from 'd3-zoom'
+import { zoomIdentity, zoomTransform, type ZoomBehavior, type ZoomTransform } from 'd3-zoom'
 import { animateZoomTo } from './animate-transform'
 import { FIT_ANIMATION_MS, FIT_TOP_MARGIN, PAN_MARGIN, REVEAL_ANIMATION_MS } from './zoom-constants'
 
@@ -33,9 +33,11 @@ interface AutoFitArgs {
  * - documents imported (`focus` changes): animated fit scrolled to the first new document — even if
  *   the user had moved the view — after which the view counts as un-moved again;
  * - later commits of the same import batch (same `focus` object): keep heading for its first doc;
- * - any other content change (re-wrap, rotate, delete, reorder) or viewport resize: only while the
- *   user has not moved the view and nothing is being dragged, and then it keeps whatever world y is
- *   at the top of the view, so it re-scales the fit without scrolling away from where they are.
+ * - any other content change (re-wrap, rotate, delete, reorder) or viewport resize, while nothing is
+ *   being dragged: an unmoved view re-fits, keeping whatever world y is at the top of the view, so
+ *   it re-scales without scrolling away from where they are;
+ * - the same for a view the user moved, but only when the pane or the content changed WIDTH, and
+ *   only horizontally framed: see keepMovedViewInFrame. A height-only change never moves it.
  */
 export function useAutoFit({
   viewportRef,
@@ -62,6 +64,8 @@ export function useAutoFit({
   const cancelAnim = useRef<(() => void) | null>(null)
   /** The transform the running animation (if any) ends at. */
   const animTarget = useRef<ZoomTransform | null>(null)
+  /** The scale the last fit set — if the view is still at it, the user has scrolled, not zoomed. */
+  const fitK = useRef<number | null>(null)
 
   const stopAnim = (): void => {
     cancelAnim.current?.()
@@ -79,6 +83,7 @@ export function useAutoFit({
     userMovedRef.current = false
     const target = fitTransform(focusY)
     animTarget.current = target
+    fitK.current = target.k
     cancelAnim.current = animateZoomTo(
       vp,
       zoom,
@@ -99,6 +104,7 @@ export function useAutoFit({
     if (!vp || !zoom) return
     stopAnim()
     select(vp).call(zoom.transform, fitTransform(focusY))
+    fitK.current = zoomTransform(vp).k
   }
 
   useLayoutEffect(() => {
@@ -149,13 +155,53 @@ export function useAutoFit({
       jumpTo(0)
       return
     }
-    if (!changed || userMovedRef.current || draggingRef.current) return
+    if (!changed || draggingRef.current) return
+    if (userMovedRef.current) {
+      keepMovedViewInFrame(last, vw)
+      return
+    }
     if (animAnchor.current !== null) {
       animateTo(animAnchor.current)
       return
     }
     jumpTo(zoomTransform(vp).invertY(FIT_TOP_MARGIN))
   }, [contentWidth, contentHeight, focus, viewportWidth, viewportHeight])
+
+  /**
+   * The user has scrolled or zoomed, so the view is theirs — but the pane or the content changed
+   * width, and the transform alone (anchored at the top-left) would leave the re-wrapped content
+   * off-centre or running off the right edge. Keep their place (the world y at the top of the
+   * view) and frame the content horizontally again:
+   * - a resize when they only scrolled (the scale is still the one the fit set): re-fit the scale to
+   *   the new width, as for an unmoved view;
+   * - otherwise (they zoomed, or only the content width changed): keep their scale, centre content
+   *   that fits across, and keep the same point of wider content at the middle of the pane.
+   * The view stays marked as moved, so later content changes still won't scroll it.
+   */
+  const keepMovedViewInFrame = (prev: { w: number; vw: number; vh: number }, vw: number): void => {
+    const vp = viewportRef.current
+    const zoom = zoomRef.current
+    if (!vp || !zoom) return
+    const resized = prev.vw !== vw || prev.vh !== viewportHeight
+    if (!resized && prev.w === contentWidth) return
+    const t = zoomTransform(vp)
+    const scrolledOnly = fitK.current !== null && Math.abs(t.k - fitK.current) <= 1e-6 * t.k
+    if (resized && scrolledOnly) {
+      jumpTo(t.invertY(FIT_TOP_MARGIN))
+      return
+    }
+    stopAnim()
+    const W = vp.clientWidth
+    let tx: number
+    if (contentWidth * t.k <= W) tx = (W - contentWidth * t.k) / 2
+    else {
+      const prevW = prev.vw > 0 ? prev.vw : W
+      const prevCw = prev.w > 0 ? prev.w : contentWidth
+      const cx = ((prevW / 2 - t.x) / t.k) * (contentWidth / prevCw)
+      tx = W / 2 - cx * t.k
+    }
+    select(vp).call(zoom.transform, zoomIdentity.translate(tx, t.y).scale(t.k))
+  }
 
   useEffect(() => stopAnim, [])
 
