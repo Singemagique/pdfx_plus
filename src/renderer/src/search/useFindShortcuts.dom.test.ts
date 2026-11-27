@@ -75,6 +75,31 @@ describe('useFindShortcuts', () => {
     expect(ctl.open).not.toHaveBeenCalled()
   })
 
+  it('takes undo/redo outside text fields while the bar is open', () => {
+    // Closed: nothing to protect, the key is left to the app (and the menu's undo role).
+    expect(press('z', { ctrlKey: true }).defaultPrevented).toBe(false)
+    open = true
+    expect(press('z', { ctrlKey: true }).defaultPrevented).toBe(true)
+    expect(press('Z', { metaKey: true, shiftKey: true }).defaultPrevented).toBe(true)
+    expect(press('y', { ctrlKey: true }).defaultPrevented).toBe(true)
+    expect(press('z').defaultPrevented).toBe(false)
+    // In a text field (an overlay's input, say) native undo stays the field's.
+    const field = document.createElement('input')
+    document.body.appendChild(field)
+    try {
+      const e = new KeyboardEvent('keydown', {
+        key: 'z',
+        ctrlKey: true,
+        bubbles: true,
+        cancelable: true
+      })
+      field.dispatchEvent(e)
+      expect(e.defaultPrevented).toBe(false)
+    } finally {
+      field.remove()
+    }
+  })
+
   it('does nothing while disabled (a modal dialog is open)', async () => {
     await act(async () => root.render(createElement(Harness, { enabled: false })))
     expect(press('f', { ctrlKey: true }).defaultPrevented).toBe(false)
