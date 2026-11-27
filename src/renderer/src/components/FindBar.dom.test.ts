@@ -5,7 +5,8 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, createElement, Fragment } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
-import { FindBarHost } from './FindBar'
+import { FindBarHost, shouldDodge } from './FindBar'
+import { FIND_HIGHLIGHTS_EVENT } from './full-view/FindHighlights'
 import { NULL_FIND_CONTROLLER } from '../search/FindContext'
 import type { FindBarState, FindController } from '../search/find-controller'
 import { useKeyboardShortcuts } from '../app/useKeyboardShortcuts'
@@ -175,6 +176,12 @@ describe('FindBar', () => {
     expect(el.value).toBe('kiwi')
   })
 
+  it('cancels the native undo on a focused bar button, but not in the input', async () => {
+    const next = container.querySelector('button[aria-label="Next match"]')!
+    expect((await key(next, 'z', { ctrlKey: true })).defaultPrevented).toBe(true)
+    expect((await key(input(), 'z', { ctrlKey: true })).defaultPrevented).toBe(false)
+  })
+
   it('keeps every key inside the bar away from the window shortcuts', async () => {
     const onWindow = vi.fn()
     window.addEventListener('keydown', onWindow)
@@ -198,5 +205,65 @@ describe('FindBar', () => {
     // Control: the same Delete outside the bar does reach them.
     await key(document.body, 'Delete')
     expect(shortcuts.onDeletePage).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('FindBar keeps off the current match', () => {
+  const W = window.innerWidth
+  const BAR = { left: W - 20 - 400, right: W - 20, top: 64, bottom: 104, width: 400, height: 40 }
+  const box = (left: number, top: number, w = 30, h = 14) => ({
+    left,
+    right: left + w,
+    top,
+    bottom: top + h
+  })
+
+  it('decides from both spots, not from where the bar is now', () => {
+    expect(shouldDodge(BAR, [box(W - 100, 70)], W)).toBe(true)
+    expect(shouldDodge(BAR, [box(W - 100, 300)], W)).toBe(false) // below the bar
+    expect(shouldDodge(BAR, [box(30, 70), box(W - 100, 70)], W)).toBe(false) // under both spots
+    expect(shouldDodge(BAR, [], W)).toBe(false)
+  })
+
+  it('moves to the left while a current match is under it, and back once it is not', async () => {
+    let hlBox = box(W - 100, 70)
+    const spy = vi
+      .spyOn(HTMLElement.prototype, 'getBoundingClientRect')
+      .mockImplementation(function (this: HTMLElement) {
+        const r = this.classList.contains('findbar') ? BAR : hlBox
+        return {
+          ...r,
+          x: r.left,
+          y: r.top,
+          width: r.right - r.left,
+          height: r.bottom - r.top,
+          toJSON: () => r
+        } as DOMRect
+      })
+    const hl = document.createElement('div')
+    hl.className = 'find-hl current'
+    const bar = (): HTMLElement => container.querySelector('.findbar') as HTMLElement
+    const frame = (): Promise<void> => act(() => new Promise<void>((r) => setTimeout(r, 50)))
+    try {
+      document.body.appendChild(hl)
+      window.dispatchEvent(new Event(FIND_HIGHLIGHTS_EVENT))
+      await frame()
+      expect(bar().classList.contains('dodge')).toBe(true)
+      hlBox = box(400, 500) // scrolled / zoomed away from the bar
+      window.dispatchEvent(new Event('scroll'))
+      await frame()
+      expect(bar().classList.contains('dodge')).toBe(false)
+      hlBox = box(W - 100, 70)
+      window.dispatchEvent(new Event(FIND_HIGHLIGHTS_EVENT))
+      await frame()
+      expect(bar().classList.contains('dodge')).toBe(true)
+      hl.remove() // left the full view, or moved to another page
+      window.dispatchEvent(new Event(FIND_HIGHLIGHTS_EVENT))
+      await frame()
+      expect(bar().classList.contains('dodge')).toBe(false)
+    } finally {
+      hl.remove()
+      spy.mockRestore()
+    }
   })
 })

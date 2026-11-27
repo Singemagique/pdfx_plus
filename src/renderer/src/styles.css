@@ -1670,6 +1670,12 @@ body {
   font-size: 13px;
 }
 
+/* Moved to the left edge while the current match (full view) is under its usual spot. */
+.findbar.dodge {
+  right: auto;
+  left: 20px;
+}
+
 .findbar-icon {
   display: inline-flex;
   color: var(--ink-faint);

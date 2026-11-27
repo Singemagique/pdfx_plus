@@ -1,3 +1,4 @@
+import { useLayoutEffect } from 'react'
 import type { PageEntry } from '../../types'
 import { usePageHighlights } from '../../search/FindContext'
 
@@ -12,8 +13,17 @@ interface FindHighlightsProps {
  * box's rotate()/zoom transform just as the overlay layer does: rects only need the fit scale. It
  * stacks under the overlay layer, so a redaction box still covers whatever it hides.
  */
+/** Fired on window after the highlights are (re)drawn, so the find bar can step off the match. */
+export const FIND_HIGHLIGHTS_EVENT = 'pdfx:find-highlights'
+
 export function FindHighlights({ page, box }: FindHighlightsProps): React.JSX.Element | null {
   const highlights = usePageHighlights(page.id)
+  // Every render: a new zoom or pan moves the rects as surely as new results do.
+  useLayoutEffect(() => {
+    window.dispatchEvent(new Event(FIND_HIGHLIGHTS_EVENT))
+  })
+  // And once gone (another page, the open/close animation), so the bar can move back.
+  useLayoutEffect(() => () => void window.dispatchEvent(new Event(FIND_HIGHLIGHTS_EVENT)), [])
   if (highlights.length === 0) return null
   const s = box.w / page.width
   return (
