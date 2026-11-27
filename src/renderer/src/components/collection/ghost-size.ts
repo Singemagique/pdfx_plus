@@ -1,5 +1,5 @@
 import { BASE_PAGE_HEIGHT, pageDisplayWidth } from '../../canvas/layout'
-import type { CanvasLayout, DropTarget } from '../../canvas/layout'
+import type { CanvasLayout, DropTarget, DropView } from '../../canvas/layout'
 import type { GhostSize } from '../DropGhost'
 import type { PageRef } from '../../app/types'
 
@@ -71,4 +71,25 @@ export function deriveDropGhosts(
     ghostSize: intoGhostSize(layout, intoDocId, intoIndex, dragKind, draggedSize),
     betweenPages: betweenGhostPages(dragKind, draggedSize, externalCount)
   }
+}
+
+/**
+ * The drop preview on screen as the hit test needs it (see computeDropTarget): the drawn target,
+ * the into-ghost width it is drawn with, and the width it would take at any other index of the
+ * same document — sized exactly as deriveDropGhosts sizes it for CollectionCanvas.
+ */
+export function deriveDropView(
+  layout: CanvasLayout,
+  draggingPage: PageRef | null,
+  dropTarget: DropTarget | null,
+  dragKind: DragKind
+): DropView {
+  const draggedSize = draggingPage
+    ? slotGhostSize(layout, draggingPage.docId, draggingPage.pageId)
+    : null
+  const intoDocId = dropTarget?.kind === 'into' ? dropTarget.docId : null
+  const widthAt = (index: number): number =>
+    intoGhostSize(layout, intoDocId, index, dragKind, draggedSize).width
+  const ghostWidth = widthAt(dropTarget?.kind === 'into' ? dropTarget.index : -1)
+  return { target: dropTarget, ghostWidth, ghostWidthAt: widthAt }
 }

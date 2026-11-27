@@ -35,7 +35,12 @@ export function GhostPage({ x, y, width, height, grow }: GhostPageProps): React.
   )
 }
 
+/** Below this width the add-page cell (narrowed to fit a nearly full last row) shows only its +. */
+const ADD_LABEL_MIN_WIDTH = 96
+
 interface AddPageGhostProps extends GhostSize, CellPosition {
+  /** The round button on the card's right edge, for a last row with no room for a cell. */
+  edge?: boolean
   onClick: () => void
 }
 
@@ -44,12 +49,14 @@ export function AddPageGhost({
   y,
   width,
   height,
+  edge,
   onClick
 }: AddPageGhostProps): React.JSX.Element {
+  const shape = edge ? ' edge' : width < ADD_LABEL_MIN_WIDTH ? ' narrow' : ''
   return (
     <button
       type="button"
-      className="page add-ghost add-page"
+      className={'page add-ghost add-page' + shape}
       style={{ ...positioned({ x, y }), width, height }}
       title="Add page"
       onClick={(e) => {
@@ -57,8 +64,13 @@ export function AddPageGhost({
         onClick()
       }}
     >
-      <DashedBorder width={width} height={height} radius={9} dash="5 7" />
-      <PlusIcon size={24} />
+      <DashedBorder
+        width={width}
+        height={height}
+        radius={edge ? Math.min(width, height) / 2 : 9}
+        dash={edge ? '4 4' : '5 7'}
+      />
+      <PlusIcon size={edge ? 16 : 24} />
       <span className="add-label">Add page</span>
     </button>
   )
