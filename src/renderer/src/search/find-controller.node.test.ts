@@ -67,17 +67,29 @@ let navigations: FindMatch[]
 let anchor: string | null
 let x: ReturnType<typeof makeExtract>
 
-function setup(docs: DocEntry[], opts: { maxMatches?: number } = {}): void {
+function setup(
+  docs: DocEntry[],
+  opts: { perPageLimit?: number; anchor?: string | null } = {}
+): void {
   navigations = []
-  anchor = null
+  anchor = opts.anchor ?? null
   x = makeExtract()
   ctl = createFindController({
-    createEngine: (onChange) => createFindEngine({ onChange, extract: x.extract as never }),
+    createEngine: (onChange) =>
+      createFindEngine({ onChange, extract: x.extract as never, perPageLimit: opts.perPageLimit }),
     onNavigate: (m) => navigations.push(m),
-    getAnchorPageId: () => anchor,
-    ...opts
+    getAnchorPageId: () => anchor
   })
   ctl.setDocs(docs)
+}
+
+/** Release held extractions two pages (the engine's concurrency) at a time until none are left. */
+const releaseInPairs = async (): Promise<void> => {
+  for (let guard = 0; guard < 1000; guard++) {
+    if (!ctl.getBarState().indexing) return
+    x.release()
+    await settle()
+  }
 }
 
 const settle = async (): Promise<void> => {
@@ -274,12 +286,127 @@ describe('find controller', () => {
     expect(ctl.getBarState().focusNonce).toBe(n + 1)
   })
 
-  it('caps the match list', async () => {
-    setup([docOf('a', ['a a a a a', 'a a'])], { maxMatches: 3 })
+  it('reports a page that hit the per-page match limit as capped', async () => {
+    setup([docOf('a', ['a a a a a', 'a a'])], { perPageLimit: 3 })
     ctl.open()
     await settle()
     await search('a')
-    expect(ctl.getBarState()).toMatchObject({ total: 3, capped: true, pagesMatched: 2 })
+    expect(ctl.getBarState()).toMatchObject({ total: 5, capped: true, pagesMatched: 2 })
+  })
+
+  it('is not capped with exactly the per-page limit of matches', async () => {
+    setup([docOf('a', ['a a a', 'a a'])], { perPageLimit: 3 })
+    ctl.open()
+    await settle()
+    await search('a')
+    expect(ctl.getBarState()).toMatchObject({ total: 5, capped: false })
+  })
+
+  it('reaches every match of a common word in a large collection, from the anchor', async () => {
+    const line = Array.from({ length: 12 }, () => 'invoice').join(' ')
+    setup(
+      [
+        docOf(
+          'd',
+          Array.from({ length: 500 }, () => line)
+        )
+      ],
+      { anchor: 'd-p450' }
+    )
+    ctl.open()
+    await settle()
+    await search('invoice')
+    expect(ctl.getBarState()).toMatchObject({ total: 6000, capped: false, pagesMatched: 500 })
+    // The first pick is on the anchor page, not page 1.
+    expect(navigations.map((m) => m.pageId)).toEqual(['d-p450'])
+    expect(ctl.getBarState().currentIndex).toBe(450 * 12)
+    expect(ctl.getPageStatus('d-p450')).toBe('current')
+    // Every page is reachable: stepping walks into the last pages and wraps to the first.
+    const seen = new Set<string>()
+    for (let i = 0; i < 6000; i++) {
+      ctl.next()
+      seen.add(current()!)
+    }
+    expect(seen.size).toBe(500)
+    expect(current()).toBe('d-p450')
+    ctl.prev()
+    expect(ctl.getCurrentMatch()).toMatchObject({ pageId: 'd-p449' })
+    expect(ctl.getPageHighlights('d-p499')).toHaveLength(12)
+  })
+
+  describe('a new query while indexing', () => {
+    const docs = (): DocEntry[] => [
+      docOf('a', ['apple', 'x', 'x', 'x', 'x', 'x', 'x', 'apple here'])
+    ]
+
+    it('waits for the anchor page instead of jumping to the first indexed match', async () => {
+      setup(docs())
+      x.hold(true)
+      ctl.open() // indexing starts in collection order: nothing is selected yet
+      anchor = 'a-p6'
+      await search('apple')
+      await releaseInPairs()
+      expect(navigations.map((m) => m.pageId)).toEqual(['a-p7'])
+      expect(ctl.getBarState()).toMatchObject({ total: 2, currentIndex: 1, indexing: false })
+    })
+
+    it('indexes from the anchor page first when the bar opens', async () => {
+      setup(docs(), { anchor: 'a-p6' })
+      x.hold(true)
+      ctl.open()
+      x.release()
+      await settle()
+      // The first two extractions were the anchor page and the one after it.
+      expect(x.extract.mock.calls.map(([, i]) => i)).toEqual(expect.arrayContaining([6, 7]))
+      expect(x.extract.mock.calls.slice(0, 2).map(([, i]) => i)).toEqual([6, 7])
+      await search('apple')
+      expect(navigations.map((m) => m.pageId)).toEqual(['a-p7'])
+      expect(ctl.getBarState().indexing).toBe(true)
+    })
+
+    it('wraps to the first match once everything from the anchor on is indexed', async () => {
+      setup([docOf('a', ['pear', 'x', 'x', 'x', 'x', 'x'])])
+      x.hold(true)
+      ctl.open()
+      anchor = 'a-p3'
+      await search('pear')
+      expect(navigations).toHaveLength(0)
+      await releaseInPairs()
+      expect(navigations.map((m) => m.pageId)).toEqual(['a-p0'])
+    })
+
+    it('lands on the anchor page in a 400-page collection searched straight after opening', async () => {
+      setup(
+        [
+          docOf(
+            'n',
+            Array.from({ length: 400 }, (_, i) => `needle ${i}`)
+          )
+        ],
+        {
+          anchor: 'n-p350'
+        }
+      )
+      x.hold(true)
+      ctl.open()
+      ctl.setQuery('needle')
+      await releaseInPairs()
+      expect(navigations.map((m) => m.pageId)).toEqual(['n-p350'])
+      expect(ctl.getBarState()).toMatchObject({ total: 400, currentIndex: 350 })
+    })
+
+    it('steps from the anchor when Enter is pressed before the first pick', async () => {
+      setup(docs())
+      x.hold(true)
+      ctl.open()
+      x.release() // pages 0 and 1: 'apple' on page 0 only
+      await settle()
+      anchor = 'a-p6'
+      await search('apple')
+      expect(ctl.getBarState()).toMatchObject({ total: 1, currentIndex: -1 })
+      ctl.next() // nothing known at/after the anchor yet: wraps to the known match
+      expect(navigations.map((m) => m.pageId)).toEqual(['a-p0'])
+    })
   })
 
   it('keeps snapshot identities stable while nothing changes', async () => {

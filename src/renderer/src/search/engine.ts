@@ -15,6 +15,8 @@ export interface PageMatches {
   /** [start, end) pairs into the page's normalized text. */
   text: Int32Array
   overlays: { overlayId: string; start: number; end: number }[]
+  /** More matches exist on the page than were kept (the per-page limit was hit). */
+  capped: boolean
 }
 
 export interface OverlayText {
@@ -25,8 +27,16 @@ export interface OverlayText {
 }
 
 export interface FindEngine {
-  /** Start indexing (idempotent). Before this, nothing is ever extracted. */
-  activate(): void
+  /**
+   * Start indexing (idempotent). Before this, nothing is ever extracted. `first` (a page key) is
+   * indexed first, then the pages after it, then the rest (see prioritize).
+   */
+  activate(first?: string): void
+  /**
+   * Reorder the pending queue to run from page key `key` onwards, in collection order, wrapping
+   * to the start: the pages a search starting at `key` reaches first are indexed first.
+   */
+  prioritize(key: string): void
   /** Track the live pages: drop removed ones, queue new ones (once active). */
   reconcile(docs: readonly DocEntry[]): void
   /** Track the searchable overlay texts (a no-op for the same array). */
@@ -68,9 +78,15 @@ export function createFindEngine({
   let active = false
   /** Live page keys → where to extract them from, in collection order. */
   let live = new Map<string, { pdf: PdfSource['pdf']; pageIndex: number }>()
+  /** Live page key → its position in collection order (first occurrence). */
+  let liveOrder = new Map<string, number>()
   const texts = new Map<string, PageText>()
-  /** Extraction dedupe across page keys that share a proxy (duplicated pages). */
-  const byProxy = new WeakMap<object, Map<number, PageText | Promise<PageText>>>()
+  /**
+   * Extraction dedupe across page keys that share a proxy (duplicated pages). Released in
+   * reconcile once no live page uses the proxy, so a removed document's text is not kept alive by
+   * a proxy that undo history (or anything else) still references.
+   */
+  const byProxy = new Map<object, Map<number, PageText | Promise<PageText>>>()
   const queue: string[] = []
   const queued = new Set<string>()
   /** Keys with an extraction (or a wait on a shared one) still outstanding → how many. */
@@ -165,15 +181,33 @@ export function createFindEngine({
     if (changed) onChange()
   }
 
+  function prioritize(key: string): void {
+    const at = liveOrder.get(key)
+    if (at === undefined || queue.length < 2) return
+    const pos = (k: string): number => liveOrder.get(k) ?? Number.MAX_SAFE_INTEGER
+    queue.sort((a, b) => pos(a) - pos(b))
+    const i = queue.findIndex((k) => pos(k) >= at)
+    if (i > 0) queue.push(...queue.splice(0, i))
+  }
+
   function reconcile(docs: readonly DocEntry[]): void {
     const next = new Map<string, { pdf: PdfSource['pdf']; pageIndex: number }>()
+    const order = new Map<string, number>()
+    const proxies = new Set<object>()
     for (const d of docs) {
       for (const p of d.pages) {
         const key = makePageKey(p.source.id, p.pageIndex)
-        if (!next.has(key)) next.set(key, { pdf: p.source.pdf, pageIndex: p.pageIndex })
+        if (next.has(key)) continue
+        order.set(key, order.size)
+        next.set(key, { pdf: p.source.pdf, pageIndex: p.pageIndex })
+        if (p.source.pdf && typeof p.source.pdf === 'object') proxies.add(p.source.pdf)
       }
     }
     live = next
+    liveOrder = order
+    // An in-flight extraction of a released proxy still settles its own keys (store() drops them
+    // if they are no longer live); only the shared slot goes.
+    for (const proxy of [...byProxy.keys()]) if (!proxies.has(proxy)) byProxy.delete(proxy)
     let dropped = false
     for (const key of [...texts.keys()]) {
       if (!live.has(key)) {
@@ -238,15 +272,28 @@ export function createFindEngine({
 
   function computeKey(key: string, re: RegExp): PageMatches | null {
     const pt = texts.get(key)
-    const text = pt && pt.norm ? match(pt.norm, re, perPageLimit) : EMPTY_PAIRS
+    // One past the limit, so hitting it can be told apart from having exactly that many.
+    let text = pt && pt.norm ? match(pt.norm, re, perPageLimit + 1) : EMPTY_PAIRS
+    let capped = false
+    if (text.length / 2 > perPageLimit) {
+      text = text.slice(0, 2 * perPageLimit)
+      capped = true
+    }
     const overlays: PageMatches['overlays'] = []
     for (const ov of overlayTexts.get(key) ?? []) {
-      const pairs = match(ov.norm, re, perPageLimit)
-      for (let i = 0; i < pairs.length; i += 2) {
-        overlays.push({ overlayId: ov.overlayId, start: pairs[i], end: pairs[i + 1] })
+      const room = perPageLimit - text.length / 2 - overlays.length
+      if (room <= 0) {
+        capped = true
+        break
+      }
+      const pairs = match(ov.norm, re, room + 1)
+      const n = Math.min(room, pairs.length / 2)
+      if (pairs.length / 2 > room) capped = true
+      for (let i = 0; i < n; i++) {
+        overlays.push({ overlayId: ov.overlayId, start: pairs[2 * i], end: pairs[2 * i + 1] })
       }
     }
-    return text.length > 0 || overlays.length > 0 ? { text, overlays } : null
+    return text.length > 0 || overlays.length > 0 ? { text, overlays, capped } : null
   }
 
   function search(norm: string, re: RegExp): ReadonlyMap<string, PageMatches | null> {
@@ -259,12 +306,14 @@ export function createFindEngine({
   }
 
   return {
-    activate() {
+    activate(first) {
       if (active) return
       active = true
       for (const key of live.keys()) enqueue(key)
+      if (first) prioritize(first)
       pump()
     },
+    prioritize,
     reconcile,
     setOverlays,
     search,

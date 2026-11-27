@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { buildPageText, type PageTextItem } from './extract'
-import { mergeLineRects, overlayRect, textMatchRects, type PageRect } from './geometry'
+import { charWeight, mergeLineRects, overlayRect, textMatchRects, type PageRect } from './geometry'
 
 /** pdf.js's viewport transform for an unrotated US Letter page at scale 1. */
 const UPRIGHT = [1, 0, 0, -1, 0, 792]
@@ -10,6 +10,10 @@ const UPRIGHT = [1, 0, 0, -1, 0, 792]
  */
 const ROTATE_90 = [0, 1, 1, 0, 0, 0]
 
+/**
+ * A text item. Monospaced by default, so the transform tests below can use an exact even split;
+ * the weighted split for proportional fonts has its own tests.
+ */
 function item(
   str: string,
   t: number[],
@@ -25,6 +29,7 @@ function item(
     descent: -0.2,
     vertical: false,
     rtl: false,
+    mono: true,
     hasEOL: false,
     ...extra
   }
@@ -110,6 +115,74 @@ describe('textMatchRects', () => {
     // First line: "exam" (the joined hyphen's glyph is not part of the match), second: "ple".
     close(rects[0], { x: 50 + 15, y: 792 - 500 - 8, w: 20, h: 10 })
     close(rects[1], { x: 50, y: 792 - 486 - 8, w: 15, h: 10 })
+  })
+
+  describe('proportional fonts', () => {
+    // Helvetica advances (1/1000 em) for the characters used below, from the standard-14 metrics.
+    const HELV: Record<string, number> = {
+      ' ': 278,
+      a: 556,
+      c: 500,
+      e: 556,
+      f: 278,
+      g: 556,
+      i: 222,
+      l: 222,
+      n: 556,
+      o: 556,
+      r: 333,
+      t: 278,
+      u: 556,
+      A: 667,
+      E: 667,
+      I: 278,
+      N: 722,
+      V: 667
+    }
+    const advance = (s: string, size: number): number =>
+      (Array.from(s.normalize('NFD').replace(/\p{M}/gu, '')).reduce((w, ch) => w + HELV[ch], 0) *
+        size) /
+      1000
+    /** A Helvetica line at 12 pt, as pdf.js reports it: one item, one advance for the whole run. */
+    const line = (s: string): PageTextItem =>
+      item(s, [12, 0, 0, 12, 100, 700], advance(s, 12), { mono: false })
+
+    it('places a word inside a one-item line at its glyphs, not an even split', () => {
+      const s = 'NAIVE garcon'
+      const pt = buildPageText([line(s)], UPRIGHT)
+      const [a, b] = range(pt.norm, 'garcon')
+      const [rect] = textMatchRects(pt, a, b)
+      // The capitals are wide: an even split would start "garcon" ~7 px early.
+      expect(rect.x).toBeCloseTo(100 + advance('NAIVE ', 12), 3)
+      expect(rect.w).toBeCloseTo(advance('garcon', 12), 3)
+    })
+
+    it('weights an accented letter as its base letter', () => {
+      const s = 'le café au lait'
+      const pt = buildPageText([line(s)], UPRIGHT)
+      const [a, b] = range(pt.norm, 'cafe')
+      const [rect] = textMatchRects(pt, a, b)
+      expect(rect.x).toBeCloseTo(100 + advance('le ', 12), 3)
+      expect(rect.w).toBeCloseTo(advance('café', 12), 3)
+      // A single letter lands on its own glyph.
+      const i = pt.norm.indexOf('a', a)
+      const [one] = textMatchRects(pt, i, i + 1)
+      expect(one.x).toBeCloseTo(100 + advance('le c', 12), 3)
+      expect(one.w).toBeCloseTo(advance('a', 12), 3)
+    })
+
+    it('splits a monospaced item evenly', () => {
+      const pt = buildPageText([item('mmii', [10, 0, 0, 10, 0, 100], 24, { mono: true })], UPRIGHT)
+      const [rect] = textMatchRects(pt, 2, 4)
+      close(rect, { x: 12, y: 792 - 100 - 8, w: 12, h: 10 })
+    })
+
+    it('gives marks and low surrogates no width of their own', () => {
+      expect(charWeight('e\u0301', 1)).toBe(0)
+      expect(charWeight('\u{1d400}', 1)).toBe(0)
+      expect(charWeight('é', 0)).toBe(charWeight('e', 0))
+      expect(charWeight('漢', 0)).toBe(1000)
+    })
   })
 
   it('is empty for an empty page text', () => {

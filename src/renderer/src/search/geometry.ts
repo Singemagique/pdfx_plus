@@ -4,6 +4,7 @@
 
 import type { Geom } from '../edit/model'
 import type { PageText, TextItemGeom } from './extract'
+import { clusterEnd } from './normalize'
 
 export interface PageRect {
   x: number
@@ -24,6 +25,57 @@ function itemAt(starts: Int32Array, g: number): number {
   return lo
 }
 
+/**
+ * Helvetica advance widths (1/1000 em) for U+0020–U+007E, from the standard-14 font metrics. pdf.js
+ * reports one advance per text item, not per glyph, so a slice of an item is placed by weighting its
+ * characters with these: most body text is set in a proportional sans or serif whose widths track
+ * Helvetica's far better than an even split does (a space or an "i" is a quarter of an "m").
+ */
+const HELVETICA = [
+  278, 278, 355, 556, 556, 889, 667, 191, 333, 333, 389, 584, 278, 333, 278, 278, 556, 556, 556,
+  556, 556, 556, 556, 556, 556, 556, 278, 278, 584, 584, 584, 556, 1015, 667, 667, 722, 722, 667,
+  611, 778, 722, 278, 500, 667, 556, 833, 722, 778, 667, 778, 722, 667, 611, 722, 667, 944, 667,
+  667, 611, 278, 278, 278, 469, 556, 333, 556, 556, 500, 556, 556, 278, 556, 556, 222, 222, 500,
+  222, 833, 556, 556, 556, 556, 333, 500, 278, 556, 500, 722, 500, 500, 500, 334, 260, 334, 584
+]
+const WIDE = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}\uff01-\uff60]/u
+
+/** The estimated advance of one UTF-16 unit of an item's str (combining marks and low surrogates: 0). */
+export function charWeight(str: string, i: number): number {
+  const c = str.charCodeAt(i)
+  if (c >= 0x20 && c <= 0x7e) return HELVETICA[c - 0x20]
+  if (c < 0x20) return 0
+  if (c >= 0xdc00 && c <= 0xdfff) return 0
+  const cp = str.codePointAt(i)!
+  const ch = String.fromCodePoint(cp)
+  if (/\p{M}/u.test(ch)) return 0
+  if (WIDE.test(ch)) return 1000
+  // An accented Latin letter is as wide as its base letter ("é" as "e").
+  const base = ch.normalize('NFD').charCodeAt(0)
+  if (base >= 0x20 && base <= 0x7e) return HELVETICA[base - 0x20]
+  return 556
+}
+
+/**
+ * The fraction of the item's advance taken by its first `lo` and first `hi` UTF-16 units. An
+ * even split for a monospaced font (exact there); otherwise the Helvetica-weighted estimate.
+ */
+function sliceFractions(it: TextItemGeom, lo: number, hi: number): [number, number] {
+  const len = Math.max(1, it.str.length)
+  if (it.mono) return [lo / len, hi / len]
+  let total = 0
+  let a = 0
+  let b = 0
+  for (let i = 0; i < it.str.length; i++) {
+    if (i === lo) a = total
+    if (i === hi) b = total
+    total += charWeight(it.str, i)
+  }
+  if (lo >= it.str.length) a = total
+  if (hi >= it.str.length) b = total
+  return total > 0 ? [a / total, b / total] : [lo / len, hi / len]
+}
+
 /** A raw [lo, hi) slice of one item → its axis-aligned box in page px. */
 function itemSliceRect(it: TextItemGeom, lo: number, hi: number, vt: readonly number[]): PageRect {
   const [a, b, c, d, e, f] = it.t
@@ -36,9 +88,10 @@ function itemSliceRect(it: TextItemGeom, lo: number, hi: number, vt: readonly nu
     const y1 = f - (it.height * hi) / len
     corners.push([e, y0], [e + fh, y0], [e, y1], [e + fh, y1])
   } else {
-    // Proportional split of the run's advance: an approximation of per-glyph positions.
-    const x0 = it.rtl ? it.width * (1 - hi / len) : (it.width * lo) / len
-    const x1 = it.rtl ? it.width * (1 - lo / len) : (it.width * hi) / len
+    // A weighted split of the run's advance: an estimate of per-glyph positions.
+    const [fa, fb] = sliceFractions(it, lo, hi)
+    const x0 = it.rtl ? it.width * (1 - fb) : it.width * fa
+    const x1 = it.rtl ? it.width * (1 - fa) : it.width * fb
     const angle = Math.atan2(b, a)
     const ax = Math.cos(angle)
     const ay = Math.sin(angle)
@@ -103,7 +156,7 @@ export function textMatchRects(pt: PageText, ns: number, ne: number): PageRect[]
     const k = itemAt(pt.itemStarts, s)
     const base = pt.itemStarts[k]
     const lo = s - base
-    const hi = pt.srcEnd[i] - base
+    const hi = clusterEnd(pt.items[k]?.str ?? '', lo)
     const span = spans.get(k)
     if (span) {
       span.lo = Math.min(span.lo, lo)

@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest'
-import { compileQuery, findAll, normalizeQuery, normalizeSegments, type Segment } from './normalize'
+import {
+  clusterEnd,
+  compileQuery,
+  findAll,
+  normalizeQuery,
+  normalizeSegments,
+  type Segment
+} from './normalize'
 
 const norm = (...segs: Array<string | Segment>): string =>
   normalizeSegments(segs.map((s) => (typeof s === 'string' ? { str: s, hasEOL: false } : s))).text
@@ -174,5 +181,22 @@ describe('compileQuery / findAll', () => {
   it('respects its limit', () => {
     const re = compileQuery('a')!
     expect(findAll('aaaaaa', re, 3).length).toBe(6)
+  })
+})
+
+describe('clusterEnd', () => {
+  it("recomputes every unit's raw end from its start (PageText keeps only the starts)", () => {
+    const segs = [
+      { str: 'Cafe\u0301 ﬁn 𝐀b', hasEOL: true },
+      { str: 'ex\u00ADam-', hasEOL: true },
+      { str: 'ple  naïve', hasEOL: false }
+    ]
+    const n = normalizeSegments(segs)
+    const raw = segs.map((x) => x.str).join('')
+    for (let i = 0; i < n.text.length; i++) {
+      const s = n.srcStart[i]
+      if (s < 0) continue
+      expect(clusterEnd(raw, s), `unit ${i}`).toBe(n.srcEnd[i])
+    }
   })
 })

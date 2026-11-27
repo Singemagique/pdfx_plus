@@ -21,6 +21,8 @@ export interface TextItemGeom {
   descent: number
   vertical: boolean
   rtl: boolean
+  /** The font is monospaced (style.fontFamily), so glyphs split the advance evenly. */
+  mono?: boolean
 }
 
 export interface PageText {
@@ -33,9 +35,12 @@ export interface PageText {
   vt: number[]
   /** Normalized searchable text. */
   norm: string
-  /** Per unit of `norm`: global raw offset into the items' str concatenated (-1: synthetic). */
+  /**
+   * Per unit of `norm`: global raw offset into the items' str concatenated (-1: synthetic). The
+   * raw end is not stored (it is the end of the cluster starting there, see clusterEnd): the index
+   * stays live for every page, so each byte per character counts.
+   */
   srcStart: Int32Array
-  srcEnd: Int32Array
   /** Raw offset each item's str starts at. */
   itemStarts: Int32Array
 }
@@ -45,7 +50,6 @@ export const EMPTY_PAGE_TEXT: PageText = Object.freeze({
   vt: [1, 0, 0, 1, 0, 0],
   norm: '',
   srcStart: new Int32Array(0),
-  srcEnd: new Int32Array(0),
   itemStarts: new Int32Array(0)
 }) as PageText
 
@@ -64,6 +68,7 @@ export interface RawTextStyle {
   ascent?: number
   descent?: number
   vertical?: boolean
+  fontFamily?: string
 }
 
 /** An input item for buildPageText: pdf.js geometry plus whether a line break follows it. */
@@ -81,6 +86,7 @@ export function toItemGeom(item: RawTextItem, style: RawTextStyle | undefined): 
     descent: style?.descent && style.descent < 0 ? style.descent : -0.2,
     vertical: !!style?.vertical,
     rtl: item.dir === 'rtl',
+    mono: style?.fontFamily === 'monospace',
     hasEOL: !!item.hasEOL
   }
 }
@@ -121,7 +127,6 @@ export function buildPageText(items: readonly PageTextItem[], vt: readonly numbe
     vt: [...vt],
     norm: n.text,
     srcStart: n.srcStart,
-    srcEnd: n.srcEnd,
     itemStarts: n.itemStarts
   }
 }

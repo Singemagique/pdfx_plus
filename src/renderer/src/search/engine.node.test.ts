@@ -291,6 +291,61 @@ describe('find engine', () => {
     })
   })
 
+  it('flags a page that has more matches than the per-page limit', async () => {
+    const x = deferredExtract()
+    const engine = createFindEngine({
+      onChange: () => {},
+      extract: x.extract as never,
+      perPageLimit: 4
+    })
+    engine.reconcile([docOf('a', source('s1', fakePdf('a a a a a a', 'a a a a')), [0, 1])])
+    engine.activate()
+    await resolveAll(x.calls)
+    const hits = engine.search(...query('a'))
+    expect(hits.get('s1#0')).toMatchObject({ capped: true })
+    expect(hits.get('s1#0')!.text.length).toBe(8)
+    expect(hits.get('s1#1')).toMatchObject({ capped: false })
+    expect(hits.get('s1#1')!.text.length).toBe(8)
+  })
+
+  it('indexes from a prioritized page onwards, then wraps to the start', async () => {
+    const x = deferredExtract()
+    const engine = createFindEngine({ onChange: () => {}, extract: x.extract as never })
+    const pdf = fakePdf(...Array.from({ length: 8 }, (_, i) => `p${i}`))
+    engine.reconcile([docOf('a', source('s1', pdf), [...Array(8).keys()])])
+    engine.activate('s1#5')
+    const order = (): number[] => x.extract.mock.calls.map(([, i]) => i as number)
+    expect(order()).toEqual([5, 6])
+    await resolveAll(x.calls)
+    expect(order()).toEqual([5, 6, 7, 0, 1, 2, 3, 4])
+  })
+
+  it('re-prioritizes the pending queue in collection order', async () => {
+    const x = deferredExtract()
+    const engine = createFindEngine({ onChange: () => {}, extract: x.extract as never })
+    const pdf = fakePdf(...Array.from({ length: 8 }, (_, i) => `p${i}`))
+    engine.reconcile([docOf('a', source('s1', pdf), [...Array(8).keys()])])
+    engine.activate('s1#6') // runs 6, 7; queue 0…5
+    engine.prioritize('s1#3') // an anchor whose own page is still queued
+    await resolveAll(x.calls)
+    expect(x.extract.mock.calls.map(([, i]) => i)).toEqual([6, 7, 3, 4, 5, 0, 1, 2])
+  })
+
+  it('releases the shared extraction of a proxy no live page uses', async () => {
+    const x = deferredExtract()
+    const engine = createFindEngine({ onChange: () => {}, extract: x.extract as never })
+    const pdf = fakePdf('once')
+    engine.reconcile([docOf('a', source('s1', pdf), [0])])
+    engine.activate()
+    await resolveAll(x.calls)
+    engine.reconcile([]) // removed: its text must not stay reachable through the proxy
+    // The same proxy back under a new source id (undo re-adding it) is extracted again.
+    engine.reconcile([docOf('a', source('s2', pdf), [0])])
+    await resolveAll(x.calls)
+    expect(x.extract).toHaveBeenCalledTimes(2)
+    expect(engine.getPageText('s2#0')?.norm).toBe('once')
+  })
+
   it('only searches newly indexed pages for the same query', async () => {
     const calls: string[] = []
     const counting: typeof findAll = (t, re, limit) => {

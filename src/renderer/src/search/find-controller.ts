@@ -6,7 +6,7 @@
 import type { Overlay } from '../edit/model'
 import { makePageKey } from '../edit/model'
 import type { DocEntry, PageEntry } from '../types'
-import { createFindEngine, type FindEngine } from './engine'
+import { createFindEngine, type FindEngine, type PageMatches } from './engine'
 import { overlayRect, textMatchRects, type PageRect } from './geometry'
 import { compileQuery, normalizeQuery } from './normalize'
 
@@ -34,7 +34,7 @@ export interface FindBarState {
   /** Bumped whenever the bar should (re)focus and select its input. */
   focusNonce: number
   total: number
-  /** More matches exist than were listed. */
+  /** More matches exist than were listed (a page hit the engine's per-page limit). */
   capped: boolean
   /** Index of the current match, -1 for none. */
   currentIndex: number
@@ -75,27 +75,39 @@ export interface FindControllerOptions {
   getAnchorPageId: () => string | null
   debounceMs?: number
   throttleMs?: number
-  maxMatches?: number
 }
 
 interface PageInfo {
   docId: string
   page: PageEntry
+  pageKey: string
   order: number
 }
 
-const EMPTY_HIGHLIGHTS: readonly PageHighlight[] = Object.freeze([])
+/**
+ * One matching page. Matches are never materialized as a flat list: match `i` of the collection is
+ * found by binary search over the pages' `offset`s, so a common word over thousands of pages costs
+ * one entry per page, and every match stays reachable.
+ */
+interface PageHits {
+  info: PageInfo
+  /** [start, end) pairs into the page's normalized text. */
+  text: Int32Array
+  /** Overlay hits, top of the page first. */
+  overlays: PageMatches['overlays']
+  count: number
+  /** The collection-wide index of this page's first match. */
+  offset: number
+}
 
-const sameMatch = (a: FindMatch, b: FindMatch): boolean =>
-  a.pageId === b.pageId && a.kind === b.kind && a.start === b.start && a.overlayId === b.overlayId
+const EMPTY_HIGHLIGHTS: readonly PageHighlight[] = Object.freeze([])
 
 export function createFindController({
   createEngine = (onChange) => createFindEngine({ onChange }),
   onNavigate,
   getAnchorPageId,
   debounceMs = 150,
-  throttleMs = 120,
-  maxMatches = 5000
+  throttleMs = 120
 }: FindControllerOptions): FindController {
   const listeners = new Set<() => void>()
   let isOpen = false
@@ -105,9 +117,12 @@ export function createFindController({
   let re: RegExp | null = null
   let docs: readonly DocEntry[] = []
   let pages = new Map<string, PageInfo>()
-  let ordered: FindMatch[] = []
-  let byPage = new Map<string, number[]>()
+  let hits: PageHits[] = []
+  /** pageId → index into `hits`. */
+  let hitIndex = new Map<string, number>()
+  let total = 0
   let current = -1
+  let currentMatch: FindMatch | null = null
   let capped = false
   let version = 0
   let focusNonce = 0
@@ -120,18 +135,18 @@ export function createFindController({
   let barState: FindBarState = buildBar()
 
   function buildBar(): FindBarState {
-    const { indexed, total } = engine.progress()
+    const { indexed, total: indexTotal } = engine.progress()
     return {
       open: isOpen,
       query,
       focusNonce,
-      total: ordered.length,
+      total,
       capped,
       currentIndex: current,
-      pagesMatched: byPage.size,
-      indexing: activated && indexed < total,
+      pagesMatched: hits.length,
+      indexing: activated && indexed < indexTotal,
       indexed,
-      indexTotal: total
+      indexTotal
     }
   }
 
@@ -176,16 +191,109 @@ export function createFindController({
     }, throttleMs)
   }
 
-  function navigate(): void {
-    const m = ordered[current]
-    if (m) onNavigate(m)
+  /** The index into `hits` of the page holding match `i` (0 <= i < total). */
+  function hitAt(i: number): number {
+    let lo = 0
+    let hi = hits.length - 1
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1
+      if (hits[mid].offset <= i) lo = mid
+      else hi = mid - 1
+    }
+    return lo
+  }
+
+  function matchAt(i: number): FindMatch | null {
+    if (i < 0 || i >= total) return null
+    const h = hits[hitAt(i)]
+    const { info } = h
+    const base = {
+      docId: info.docId,
+      pageId: info.page.id,
+      pageKey: info.pageKey,
+      order: info.order
+    }
+    const j = i - h.offset
+    const nText = h.text.length / 2
+    if (j < nText) return { ...base, kind: 'text', start: h.text[2 * j], end: h.text[2 * j + 1] }
+    const o = h.overlays[j - nText]
+    return { ...base, kind: 'overlay', start: o.start, end: o.end, overlayId: o.overlayId }
+  }
+
+  function setCurrent(i: number): void {
+    current = i
+    currentMatch = matchAt(i)
+  }
+
+  /** The index of a match equal to `m` (same page, kind, start and overlay) in the new hits, or -1. */
+  function indexOfMatch(m: FindMatch): number {
+    const hi = hitIndex.get(m.pageId)
+    if (hi === undefined) return -1
+    const h = hits[hi]
+    if (m.kind === 'text') {
+      for (let j = 0; j < h.text.length; j += 2) if (h.text[j] === m.start) return h.offset + j / 2
+      return -1
+    }
+    const k = h.overlays.findIndex((o) => o.overlayId === m.overlayId && o.start === m.start)
+    return k >= 0 ? h.offset + h.text.length / 2 + k : -1
+  }
+
+  /** The index into `hits` of the first matching page at or after position `order`. */
+  function hitFrom(order: number): number {
+    let lo = 0
+    let hi = hits.length
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1
+      if (hits[mid].info.order < order) lo = mid + 1
+      else hi = mid
+    }
+    return lo
   }
 
   /** The first match at or after page position `order`, else the first match (-1 if none). */
   function firstFrom(order: number): number {
-    if (ordered.length === 0) return -1
-    const i = ordered.findIndex((m) => m.order >= order)
-    return i >= 0 ? i : 0
+    if (total === 0) return -1
+    const k = hitFrom(order)
+    return k < hits.length ? hits[k].offset : 0
+  }
+
+  /** The last match before page position `order`, else the last match (-1 if none). */
+  function lastBefore(order: number): number {
+    if (total === 0) return -1
+    const k = hitFrom(order) - 1
+    return k >= 0 ? hits[k].offset + hits[k].count - 1 : total - 1
+  }
+
+  function anchorOrder(): number {
+    const anchor = getAnchorPageId()
+    return anchor ? (pages.get(anchor)?.order ?? 0) : 0
+  }
+
+  /**
+   * Where a new search starts: the first match reading on from the anchor page, wrapping to the
+   * start. While indexing, a page on the way there may not be indexed yet and could hold a nearer
+   * match, so this returns -1 (wait) until every page from the anchor up to the pick is indexed —
+   * a search must not jump to page 1 just because the anchor's own page had not been read yet.
+   */
+  function freshPick(): number {
+    if (total === 0) return -1
+    const { indexed, total: all } = engine.progress()
+    const from = anchorOrder()
+    if (indexed >= all) return firstFrom(from)
+    const list = [...pages.values()]
+    const n = list.length
+    const start = Math.min(Math.max(0, from), Math.max(0, n - 1))
+    for (let step = 0; step < n; step++) {
+      const info = list[(start + step) % n]
+      if (!engine.getPageText(info.pageKey)) return -1
+      const k = hitIndex.get(info.page.id)
+      if (k !== undefined) return hits[k].offset
+    }
+    return -1
+  }
+
+  function navigate(): void {
+    if (currentMatch) onNavigate(currentMatch)
   }
 
   /**
@@ -195,56 +303,54 @@ export function createFindController({
    */
   function recompute(fresh: boolean): void {
     if (!isOpen) return
-    const prev = fresh ? null : (ordered[current] ?? null)
+    if (fresh) {
+      // Index onwards from where this search starts, so its first pick is known soonest.
+      const anchor = getAnchorPageId()
+      const info = anchor ? pages.get(anchor) : undefined
+      if (info) engine.prioritize(info.pageKey)
+    }
+    const prev = fresh ? null : currentMatch
     const results = query && re ? engine.search(query, re) : null
-    const nextOrdered: FindMatch[] = []
-    const nextByPage = new Map<string, number[]>()
+    const nextHits: PageHits[] = []
+    const nextIndex = new Map<string, number>()
+    let nextTotal = 0
     let nextCapped = false
     if (results) {
+      const top = (id: string): number => {
+        const g = engine.getOverlay(id)?.geom
+        return g ? g.y + g.h : 0
+      }
       for (const info of pages.values()) {
-        const pageKey = makePageKey(info.page.source.id, info.page.pageIndex)
-        const pm = results.get(pageKey)
+        const pm = results.get(info.pageKey)
         if (!pm) continue
-        const indices: number[] = []
-        nextByPage.set(info.page.id, indices)
-        const base = { docId: info.docId, pageId: info.page.id, pageKey, order: info.order }
-        const push = (m: FindMatch): void => {
-          if (nextOrdered.length >= maxMatches) {
-            nextCapped = true
-            return
-          }
-          indices.push(nextOrdered.length)
-          nextOrdered.push(m)
-        }
-        for (let i = 0; i < pm.text.length; i += 2) {
-          push({ ...base, kind: 'text', start: pm.text[i], end: pm.text[i + 1] })
-        }
-        const top = (id: string): number => {
-          const g = engine.getOverlay(id)?.geom
-          return g ? g.y + g.h : 0
-        }
-        const ovs = [...pm.overlays].sort((a, b) => top(b.overlayId) - top(a.overlayId))
-        for (const o of ovs) {
-          push({ ...base, kind: 'overlay', start: o.start, end: o.end, overlayId: o.overlayId })
-        }
+        const overlays =
+          pm.overlays.length > 1
+            ? [...pm.overlays].sort((a, b) => top(b.overlayId) - top(a.overlayId))
+            : pm.overlays
+        const count = pm.text.length / 2 + overlays.length
+        nextIndex.set(info.page.id, nextHits.length)
+        nextHits.push({ info, text: pm.text, overlays, count, offset: nextTotal })
+        nextTotal += count
+        if (pm.capped) nextCapped = true
       }
     }
-    ordered = nextOrdered
-    byPage = nextByPage
+    hits = nextHits
+    hitIndex = nextIndex
+    total = nextTotal
     capped = nextCapped
 
     let nav = false
     if (prev) {
-      const kept = ordered.findIndex((m) => sameMatch(m, prev))
-      if (kept >= 0) current = kept
+      const kept = indexOfMatch(prev)
+      if (kept >= 0) setCurrent(kept)
       else {
-        current = firstFrom(pages.get(prev.pageId)?.order ?? prev.order)
-        nav = current >= 0 && ordered[current].pageId !== prev.pageId
+        setCurrent(firstFrom(pages.get(prev.pageId)?.order ?? prev.order))
+        nav = currentMatch !== null && currentMatch.pageId !== prev.pageId
       }
     } else {
-      // A new query (or the first matches of one still indexing): start from the anchor page.
-      const anchor = getAnchorPageId()
-      current = firstFrom(anchor ? (pages.get(anchor)?.order ?? 0) : 0)
+      // A new query (or one still waiting for its first pick while indexing): start from the
+      // anchor page.
+      setCurrent(freshPick())
       nav = current >= 0
     }
     version++
@@ -258,8 +364,7 @@ export function createFindController({
     if (norm === query) return false
     query = norm
     re = compileQuery(norm)
-    current = -1
-    ordered = []
+    setCurrent(-1)
     if (isOpen) recompute(true)
     else refreshBar()
     return true
@@ -268,9 +373,11 @@ export function createFindController({
   function step(dir: 1 | -1): void {
     if (!isOpen) return
     if (flush()) return
-    const n = ordered.length
+    const n = total
     if (n === 0) return
-    current = current < 0 ? (dir > 0 ? 0 : n - 1) : (current + dir + n) % n
+    // No pick yet (still indexing towards it): step from the anchor page.
+    if (current < 0) setCurrent(dir > 0 ? firstFrom(anchorOrder()) : lastBefore(anchorOrder()))
+    else setCurrent((current + dir + n) % n)
     version++
     notify()
     navigate()
@@ -289,38 +396,40 @@ export function createFindController({
     getRawQuery: () => raw,
     getPageStatus(pageId) {
       if (!isOpen) return null
-      if (ordered[current]?.pageId === pageId) return 'current'
-      return byPage.has(pageId) ? 'hit' : null
+      if (currentMatch?.pageId === pageId) return 'current'
+      return hitIndex.has(pageId) ? 'hit' : null
     },
     getPageHighlights(pageId) {
-      const indices = isOpen ? byPage.get(pageId) : undefined
-      if (!indices || indices.length === 0) return EMPTY_HIGHLIGHTS
+      const hi = isOpen ? hitIndex.get(pageId) : undefined
+      if (hi === undefined) return EMPTY_HIGHLIGHTS
       const cached = highlightCache.get(pageId)
       if (cached && cached.version === version) return cached.value
-      const info = pages.get(pageId)
+      const h = hits[hi]
       const out: PageHighlight[] = []
-      for (const i of indices) {
-        const m = ordered[i]
-        const isCurrent = i === current
-        if (m.kind === 'text') {
-          const pt = engine.getPageText(m.pageKey)
-          if (!pt) continue
-          for (const rect of textMatchRects(pt, m.start, m.end))
-            out.push({ rect, current: isCurrent })
-        } else if (m.overlayId && info) {
-          const ov = engine.getOverlay(m.overlayId)
-          if (ov) out.push({ rect: overlayRect(ov.geom, info.page.height), current: isCurrent })
-        }
+      const pt = engine.getPageText(h.info.pageKey)
+      for (let j = 0; j < h.text.length; j += 2) {
+        if (!pt) break
+        const isCurrent = h.offset + j / 2 === current
+        for (const rect of textMatchRects(pt, h.text[j], h.text[j + 1]))
+          out.push({ rect, current: isCurrent })
       }
+      const nText = h.text.length / 2
+      h.overlays.forEach((o, k) => {
+        const ov = engine.getOverlay(o.overlayId)
+        const isCurrent = h.offset + nText + k === current
+        if (ov) out.push({ rect: overlayRect(ov.geom, h.info.page.height), current: isCurrent })
+      })
       const value = out.length ? out : EMPTY_HIGHLIGHTS
       highlightCache.set(pageId, { version, value })
       return value
     },
-    getCurrentMatch: () => (isOpen ? (ordered[current] ?? null) : null),
+    getCurrentMatch: () => (isOpen ? currentMatch : null),
     open() {
       if (!activated) {
         activated = true
-        engine.activate()
+        // Index from the page the search will start at, so its matches come first.
+        const anchor = getAnchorPageId()
+        engine.activate(anchor ? pages.get(anchor)?.pageKey : undefined)
       }
       focusNonce++
       if (isOpen) {
@@ -343,9 +452,10 @@ export function createFindController({
       isOpen = false
       clearDebounce()
       clearThrottle()
-      ordered = []
-      byPage = new Map()
-      current = -1
+      hits = []
+      hitIndex = new Map()
+      total = 0
+      setCurrent(-1)
       capped = false
       highlightCache.clear()
       version++
@@ -367,8 +477,12 @@ export function createFindController({
       docs = next
       const map = new Map<string, PageInfo>()
       let order = 0
-      for (const d of next)
-        for (const p of d.pages) map.set(p.id, { docId: d.id, page: p, order: order++ })
+      for (const d of next) {
+        for (const p of d.pages) {
+          const pageKey = makePageKey(p.source.id, p.pageIndex)
+          map.set(p.id, { docId: d.id, page: p, pageKey, order: order++ })
+        }
+      }
       pages = map
       engine.reconcile(next)
       if (isOpen && query) scheduleRecompute()

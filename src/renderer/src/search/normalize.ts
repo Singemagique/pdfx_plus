@@ -40,6 +40,23 @@ const SOFT_HYPHEN = '­'
 const isMark = (cp: number): boolean => cp >= 0x300 && MARK.test(String.fromCodePoint(cp))
 
 /**
+ * Where the cluster starting at `i` in `str` ends: one code point plus any combining marks after
+ * it. This is the unit normalizeSegments maps, so a normalized unit's raw end can be recomputed
+ * from its start (PageText keeps only the starts).
+ */
+export function clusterEnd(str: string, i: number): number {
+  const first = str.codePointAt(i)
+  if (first === undefined) return i
+  let j = i + (first > 0xffff ? 2 : 1)
+  while (j < str.length) {
+    const cp = str.codePointAt(j)!
+    if (!isMark(cp)) break
+    j += cp > 0xffff ? 2 : 1
+  }
+  return j
+}
+
+/**
  * Normalize one grapheme-ish cluster (a base code point plus its combining marks). Working per
  * cluster keeps the offset map exact, and keeps the result independent of the neighbouring text.
  * The trailing NFC only recomposes what NFD split apart without a mark to strip (Hangul syllables),
@@ -121,13 +138,7 @@ export function normalizeSegments(segments: readonly Segment[]): NormalizedText 
       // One cluster: a base code point plus any following marks (a leading run of marks with no
       // base forms a cluster of its own).
       const cs = i
-      const first = str.codePointAt(i)!
-      i += first > 0xffff ? 2 : 1
-      while (i < str.length) {
-        const cp = str.codePointAt(i)!
-        if (!isMark(cp)) break
-        i += cp > 0xffff ? 2 : 1
-      }
+      i = clusterEnd(str, i)
       const s = g + cs
       const e = g + i
       const norm = normalizeCluster(str.slice(cs, i))
