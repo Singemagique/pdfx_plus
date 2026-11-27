@@ -1,14 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import { computeDragView, type DragViewInput } from './drag-view'
 import { deriveDropGhosts } from './ghost-size'
-import {
-  BETWEEN_GHOST_SHIFT,
-  MIN_DOC_WIDTH,
-  computeLayout,
-  docHeightForRows
-} from '../../canvas/layout'
+import { BETWEEN_GHOST_SHIFT, computeLayout, docHeightForRows } from '../../canvas/layout'
 import { makePageKey } from '../../edit/model'
-import { LANDSCAPE, doc, page } from '../../canvas/test-utils/layout-fixtures'
+import { LANDSCAPE, WRAP_5, doc, page } from '../../canvas/test-utils/layout-fixtures'
 
 const idle: DragViewInput = {
   collapsedId: null,
@@ -20,7 +15,7 @@ const idle: DragViewInput = {
 }
 
 describe('computeDragView', () => {
-  const layout = computeLayout([doc('a', 3), doc('b', 9), doc('c', 1)], undefined, MIN_DOC_WIDTH)
+  const layout = computeLayout([doc('a', 3), doc('b', 9), doc('c', 1)], undefined, WRAP_5)
 
   it('leaves everything in place with no drag', () => {
     expect(computeDragView(layout, idle)).toEqual({ reflows: new Map(), shifts: [0, 0, 0] })

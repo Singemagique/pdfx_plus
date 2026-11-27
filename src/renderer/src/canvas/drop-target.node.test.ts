@@ -3,7 +3,6 @@ import {
   BASE_PAGE_HEIGHT,
   CARD_PAD_X,
   DOC_GAP_Y,
-  MIN_DOC_WIDTH,
   PAGE_GAP,
   PAGES_TOP,
   ROW_GAP,
@@ -11,7 +10,7 @@ import {
 } from './layout'
 import { betweenSlotY, computeDropTarget } from './drop-target'
 import { makePageKey } from '../edit/model'
-import { LANDSCAPE, doc, page } from './test-utils/layout-fixtures'
+import { LANDSCAPE, WRAP_5, doc, page } from './test-utils/layout-fixtures'
 
 const ROW_PITCH = BASE_PAGE_HEIGHT + ROW_GAP
 const LETTER_W = 216
@@ -20,8 +19,8 @@ const rowMid = (docY: number, row: number): number =>
 /** x of the centre of the n-th letter page in a row. */
 const centreX = (n: number): number => CARD_PAD_X + n * (LETTER_W + PAGE_GAP) + LETTER_W / 2
 
-// 12 letter pages at the minimum wrap: rows of 5 / 5 / 2 (+ add-page).
-const layout = computeLayout([doc('a', 12), doc('b', 1)], undefined, MIN_DOC_WIDTH)
+// 12 letter pages at a five-page wrap: rows of 5 / 5 / 2 (+ add-page).
+const layout = computeLayout([doc('a', 12), doc('b', 1)], undefined, WRAP_5)
 const [a, b] = layout.items
 
 const into = (x: number, y: number, exclude: string | null = null): unknown =>
@@ -37,10 +36,10 @@ describe('computeDropTarget into a multi-row document', () => {
   })
 
   it('past the end of a row inserts after that row’s last page', () => {
-    expect(into(MIN_DOC_WIDTH - 5, rowMid(a.y, 0))).toMatchObject({ index: 5 })
-    expect(into(MIN_DOC_WIDTH - 5, rowMid(a.y, 1))).toMatchObject({ index: 10 })
+    expect(into(WRAP_5 - 5, rowMid(a.y, 0))).toMatchObject({ index: 5 })
+    expect(into(WRAP_5 - 5, rowMid(a.y, 1))).toMatchObject({ index: 10 })
     // The last row: beyond the final page (over the add-page slot) appends.
-    expect(into(MIN_DOC_WIDTH - 5, rowMid(a.y, 2))).toMatchObject({ index: 12 })
+    expect(into(WRAP_5 - 5, rowMid(a.y, 2))).toMatchObject({ index: 12 })
   })
 
   it('treats the header band as the first row and splits row gaps in the middle', () => {
@@ -52,15 +51,42 @@ describe('computeDropTarget into a multi-row document', () => {
 
   it('hit-tests against the layout re-flowed without the dragged page', () => {
     // Without a-p4, a-p5 moves up to the end of row 0, so the 2nd row starts at a-p6.
-    expect(into(MIN_DOC_WIDTH - 5, rowMid(a.y, 0), 'a-p4')).toMatchObject({ index: 5 })
+    expect(into(WRAP_5 - 5, rowMid(a.y, 0), 'a-p4')).toMatchObject({ index: 5 })
     expect(into(centreX(0) - 1, rowMid(a.y, 1), 'a-p4')).toMatchObject({ index: 5 })
     expect(into(centreX(4) + 1, rowMid(a.y, 1), 'a-p4')).toMatchObject({ index: 10 })
+  })
+
+  it('a drop on the row the add-page slot sits on alone appends', () => {
+    // 10 pages fill two rows exactly, so the add-page slot opens a third row with no page in it.
+    const full = computeLayout([doc('f', 10), doc('g', 1)], undefined, WRAP_5)
+    const f = full.items[0]
+    expect(f.rows).toBe(3)
+    const at = (x: number, y: number): unknown => computeDropTarget(full, x, y, 1, null, true)
+    const add = f.addPage
+    expect(at(add.x + add.w / 2, add.y + add.h / 2)).toEqual({
+      kind: 'into',
+      docId: 'f',
+      index: 10
+    })
+    expect(at(f.width - 5, rowMid(f.y, 2))).toMatchObject({ index: 10 })
+    // Just below the middle of the gap above that row already counts as that row.
+    expect(at(centreX(0), add.y - ROW_GAP / 2 + 1)).toMatchObject({ index: 10 })
+    // The rows above are untouched.
+    expect(at(centreX(0) - 1, rowMid(f.y, 1))).toMatchObject({ index: 5 })
+  })
+
+  it('a drop on a row emptied by the dragged page appends', () => {
+    // 6 pages: 5 + 1 (+ add-page). Dragging a-p0 out pulls a-p5 up, emptying the second row.
+    const six = computeLayout([doc('s', 6)], undefined, WRAP_5)
+    const at = (x: number, y: number): unknown => computeDropTarget(six, x, y, 1, 's-p0', true)
+    expect(at(CARD_PAD_X + 50, rowMid(0, 1))).toEqual({ kind: 'into', docId: 's', index: 5 })
+    expect(at(CARD_PAD_X + 50, rowMid(0, 0))).toMatchObject({ index: 0 })
   })
 
   it('uses rotated page widths (the strip used to ignore rotation)', () => {
     const d = { id: 'r', name: 'r.pdf', pages: [page('l0', LANDSCAPE, 0), page('p1')] }
     const rotations = new Map([[makePageKey(d.pages[0].source.id, 0), 90]])
-    const rl = computeLayout([d], rotations, MIN_DOC_WIDTH)
+    const rl = computeLayout([d], rotations, WRAP_5)
     // l0 is drawn 216 wide, so p1 is centred at 22 + 216 + 18 + 108 = 364. Unrotated (362 wide)
     // math would have put p1's centre at 510 and called x = 380 "before p1".
     expect(computeDropTarget(rl, 380, rowMid(0, 0), 1, null, true)).toEqual({

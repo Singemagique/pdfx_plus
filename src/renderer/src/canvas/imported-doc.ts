@@ -26,25 +26,41 @@ export function findImportedDoc(
 
 /**
  * Compare the docs being rendered with the last COMMITTED docs and, when documents were imported,
- * return a fresh focus on the first new one (its top in `layout`). It is non-null for exactly the
- * render that introduces the documents; the canvas keys its animated fit on the object's identity.
+ * return a focus on the first new one (its top in `layout`). It is non-null for exactly the renders
+ * that introduce documents; the canvas keys its animated fit on the object's identity.
+ *
+ * One import operation can commit several times — a multi-file open adds each file as it finishes
+ * loading. While `busy` (and in the commit that clears it, which can carry the last file) every
+ * later import of the batch hands back the SAME focus object as its first, so the view stays on the
+ * batch's first document instead of chasing each file down the column.
  */
-export function useImportFocus(docs: DocEntry[], layout: CanvasLayout): FitFocus | null {
-  const committed = useRef<DocEntry[] | null>(null)
+export function useImportFocus(
+  docs: DocEntry[],
+  layout: CanvasLayout,
+  busy = false
+): FitFocus | null {
+  const committed = useRef<{ docs: DocEntry[]; busy: boolean } | null>(null)
   const lastFocus = useRef<{ docs: DocEntry[]; focus: FitFocus | null } | null>(null)
+  const batch = useRef<FitFocus | null>(null)
   let focus: FitFocus | null = null
-  if (committed.current && committed.current !== docs) {
+  if (committed.current && committed.current.docs !== docs) {
     // Memoised per `docs` so a re-render before commit (e.g. StrictMode) hands back the same object.
     if (lastFocus.current?.docs === docs) focus = lastFocus.current.focus
     else {
-      const id = findImportedDoc(committed.current, docs)
-      const item = id ? layout.items.find((i) => i.doc.id === id) : undefined
-      focus = item ? { y: item.y } : null
+      const inBatch = busy || committed.current.busy
+      const id = findImportedDoc(committed.current.docs, docs)
+      if (id && inBatch && batch.current) focus = batch.current
+      else {
+        const item = id ? layout.items.find((i) => i.doc.id === id) : undefined
+        focus = item ? { y: item.y } : null
+        if (focus && inBatch) batch.current = focus
+      }
       lastFocus.current = { docs, focus }
     }
   }
   useLayoutEffect(() => {
-    committed.current = docs
+    committed.current = { docs, busy }
+    if (!busy) batch.current = null
   })
   return focus
 }

@@ -1,4 +1,11 @@
 import type { DocEntry, PageEntry } from '../../types'
+import { CARD_PAD_X, PAGE_GAP } from '../layout'
+
+/** A wrap width holding exactly `n` letter pages (216 world px) per row. */
+export const wrapForLetterPages = (n: number): number =>
+  n * 216 + (n - 1) * PAGE_GAP + 2 * CARD_PAD_X
+/** Five letter pages per row: what the default ~1300–1400 css px canvas wraps to. */
+export const WRAP_5 = wrapForLetterPages(5)
 
 /** US Letter portrait: 216 world px wide at the 280 px thumbnail height. */
 export const LETTER = { width: 612, height: 792 }

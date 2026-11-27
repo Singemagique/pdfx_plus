@@ -27,7 +27,12 @@ export const GHOST_ROW_HEIGHT = GHOST_ROW_PAD_TOP + BASE_PAGE_HEIGHT + CARD_PAD_
 /** How far later documents slide down to open room for the between-documents ghost. */
 export const BETWEEN_GHOST_SHIFT = GHOST_ROW_HEIGHT + DOC_GAP_Y
 
-const MIN_PAGES = 5
+/**
+ * Letter pages per row at the narrowest wrap. Small enough that a narrow window (down to ~850 css
+ * px of canvas) still wraps to fewer columns at about TARGET_FIT_SCALE instead of shrinking a wide
+ * row; and exactly the room the between-documents ghost needs for its up-to-three page ghosts.
+ */
+const MIN_PAGES = 3
 const REF_PAGE_WIDTH = Math.round((BASE_PAGE_HEIGHT * 612) / 792)
 export const MIN_DOC_WIDTH =
   MIN_PAGES * REF_PAGE_WIDTH + (MIN_PAGES - 1) * PAGE_GAP + CARD_PAD_X * 2
@@ -209,6 +214,8 @@ export function computeLayout(
     return placement
   })
   const contentWidth = Math.max(1, ...items.map((i) => i.width))
+  // Every card spans the collection's width so the right edges line up.
+  for (const item of items) item.width = contentWidth
   // The trailing "Add document" row sits one gap below the last card.
   const contentHeight = items.length > 0 ? y + SINGLE_ROW_DOC_HEIGHT : 1
   return { items, contentWidth, contentHeight, wrapWidth: wrap }

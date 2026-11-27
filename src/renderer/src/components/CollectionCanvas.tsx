@@ -52,7 +52,11 @@ export function CollectionCanvas(props: CollectionCanvasProps): React.JSX.Elemen
   const { docs, layout, dragKind, draggingPage, dropTarget, externalCount, collapsedId } = props
   const { onWrapWidthChange } = props
 
-  const focus = useImportFocus(docs, layout)
+  // `busy` spans one import operation (every file of a multi-file open), so the whole batch is
+  // brought into view as one: scrolled to its first document, not to each file as it lands.
+  const focus = useImportFocus(docs, layout, props.busy)
+  // Cards all span the collection's width; the between ghost and "Add document" slot match them.
+  const cardWidth = Math.max(MIN_DOC_WIDTH, layout.contentWidth)
 
   const { intoDocId, intoIndex, betweenIndex, ghostSize, betweenPages } = deriveDropGhosts(
     layout,
@@ -138,16 +142,16 @@ export function CollectionCanvas(props: CollectionCanvasProps): React.JSX.Elemen
       {dropTarget?.kind === 'between' && (
         <div
           className="canvas-doc ghost-doc"
-          style={{ left: 0, top: betweenSlotY(layout, dropTarget.docIndex), width: MIN_DOC_WIDTH }}
+          style={{ left: 0, top: betweenSlotY(layout, dropTarget.docIndex), width: cardWidth }}
         >
-          <GhostRow width={MIN_DOC_WIDTH} pageHeight={BASE_PAGE_HEIGHT} pages={betweenPages} />
+          <GhostRow width={cardWidth} pageHeight={BASE_PAGE_HEIGHT} pages={betweenPages} />
         </div>
       )}
       <div
         className="canvas-doc"
-        style={{ left: 0, top: betweenSlotY(layout, layout.items.length), width: MIN_DOC_WIDTH }}
+        style={{ left: 0, top: betweenSlotY(layout, layout.items.length), width: cardWidth }}
       >
-        <AddDocGhost width={MIN_DOC_WIDTH} onClick={props.onOpen} />
+        <AddDocGhost width={cardWidth} onClick={props.onOpen} />
       </div>
     </Canvas>
   )

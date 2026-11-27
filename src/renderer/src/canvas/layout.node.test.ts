@@ -17,16 +17,24 @@ import {
 } from './layout'
 import { FIT_MARGIN, TARGET_FIT_SCALE } from './zoom-constants'
 import { makePageKey } from '../edit/model'
-import { LANDSCAPE, LETTER, doc, page } from './test-utils/layout-fixtures'
+import {
+  LANDSCAPE,
+  LETTER,
+  WRAP_5,
+  doc,
+  page,
+  wrapForLetterPages
+} from './test-utils/layout-fixtures'
 
 const ROW_PITCH = BASE_PAGE_HEIGHT + ROW_GAP
 const LETTER_W = 216
 const LANDSCAPE_W = 362
 
 describe('layout constants', () => {
-  it('MIN_DOC_WIDTH holds exactly five letter pages per row', () => {
+  it('MIN_DOC_WIDTH holds exactly three letter pages per row', () => {
     expect(ADD_PAGE_WIDTH).toBe(LETTER_W)
-    expect(MIN_DOC_WIDTH).toBe(5 * LETTER_W + 4 * PAGE_GAP + 2 * CARD_PAD_X)
+    expect(MIN_DOC_WIDTH).toBe(3 * LETTER_W + 2 * PAGE_GAP + 2 * CARD_PAD_X)
+    expect(MIN_DOC_WIDTH).toBe(wrapForLetterPages(3))
   })
 
   it('a one-row card is PAGES_TOP + one page + bottom padding', () => {
@@ -60,8 +68,8 @@ describe('flowCells', () => {
 })
 
 describe('computeLayout wrapping', () => {
-  it('wraps 12 letter pages into 5 + 5 + 2 (+ add-page) at the minimum width', () => {
-    const layout = computeLayout([doc('a', 12)], undefined, MIN_DOC_WIDTH)
+  it('wraps 12 letter pages into 5 + 5 + 2 (+ add-page) at a five-page wrap', () => {
+    const layout = computeLayout([doc('a', 12)], undefined, WRAP_5)
     const item = layout.items[0]
     expect(item.rows).toBe(3)
     expect(item.pages.map((p) => p.row)).toEqual([0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 2, 2])
@@ -72,7 +80,7 @@ describe('computeLayout wrapping', () => {
       h: BASE_PAGE_HEIGHT
     })
     expect(item.height).toBe(docHeightForRows(3))
-    expect(item.width).toBe(MIN_DOC_WIDTH)
+    expect(item.width).toBe(WRAP_5)
   })
 
   it('puts more pages per row on a wider wrap', () => {
@@ -84,7 +92,7 @@ describe('computeLayout wrapping', () => {
   })
 
   it('puts the add-page slot on a row of its own when the pages exactly fill the rows', () => {
-    const item = computeLayout([doc('a', 5)], undefined, MIN_DOC_WIDTH).items[0]
+    const item = computeLayout([doc('a', 5)], undefined, WRAP_5).items[0]
     expect(item.pages.every((p) => p.row === 0)).toBe(true)
     expect(item.rows).toBe(2)
     expect(item.addPage.x).toBe(CARD_PAD_X)
@@ -93,13 +101,15 @@ describe('computeLayout wrapping', () => {
   it('clamps a wrap narrower than MIN_DOC_WIDTH', () => {
     const layout = computeLayout([doc('a', 12)], undefined, 300)
     expect(layout.wrapWidth).toBe(MIN_DOC_WIDTH)
-    expect(layout.items[0].rows).toBe(3)
+    // 12 pages + the add-page slot, three per row.
+    expect(layout.items[0].pages.filter((p) => p.row === 0)).toHaveLength(3)
+    expect(layout.items[0].rows).toBe(5)
   })
 
   it('gives a page wider than the wrap a row to itself', () => {
     const wide = { width: 6000, height: 100 }
     const d = { id: 'w', name: 'w.pdf', pages: [page('n0'), page('wide', wide), page('n1')] }
-    const item = computeLayout([d], undefined, MIN_DOC_WIDTH).items[0]
+    const item = computeLayout([d], undefined, WRAP_5).items[0]
     expect(item.pages.map((p) => [p.row, p.x])).toEqual([
       [0, CARD_PAD_X],
       [1, CARD_PAD_X],
@@ -116,14 +126,14 @@ describe('computeLayout wrapping', () => {
       pages: [page('l0', LANDSCAPE, 0), page('l1', LANDSCAPE, 1)]
     }
     const rotations = new Map([[makePageKey(d.pages[0].source.id, 0), 90]])
-    const item = computeLayout([d], rotations, MIN_DOC_WIDTH).items[0]
+    const item = computeLayout([d], rotations, WRAP_5).items[0]
     expect(item.pages[0].w).toBe(LETTER_W)
     expect(item.pages[1].w).toBe(LANDSCAPE_W)
     expect(item.pages[1].x).toBe(CARD_PAD_X + LETTER_W + PAGE_GAP)
   })
 
   it('stacks cards by their real heights', () => {
-    const layout = computeLayout([doc('a', 12), doc('b', 1), doc('c', 3)], undefined, MIN_DOC_WIDTH)
+    const layout = computeLayout([doc('a', 12), doc('b', 1), doc('c', 3)], undefined, WRAP_5)
     const [a, b, c] = layout.items
     expect(a.y).toBe(0)
     expect(b.y).toBe(a.height + DOC_GAP_Y)
@@ -133,7 +143,7 @@ describe('computeLayout wrapping', () => {
   })
 
   it('places page cells in world coordinates (card offset included)', () => {
-    const layout = computeLayout([doc('a', 1), doc('b', 7)], undefined, MIN_DOC_WIDTH)
+    const layout = computeLayout([doc('a', 1), doc('b', 7)], undefined, WRAP_5)
     const b = layout.items[1]
     expect(b.pages[6]).toEqual({
       pageId: 'b-p6',
@@ -150,6 +160,8 @@ describe('computeLayout wrapping', () => {
     const wide = computeLayout([doc('a', 2), doc('b', 30)], undefined, 3000)
     expect(wide.contentWidth).toBe(wide.items[1].width)
     expect(wide.contentWidth).toBeLessThanOrEqual(3000)
+    // Every card spans the collection's width, so the right edges line up.
+    expect(wide.items[0].width).toBe(wide.contentWidth)
   })
 
   it('an empty collection has a 1×1 placeholder extent', () => {
@@ -158,7 +170,7 @@ describe('computeLayout wrapping', () => {
 })
 
 describe('reflowDoc (mid-drag view)', () => {
-  const item = computeLayout([doc('a', 6)], undefined, MIN_DOC_WIDTH).items[0]
+  const item = computeLayout([doc('a', 6)], undefined, WRAP_5).items[0]
 
   it('closes up around the excluded page', () => {
     const r = reflowDoc(item, 'a-p1', null)

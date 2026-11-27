@@ -1,7 +1,7 @@
-import { forwardRef, useImperativeHandle, useRef } from 'react'
+import { forwardRef, useImperativeHandle, useRef, useState } from 'react'
 import { useZoomBehavior } from '../canvas/use-zoom-behavior'
 import { useAutoFit, type FitFocus } from '../canvas/use-auto-fit'
-import { useViewportWidth } from '../canvas/use-viewport-width'
+import { useViewportSize, type ViewportSize } from '../canvas/use-viewport-size'
 import { createCanvasHandle } from '../canvas/canvas-handle'
 
 export interface CanvasHandle {
@@ -20,7 +20,10 @@ interface CanvasProps {
   onScaleChange?: (scale: number) => void
   onSettle?: () => void
   onBackgroundClick?: () => void
-  /** The viewport's css width — on mount, then on (debounced) resize; held back mid-drag. */
+  /**
+   * The viewport's css width — on mount, then on (debounced) resize; held back mid-drag. A resize
+   * also re-fits a view the user hasn't moved, even when the width change doesn't re-wrap.
+   */
   onViewportWidth?: (width: number) => void
   children: React.ReactNode
   overlay?: React.ReactNode
@@ -60,7 +63,12 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
     onSettle
   })
 
-  useViewportWidth(viewportRef, !!dragging, onViewportWidth)
+  const [viewportSize, setViewportSize] = useState<ViewportSize>({ width: 0, height: 0 })
+  useViewportSize(viewportRef, !!dragging, (size) => {
+    // Both updates land in one render: the re-wrapped layout and the new size re-fit together.
+    setViewportSize(size)
+    onViewportWidth?.(size.width)
+  })
 
   const { refit } = useAutoFit({
     viewportRef,
@@ -70,7 +78,9 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
     fitTransform,
     contentWidth,
     contentHeight,
-    focus
+    focus,
+    viewportWidth: viewportSize.width,
+    viewportHeight: viewportSize.height
   })
 
   useImperativeHandle(ref, () => createCanvasHandle({ viewportRef, zoomRef, userMovedRef, refit }))

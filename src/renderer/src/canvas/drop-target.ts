@@ -1,5 +1,12 @@
 import type { DocPlacement, CanvasLayout, PageSlot } from './layout'
-import { DOC_GAP_Y, ROW_GAP, SINGLE_ROW_DOC_HEIGHT, reflowDoc } from './layout'
+import {
+  BASE_PAGE_HEIGHT,
+  DOC_GAP_Y,
+  PAGES_TOP,
+  ROW_GAP,
+  SINGLE_ROW_DOC_HEIGHT,
+  reflowDoc
+} from './layout'
 
 export type DropTarget =
   | { kind: 'into'; docId: string; index: number }
@@ -14,6 +21,10 @@ const INTO_MIN_SCREEN_PX = 90
  * slot by x against each page's midpoint. Positions come from the layout itself (re-flowed without
  * the dragged page when it lives in this document), so rotated pages and multi-row cards are hit
  * exactly where they are drawn.
+ *
+ * The card is drawn with all `item.rows` rows, and the trailing ones can hold no page: the row the
+ * add-page slot sits on alone, or a row emptied by the page being dragged out of this document. A
+ * drop on such a row appends — it must not be matched by x against the pages of the row above.
  */
 function insertionIndex(
   item: DocPlacement,
@@ -27,12 +38,12 @@ function insertionIndex(
       : item.pages
   if (slots.length === 0) return 0
 
-  const lastRow = slots[slots.length - 1].row
-  let row = 0
-  for (let r = 1; r <= lastRow; r++) {
-    const top = slots.find((s) => s.row === r)?.y
-    if (top !== undefined && wy >= top - ROW_GAP / 2) row = r
-  }
+  // Not a module constant: layout.ts re-exports this module, so its constants aren't initialised
+  // yet when this module first evaluates.
+  const pitch = BASE_PAGE_HEIGHT + ROW_GAP
+  const nearest = Math.floor((wy - item.y - PAGES_TOP + ROW_GAP / 2) / pitch)
+  const row = Math.max(0, Math.min(item.rows - 1, nearest))
+  if (row > slots[slots.length - 1].row) return slots.length
 
   let index = slots.findIndex((s) => s.row === row)
   for (; index < slots.length && slots[index].row === row; index++) {
