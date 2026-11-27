@@ -36,6 +36,7 @@ import {
 
 import type { Overlay, RGB, StandardFontName, TextAlign } from '../edit/model'
 import { embedUnicodeFont, resolveTextFont } from './fonts'
+import { embedPngFaithful } from './png-embed'
 
 export interface Attachment {
   bytes: Uint8Array
@@ -74,7 +75,7 @@ export function createFlattenResources(
       if (!p) {
         const a = attachments.get(attachmentId)
         if (!a) return Promise.reject(new Error(`missing attachment: ${attachmentId}`))
-        p = a.mime === 'image/jpeg' ? doc.embedJpg(a.bytes) : doc.embedPng(a.bytes)
+        p = a.mime === 'image/jpeg' ? doc.embedJpg(a.bytes) : embedPngFaithful(doc, a.bytes)
         images.set(attachmentId, p)
       }
       return p

@@ -1,6 +1,7 @@
 import { PDFDocument } from 'pdf-lib'
 
 import { jpegOrientation } from './exif'
+import { embedPngFaithful } from './png-embed'
 
 const IMAGE_EXT = /\.(png|jpe?g|webp|gif|bmp|avif)$/i
 
@@ -152,7 +153,7 @@ export async function imageToPdf(
   if (isPng(data)) {
     const dim = pngSize(data)
     if (dim && oversizePixels(dim)) throw tooLarge
-    image = await doc.embedPng(data)
+    image = await embedPngFaithful(doc, data)
   } else if (isJpeg(data)) {
     const dim = jpegSize(data)
     if (dim && oversizePixels(dim)) throw tooLarge // reject the bomb before decoding it
@@ -161,7 +162,7 @@ export async function imageToPdf(
       // decoded bitmap bakes the upright frame into pixels that embedPng can't misread.
       const oriented = await createImageBitmap(toBlob(data))
       try {
-        image = await doc.embedPng(await rasterToPng(oriented))
+        image = await embedPngFaithful(doc, await rasterToPng(oriented))
       } finally {
         oriented.close()
       }
@@ -175,7 +176,7 @@ export async function imageToPdf(
       bitmap.close()
       throw tooLarge
     }
-    image = await doc.embedPng(await rasterToPng(bitmap))
+    image = await embedPngFaithful(doc, await rasterToPng(bitmap))
     bitmap.close()
   }
 
