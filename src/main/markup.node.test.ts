@@ -225,7 +225,21 @@ describe('markupToPdf temp document', () => {
     expect(new TextDecoder().decode(pdf)).toBe('%PDF-fake')
     expect(docUrl().startsWith('file:')).toBe(true)
     expect(h.windows[0].loadedUrls.every((u) => u.length < 1024)).toBe(true)
-    expect(onDisk).toBe(html)
+    expect(onDisk).toBe('﻿' + html) // the document, behind the UTF-8 BOM
+  })
+
+  it('forces UTF-8 decoding with a BOM, since a file: load carries no charset', async () => {
+    // No <meta charset>: without the BOM Chromium sniffs/falls back and renders mojibake.
+    const html = '<p>héllo — ü 中</p>'
+    let raw: Buffer | null = null
+    h.cfg.onLoad = (url) => {
+      if (url.startsWith('file:')) raw = readFileSync(fileURLToPath(url))
+    }
+    await markup.markupToPdf(html)
+
+    expect(raw).not.toBeNull()
+    expect([...raw!.subarray(0, 3)]).toEqual([0xef, 0xbb, 0xbf]) // the UTF-8 BOM, first
+    expect(raw!.subarray(3).toString('utf8')).toBe(html) // then the document, UTF-8 encoded
   })
 
   it('writes the document under the OS temp dir and deletes it after the render', async () => {

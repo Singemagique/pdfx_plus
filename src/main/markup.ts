@@ -58,6 +58,8 @@ export function isAllowedRenderRequest(url: string, docPath: string | null): boo
  * it. The directory is created by mkdtemp (0700 on POSIX) and the file is 0600, so other local
  * users cannot read the document while it exists.
  */
+const UTF8_BOM = '﻿'
+
 async function writeTempDocument(
   html: string
 ): Promise<{ file: string; dispose: () => Promise<void> }> {
@@ -65,7 +67,11 @@ async function writeTempDocument(
   const dispose = (): Promise<void> => rm(dir, { recursive: true, force: true }).catch(() => {})
   try {
     const file = path.join(dir, 'document.html')
-    await writeFile(file, html, { encoding: 'utf8', mode: 0o600 })
+    // A file: load carries no transport charset (the old data: URL said `charset=utf-8`), so
+    // Chromium would fall back to the document's own <meta> or to detection — and a source with no
+    // meta, or a conflicting one, rendered é/—/中 as mojibake. A UTF-8 BOM outranks both in the
+    // HTML encoding sniffing algorithm, so the bytes we write are always decoded as UTF-8.
+    await writeFile(file, UTF8_BOM + html, { encoding: 'utf8', mode: 0o600 })
     return { file, dispose }
   } catch (err) {
     await dispose()
