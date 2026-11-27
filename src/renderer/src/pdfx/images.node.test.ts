@@ -72,6 +72,39 @@ describe('imageToPdf PNG branch (the older half of the pixel cap)', () => {
     await expect(imageToPdf(pngWithIHDR(10240, 10240))).rejects.not.toThrow(/too large/)
   })
 
+  it('rejects a PNG with a second IHDR before any decoder sees it', async () => {
+    // A 1×1 IHDR in front of a 46341² one (2.1 GP): a first-IHDR size check passed it, and the
+    // pdf-lib fallback (last IHDR wins) would then try to allocate ~8.6 GB.
+    const embedPng = vi
+      .spyOn(PDFDocument.prototype, 'embedPng')
+      .mockRejectedValue(new Error('embedPng reached'))
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const second = ONE_PIXEL_PNG.slice(8, 33) // the IHDR chunk: length, type, 13 data bytes, CRC
+    new DataView(second.buffer).setUint32(8, 46341)
+    new DataView(second.buffer).setUint32(12, 46341)
+    const dual = new Uint8Array([...ONE_PIXEL_PNG.subarray(0, 33), ...second, ...ONE_PIXEL_PNG.subarray(33)]) // prettier-ignore
+    // Rejected as malformed — not sized by whichever IHDR a walker happens to keep.
+    await expect(imageToPdf(dual)).rejects.toThrow(/Malformed PNG/)
+    expect(embedPng).not.toHaveBeenCalled()
+    embedPng.mockRestore()
+    warn.mockRestore()
+  })
+
+  it('caps on the real IHDR even when another chunk comes first', async () => {
+    // Offsets 16/20 here hold a tEXt chunk's bytes (tiny "dimensions"); the IHDR after it is huge.
+    const text = [...[0, 0, 0, 8], ...[0x74, 0x45, 0x58, 0x74], ...[0, 0, 0, 1, 0, 0, 0, 1], 0, 0, 0, 0] // prettier-ignore
+    const ihdr = pngWithIHDR(30000, 30000).subarray(8)
+    const png = new Uint8Array([...ONE_PIXEL_PNG.subarray(0, 8), ...text, ...ihdr])
+    const embedPng = vi
+      .spyOn(PDFDocument.prototype, 'embedPng')
+      .mockRejectedValue(new Error('embedPng reached'))
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    await expect(imageToPdf(png)).rejects.toThrow(/too large/)
+    expect(embedPng).not.toHaveBeenCalled()
+    embedPng.mockRestore()
+    warn.mockRestore()
+  })
+
   it('turns a small PNG into a one-page PDF', async () => {
     const pdf = await imageToPdf(ONE_PIXEL_PNG)
     const doc = await PDFDocument.load(pdf)
