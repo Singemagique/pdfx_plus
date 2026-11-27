@@ -69,7 +69,8 @@ function PageCellImpl({
           left: '50%',
           width: winW,
           height: winH,
-          overflow: 'hidden',
+          // `clip` (no scroll container), like `.full-page`: the window can never be scrolled.
+          overflow: 'clip',
           transform: `translate(-50%, -50%) rotate(${rot}deg)`
         }}
       >

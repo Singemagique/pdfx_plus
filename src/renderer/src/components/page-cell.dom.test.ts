@@ -98,7 +98,8 @@ describe('PageCell at the cropped geometry', () => {
     await act(async () => store.setCrop(key, CROP))
     expect(container.querySelector('.cell-crop-mask')).toBeNull()
     const r = rotor()!
-    expect(r.style.overflow).toBe('hidden')
+    // `clip`, not `hidden`: a `hidden` box is a scroll container and could be scrolled off the crop.
+    expect(r.style.overflow).toBe('clip')
     expect([px(r.style.width), px(r.style.height)]).toEqual([155, 200])
     // Window 300×400 contained in 155×200: scale 0.5, centred horizontally (2.5 px spare each side).
     const f = frame()!

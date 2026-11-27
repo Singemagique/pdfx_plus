@@ -921,7 +921,10 @@ body {
   flex: none;
   background: var(--surface);
   border-radius: 4px;
-  overflow: hidden;
+  /* `clip`, not `hidden`: a cropped page's `.full-page` is the crop window over a larger
+     `.page-frame`, and a `hidden` box is still a scroll container — focusing a form field in the
+     cropped-away margin (Tab) would scroll it and show a region other than the crop. */
+  overflow: clip;
   box-shadow: 0 10px 40px rgba(0, 0, 0, 0.35);
 }
 
