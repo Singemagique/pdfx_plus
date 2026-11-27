@@ -507,7 +507,9 @@ body {
   font-weight: 500;
 }
 
-/* The "Add page" ghost lives in every row's reserved trailing slot, revealed on hover. */
+/* The "Add page" ghost sits at the end of a card's last row, revealed on hover. It never opens a
+   row of its own: beside a nearly full row it narrows (see ADD_PAGE_MIN_WIDTH) to just the +, and
+   beside a full one it becomes a round button straddling the card's right edge (.edge). */
 .doc-row .page.add-page {
   box-shadow: none;
   pointer-events: auto;
@@ -519,6 +521,16 @@ body {
 
 .doc-row:hover .page.add-page {
   opacity: 1;
+}
+
+.add-ghost.narrow .add-label,
+.add-ghost.edge .add-label {
+  display: none;
+}
+
+.doc-row .page.add-page.edge {
+  border-radius: 50%;
+  background: var(--group-bg);
 }
 
 .add-ghost:hover {
@@ -536,12 +548,13 @@ body {
 
 /* Persistent, transparent "Add document" row after the last document: a dashed
    outline (drawn by DashedBorder) holding one always-visible ghost page. The padding
-   places that page where a real first page sits — keep in sync with ROW_PAD_Y. */
+   and centring place that page where a new one-page document's page sits (cards centre
+   their pages; see placeDoc in canvas/layout.ts). */
 .add-doc-row {
   position: relative;
   display: flex;
   align-items: flex-start;
-  justify-content: flex-start;
+  justify-content: center;
   padding: 52px 22px 14px;
   background: transparent;
   border: none;
@@ -575,11 +588,13 @@ body {
   padding: 42px 16px 14px;
 }
 
+/* Centred like a card's pages, so the ghost previews where a new document's pages will land. */
 .ghost-strip {
   display: flex;
   gap: 18px;
   padding: 0 6px;
   width: max-content;
+  margin: 0 auto;
 }
 
 @keyframes ghost-row-in {

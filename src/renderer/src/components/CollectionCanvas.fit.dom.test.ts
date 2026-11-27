@@ -275,7 +275,8 @@ describe('fit on viewport resize', () => {
   it('re-fits a view the user only SCROLLED, keeping their place, on a narrower and a wider pane', async () => {
     await act(async () => setDocs([a, b]))
     await settle()
-    await wheel(600)
+    // Far enough down to be the user's place, short of the end of the shortest re-wrap (1700 px).
+    await wheel(400)
     const topWorldY = (FIT_TOP_MARGIN - transform().y) / transform().k
 
     for (const w of [1000, 1700, 840]) {
