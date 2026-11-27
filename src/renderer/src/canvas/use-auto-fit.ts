@@ -48,18 +48,26 @@ export function useAutoFit({
   focus,
   viewportWidth,
   viewportHeight
-}: AutoFitArgs): { refit: (focusY: number) => void; reveal: (target: ZoomTransform) => void } {
+}: AutoFitArgs): {
+  refit: (focusY: number) => void
+  reveal: (target: ZoomTransform) => void
+  /** Where the running fit or reveal tween will leave the view, or null when none is running. */
+  pendingTarget: () => ZoomTransform | null
+} {
   const fitted = useRef(false)
   const lastDims = useRef({ w: 0, h: 0, vw: 0, vh: 0 })
   const lastFocus = useRef<FitFocus | null>(null)
   /** The world y the running animation (if any) is heading for. */
   const animAnchor = useRef<number | null>(null)
   const cancelAnim = useRef<(() => void) | null>(null)
+  /** The transform the running animation (if any) ends at. */
+  const animTarget = useRef<ZoomTransform | null>(null)
 
   const stopAnim = (): void => {
     cancelAnim.current?.()
     cancelAnim.current = null
     animAnchor.current = null
+    animTarget.current = null
   }
 
   const animateTo = (focusY: number): void => {
@@ -69,15 +77,18 @@ export function useAutoFit({
     stopAnim()
     animAnchor.current = focusY
     userMovedRef.current = false
+    const target = fitTransform(focusY)
+    animTarget.current = target
     cancelAnim.current = animateZoomTo(
       vp,
       zoom,
-      fitTransform(focusY),
+      target,
       FIT_ANIMATION_MS,
       () => userMovedRef.current,
       () => {
         cancelAnim.current = null
         animAnchor.current = null
+        animTarget.current = null
       }
     )
   }
@@ -161,6 +172,7 @@ export function useAutoFit({
     if (!vp || !zoom) return
     stopAnim()
     userMovedRef.current = false
+    animTarget.current = target
     cancelAnim.current = animateZoomTo(
       vp,
       zoom,
@@ -169,9 +181,16 @@ export function useAutoFit({
       () => userMovedRef.current,
       () => {
         cancelAnim.current = null
+        animTarget.current = null
         userMovedRef.current = true
       }
     )
   }, [])
-  return { refit, reveal }
+
+  // A tween the user aborted (wheel/drag) has not reached its target: only a live one counts.
+  const pendingTarget = useCallback(
+    () => (cancelAnim.current && !userMovedRef.current ? animTarget.current : null),
+    []
+  )
+  return { refit, reveal, pendingTarget }
 }

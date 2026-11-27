@@ -72,7 +72,7 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
     onViewportWidth?.(size.width)
   })
 
-  const { refit, reveal } = useAutoFit({
+  const { refit, reveal, pendingTarget } = useAutoFit({
     viewportRef,
     zoomRef,
     userMovedRef,
@@ -93,6 +93,7 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
       refit,
       draggingRef,
       reveal,
+      pendingTarget,
       contentHeightRef: dims
     })
   )

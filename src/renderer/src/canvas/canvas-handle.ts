@@ -16,6 +16,8 @@ interface CanvasHandleArgs {
   draggingRef?: RefObject<boolean | undefined>
   /** Animate to a transform (see useAutoFit's reveal). */
   reveal?: (target: ZoomTransform) => void
+  /** Where a running fit/reveal tween ends (see useAutoFit), or null. */
+  pendingTarget?: () => ZoomTransform | null
   /** The content's world height, so a reveal never scrolls past its ends. */
   contentHeightRef?: RefObject<{ contentHeight: number } | null>
 }
@@ -29,6 +31,7 @@ export function createCanvasHandle({
   refit,
   draggingRef,
   reveal,
+  pendingTarget,
   contentHeightRef
 }: CanvasHandleArgs): CanvasHandle {
   return {
@@ -53,8 +56,10 @@ export function createCanvasHandle({
       if (!vp || !zoomRef.current || !reveal) return
       // Never fight the user: not mid page-drag, and not while d3 has a pan in progress.
       if (draggingRef?.current || vp.classList.contains('panning')) return
+      // Measure against where a running tween is heading, not the frame it is at: a rect that
+      // happens to be visible mid-tween may be carried off screen by the time it ends.
       const target = computeRevealTransform(
-        zoomTransform(vp),
+        pendingTarget?.() ?? zoomTransform(vp),
         { w: vp.clientWidth, h: vp.clientHeight },
         rect,
         { top: REVEAL_TOP_MARGIN, bottom: REVEAL_BOTTOM_MARGIN, side: REVEAL_SIDE_MARGIN },

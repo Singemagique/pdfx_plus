@@ -45,11 +45,12 @@ function docOf(id: string, texts: string[]): DocEntry {
 const filler = (n: number, words: Record<number, string> = {}): string[] =>
   Array.from({ length: n }, (_, i) => words[i] ?? `plain page ${i}`)
 
-// 3 documents × 12 pages; "zebra" only near the end of the last one, "apple" on the first page.
+// 3 documents × 12 pages; "zebra" only near the end of the last one, "apple" on the first page,
+// "okapi" at the top, in the middle and near the end.
 const DOCS = [
-  docOf('a', filler(12, { 0: 'an apple' })),
-  docOf('b', filler(12)),
-  docOf('c', filler(12, { 10: 'a zebra', 11: 'another zebra' }))
+  docOf('a', filler(12, { 0: 'an apple okapi' })),
+  docOf('b', filler(12, { 6: 'okapi' })),
+  docOf('c', filler(12, { 10: 'a zebra okapi', 11: 'another zebra' }))
 ]
 
 const extract = async (pdf: unknown, pageIndex: number): Promise<PageText> => {
@@ -255,6 +256,25 @@ describe('Find in the collection canvas', () => {
     const t1 = zoomTransform(container.querySelector('.canvas-viewport') as HTMLElement)
     expect([t1.x, t1.y, t1.k]).toEqual([t0.x, t0.y, t0.k])
   })
+
+  // Stepping again while the previous reveal is still tweening: the new page may be on screen at
+  // that instant and yet be carried off by the rest of the tween.
+  it.each([20, 40, 60, 100])(
+    'keeps the page in view when stepping again %i ms into a reveal',
+    async (gap) => {
+      await render()
+      await findFor('okapi')
+      expect(ctl.getCurrentMatch()?.pageId).toBe('a-p0')
+      await act(async () => ctl.prev()) // wraps to c-p10, far below
+      await wait(gap)
+      await act(async () => ctl.prev()) // b-p6
+      expect(ctl.getCurrentMatch()?.pageId).toBe('b-p6')
+      await wait(REVEAL_ANIMATION_MS + 100)
+      const box = onScreen('b-p6')
+      expect(box.top).toBeGreaterThanOrEqual(0)
+      expect(box.bottom).toBeLessThanOrEqual(VP_H)
+    }
+  )
 
   it('does not move the view while a page is being dragged', async () => {
     await render(true)
