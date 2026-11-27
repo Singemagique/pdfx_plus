@@ -1,38 +1,56 @@
-import { ADD_PAGE_WIDTH, BASE_PAGE_HEIGHT } from '../canvas/layout'
+import {
+  ADD_PAGE_WIDTH,
+  BASE_PAGE_HEIGHT,
+  GHOST_ROW_HEIGHT,
+  SINGLE_ROW_DOC_HEIGHT
+} from '../canvas/layout'
 import { DashedBorder } from './dashed-border'
 import { PlusIcon } from './icons'
-
-const ROW_PAD_Y = 52 + 14
 
 export interface GhostSize {
   width: number
   height: number
 }
 
-interface GhostPageProps extends GhostSize {
+/** Card-relative position; omitted for a ghost that sits in a flex row (the between-docs ghost). */
+interface CellPosition {
+  x?: number
+  y?: number
+}
+
+const positioned = ({ x, y }: CellPosition): React.CSSProperties =>
+  x === undefined || y === undefined ? {} : { position: 'absolute', left: x, top: y }
+
+interface GhostPageProps extends GhostSize, CellPosition {
   grow?: boolean
 }
 
-export function GhostPage({ width, height, grow }: GhostPageProps): React.JSX.Element {
+export function GhostPage({ x, y, width, height, grow }: GhostPageProps): React.JSX.Element {
   return (
     <div
       className={'page ghost' + (grow ? ' grow' : '')}
-      style={{ width, height }}
+      style={{ ...positioned({ x, y }), width, height }}
       aria-hidden="true"
     />
   )
 }
 
-interface AddPageGhostProps extends GhostSize {
+interface AddPageGhostProps extends GhostSize, CellPosition {
   onClick: () => void
 }
 
-export function AddPageGhost({ width, height, onClick }: AddPageGhostProps): React.JSX.Element {
+export function AddPageGhost({
+  x,
+  y,
+  width,
+  height,
+  onClick
+}: AddPageGhostProps): React.JSX.Element {
   return (
     <button
       type="button"
       className="page add-ghost add-page"
-      style={{ width, height }}
+      style={{ ...positioned({ x, y }), width, height }}
       title="Add page"
       onClick={(e) => {
         e.stopPropagation()
@@ -52,7 +70,7 @@ interface AddDocGhostProps {
 }
 
 export function AddDocGhost({ width, onClick }: AddDocGhostProps): React.JSX.Element {
-  const height = ROW_PAD_Y + BASE_PAGE_HEIGHT
+  const height = SINGLE_ROW_DOC_HEIGHT
   return (
     <button
       type="button"
@@ -85,7 +103,7 @@ interface GhostRowProps {
 
 export function GhostRow({ width, pageHeight, pages }: GhostRowProps): React.JSX.Element {
   return (
-    <div className="doc-row ghost" style={{ width }} aria-hidden="true">
+    <div className="doc-row ghost" style={{ width, height: GHOST_ROW_HEIGHT }} aria-hidden="true">
       <div className="ghost-strip">
         {pages.map((p, i) => (
           <GhostPage key={i} width={p.width} height={pageHeight} />

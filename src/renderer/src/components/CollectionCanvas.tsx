@@ -1,10 +1,18 @@
-import { BASE_PAGE_HEIGHT, MIN_DOC_WIDTH, betweenSlotY } from '../canvas/layout'
+import { useCallback, useMemo } from 'react'
+import {
+  MIN_DOC_WIDTH,
+  BASE_PAGE_HEIGHT,
+  betweenSlotY,
+  wrapWidthForViewport
+} from '../canvas/layout'
+import { useImportFocus } from '../canvas/imported-doc'
 import { Canvas } from './Canvas'
 import { EmptyState } from './EmptyState'
 import { AddDocGhost, GhostRow } from './DropGhost'
 import { DocLayer } from './collection/DocLayer'
 import { HeaderLayer } from './collection/HeaderLayer'
 import { deriveDropGhosts } from './collection/ghost-size'
+import { computeDragView } from './collection/drag-view'
 import type { CanvasHandle } from './Canvas'
 import type { CanvasLayout, DropTarget } from '../canvas/layout'
 import type { PageRef } from '../app/types'
@@ -27,6 +35,8 @@ interface CollectionCanvasProps {
   onScaleChange: (scale: number) => void
   onSettle: () => void
   onBackgroundClick: () => void
+  /** The world width documents should wrap to, derived from the canvas viewport's width. */
+  onWrapWidthChange?: (wrapWidth: number) => void
   onOpen: () => void
   onSelectPage: (docId: string, pageId: string) => void
   onOpenPage: (docId: string, pageId: string) => void
@@ -39,14 +49,41 @@ interface CollectionCanvasProps {
 }
 
 export function CollectionCanvas(props: CollectionCanvasProps): React.JSX.Element {
-  const { docs, layout, dragKind, draggingPage, dropTarget, externalCount } = props
+  const { docs, layout, dragKind, draggingPage, dropTarget, externalCount, collapsedId } = props
+  const { onWrapWidthChange } = props
+
+  // `busy` spans one import operation (every file of a multi-file open), so the whole batch is
+  // brought into view as one: scrolled to its first document, not to each file as it lands.
+  const focus = useImportFocus(docs, layout, props.busy)
+  // Cards all span the collection's width; the between ghost and "Add document" slot match them.
+  const cardWidth = Math.max(MIN_DOC_WIDTH, layout.contentWidth)
 
   const { intoDocId, intoIndex, betweenIndex, ghostSize, betweenPages } = deriveDropGhosts(
-    docs,
+    layout,
     draggingPage,
     dropTarget,
     dragKind,
     externalCount
+  )
+
+  const draggingDocId = draggingPage?.docId ?? null
+  const ghostWidth = ghostSize.width
+  const dragView = useMemo(
+    () =>
+      computeDragView(layout, {
+        collapsedId,
+        draggingDocId,
+        intoDocId,
+        intoIndex,
+        intoGhostWidth: ghostWidth,
+        betweenIndex
+      }),
+    [layout, collapsedId, draggingDocId, intoDocId, intoIndex, ghostWidth, betweenIndex]
+  )
+
+  const onViewportWidth = useCallback(
+    (width: number) => onWrapWidthChange?.(wrapWidthForViewport(width)),
+    [onWrapWidthChange]
   )
 
   if (docs.length === 0) {
@@ -67,15 +104,16 @@ export function CollectionCanvas(props: CollectionCanvasProps): React.JSX.Elemen
       ref={props.canvasRef}
       contentWidth={layout.contentWidth}
       contentHeight={layout.contentHeight}
-      slotHeight={layout.slotHeight}
+      focus={focus}
       dragging={dragKind !== null}
       onScaleChange={props.onScaleChange}
       onSettle={props.onSettle}
       onBackgroundClick={props.onBackgroundClick}
+      onViewportWidth={onViewportWidth}
       overlay={
         <HeaderLayer
           items={layout.items}
-          betweenIndex={betweenIndex}
+          shifts={dragView.shifts}
           onMove={props.onMoveDoc}
           onRemove={props.onRemoveDoc}
           onRename={props.onRenameDoc}
@@ -84,17 +122,17 @@ export function CollectionCanvas(props: CollectionCanvasProps): React.JSX.Elemen
     >
       <DocLayer
         items={layout.items}
+        dragView={dragView}
         renderVersion={props.renderVersion}
         selected={props.selected}
         pagesDraggable={props.pagesDraggable}
-        collapsedId={props.collapsedId}
+        collapsedId={collapsedId}
         draggingPage={draggingPage}
         hiddenPageId={props.hiddenPageId}
         intoDocId={intoDocId}
         intoIndex={intoIndex}
         intoGhostWidth={ghostSize.width}
         intoGhostHeight={ghostSize.height}
-        betweenIndex={betweenIndex}
         onSelectPage={props.onSelectPage}
         onOpenPage={props.onOpenPage}
         onPageDragStart={props.onPageDragStart}
@@ -104,16 +142,16 @@ export function CollectionCanvas(props: CollectionCanvasProps): React.JSX.Elemen
       {dropTarget?.kind === 'between' && (
         <div
           className="canvas-doc ghost-doc"
-          style={{ left: 0, top: betweenSlotY(layout, dropTarget.docIndex), width: MIN_DOC_WIDTH }}
+          style={{ left: 0, top: betweenSlotY(layout, dropTarget.docIndex), width: cardWidth }}
         >
-          <GhostRow width={MIN_DOC_WIDTH} pageHeight={BASE_PAGE_HEIGHT} pages={betweenPages} />
+          <GhostRow width={cardWidth} pageHeight={BASE_PAGE_HEIGHT} pages={betweenPages} />
         </div>
       )}
       <div
         className="canvas-doc"
-        style={{ left: 0, top: betweenSlotY(layout, layout.items.length), width: MIN_DOC_WIDTH }}
+        style={{ left: 0, top: betweenSlotY(layout, layout.items.length), width: cardWidth }}
       >
-        <AddDocGhost width={MIN_DOC_WIDTH} onClick={props.onOpen} />
+        <AddDocGhost width={cardWidth} onClick={props.onOpen} />
       </div>
     </Canvas>
   )

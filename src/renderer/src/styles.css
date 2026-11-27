@@ -287,15 +287,26 @@ body {
   transition: transform 0.2s cubic-bezier(0.2, 0, 0, 1);
 }
 
-.app.committing .canvas-doc {
+.app.committing .canvas-doc,
+.app.committing .doc-row .page {
   transition: none;
 }
 
+/* A document card. Its height and every cell's left/top come from the canvas layout (pages are
+   absolutely positioned, wrapped into rows), so this box only paints the card. */
 .doc-row {
+  position: relative;
   width: 100%;
   padding: 52px 16px 14px;
   background: var(--group-bg);
   border-radius: 24px;
+}
+
+/* Cells glide to their new slot when a drag opens or closes a gap, or the card re-wraps. */
+.doc-row .page {
+  transition:
+    left 0.18s cubic-bezier(0.2, 0, 0, 1),
+    top 0.18s cubic-bezier(0.2, 0, 0, 1);
 }
 
 .canvas-overlay {
@@ -397,17 +408,6 @@ body {
   opacity: 1;
 }
 
-.page-strip {
-  overflow: visible;
-}
-
-.page-strip-inner {
-  display: flex;
-  gap: 18px;
-  padding: 0 6px;
-  width: max-content;
-}
-
 .page {
   position: relative;
   flex-shrink: 0;
@@ -486,7 +486,7 @@ body {
 }
 
 /* The "Add page" ghost lives in every row's reserved trailing slot, revealed on hover. */
-.page.add-page {
+.doc-row .page.add-page {
   box-shadow: none;
   pointer-events: auto;
   opacity: 0;
@@ -648,11 +648,6 @@ body {
   font-size: 10px;
 }
 
-.doc-list.compact .page-strip-inner {
-  gap: 8px;
-  padding: 2px 6px 8px;
-}
-
 .doc-list.compact .page {
   border-radius: 5px;
   box-shadow: 0 1px 3px rgba(20, 20, 24, 0.1);
@@ -662,15 +657,10 @@ body {
   display: none;
 }
 
-.page-strip::-webkit-scrollbar {
-  height: 8px;
-}
-
 .content::-webkit-scrollbar {
   width: 10px;
 }
 
-.page-strip::-webkit-scrollbar-thumb,
 .content::-webkit-scrollbar-thumb {
   background: var(--scrollbar-thumb);
   border-radius: 8px;
@@ -678,12 +668,10 @@ body {
   border: 2px solid transparent;
 }
 
-.page-strip::-webkit-scrollbar-thumb:hover,
 .content::-webkit-scrollbar-thumb:hover {
   background-color: var(--scrollbar-thumb-hover);
 }
 
-.page-strip::-webkit-scrollbar-track,
 .content::-webkit-scrollbar-track {
   background: transparent;
 }
@@ -757,6 +745,12 @@ body {
   align-items: center;
   justify-content: center;
   pointer-events: none;
+}
+
+/* The stage is screen-space (no canvas zoom), so keep its ghost row inside a narrow window. */
+.empty-drop-stage .doc-row.ghost {
+  max-width: calc(100% - 48px);
+  overflow: hidden;
 }
 
 .empty-card {

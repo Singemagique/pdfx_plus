@@ -57,9 +57,12 @@ export default function App(): React.JSX.Element {
   const editStore = useEditStore()
   const { fullView } = fullViewState
   const docs = collection.docs
+  // Documents wrap to a width derived from the canvas viewport (reported by the canvas once it is
+  // mounted, then on resize); until then computeLayout's default stands in.
+  const [wrapWidth, setWrapWidth] = useState<number | undefined>(undefined)
   const layout = useMemo(
-    () => computeLayout(docs, editStore.rotations),
-    [docs, editStore.rotations]
+    () => computeLayout(docs, editStore.rotations, wrapWidth),
+    [docs, editStore.rotations, wrapWidth]
   )
 
   // Drop a signature placement whose page no longer exists (its document/page was removed), so a
@@ -244,6 +247,7 @@ export default function App(): React.JSX.Element {
           onScaleChange={onScaleChange}
           onSettle={onSettle}
           onBackgroundClick={collection.clearSelection}
+          onWrapWidthChange={setWrapWidth}
           onOpen={openViaDialog}
           onSelectPage={collection.selectPage}
           onOpenPage={fullViewState.openPage}
