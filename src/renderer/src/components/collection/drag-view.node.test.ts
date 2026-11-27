@@ -57,7 +57,7 @@ describe('deriveDropGhosts sizes ghosts from the layout', () => {
   it('a dragged rotated page keeps its rotated width', () => {
     const d = { id: 'r', name: 'r.pdf', pages: [page('l0', LANDSCAPE, 0), page('p1')] }
     const rotations = new Map([[makePageKey(d.pages[0].source.id, 0), 90]])
-    const layout = computeLayout([d], rotations)
+    const layout = computeLayout([d], { rotations })
     const g = deriveDropGhosts(
       layout,
       { docId: 'r', pageId: 'l0' },
@@ -67,6 +67,35 @@ describe('deriveDropGhosts sizes ghosts from the layout', () => {
     )
     expect(g.ghostSize).toEqual({ width: 216, height: 280 })
     expect(g.betweenPages).toEqual([{ width: 216, height: 280 }])
+  })
+
+  it('a dragged cropped page keeps its cropped slot size, and its reflow ghost is centred', () => {
+    const d = { id: 'c', name: 'c.pdf', pages: [page('c0'), page('c1')] }
+    const line = { x: 0, y: 300, w: 612, h: 20 }
+    const crops = new Map([[makePageKey(d.pages[0].source.id, 0), line]])
+    const layout = computeLayout([d], { crops }, 3000)
+    const slot = layout.items[0].pages[0]
+    const g = deriveDropGhosts(
+      layout,
+      { docId: 'c', pageId: 'c0' },
+      { kind: 'into', docId: 'c', index: 1 },
+      'internal',
+      0
+    )
+    expect(g.ghostSize).toEqual({ width: slot.w, height: slot.h })
+    expect(slot.h).toBeLessThan(280)
+    const v = computeDragView(layout, {
+      ...idle,
+      collapsedId: 'c0',
+      draggingDocId: 'c',
+      intoDocId: 'c',
+      intoIndex: 1,
+      intoGhostWidth: g.ghostSize.width,
+      intoGhostHeight: g.ghostSize.height
+    })
+    const ghost = v.reflows.get('c')!.ghost!
+    expect(ghost.h).toBe(slot.h)
+    expect(ghost.y).toBe(slot.y)
   })
 
   it('an external drop borrows the size of the target page at the index', () => {

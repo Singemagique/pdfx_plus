@@ -121,6 +121,25 @@ export function imageStampSize(
 }
 
 /**
+ * Where a new image stamp lands: sized by the VISIBLE width (a cropped page's crop, else the whole
+ * page) and centred on that area, so it is never placed in a cropped-away margin. `visible` and the
+ * result are in PDF points, bottom-left origin.
+ */
+export function stampGeom(
+  visible: { x: number; y: number; w: number; h: number },
+  natural: { width: number; height: number },
+  widthFrac = 0.4
+): { x: number; y: number; w: number; h: number } {
+  const { width, height } = imageStampSize(natural, visible.w, widthFrac)
+  return {
+    x: visible.x + (visible.w - width) / 2,
+    y: visible.y + (visible.h - height) / 2,
+    w: width,
+    h: height
+  }
+}
+
+/**
  * Normalise an image picked for an image stamp so the editor overlay and the flattened export agree:
  * returns the bytes/mime to store as the attachment plus the upright pixel size. A JPEG carrying a
  * non-identity EXIF orientation is decoded (which applies the orientation) and re-encoded as PNG —

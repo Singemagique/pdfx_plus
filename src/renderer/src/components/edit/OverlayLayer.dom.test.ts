@@ -248,3 +248,24 @@ describe('OverlayLayer currentPage reporting', () => {
     expect(store.currentPage).toBeNull()
   })
 })
+
+describe('OverlayLayer crop mask and currentPage crop', () => {
+  const CROP = { x: 100, y: 200, w: 300, h: 400 }
+
+  it('reports the crop with the current page, so a stamp lands inside it', async () => {
+    expect(store.currentPage?.crop ?? null).toBeNull()
+    await act(async () => store.setCrop('src-1#0', CROP))
+    expect(store.currentPage?.crop).toEqual(CROP)
+  })
+
+  it('outlines the crop only while the crop tool is on (the page shows whole then)', async () => {
+    await act(async () => store.setCrop('src-1#0', CROP))
+    expect(container.querySelector('.ov-crop-mask')).toBeNull()
+    await act(async () => store.setTool('crop'))
+    const rect = container.querySelector('.ov-crop-rect')
+    expect(rect?.getAttribute('x')).toBe('100')
+    expect(rect?.getAttribute('y')).toBe(String(PAGE_H - 200 - 400))
+    await act(async () => store.setTool('browse'))
+    expect(container.querySelector('.ov-crop-mask')).toBeNull()
+  })
+})

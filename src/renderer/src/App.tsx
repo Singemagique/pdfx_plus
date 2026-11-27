@@ -64,11 +64,14 @@ export default function App(): React.JSX.Element {
   const { fullView } = fullViewState
   const docs = collection.docs
   // Documents wrap to a width derived from the canvas viewport (reported by the canvas once it is
-  // mounted, then on resize); until then computeLayout's default stands in.
+  // mounted, then on resize); until then computeLayout's default stands in. Cells take each page's
+  // cropped + rotated geometry; both maps keep their identity across unrelated edits (EditProvider
+  // memoizes them), so the edits object is built inside the memo, never listed as a dep.
   const [wrapWidth, setWrapWidth] = useState<number | undefined>(undefined)
+  const { rotations, crops } = editStore
   const layout = useMemo(
-    () => computeLayout(docs, editStore.rotations, wrapWidth),
-    [docs, editStore.rotations, wrapWidth]
+    () => computeLayout(docs, { rotations, crops }, wrapWidth),
+    [docs, rotations, crops, wrapWidth]
   )
 
   // Drop a signature placement whose page no longer exists (its document/page was removed), so a

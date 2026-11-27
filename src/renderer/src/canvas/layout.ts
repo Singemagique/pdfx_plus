@@ -1,10 +1,16 @@
 import type { DocEntry, PageEntry } from '../types'
-import { makePageKey } from '../edit/model'
+import { makePageKey, type CropBox } from '../edit/model'
+import { effectiveSize } from '../page-geometry'
 import { FIT_MARGIN, TARGET_FIT_SCALE } from './zoom-constants'
 
 export type Rotations = Map<string, number>
+export type Crops = Map<string, CropBox>
 
-const isRotated = (rot: number | undefined): boolean => rot === 90 || rot === 270
+/** The page edits that change a cell's geometry. */
+export interface LayoutEdits {
+  rotations?: Rotations
+  crops?: Crops
+}
 
 /** World-px height of every page thumbnail. */
 export const BASE_PAGE_HEIGHT = 280
@@ -96,12 +102,28 @@ export function pageDisplayWidth(width: number, height: number): number {
   return Math.max(6, Math.round((BASE_PAGE_HEIGHT * width) / height))
 }
 
-/** Display width at the fixed thumbnail height, accounting for a 90°/270° rotation. */
-export function pageCellWidth(page: PageEntry, rotations?: Rotations): number {
-  const rot = rotations?.get(makePageKey(page.source.id, page.pageIndex))
-  return isRotated(rot)
-    ? pageDisplayWidth(page.height, page.width)
-    : pageDisplayWidth(page.width, page.height)
+/**
+ * The widest a page cell gets. A very wide crop (a single text line is aspect ~25) would otherwise
+ * make a cell thousands of px wide and shrink the whole fit; past this it gets a shorter cell
+ * instead, centred vertically in its row.
+ */
+export const MAX_CELL_WIDTH = 4 * BASE_PAGE_HEIGHT
+
+/**
+ * A page's cell at the fixed thumbnail height: its EFFECTIVE (cropped, then rotated) aspect — the
+ * geometry it exports at. Width is capped at {@link MAX_CELL_WIDTH}, which shortens the cell.
+ */
+export function pageCellSize(page: PageEntry, edits?: LayoutEdits): { w: number; h: number } {
+  const key = makePageKey(page.source.id, page.pageIndex)
+  const size = effectiveSize(page, edits?.rotations?.get(key) ?? 0, edits?.crops?.get(key))
+  const raw = pageDisplayWidth(size.w, size.h)
+  if (raw <= MAX_CELL_WIDTH) return { w: raw, h: BASE_PAGE_HEIGHT }
+  return { w: MAX_CELL_WIDTH, h: Math.max(1, Math.round((MAX_CELL_WIDTH * size.h) / size.w)) }
+}
+
+/** Display width of a page's cell (see {@link pageCellSize}). */
+export function pageCellWidth(page: PageEntry, edits?: LayoutEdits): number {
+  return pageCellSize(page, edits).w
 }
 
 export interface FlowPosition {
@@ -149,12 +171,16 @@ export interface FlowedCell extends Rect {
   row: number
 }
 
-/** Flow `widths` into a card at (docX, docY) wrapping at `wrapWidth`; world-coordinate cells. */
+/**
+ * Flow `widths` into a card at (docX, docY) wrapping at `wrapWidth`; world-coordinate cells. A cell
+ * shorter than the row band (`heights[i]` < BASE_PAGE_HEIGHT, see MAX_CELL_WIDTH) is centred in it.
+ */
 export function flowDoc(
   widths: readonly number[],
   docX: number,
   docY: number,
-  wrapWidth: number
+  wrapWidth: number,
+  heights?: readonly number[]
 ): { cells: FlowedCell[]; rows: number; extent: number } {
   const positions = flowCells(widths, innerWidth(wrapWidth))
   let rows = 1
@@ -162,26 +188,25 @@ export function flowDoc(
   const cells = positions.map((p, i) => {
     rows = Math.max(rows, p.row + 1)
     extent = Math.max(extent, p.x + widths[i])
+    const h = heights?.[i] ?? BASE_PAGE_HEIGHT
     return {
       x: docX + CARD_PAD_X + p.x,
-      y: rowTop(docY, p.row),
+      y: rowTop(docY, p.row) + (BASE_PAGE_HEIGHT - h) / 2,
       w: widths[i],
-      h: BASE_PAGE_HEIGHT,
+      h,
       row: p.row
     }
   })
   return { cells, rows, extent }
 }
 
-function placeDoc(
-  doc: DocEntry,
-  y: number,
-  wrapWidth: number,
-  rotations?: Rotations
-): DocPlacement {
-  const widths = doc.pages.map((p) => pageCellWidth(p, rotations))
+function placeDoc(doc: DocEntry, y: number, wrapWidth: number, edits?: LayoutEdits): DocPlacement {
+  const sizes = doc.pages.map((p) => pageCellSize(p, edits))
+  const widths = sizes.map((s) => s.w)
+  const heights = sizes.map((s) => s.h)
   widths.push(ADD_PAGE_WIDTH)
-  const { cells, rows, extent } = flowDoc(widths, 0, y, wrapWidth)
+  heights.push(BASE_PAGE_HEIGHT)
+  const { cells, rows, extent } = flowDoc(widths, 0, y, wrapWidth, heights)
   const add = cells[cells.length - 1]
   return {
     doc,
@@ -199,17 +224,18 @@ function placeDoc(
 /**
  * Lay the collection out as a column of document cards, each wrapping its pages into rows no wider
  * than `wrapWidth` world px (clamped to at least MIN_DOC_WIDTH). Card heights follow their row
- * count, and each card's y is the cumulative height of those above it.
+ * count, and each card's y is the cumulative height of those above it. Cells take each page's
+ * effective geometry: its crop (`edits.crops`) and then its rotation (`edits.rotations`).
  */
 export function computeLayout(
   docs: DocEntry[],
-  rotations?: Rotations,
+  edits?: LayoutEdits,
   wrapWidth: number = DEFAULT_WRAP_WIDTH
 ): CanvasLayout {
   const wrap = Math.max(MIN_DOC_WIDTH, wrapWidth)
   let y = 0
   const items = docs.map((doc) => {
-    const placement = placeDoc(doc, y, wrap, rotations)
+    const placement = placeDoc(doc, y, wrap, edits)
     y += placement.height + DOC_GAP_Y
     return placement
   })
@@ -238,13 +264,17 @@ export interface DocReflow {
 export function reflowDoc(
   item: DocPlacement,
   excludeId: string | null,
-  ghost: { index: number; w: number } | null
+  ghost: { index: number; w: number; h?: number } | null
 ): DocReflow {
   const kept = item.pages.filter((p) => p.pageId !== excludeId)
   const widths = kept.map((p) => p.w)
+  const heights = kept.map((p) => p.h)
   const ghostAt = ghost ? Math.max(0, Math.min(kept.length, ghost.index)) : -1
-  if (ghost) widths.splice(ghostAt, 0, ghost.w)
-  const { cells, rows } = flowDoc(widths, item.x, item.y, item.wrapWidth)
+  if (ghost) {
+    widths.splice(ghostAt, 0, ghost.w)
+    heights.splice(ghostAt, 0, ghost.h ?? BASE_PAGE_HEIGHT)
+  }
+  const { cells, rows } = flowDoc(widths, item.x, item.y, item.wrapWidth, heights)
   const pages: PageSlot[] = []
   let ghostRect: Rect | null = null
   let k = 0

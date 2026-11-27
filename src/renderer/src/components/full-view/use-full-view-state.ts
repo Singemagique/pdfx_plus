@@ -1,13 +1,20 @@
 import { useRef, useState } from 'react'
-import type { DocEntry } from '../../types'
-import type { Rect, View, Phase } from './geometry'
-import { clamp, fitInto, flipTo } from './geometry'
+import type { DocEntry, PageEntry } from '../../types'
+import type { PageFrame } from '../../page-geometry'
+import type { Rect, Size, View, Phase } from './geometry'
+import { clamp, flipTo } from './geometry'
+import { fullViewBox } from './page-display'
 
+/**
+ * @param currentFrameOf How the CURRENT page is displayed (its crop window and rotation — or the
+ *   whole page while the crop tool edits it). Only ever called for the current page.
+ */
 export function useFullViewState(
   docs: DocEntry[],
   startDocId: string,
   startPageId: string,
-  originRect: Rect | null
+  originRect: Rect | null,
+  currentFrameOf: (page: PageEntry) => PageFrame
 ) {
   const scrollRef = useRef<HTMLDivElement>(null)
   const drag = useRef<{ x: number; y: number; panX: number; panY: number } | null>(null)
@@ -35,7 +42,7 @@ export function useFullViewState(
     if (!originRect) return null
     const sp = (docs[startDi] ?? docs[0]).pages[startPi]
     const vp = { w: window.innerWidth, h: window.innerHeight }
-    return flipTo(fitInto(sp.width, sp.height, vp), vp, originRect)
+    return flipTo(fullViewBox(currentFrameOf(sp), vp).box, vp, originRect)
   })
 
   const di = clamp(current.di, 0, docs.length - 1)
@@ -45,9 +52,15 @@ export function useFullViewState(
 
   const vw = viewport.w
   const vh = viewport.h
-  const fit = fitInto(page.width, page.height, viewport)
+  // The displayed (cropped + rotated) page fitted to the viewport, and the upright box it is drawn in.
+  const { dfit: fit, box } = fullViewBox(currentFrameOf(page), viewport)
   const zoomed = view.zoom > 1.0001
   const interactive = phase === 'open'
+
+  const fitRef = useRef<Size>(fit)
+  fitRef.current = fit
+  const boxRef = useRef<Size>(box)
+  boxRef.current = box
 
   const docsRef = useRef(docs)
   docsRef.current = docs
@@ -71,6 +84,8 @@ export function useFullViewState(
     curRef,
     zoomedRef,
     phaseRef,
+    fitRef,
+    boxRef,
     current,
     setCurrent,
     viewport,

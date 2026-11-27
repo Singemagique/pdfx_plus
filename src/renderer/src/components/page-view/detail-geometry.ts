@@ -9,7 +9,13 @@
  * first, and the visible screen region is mapped back through the rotation — so the detail
  * canvas (a child of the upright box) is rendered at the right scale and lands on the region
  * that is actually on screen.
+ *
+ * A cropped page still lays its box out as the FULL page (offset inside a clipping crop window), and
+ * `clip` says which part of it is visible: the base raster covers only that part, and the detail
+ * region is intersected with it.
  */
+
+import { normalizeRotation, type WindowFractions } from '../../page-geometry'
 
 /** Base raster's long side in device pixels (fixed, independent of zoom/DPR). */
 export const BASE_RASTER = 1100
@@ -56,6 +62,8 @@ export interface DetailInput {
   naturalHeight: number
   /** Device-pixel ratio to render at (already capped, see {@link detailDpr}). */
   dpr: number
+  /** The only part of the page that is shown (a crop window), as page fractions. */
+  clip?: PageClip
 }
 
 export interface DetailPlan {
@@ -71,10 +79,28 @@ export interface DetailPlan {
   css: { left: number; top: number; width: number; height: number }
 }
 
-/** Normalise any rotation to 0 / 90 / 180 / 270. */
-export function normalizeRotation(rotation: number): 0 | 90 | 180 | 270 {
-  const r = ((Math.round(rotation / 90) * 90) % 360) + 360
-  return (r % 360) as 0 | 90 | 180 | 270
+export { normalizeRotation }
+
+/**
+ * The part of the page that needs pixels, as fractions of the upright page (see
+ * page-geometry.ts `windowFractions`). Null / absent means the whole page.
+ */
+export type PageClip = WindowFractions | null | undefined
+
+const clipExtents = (clip: PageClip): { x0: number; y0: number; x1: number; y1: number } =>
+  clip ?? { x0: 0, y0: 0, x1: 1, y1: 1 }
+
+/**
+ * The base raster's pdf.js scale: {@link BASE_RASTER} device px on the long side of the region it
+ * covers — the whole page, or only `clip` (so a small crop's thumbnail stays sharp).
+ */
+export function baseRasterScale(
+  naturalWidth: number,
+  naturalHeight: number,
+  clip?: PageClip
+): number {
+  const c = clipExtents(clip)
+  return BASE_RASTER / Math.max((c.x1 - c.x0) * naturalWidth, (c.y1 - c.y0) * naturalHeight)
 }
 
 /**
@@ -97,10 +123,25 @@ export function planDetail(input: DetailInput): DetailPlan | null {
   const y1 = Math.min(viewportH, rect.top + rect.height) - rect.top
   if (x1 - x0 <= 0 || y1 - y0 <= 0) return null
 
-  const baseDevicePx = (BASE_RASTER / Math.max(naturalWidth, naturalHeight)) * naturalWidth
+  const baseDevicePx = baseRasterScale(naturalWidth, naturalHeight, input.clip) * naturalWidth
   if (uw * d <= baseDevicePx * 1.05) return null
 
-  const { u0, v0, visW, visH } = unrotateRegion(rot, uw, uh, x0, y0, x1, y1)
+  const region = unrotateRegion(rot, uw, uh, x0, y0, x1, y1)
+  let { u0, v0, visW, visH } = region
+  if (input.clip) {
+    // Only the crop window is ever shown: the DPR cap and the pixel budget apply to what is
+    // actually visible, not to the clipped-away rest of the page.
+    const c = input.clip
+    const cu0 = Math.max(u0, c.x0 * uw)
+    const cv0 = Math.max(v0, c.y0 * uh)
+    const cu1 = Math.min(u0 + visW, c.x1 * uw)
+    const cv1 = Math.min(v0 + visH, c.y1 * uh)
+    if (!(cu1 - cu0 > 0) || !(cv1 - cv0 > 0)) return null
+    u0 = cu0
+    v0 = cv0
+    visW = cu1 - cu0
+    visH = cv1 - cv0
+  }
 
   const cap = detailCapFactor(visW * d, visH * d)
   // Uncapped: round to the nearest device pixel. Capped: floor, so the budget is never exceeded.

@@ -32,7 +32,9 @@ import {
 
 interface OverlayLayerProps {
   page: PageEntry
-  /** Upright CSS size of the page box (before any rotation transform). */
+  /** Upright CSS size of the FULL-page frame (before any rotation transform). On a cropped page this
+   *  is larger than the visible crop window, which offsets and clips the layer; every overlay
+   *  coordinate therefore stays a whole-page coordinate. */
   fit: FitSize
   /** Page rotation in degrees CW (0/90/180/270). */
   rot: number
@@ -225,9 +227,10 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
   // the animation window. Ordering is safe on a page swap: React runs the outgoing layer's effect
   // cleanup before the incoming layer's effect, so the null can't clobber the new page.
   useEffect(() => {
-    if (active) setCurrentPage({ pageKey, width: page.width, height: page.height })
+    if (active)
+      setCurrentPage({ pageKey, width: page.width, height: page.height, crop: cropBox ?? null })
     return () => setCurrentPage(null)
-  }, [active, pageKey, page.width, page.height, setCurrentPage])
+  }, [active, pageKey, page.width, page.height, cropBox, setCurrentPage])
 
   // Detect fillable AcroForm fields (text, checkbox, radio, dropdown, list box) via pdf.js.
   useEffect(() => {
@@ -964,9 +967,12 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
           }
           return renderVisual(preview)
         })()}
+      {/* Only while the crop tool is on: the page then shows whole (FullViewPage), so the kept
+          region is outlined and the margins dimmed. Otherwise the page already shows only its crop
+          window, and the mask would just trace the window's edge. */}
       {draft?.kind === 'crop'
         ? cropMask(geomToCss(rectGeom(draft.start, draft.current, 1), page, fit), true)
-        : cropBox
+        : cropBox && edits.tool === 'crop'
           ? cropMask(geomToCss({ ...cropBox, rotation: 0, opacity: 1 }, page, fit), false)
           : null}
       {formMode &&

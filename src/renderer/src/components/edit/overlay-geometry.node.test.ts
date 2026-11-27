@@ -1,4 +1,6 @@
 import { describe, expect, it } from 'vitest'
+import { pageFrame } from '../../page-geometry'
+import { fullViewBox } from '../full-view/page-display'
 
 import {
   boundsOfPath,
@@ -11,7 +13,8 @@ import {
   rectGeom,
   rectToVisual,
   resizeGeom,
-  scalePath
+  scalePath,
+  type Pt
 } from './overlay-geometry'
 
 const page = { width: 200, height: 400 } // PDF points
@@ -155,5 +158,57 @@ describe('scalePath', () => {
     const from = { x: 0, y: 0, w: 100, h: 100, rotation: 0, opacity: 1 }
     const to = { x: 0, y: 0, w: 200, h: 100, rotation: 0, opacity: 1 }
     expect(scalePath([50, 50], from, to)).toEqual([100, 50])
+  })
+})
+
+describe('clientToPdfRotated on a cropped page (full-page layer offset inside a clipping window)', () => {
+  const PAGE = { width: 612, height: 792 }
+  const CROP = { x: 100, y: 200, w: 300, h: 400 } // window {x: 100, y: 192, w: 300, h: 400}
+  const VP = { w: 1200, h: 900 }
+  const ZOOM = 1.7
+  const CENTRE = { x: 630, y: 430 } // the window's centre on screen (fitted, then panned)
+
+  /** Window-local upright point → screen, through `.full-page`'s scale + rotate about its centre. */
+  const toScreen = (rot: number, bw: number, bh: number, x: number, y: number): Pt => {
+    const a = (rot * Math.PI) / 180
+    const dx = (x - bw / 2) * ZOOM
+    const dy = (y - bh / 2) * ZOOM
+    return {
+      x: CENTRE.x + dx * Math.cos(a) - dy * Math.sin(a),
+      y: CENTRE.y + dx * Math.sin(a) + dy * Math.cos(a)
+    }
+  }
+
+  it.each([0, 90, 180, 270])('maps the window corners to the crop corners at %i°', (rot) => {
+    const frame = pageFrame(PAGE, rot, CROP)
+    const { box, inner } = fullViewBox(frame, VP)
+    // The layer's on-screen bbox: the axis-aligned box of its four transformed corners.
+    const corners = [
+      [inner.left, inner.top],
+      [inner.left + inner.width, inner.top],
+      [inner.left + inner.width, inner.top + inner.height],
+      [inner.left, inner.top + inner.height]
+    ].map(([x, y]) => toScreen(rot, box.w, box.h, x, y))
+    const xs = corners.map((p) => p.x)
+    const ys = corners.map((p) => p.y)
+    const bbox = {
+      left: Math.min(...xs),
+      top: Math.min(...ys),
+      width: Math.max(...xs) - Math.min(...xs),
+      height: Math.max(...ys) - Math.min(...ys)
+    }
+    const fit = { w: inner.width, h: inner.height }
+    const expected: Array<[number, number, number, number]> = [
+      [0, 0, 100, 600],
+      [box.w, 0, 400, 600],
+      [box.w, box.h, 400, 200],
+      [0, box.h, 100, 200]
+    ]
+    for (const [wx, wy, px, py] of expected) {
+      const s = toScreen(rot, box.w, box.h, wx, wy)
+      const p = clientToPdfRotated(s.x, s.y, bbox, fit, PAGE, rot)
+      expect(p.x).toBeCloseTo(px, 6)
+      expect(p.y).toBeCloseTo(py, 6)
+    }
   })
 })

@@ -4,6 +4,7 @@ import {
   BASE_PAGE_HEIGHT,
   CARD_PAD_X,
   DOC_GAP_Y,
+  MAX_CELL_WIDTH,
   MIN_DOC_WIDTH,
   PAGE_GAP,
   PAGES_TOP,
@@ -12,6 +13,8 @@ import {
   computeLayout,
   docHeightForRows,
   flowCells,
+  pageCellSize,
+  pageDisplayWidth,
   reflowDoc,
   wrapWidthForViewport
 } from './layout'
@@ -126,10 +129,52 @@ describe('computeLayout wrapping', () => {
       pages: [page('l0', LANDSCAPE, 0), page('l1', LANDSCAPE, 1)]
     }
     const rotations = new Map([[makePageKey(d.pages[0].source.id, 0), 90]])
-    const item = computeLayout([d], rotations, WRAP_5).items[0]
+    const item = computeLayout([d], { rotations }, WRAP_5).items[0]
     expect(item.pages[0].w).toBe(LETTER_W)
     expect(item.pages[1].w).toBe(LANDSCAPE_W)
     expect(item.pages[1].x).toBe(CARD_PAD_X + LETTER_W + PAGE_GAP)
+  })
+
+  it('sizes a cropped page by its crop, rotated on top', () => {
+    const d = { id: 'c', name: 'c.pdf', pages: [page('c0', LETTER, 0), page('c1', LETTER, 1)] }
+    const k0 = makePageKey(d.pages[0].source.id, 0)
+    const k1 = makePageKey(d.pages[1].source.id, 1)
+    const crop = { x: 50, y: 100, w: 400, h: 200 }
+    const crops = new Map([
+      [k0, crop],
+      [k1, crop]
+    ])
+    const rotations = new Map([[k1, 90]])
+    const item = computeLayout([d], { rotations, crops }, WRAP_5).items[0]
+    expect(item.pages[0].w).toBe(pageDisplayWidth(400, 200))
+    expect(item.pages[1].w).toBe(pageDisplayWidth(200, 400))
+    expect(item.pages.map((p) => p.h)).toEqual([BASE_PAGE_HEIGHT, BASE_PAGE_HEIGHT])
+    expect(item.pages[1].x).toBe(CARD_PAD_X + pageDisplayWidth(400, 200) + PAGE_GAP)
+  })
+
+  it('re-wraps rows for a crop, and is unchanged without one', () => {
+    const d = doc('a', 5)
+    const plain = computeLayout([d], undefined, WRAP_5)
+    expect(computeLayout([d], { crops: new Map() }, WRAP_5)).toEqual(plain)
+    // Two wide crops no longer fit five to a row.
+    const wide = { x: 0, y: 0, w: 612, h: 400 }
+    const crops = new Map(
+      d.pages.slice(0, 2).map((p) => [makePageKey(p.source.id, p.pageIndex), wide])
+    )
+    const item = computeLayout([d], { crops }, WRAP_5).items[0]
+    expect(item.pages[0].w).toBe(pageDisplayWidth(612, 400))
+    expect(item.pages.map((p) => p.row)).toEqual([0, 0, 0, 1, 1])
+  })
+
+  it('caps a very wide crop at MAX_CELL_WIDTH with a shorter cell centred in its row', () => {
+    const d = { id: 'l', name: 'l.pdf', pages: [page('l0', LETTER, 0)] }
+    const line = { x: 0, y: 400, w: 600, h: 20 } // aspect 30
+    const crops = new Map([[makePageKey(d.pages[0].source.id, 0), line]])
+    const cell = computeLayout([d], { crops }, 3000).items[0].pages[0]
+    expect(cell.w).toBe(MAX_CELL_WIDTH)
+    expect(cell.h).toBe(Math.round((MAX_CELL_WIDTH * 20) / 600))
+    expect(cell.y).toBe(PAGES_TOP + (BASE_PAGE_HEIGHT - cell.h) / 2)
+    expect(pageCellSize(d.pages[0], { crops })).toEqual({ w: cell.w, h: cell.h })
   })
 
   it('stacks cards by their real heights', () => {
@@ -201,6 +246,19 @@ describe('reflowDoc (mid-drag view)', () => {
   it('without exclusion or ghost matches the layout cells', () => {
     const r = reflowDoc(item, null, null)
     expect(r.pages).toEqual(item.pages)
+  })
+
+  it('keeps cropped cells (and a short ghost) at their own size and centred', () => {
+    const d = doc('k', 3)
+    const line = { x: 0, y: 400, w: 600, h: 20 }
+    const crops = new Map([[makePageKey(d.pages[1].source.id, d.pages[1].pageIndex), line]])
+    const cropped = computeLayout([d], { crops }, 3000).items[0]
+    const r = reflowDoc(cropped, 'k-p0', { index: 0, w: 300, h: 100 })
+    const kept = r.pages.find((p) => p.pageId === 'k-p1')!
+    expect(kept.w).toBe(MAX_CELL_WIDTH)
+    expect(kept.h).toBe(cropped.pages[1].h)
+    expect(kept.y).toBe(cropped.pages[1].y)
+    expect(r.ghost).toMatchObject({ w: 300, h: 100, y: PAGES_TOP + (BASE_PAGE_HEIGHT - 100) / 2 })
   })
 
   it('uses the letter fixture as 216 px', () => {

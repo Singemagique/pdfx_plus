@@ -122,6 +122,24 @@ describe('FindHighlights in full view', () => {
     expect(px(a.style.top)).toBeCloseTo(80 * s)
   })
 
+  it('on a cropped page, draws in the full-page frame and skips matches outside the crop', async () => {
+    await render()
+    // Window x ∈ [50, 400], y ∈ [0, 300] (top-left): holds the first match, not the second.
+    const key = makePageKey(page.source.id, page.pageIndex)
+    await act(async () => store.setCrop(key, { x: 50, y: 492, w: 350, h: 300 }))
+    const frame = container.querySelector('.full-page .page-frame') as HTMLElement
+    expect(frame.querySelector('.find-hl-layer')).not.toBeNull()
+    const s = px(frame.style.width) / page.width
+    const drawn = rects()
+    expect(drawn).toHaveLength(1)
+    expect(drawn[0].classList.contains('current')).toBe(false)
+    expect(px(drawn[0].style.left)).toBeCloseTo(100 * s)
+    expect(px(drawn[0].style.top)).toBeCloseTo(80 * s)
+    // Uncropped again, both are drawn.
+    await act(async () => store.setCrop(key, null))
+    expect(rects()).toHaveLength(2)
+  })
+
   it('draws nothing on a page that is not current, or while animating', async () => {
     await render({ isCurrent: false })
     expect(rects()).toHaveLength(0)

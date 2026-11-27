@@ -3,9 +3,10 @@ import { PageView } from '../PageView'
 import { OverlayLayer } from '../edit/OverlayLayer'
 import { FindHighlights } from './FindHighlights'
 import { useEdits } from '../../edit/EditProvider'
-import { makePageKey } from '../../edit/model'
+import { frameOf, windowFractions } from '../../page-geometry'
 import type { View } from './geometry'
-import { DOUBLE_CLICK_ZOOM, fitInto, TRANSITION_MS } from './geometry'
+import { DOUBLE_CLICK_ZOOM, TRANSITION_MS } from './geometry'
+import { fullViewBox } from './page-display'
 
 interface FullViewPageProps {
   page: PageEntry
@@ -25,14 +26,19 @@ interface FullViewPageProps {
 export function FullViewPage(props: FullViewPageProps): React.JSX.Element {
   const { page: p, viewport, isCurrent, view, zoomed, interactive, animating } = props
   const { flip, flipTransition, renderVersion, resetView, applyZoom } = props
-  const { rotations } = useEdits()
+  const { rotations, crops, tool } = useEdits()
 
-  const rot = rotations.get(makePageKey(p.source.id, p.pageIndex)) ?? 0
-  const rotated = rot === 90 || rot === 270
-  // Box holds the upright canvas; CSS-rotating it yields the displayed (rotated) page that
-  // fits the viewport. The box's aspect therefore matches the upright page.
-  const dfit = fitInto(rotated ? p.height : p.width, rotated ? p.width : p.height, viewport)
-  const box = rotated ? { w: dfit.h, h: dfit.w } : { w: dfit.w, h: dfit.h }
+  // A page shows at its exported geometry: only its crop window, then its rotation. While the crop
+  // tool is on, the current page shows whole instead, with the crop rectangle editable on top
+  // (otherwise a crop could never be widened again). FullView's fit agrees (see currentFrameOf).
+  const editingCrop = isCurrent && tool === 'crop'
+  const frame = frameOf(p, { rotations, crops }, { ignoreCrop: editingCrop })
+  const rot = frame.rotation
+  // `.full-page` is the upright crop window; CSS-rotating it yields the displayed page that fits the
+  // viewport, and it clips the full-page `.page-frame` positioned inside it (overlays, Find and the
+  // pointer mapping all keep working in whole-page coordinates there).
+  const { box, inner } = fullViewBox(frame, viewport)
+  const fullFit = { w: inner.width, h: inner.height }
   const rotateT = rot ? ` rotate(${rot}deg)` : ''
 
   // The rotation the box's CSS transform actually carries right now: the open/close FLIP
@@ -74,19 +80,31 @@ export function FullViewPage(props: FullViewPageProps): React.JSX.Element {
             : undefined
         }
       >
-        <PageView
-          pdf={p.source.pdf}
-          pageNumber={p.pageIndex + 1}
-          naturalWidth={p.width}
-          naturalHeight={p.height}
-          version={isCurrent ? renderVersion : 0}
-          eager={isCurrent}
-          rotation={cssRotation}
-        />
-        {isCurrent && !animating && <FindHighlights page={p} box={box} />}
-        {isCurrent && (
-          <OverlayLayer page={p} fit={box} rot={rot} active={interactive && !animating} />
-        )}
+        <div
+          className="page-frame"
+          style={{ left: inner.left, top: inner.top, width: inner.width, height: inner.height }}
+        >
+          <PageView
+            pdf={p.source.pdf}
+            pageNumber={p.pageIndex + 1}
+            naturalWidth={p.width}
+            naturalHeight={p.height}
+            version={isCurrent ? renderVersion : 0}
+            eager={isCurrent}
+            rotation={cssRotation}
+            clip={windowFractions(frame)}
+          />
+          {isCurrent && !animating && (
+            <FindHighlights
+              page={p}
+              box={fullFit}
+              window={frame.cropped ? frame.window : undefined}
+            />
+          )}
+          {isCurrent && (
+            <OverlayLayer page={p} fit={fullFit} rot={rot} active={interactive && !animating} />
+          )}
+        </div>
       </div>
     </div>
   )
