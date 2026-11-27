@@ -32,18 +32,23 @@ export function FullView({
   navRef
 }: FullViewProps): React.JSX.Element {
   // The current page shows at its exported geometry (crop window, then rotation) — except while the
-  // crop tool is on, when it shows whole so the crop can be redrawn wider (FullViewPage agrees).
+  // crop tool is on and the view is open, when it shows whole so the crop can be redrawn wider
+  // (FullViewPage agrees). The open/close FLIP always uses the exported geometry: the collection
+  // cell it animates from/to has the cropped aspect, and a whole-page box scaled to the cell's width
+  // would balloon past it.
   const { rotations, crops, tool } = useEdits()
-  const editingCrop = tool === 'crop'
   const currentFrameOf = useCallback(
-    (page: PageEntry) => frameOf(page, { rotations, crops }, { ignoreCrop: editingCrop }),
-    [rotations, crops, editingCrop]
+    (page: PageEntry, animating: boolean) =>
+      frameOf(page, { rotations, crops }, { ignoreCrop: tool === 'crop' && !animating }),
+    [rotations, crops, tool]
   )
   const s = useFullViewState(docs, startDocId, startPageId, originRect, currentFrameOf)
 
   // Entering/leaving crop editing, or undoing/redoing a crop, changes the displayed frame: a zoom
   // and pan computed for the old one would be meaningless, so start the new one fitted.
-  const win = currentFrameOf(s.page).window
+  const animating = s.phase !== 'open'
+  const editingCrop = tool === 'crop' && !animating
+  const win = currentFrameOf(s.page, animating).window
   const frameKey = `${editingCrop}|${win.x}|${win.y}|${win.w}|${win.h}`
   const lastFrameKey = useRef(frameKey)
   const { setView } = s
@@ -115,7 +120,6 @@ export function FullView({
     ...controls
   })
 
-  const animating = s.phase !== 'open'
   const chromeOpacity = s.revealed ? 1 : 0
 
   return (

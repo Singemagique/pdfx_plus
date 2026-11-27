@@ -30,8 +30,9 @@ export function FullViewPage(props: FullViewPageProps): React.JSX.Element {
 
   // A page shows at its exported geometry: only its crop window, then its rotation. While the crop
   // tool is on, the current page shows whole instead, with the crop rectangle editable on top
-  // (otherwise a crop could never be widened again). FullView's fit agrees (see currentFrameOf).
-  const editingCrop = isCurrent && tool === 'crop'
+  // (otherwise a crop could never be widened again) — but not during the open/close FLIP, which
+  // animates to/from the collection cell's cropped aspect. FullView's fit agrees (currentFrameOf).
+  const editingCrop = isCurrent && tool === 'crop' && !animating
   const frame = frameOf(p, { rotations, crops }, { ignoreCrop: editingCrop })
   const rot = frame.rotation
   // `.full-page` is the upright crop window; CSS-rotating it yields the displayed page that fits the

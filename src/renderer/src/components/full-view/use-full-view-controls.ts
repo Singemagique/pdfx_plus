@@ -10,7 +10,8 @@ interface ControlsOptions {
   docsRef: React.MutableRefObject<DocEntry[]>
   vpRef: React.MutableRefObject<{ w: number; h: number }>
   curRef: React.MutableRefObject<{ di: number; pi: number }>
-  /** The current page's displayed fit (zoom/pan clamp) and upright box (open/close FLIP). */
+  /** The current page's displayed fit (zoom/pan clamp) and its upright box at the exported
+   *  geometry (open/close FLIP). */
   fitRef: React.MutableRefObject<Size>
   boxRef: React.MutableRefObject<Size>
   phaseRef: React.MutableRefObject<'opening' | 'open' | 'closing'>
@@ -95,7 +96,9 @@ export function useFullViewControls(
       return
     }
     const vp = vpRef.current
-    // The box the animated `.full-page` really has (its upright crop window).
+    // The box the animated `.full-page` really has once 'closing' renders: its upright crop window
+    // (exported geometry, even if the crop tool showed the page whole while open), so it lands on
+    // the cell's cropped aspect.
     const target = flipTo(boxRef.current, vp, r)
     setView({ zoom: 1, x: 0, y: 0 })
     setPhase('closing')

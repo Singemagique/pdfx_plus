@@ -969,10 +969,11 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
         })()}
       {/* Only while the crop tool is on: the page then shows whole (FullViewPage), so the kept
           region is outlined and the margins dimmed. Otherwise the page already shows only its crop
-          window, and the mask would just trace the window's edge. */}
+          window, and the mask would just trace the window's edge — as it would during the open/close
+          animation (inactive layer), which shows the crop window even with the crop tool on. */}
       {draft?.kind === 'crop'
         ? cropMask(geomToCss(rectGeom(draft.start, draft.current, 1), page, fit), true)
-        : cropBox && edits.tool === 'crop'
+        : cropBox && edits.tool === 'crop' && active
           ? cropMask(geomToCss({ ...cropBox, rotation: 0, opacity: 1 }, page, fit), false)
           : null}
       {formMode &&

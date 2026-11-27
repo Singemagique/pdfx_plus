@@ -7,14 +7,16 @@ import { fullViewBox } from './page-display'
 
 /**
  * @param currentFrameOf How the CURRENT page is displayed (its crop window and rotation — or the
- *   whole page while the crop tool edits it). Only ever called for the current page.
+ *   whole page while the crop tool edits it), given whether the open/close animation is running
+ *   (which always shows the exported geometry, matching the collection cell). Only ever called for
+ *   the current page.
  */
 export function useFullViewState(
   docs: DocEntry[],
   startDocId: string,
   startPageId: string,
   originRect: Rect | null,
-  currentFrameOf: (page: PageEntry) => PageFrame
+  currentFrameOf: (page: PageEntry, animating: boolean) => PageFrame
 ) {
   const scrollRef = useRef<HTMLDivElement>(null)
   const drag = useRef<{ x: number; y: number; panX: number; panY: number } | null>(null)
@@ -42,7 +44,7 @@ export function useFullViewState(
     if (!originRect) return null
     const sp = (docs[startDi] ?? docs[0]).pages[startPi]
     const vp = { w: window.innerWidth, h: window.innerHeight }
-    return flipTo(fullViewBox(currentFrameOf(sp), vp).box, vp, originRect)
+    return flipTo(fullViewBox(currentFrameOf(sp, true), vp).box, vp, originRect)
   })
 
   const di = clamp(current.di, 0, docs.length - 1)
@@ -52,8 +54,11 @@ export function useFullViewState(
 
   const vw = viewport.w
   const vh = viewport.h
-  // The displayed (cropped + rotated) page fitted to the viewport, and the upright box it is drawn in.
-  const { dfit: fit, box } = fullViewBox(currentFrameOf(page), viewport)
+  // The displayed (cropped + rotated) page fitted to the viewport: what zoom and pan clamp to.
+  const { dfit: fit } = fullViewBox(currentFrameOf(page, phase !== 'open'), viewport)
+  // The upright box the page is drawn in while the FLIP runs — its exported geometry, even while the
+  // crop tool shows it whole: what close() scales onto the collection cell.
+  const { box } = fullViewBox(currentFrameOf(page, true), viewport)
   const zoomed = view.zoom > 1.0001
   const interactive = phase === 'open'
 
