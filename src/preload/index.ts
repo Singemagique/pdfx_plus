@@ -8,7 +8,7 @@ export interface OpenedFile {
 
 export type ZoomAction = 'in' | 'out' | 'reset'
 
-export type MenuAction = 'open' | 'export-pdfx' | 'export-pdf' | 'export-zip'
+export type MenuAction = 'open' | 'export-pdfx' | 'export-pdf' | 'export-zip' | 'find'
 
 export interface SaveFilter {
   name: string

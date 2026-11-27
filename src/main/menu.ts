@@ -1,12 +1,55 @@
 import { Menu } from 'electron'
 import { getMainWindow, toggleDevTools } from './window'
 
+/**
+ * What `role: 'editMenu'` expands to on each platform, spelled out so Find… can join it. Keep it
+ * in step with Electron's: these roles are what make undo, clipboard and select-all work in text
+ * fields (and the macOS speech submenu).
+ */
+export function editItems(isMac: boolean): Electron.MenuItemConstructorOptions[] {
+  if (isMac) {
+    return [
+      { role: 'undo' },
+      { role: 'redo' },
+      { type: 'separator' },
+      { role: 'cut' },
+      { role: 'copy' },
+      { role: 'paste' },
+      { role: 'pasteAndMatchStyle' },
+      { role: 'delete' },
+      { role: 'selectAll' },
+      { type: 'separator' },
+      { label: 'Speech', submenu: [{ role: 'startSpeaking' }, { role: 'stopSpeaking' }] }
+    ]
+  }
+  return [
+    { role: 'undo' },
+    { role: 'redo' },
+    { type: 'separator' },
+    { role: 'cut' },
+    { role: 'copy' },
+    { role: 'paste' },
+    { role: 'delete' },
+    { type: 'separator' },
+    { role: 'selectAll' }
+  ]
+}
+
+// Find Next / Find Previous are deliberately NOT menu items: if both a menu accelerator and the
+// renderer's own key handling fired, a step would advance twice. Opening is idempotent.
 export function buildMenu(): void {
   const sendZoom = (action: 'in' | 'out' | 'reset') => (): void => {
     getMainWindow()?.webContents.send('pdfx:zoom', action)
   }
   const sendMenu = (action: string) => (): void => {
     getMainWindow()?.webContents.send('pdfx:menu', action)
+  }
+  const isMac = process.platform === 'darwin'
+  const findItem: Electron.MenuItemConstructorOptions = {
+    id: 'find',
+    label: 'Find…',
+    accelerator: 'CommandOrControl+F',
+    click: sendMenu('find')
   }
   const template: Electron.MenuItemConstructorOptions[] = [
     ...(process.platform === 'darwin'
@@ -29,7 +72,10 @@ export function buildMenu(): void {
         process.platform === 'darwin' ? { role: 'close' as const } : { role: 'quit' as const }
       ]
     },
-    { role: 'editMenu' },
+    {
+      label: 'Edit',
+      submenu: [...editItems(isMac), { type: 'separator' }, findItem]
+    },
     {
       label: 'View',
       submenu: [
