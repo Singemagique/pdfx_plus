@@ -52,6 +52,15 @@ asarUnpack:
   - '**/*.node'
   - node_modules/koffi/**
   - node_modules/@koromix/**
+# Licence notices for third-party files bundled into the RENDERER build (devDependencies, so their
+# node_modules copies — and LICENSE files — are not packed into the asar). The DejaVu/Bitstream Vera
+# licence requires its notice to accompany copies of the font (embedded for non-Latin text export);
+# pdf.js (Apache-2.0) is bundled into the renderer. Shipped as resources/licenses/*.
+extraResources:
+  - from: node_modules/dejavu-fonts-ttf/LICENSE
+    to: licenses/DejaVu-Fonts-LICENSE.txt
+  - from: node_modules/pdfjs-dist/LICENSE
+    to: licenses/pdfjs-dist-LICENSE.txt
 fileAssociations:
   - ext: pdfx
     name: PDFX Collection
