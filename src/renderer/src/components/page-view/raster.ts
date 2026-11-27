@@ -1,9 +1,5 @@
 import type { PDFDocumentProxy, RenderTask } from 'pdfjs-dist'
-
-export const BASE_RASTER = 1100
-export const MAX_DETAIL = 4096
-
-export const dpr = (): number => Math.min(window.devicePixelRatio || 1, 2)
+import { BASE_RASTER, type DetailPlan } from './detail-geometry'
 
 export const logRenderError =
   (label: string) =>
@@ -53,46 +49,28 @@ export async function renderBase({
   onReady()
 }
 
-interface DetailGeometry {
-  rect: DOMRect
-  layoutW: number
-  visLeft: number
-  visTop: number
-  visW: number
-  visH: number
-}
-
 interface DetailParams {
   pdf: PDFDocumentProxy
   pageNumber: number
-  naturalWidth: number
-  geometry: DetailGeometry
+  plan: DetailPlan
   detailCanvas: HTMLCanvasElement
   isCancelled: () => boolean
   onTask: (task: RenderTask) => void
 }
 
+/** Render the visible region described by `plan` (see planDetail) into the detail canvas. */
 export async function renderDetail({
   pdf,
   pageNumber,
-  naturalWidth,
-  geometry,
+  plan,
   detailCanvas,
   isCancelled,
   onTask
 }: DetailParams): Promise<void> {
-  const { rect, layoutW, visLeft, visTop, visW, visH } = geometry
-  const d = dpr()
-  const capFactor = Math.min(1, MAX_DETAIL / (visW * d), MAX_DETAIL / (visH * d))
-  const renderScale = (rect.width / naturalWidth) * d * capFactor
-
+  const { renderScale, fx, fy, backingW, backingH, css } = plan
   const page = await pdf.getPage(pageNumber)
   if (isCancelled()) return
   const viewport = page.getViewport({ scale: renderScale })
-  const fx0 = (visLeft - rect.left) / rect.width
-  const fy0 = (visTop - rect.top) / rect.height
-  const backingW = Math.max(1, Math.round(visW * d * capFactor))
-  const backingH = Math.max(1, Math.round(visH * d * capFactor))
 
   const off = document.createElement('canvas')
   off.width = backingW
@@ -100,7 +78,7 @@ export async function renderDetail({
   const task = page.render({
     canvas: off,
     viewport,
-    transform: [1, 0, 0, 1, -fx0 * viewport.width, -fy0 * viewport.height]
+    transform: [1, 0, 0, 1, -fx * viewport.width, -fy * viewport.height]
   })
   onTask(task)
   await task.promise
@@ -109,10 +87,9 @@ export async function renderDetail({
   detailCanvas.width = backingW
   detailCanvas.height = backingH
   detailCanvas.getContext('2d')!.drawImage(off, 0, 0)
-  const effScale = rect.width / layoutW || 1
   detailCanvas.style.display = 'block'
-  detailCanvas.style.left = `${(visLeft - rect.left) / effScale}px`
-  detailCanvas.style.top = `${(visTop - rect.top) / effScale}px`
-  detailCanvas.style.width = `${visW / effScale}px`
-  detailCanvas.style.height = `${visH / effScale}px`
+  detailCanvas.style.left = `${css.left}px`
+  detailCanvas.style.top = `${css.top}px`
+  detailCanvas.style.width = `${css.width}px`
+  detailCanvas.style.height = `${css.height}px`
 }

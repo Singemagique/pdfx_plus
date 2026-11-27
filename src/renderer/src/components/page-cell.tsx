@@ -130,6 +130,7 @@ function PageCellImpl({
             naturalWidth={page.width}
             naturalHeight={page.height}
             version={renderVersion}
+            rotation={rot}
           />
           {crop && (
             <CropMask

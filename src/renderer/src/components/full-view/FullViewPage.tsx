@@ -34,6 +34,10 @@ export function FullViewPage(props: FullViewPageProps): React.JSX.Element {
   const box = rotated ? { w: dfit.h, h: dfit.w } : { w: dfit.w, h: dfit.h }
   const rotateT = rot ? ` rotate(${rot}deg)` : ''
 
+  // The rotation the box's CSS transform actually carries right now: the open/close FLIP
+  // transform has no rotate(), so PageView must plan its detail canvas unrotated then (and
+  // re-plans, via this prop changing, once the rotated transform is back).
+  const cssRotation = isCurrent && animating ? 0 : rot
   let style: React.CSSProperties = { width: box.w, height: box.h }
   if (isCurrent && animating) {
     style = {
@@ -76,6 +80,7 @@ export function FullViewPage(props: FullViewPageProps): React.JSX.Element {
           naturalHeight={p.height}
           version={isCurrent ? renderVersion : 0}
           eager={isCurrent}
+          rotation={cssRotation}
         />
         {isCurrent && (
           <OverlayLayer page={p} fit={box} rot={rot} active={interactive && !animating} />
