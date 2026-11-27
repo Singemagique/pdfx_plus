@@ -1,4 +1,8 @@
 import { BrowserWindow, session } from 'electron'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const PARTITION = 'pdfx-markup-render'
 const RENDER_TIMEOUT_MS = 10_000
@@ -6,12 +10,76 @@ const RENDER_TIMEOUT_MS = 10_000
 let renderWin: BrowserWindow | null = null
 let sessionHardened = false
 let chain: Promise<unknown> = Promise.resolve()
+/**
+ * The temp file the in-flight render is loading, or null between renders. Renders are serialised
+ * through `chain`, so there is at most one, and it is the ONLY file: URL the session will load.
+ */
+let allowedDocPath: string | null = null
+
+function samePath(a: string, b: string): boolean {
+  const x = path.resolve(a)
+  const y = path.resolve(b)
+  // NTFS is case-insensitive; elsewhere compare exactly (a mismatch can only block, never allow).
+  return process.platform === 'win32' ? x.toLowerCase() === y.toLowerCase() : x === y
+}
+
+/**
+ * The render session's network allowlist: `data:` URLs (inlined images/fonts/styles and the
+ * blank page loaded between renders) and exactly the one temp document being rendered. Every
+ * other request — http(s), any other file (a sibling in the temp dir, `../`, a UNC share), a
+ * query-string variant of the document — is cancelled.
+ *
+ * Compares decoded filesystem paths, not URL strings: Chromium's file-URL canonicalisation need not
+ * match Node's `pathToFileURL` (Chromium percent-encodes `~`, as in Windows 8.3 short names like
+ * `ABCDEF~1` in the temp path; Node does or does not depending on version), so a string compare
+ * could block the very document being rendered.
+ */
+export function isAllowedRenderRequest(url: string, docPath: string | null): boolean {
+  if (url.startsWith('data:')) return true
+  if (docPath == null || !url.startsWith('file:')) return false
+  let requested: string
+  try {
+    const u = new URL(url)
+    if (u.search !== '') return false
+    // Throws on a non-local host (POSIX) or an encoded path separator — both refused.
+    requested = fileURLToPath(u)
+  } catch {
+    return false
+  }
+  return samePath(requested, docPath)
+}
+
+/**
+ * Write the markup to a private temp file for the render window to load.
+ *
+ * The document used to be handed over as a base64 `data:` URL, but Chromium rejects URLs past
+ * ~2 MB (ERR_INVALID_URL), so any page with an inlined photo (>~1.57 MB of HTML, once base64'd)
+ * failed to open at all. A file has no such limit; the 64 MiB IPC cap in register-ipc still bounds
+ * it. The directory is created by mkdtemp (0700 on POSIX) and the file is 0600, so other local
+ * users cannot read the document while it exists.
+ */
+async function writeTempDocument(
+  html: string
+): Promise<{ file: string; dispose: () => Promise<void> }> {
+  const dir = await mkdtemp(path.join(tmpdir(), 'pdfx-markup-'))
+  const dispose = (): Promise<void> => rm(dir, { recursive: true, force: true }).catch(() => {})
+  try {
+    const file = path.join(dir, 'document.html')
+    await writeFile(file, html, { encoding: 'utf8', mode: 0o600 })
+    return { file, dispose }
+  } catch (err) {
+    await dispose()
+    throw err
+  }
+}
 
 function hardenSession(): void {
   if (sessionHardened) return
   sessionHardened = true
   const ses = session.fromPartition(PARTITION)
-  ses.webRequest.onBeforeRequest((details, cb) => cb({ cancel: !details.url.startsWith('data:') }))
+  ses.webRequest.onBeforeRequest((details, cb) =>
+    cb({ cancel: !isAllowedRenderRequest(details.url, allowedDocPath) })
+  )
   ses.webRequest.onHeadersReceived((details, cb) =>
     cb({
       responseHeaders: {
@@ -84,11 +152,9 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   ]).finally(() => clearTimeout(timer))
 }
 
-async function renderOnce(html: string, fitPageHeightPx?: number): Promise<Uint8Array> {
+async function renderOnce(docPath: string, fitPageHeightPx?: number): Promise<Uint8Array> {
   const win = getRenderWindow()
-  const dataUrl =
-    'data:text/html;charset=utf-8;base64,' + Buffer.from(html, 'utf8').toString('base64')
-  await win.loadURL(dataUrl)
+  await win.loadURL(pathToFileURL(docPath).href)
   await win.webContents.executeJavaScript('document.fonts.ready.then(() => true).catch(() => true)')
 
   if (fitPageHeightPx != null) {
@@ -113,8 +179,22 @@ async function renderOnce(html: string, fitPageHeightPx?: number): Promise<Uint8
   return new Uint8Array(data)
 }
 
+async function renderJob(html: string, fitPageHeightPx?: number): Promise<Uint8Array> {
+  const doc = await writeTempDocument(html)
+  allowedDocPath = doc.file
+  try {
+    return await withTimeout(renderOnce(doc.file, fitPageHeightPx), RENDER_TIMEOUT_MS)
+  } finally {
+    // Outside withTimeout on purpose: a timed-out render never settles, but its window has been
+    // destroyed by then, so revoking the allowlist entry and deleting the file here is safe — and
+    // it happens before the chain advances to the next job.
+    allowedDocPath = null
+    await doc.dispose()
+  }
+}
+
 export function markupToPdf(html: string, fitPageHeightPx?: number): Promise<Uint8Array> {
-  const job = chain.then(() => withTimeout(renderOnce(html, fitPageHeightPx), RENDER_TIMEOUT_MS))
+  const job = chain.then(() => renderJob(html, fitPageHeightPx))
   chain = job.catch(() => undefined)
   return job
 }
