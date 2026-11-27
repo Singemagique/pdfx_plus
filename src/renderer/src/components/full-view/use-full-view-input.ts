@@ -1,6 +1,7 @@
 import { useEffect } from 'react'
 import { ARROW_PAN, clamp, WHEEL_ZOOM_SPEED, ZOOM_STEP } from './geometry'
 import type { FullViewControls } from './use-full-view-controls'
+import { isEditableTarget } from '../../app/useKeyboardShortcuts'
 
 interface InputOptions extends FullViewControls {
   scrollRef: React.RefObject<HTMLDivElement | null>
@@ -19,6 +20,8 @@ export function useFullViewInput(opts: InputOptions): void {
         return
       }
       if (phaseRef.current !== 'open') return
+      // Arrow keys belong to a focused text field (an overlay's form input, the find bar).
+      if (isEditableTarget(event.target)) return
       if (zoomedRef.current) {
         if (event.key === 'ArrowLeft') panBy(ARROW_PAN, 0)
         else if (event.key === 'ArrowRight') panBy(-ARROW_PAN, 0)

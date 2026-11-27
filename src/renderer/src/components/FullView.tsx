@@ -1,7 +1,8 @@
+import { useEffect, useImperativeHandle } from 'react'
 import type { DocEntry } from '../types'
 import type { Rect } from './full-view/geometry'
 import { useFullViewState } from './full-view/use-full-view-state'
-import { useFullViewControls } from './full-view/use-full-view-controls'
+import { useFullViewControls, type FullViewNav } from './full-view/use-full-view-controls'
 import { useFullViewLayout } from './full-view/use-full-view-layout'
 import { useFullViewEffects } from './full-view/use-full-view-effects'
 import { useFullViewInput } from './full-view/use-full-view-input'
@@ -15,6 +16,8 @@ interface FullViewProps {
   originRect: Rect | null
   onActivePageChange: (pageId: string) => void
   onClose: () => void
+  /** Imperative navigation for Find (scroll to the page holding a match). */
+  navRef?: React.Ref<FullViewNav>
 }
 
 export function FullView({
@@ -23,7 +26,8 @@ export function FullView({
   startPageId,
   originRect,
   onActivePageChange,
-  onClose
+  onClose,
+  navRef
 }: FullViewProps): React.JSX.Element {
   const s = useFullViewState(docs, startDocId, startPageId, originRect)
 
@@ -34,6 +38,8 @@ export function FullView({
     vpRef: s.vpRef,
     curRef: s.curRef,
     phaseRef: s.phaseRef,
+    dragRef: s.drag,
+    zoomedRef: s.zoomedRef,
     setView: s.setView,
     setPhase: s.setPhase,
     setFlip: s.setFlip,
@@ -41,6 +47,13 @@ export function FullView({
     setRevealed: s.setRevealed,
     onClose
   })
+
+  const { goTo, runPendingGoTo } = controls
+  useImperativeHandle(navRef, () => ({ goTo }), [goTo])
+  // A Find navigation that arrived during the open animation runs once the page has landed.
+  useEffect(() => {
+    if (s.phase === 'open') runPendingGoTo()
+  }, [s.phase, runPendingGoTo])
 
   useFullViewLayout({
     scrollRef: s.scrollRef,

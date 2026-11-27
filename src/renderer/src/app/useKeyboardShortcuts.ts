@@ -11,7 +11,7 @@ interface KeyboardShortcutDeps {
   onClearSelection: () => void
 }
 
-function isEditableTarget(target: EventTarget | null): boolean {
+export function isEditableTarget(target: EventTarget | null): boolean {
   const el = target as HTMLElement | null
   return !!el && (el.isContentEditable || el.tagName === 'INPUT' || el.tagName === 'TEXTAREA')
 }
