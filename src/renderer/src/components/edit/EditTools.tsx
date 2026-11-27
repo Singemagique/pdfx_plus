@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react'
 import { useEdits, type ToolKind } from '../../edit/EditProvider'
 import { cssColor, newOverlayId, nextZ, type RGB, type ShapeKind } from '../../edit/model'
+import { imageStampSize, prepareImageStamp } from '../../pdfx/images'
 
 const SHAPE_KINDS: { kind: ShapeKind; label: string; icon: React.JSX.Element }[] = [
   { kind: 'rect', label: 'Rectangle', icon: <rect x="3" y="5" width="18" height="14" rx="1" /> },
@@ -143,20 +144,17 @@ export function EditTools(): React.JSX.Element {
     widthFrac = 0.4
   ): Promise<void> => {
     if (!currentPage) return
-    let natW = 1
-    let natH = 1
+    // An EXIF-rotated JPEG comes back as upright PNG bytes, so the stored attachment (what flatten
+    // embeds on export) matches the upright size the overlay is drawn at.
+    let stamp = { bytes, mime, width: 1, height: 1 }
     try {
-      const bmp = await createImageBitmap(new Blob([new Uint8Array(bytes)], { type: mime }))
-      natW = bmp.width
-      natH = bmp.height
-      bmp.close()
+      stamp = await prepareImageStamp(bytes, mime)
     } catch {
-      /* keep 1:1 fallback */
+      /* keep the original bytes at a 1:1 fallback size */
     }
-    const targetW = Math.min(currentPage.width * widthFrac, natW)
-    const targetH = (targetW * natH) / natW
+    const { width: targetW, height: targetH } = imageStampSize(stamp, currentPage.width, widthFrac)
     const attachmentId = newOverlayId()
-    addAttachment(attachmentId, bytes, mime)
+    addAttachment(attachmentId, stamp.bytes, stamp.mime)
     const id = newOverlayId()
     addOverlay({
       id,
@@ -173,7 +171,7 @@ export function EditTools(): React.JSX.Element {
       },
       type: 'image',
       attachmentId,
-      mime
+      mime: stamp.mime // image/png when prepareImageStamp re-oriented a JPEG
     })
     setTool('browse')
     select(id)

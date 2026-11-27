@@ -1,4 +1,5 @@
 import {
+  PDFArray,
   PDFDocument,
   PDFDict,
   PDFHexString,
@@ -257,6 +258,107 @@ async function bakePage(
   }
 }
 
+/** Tag a failure with the output page it happened on, so one bad source is identifiable. */
+function pageError(ordinal: number, page: ExportPage, e: unknown): Error {
+  return new Error(
+    `Export failed on page ${ordinal} (source page ${page.pageIndex + 1}): ${e instanceof Error ? e.message : String(e)}`
+  )
+}
+
+/**
+ * Copy every export page into `output`, returning the copied pages in the SAME order as `pages`
+ * (not yet added to the page tree).
+ *
+ * pdf-lib dedupes shared objects only within ONE copyPages call (each call builds a fresh object
+ * copier), so copying page-by-page re-copied every object two pages share — a letterhead logo, a
+ * font, a repeated scan — once per page: a 3.7 MB JPEG on two pages exported as 7.4 MB. Instead,
+ * each source's pages are copied in a single batch, so a shared image/font lands in the output once.
+ *
+ * A page that appears more than once in the collection goes into a LATER batch per repeat (the
+ * Nth occurrence of each page joins batch N for its source). Within one copier a repeated page
+ * would share its direct /Contents and /Annots containers — and the very same annotation dicts —
+ * with the first copy, so the copies stay fully independent exactly as before (at the cost of
+ * re-copying that page's resources, which only a deliberate duplicate pays).
+ */
+async function copyExportPages(output: PDFDocument, pages: ExportPage[]): Promise<PDFPage[]> {
+  const sources = new Map<string, PDFDocument>()
+  const occurrences = new Map<string, number>()
+  // Insertion-ordered: batch key (source + repeat round) -> the output slots it fills.
+  const batches = new Map<string, { source: PDFDocument; slots: number[] }>()
+  for (let slot = 0; slot < pages.length; slot++) {
+    const page = pages[slot]
+    let source = sources.get(page.sourceKey)
+    if (!source) {
+      try {
+        source = await PDFDocument.load(page.bytes, { ignoreEncryption: true })
+      } catch (e) {
+        throw pageError(slot + 1, page, e)
+      }
+      sources.set(page.sourceKey, source)
+    }
+    const pageKey = makePageKey(page.sourceKey, page.pageIndex)
+    const round = occurrences.get(pageKey) ?? 0
+    occurrences.set(pageKey, round + 1)
+    // JSON keeps the (arbitrary-string) sourceKey and the round unambiguously separated.
+    const batchKey = JSON.stringify([page.sourceKey, round])
+    let batch = batches.get(batchKey)
+    if (!batch) batches.set(batchKey, (batch = { source, slots: [] }))
+    batch.slots.push(slot)
+  }
+
+  const copied = new Array<PDFPage>(pages.length)
+  for (const { source, slots } of batches.values()) {
+    let result: PDFPage[]
+    try {
+      result = await output.copyPages(
+        source,
+        slots.map((s) => pages[s].pageIndex)
+      )
+    } catch (batchError) {
+      // A batch failure doesn't say which page broke it. Re-copy the batch page by page to name
+      // the culprit (the output document is discarded on any throw, so the strays don't matter).
+      for (const s of slots) {
+        try {
+          await output.copyPages(source, [pages[s].pageIndex])
+        } catch (e) {
+          throw pageError(s + 1, pages[s], e)
+        }
+      }
+      throw pageError(slots[0] + 1, pages[slots[0]], batchError)
+    }
+    slots.forEach((s, i) => (copied[s] = result[i]))
+  }
+  return copied
+}
+
+/**
+ * Give a copied page private copies of the containers that baking MUTATES IN PLACE — the
+ * /Contents array (pushOperators appends to it), /Annots, and /Resources with its Font, XObject
+ * and ExtGState sub-dicts (drawText/drawImage register names there). Pages copied in one batch
+ * share whatever the source shared: an indirect /Resources dict common to every page (typical of
+ * scanners) or even a shared indirect /Contents array. Without this an overlay baked onto one page
+ * would append its content stream to — and render on — every page sharing that array. The leaf
+ * objects (content streams, images, fonts) stay shared; that's the dedupe we want.
+ */
+function isolateMutableContainers(page: PDFPage): void {
+  const node = page.node
+  const ctx = node.context
+  const contentsEntry = node.get(PDFName.of('Contents'))
+  const contents = contentsEntry ? ctx.lookup(contentsEntry) : undefined
+  if (contents instanceof PDFArray) node.set(PDFName.of('Contents'), ctx.obj(contents.asArray()))
+  const annots = node.Annots()
+  if (annots) node.set(PDFName.of('Annots'), ctx.obj(annots.asArray()))
+  const resources = node.Resources()
+  if (resources) {
+    const own = resources.clone(ctx)
+    for (const name of ['Font', 'XObject', 'ExtGState']) {
+      const sub = own.lookupMaybe(PDFName.of(name), PDFDict)
+      if (sub) own.set(PDFName.of(name), sub.clone(ctx))
+    }
+    node.set(PDFName.of('Resources'), own)
+  }
+}
+
 export async function buildPdf(
   pages: ExportPage[],
   edits?: EditLayer,
@@ -264,28 +366,20 @@ export async function buildPdf(
 ): Promise<Uint8Array> {
   const output = await PDFDocument.create()
   const res = edits ? createFlattenResources(output, edits.attachments) : undefined
-  const sources = new Map<string, PDFDocument>()
-  let ordinal = 0
-  for (const page of pages) {
-    ordinal++
+  const copied = await copyExportPages(output, pages)
+  for (let i = 0; i < pages.length; i++) {
+    const page = copied[i]
     // Tag any failure with which page failed, so a single bad source (e.g. one odd scan) is
     // identifiable instead of surfacing as a bare "Export failed".
     try {
-      let source = sources.get(page.sourceKey)
-      if (!source) {
-        source = await PDFDocument.load(page.bytes, { ignoreEncryption: true })
-        sources.set(page.sourceKey, source)
-      }
-      const [copied] = await output.copyPages(source, [page.pageIndex])
-      output.addPage(copied)
+      output.addPage(page)
+      isolateMutableContainers(page)
       // Before signing, strip empty/leftover signature fields so the signed PDF has only our
       // signature — not a dangling "sign here" field Adobe would offer to sign.
-      if (opts?.stripSignatureFields) removeSignatureWidgets(copied)
-      await bakePage(copied, page, edits, res)
+      if (opts?.stripSignatureFields) removeSignatureWidgets(page)
+      await bakePage(page, pages[i], edits, res)
     } catch (e) {
-      throw new Error(
-        `Export failed on page ${ordinal} (source page ${page.pageIndex + 1}): ${e instanceof Error ? e.message : String(e)}`
-      )
+      throw pageError(i + 1, pages[i], e)
     }
   }
   output.setProducer(`PDFX ${PDFX_VERSION}`)
@@ -305,32 +399,17 @@ export async function buildPdfx(
 ): Promise<Uint8Array> {
   const output = await PDFDocument.create()
   const manifest: PdfxManifest = { pdfx: PDFX_VERSION, title, documents: [] }
-  const sources = new Map<string, PDFDocument>()
 
   // .pdfx keeps pages CLEAN — overlays/rotation are stored in the manifest mirror instead of
   // baked in, so the file reopens fully editable. Export PDF produces the flattened, shareable
-  // copy (any viewer sees the annotations there).
-  let ordinal = 0
+  // copy (any viewer sees the annotations there). Nothing mutates the copied pages here, so they
+  // need no isolateMutableContainers. Pages are copied across ALL documents at once so an image
+  // shared between documents of the same source is also stored once; failures name the page by
+  // its ordinal across documents, as buildPdf does.
+  const ordered = documents.flatMap((doc) => doc.pages)
+  for (const page of await copyExportPages(output, ordered)) output.addPage(page)
   for (const doc of documents) {
     if (doc.pages.length === 0) continue
-    for (const page of doc.pages) {
-      ordinal++
-      // Same contextualization as buildPdf: name the failing page so one bad source is identifiable
-      // instead of surfacing as a bare "Export failed".
-      try {
-        let source = sources.get(page.sourceKey)
-        if (!source) {
-          source = await PDFDocument.load(page.bytes, { ignoreEncryption: true })
-          sources.set(page.sourceKey, source)
-        }
-        const [copied] = await output.copyPages(source, [page.pageIndex])
-        output.addPage(copied)
-      } catch (e) {
-        throw new Error(
-          `Export failed on page ${ordinal} (source page ${page.pageIndex + 1}): ${e instanceof Error ? e.message : String(e)}`
-        )
-      }
-    }
     manifest.documents.push({ name: doc.name, pages: doc.pages.length })
   }
 

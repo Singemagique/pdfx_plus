@@ -488,6 +488,212 @@ describe('buildPdf', () => {
   })
 })
 
+// A deterministic, incompressible-ish payload standing in for a large photo/scan.
+function noise(n: number): Uint8Array {
+  const out = new Uint8Array(n)
+  let s = 0x2545f491
+  for (let i = 0; i < n; i++) {
+    s ^= s << 13
+    s ^= s >>> 17
+    s ^= s << 5
+    out[i] = s & 0xff
+  }
+  return out
+}
+
+const IMAGE_BYTES = 64 * 64 * 3 // a 64×64 DeviceRGB image
+
+// A source whose `pageCount` pages ALL draw one shared image XObject (a letterhead logo / scan).
+async function makeSharedImageSource(pageCount: number): Promise<Uint8Array> {
+  const doc = await PDFDocument.create()
+  const ctx = doc.context
+  const img = ctx.register(
+    ctx.stream(noise(IMAGE_BYTES), {
+      Type: 'XObject',
+      Subtype: 'Image',
+      Width: 64,
+      Height: 64,
+      ColorSpace: 'DeviceRGB',
+      BitsPerComponent: 8
+    })
+  )
+  for (let i = 0; i < pageCount; i++) {
+    const page = doc.addPage([200 + i, 200])
+    page.node.set(PDFName.of('Resources'), ctx.obj({ XObject: { Logo: img } }))
+    const content = ctx.register(ctx.stream('q 64 0 0 64 10 10 cm /Logo Do Q'))
+    page.node.set(PDFName.of('Contents'), content)
+  }
+  return doc.save()
+}
+
+// Every distinct image XObject stream in a saved PDF, as its (raw) byte length.
+async function imageStreams(out: Uint8Array): Promise<number[]> {
+  const pdf = await PDFDocument.load(out)
+  const sizes: number[] = []
+  for (const [, obj] of pdf.context.enumerateIndirectObjects()) {
+    if (obj instanceof PDFStream && obj.dict.get(PDFName.of('Subtype')) === PDFName.of('Image')) {
+      sizes.push((obj as PDFRawStream).getContents().length)
+    }
+  }
+  return sizes
+}
+
+// Count non-overlapping occurrences of `needle` in `hay`.
+const occurrencesOf = (hay: string, needle: string): number => hay.split(needle).length - 1
+
+describe('shared objects are copied once per source', () => {
+  it('buildPdf stores an image shared by two pages exactly once', async () => {
+    const bytes = await makeSharedImageSource(2)
+    const pages: ExportPage[] = [
+      { bytes, sourceKey: 'a', pageIndex: 0 },
+      { bytes, sourceKey: 'a', pageIndex: 1 }
+    ]
+    // With baked overlays too, so the per-page isolation path is exercised alongside the dedupe.
+    const editLayer: EditLayer = {
+      overlays: new Map([
+        [
+          makePageKey('a', 0),
+          [TEXT(makePageKey('a', 0), 'ONE', { x: 10, y: 100, w: 40, h: 12 }, 0)]
+        ],
+        [
+          makePageKey('a', 1),
+          [TEXT(makePageKey('a', 1), 'TWO', { x: 10, y: 100, w: 40, h: 12 }, 0)]
+        ]
+      ]),
+      attachments: new Map()
+    }
+    for (const out of [await buildPdf(pages), await buildPdf(pages, editLayer)]) {
+      const images = await imageStreams(out)
+      expect(images).toEqual([IMAGE_BYTES]) // ONE stream, not one per page
+      expect(out.length).toBeLessThan(IMAGE_BYTES * 1.5)
+      const pdf = await PDFDocument.load(out)
+      expect(pdf.getPageCount()).toBe(2)
+      // Both pages still draw it.
+      for (let i = 0; i < 2; i++) expect(pageContent(pdf, i)).toContain('/Logo Do')
+    }
+  })
+
+  it('buildPdfx stores an image shared by pages in different documents exactly once', async () => {
+    const bytes = await makeSharedImageSource(2)
+    const documents: ExportDocument[] = [
+      { name: 'A', pages: [{ bytes, sourceKey: 'a', pageIndex: 0 }] },
+      { name: 'B', pages: [{ bytes, sourceKey: 'a', pageIndex: 1 }] }
+    ]
+    const out = await buildPdfx(documents, 'X')
+    expect(await imageStreams(out)).toEqual([IMAGE_BYTES])
+    expect((await PDFDocument.load(out)).getPageCount()).toBe(2)
+    // The integrity record still matches the (deduplicated) assembled content.
+    const manifest = JSON.parse(
+      new TextDecoder().decode(extractEmbeddedFile(await PDFDocument.load(out), MANIFEST_NAME)!)
+    ) as PdfxManifest
+    expect((await integrityOf(out)).flattenedSha256).toBe(manifest.integrity?.flattenedSha256)
+  })
+
+  it('preserves output page order when pages from two sources interleave', async () => {
+    const a = await makeSharedImageSource(2) // widths 200, 201
+    const bDoc = await PDFDocument.create()
+    bDoc.addPage([300, 300])
+    bDoc.addPage([301, 300])
+    const b = await bDoc.save()
+    const order: ExportPage[] = [
+      { bytes: b, sourceKey: 'b', pageIndex: 1 },
+      { bytes: a, sourceKey: 'a', pageIndex: 1 },
+      { bytes: b, sourceKey: 'b', pageIndex: 0 },
+      { bytes: a, sourceKey: 'a', pageIndex: 0 }
+    ]
+    const widths = async (out: Uint8Array): Promise<number[]> =>
+      (await PDFDocument.load(out)).getPages().map((p) => p.getWidth())
+    expect(await widths(await buildPdf(order))).toEqual([301, 201, 300, 200])
+    const docs: ExportDocument[] = [
+      { name: 'One', pages: order.slice(0, 3) },
+      { name: 'Two', pages: order.slice(3) }
+    ]
+    expect(await widths(await buildPdfx(docs, 'X'))).toEqual([301, 201, 300, 200])
+  })
+
+  it('exports a page duplicated in the collection twice, each with its overlay baked once', async () => {
+    // A direct /Contents ARRAY: one object copier would hand both copies the same array, so the
+    // second bake would append to the first page's content too (overlay drawn twice on each).
+    const doc = await PDFDocument.create()
+    const page = doc.addPage([200, 200])
+    const stream = doc.context.register(doc.context.stream('0 0 1 rg 0 0 5 5 re f'))
+    page.node.set(PDFName.of('Contents'), doc.context.obj([stream]))
+    const note = doc.context.register(
+      doc.context.obj({ Type: 'Annot', Subtype: 'Text', Rect: [150, 150, 170, 170], P: page.ref })
+    )
+    page.node.set(PDFName.of('Annots'), doc.context.obj([note]))
+    const bytes = await doc.save()
+    const key = makePageKey('d', 0)
+    const editLayer: EditLayer = {
+      overlays: new Map([[key, [TEXT(key, 'DUP', { x: 10, y: 100, w: 40, h: 12 }, 0)]]]),
+      attachments: new Map()
+    }
+    const pages: ExportPage[] = [
+      { bytes, sourceKey: 'd', pageIndex: 0 },
+      { bytes, sourceKey: 'd', pageIndex: 0 }
+    ]
+    const pdf = await PDFDocument.load(await buildPdf(pages, editLayer))
+    expect(pdf.getPageCount()).toBe(2)
+    expect(pdf.getPage(0).ref).not.toEqual(pdf.getPage(1).ref)
+    // Each copy owns its annotation: one annotation dict on two pages is malformed (it has one /P).
+    const annot = (i: number): string => String(pdf.getPage(i).node.Annots()!.get(0))
+    expect(annot(0)).not.toBe(annot(1))
+    for (let i = 0; i < 2; i++) {
+      const content = pageContent(pdf, i)
+      expect(occurrencesOf(content, showText('DUP'))).toBe(1)
+      expect(content).toContain('0 0 5 5 re') // the source content survives on both copies
+    }
+  })
+
+  it('keeps an overlay on its own page when two source pages share an indirect /Contents array', async () => {
+    const doc = await PDFDocument.create()
+    const ctx = doc.context
+    const stream = ctx.register(ctx.stream('0 0 1 rg 0 0 5 5 re f'))
+    const sharedContents = ctx.register(ctx.obj([stream]))
+    const sharedResources = ctx.register(ctx.obj({ Font: {}, XObject: {}, ExtGState: {} }))
+    for (let i = 0; i < 2; i++) {
+      const p = doc.addPage([200, 200])
+      p.node.set(PDFName.of('Contents'), sharedContents)
+      p.node.set(PDFName.of('Resources'), sharedResources)
+    }
+    const bytes = await doc.save()
+    const key = makePageKey('s', 0)
+    const editLayer: EditLayer = {
+      overlays: new Map([[key, [TEXT(key, 'ONLY', { x: 10, y: 100, w: 40, h: 12 }, 0)]]]),
+      attachments: new Map()
+    }
+    const out = await buildPdf(
+      [
+        { bytes, sourceKey: 's', pageIndex: 0 },
+        { bytes, sourceKey: 's', pageIndex: 1 }
+      ],
+      editLayer
+    )
+    const pdf = await PDFDocument.load(out)
+    expect(pageContent(pdf, 0)).toContain(showText('ONLY'))
+    expect(pageContent(pdf, 1)).not.toContain(showText('ONLY'))
+    expect(pageContent(pdf, 1)).toContain('0 0 5 5 re')
+    // The overlay's font is registered on page 0's resources only.
+    const fonts = (i: number): number =>
+      pdf.getPage(i).node.Resources()!.lookup(PDFName.of('Font'), PDFDict).keys().length
+    expect(fonts(0)).toBe(1)
+    expect(fonts(1)).toBe(0)
+  })
+
+  it('still names the failing page when one page of a batched source cannot be copied', async () => {
+    const bytes = await makeSourcePdf() // ONE page
+    const pages: ExportPage[] = [
+      { bytes, sourceKey: 'a', pageIndex: 0 },
+      { bytes, sourceKey: 'a', pageIndex: 0 },
+      { bytes, sourceKey: 'a', pageIndex: 6 } // out of range, in the first batch for 'a'
+    ]
+    await expect(buildPdf(pages)).rejects.toThrow(/Export failed on page 3 \(source page 7\)/)
+    await expect(buildPdfx([{ name: 'A', pages }], 'X')).rejects.toThrow(
+      /Export failed on page 3 \(source page 7\)/
+    )
+  })
+})
+
 describe('formValue flatten', () => {
   const formValue = (pageKey: string, field: string, value: string | boolean): Overlay => ({
     id: `fv-${field}`,
