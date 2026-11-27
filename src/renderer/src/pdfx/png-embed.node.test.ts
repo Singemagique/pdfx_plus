@@ -1,4 +1,6 @@
-import { unzlibSync, zlibSync } from 'fflate'
+import { deflateSync } from 'node:zlib'
+
+import { unzlibSync, zlibSync, type FlateStreamHandler } from 'fflate'
 import {
   PDFArray,
   PDFDocument,
@@ -14,8 +16,24 @@ import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 
 import { createFlattenResources } from './flatten'
 import { imageToPdf } from './images'
-import { embedPngFaithful } from './png-embed'
+import { embedPngFaithful, parsePng } from './png-embed'
 import { loadTestPdfium, withDoc, type TextPdfium } from '../test-utils/pdfium'
+
+// Count every byte png-embed's streaming inflates (Unzlib) produce, so the bomb tests can pin that
+// inflation stops early rather than only that the result is right.
+const inflated = vi.hoisted(() => ({ bytes: 0 }))
+vi.mock('fflate', async (importOriginal) => {
+  const real = await importOriginal<typeof import('fflate')>()
+  class CountingUnzlib extends real.Unzlib {
+    constructor(cb: FlateStreamHandler) {
+      super((chunk, final) => {
+        inflated.bytes += chunk.length
+        cb(chunk, final)
+      })
+    }
+  }
+  return { ...real, Unzlib: CountingUnzlib }
+})
 
 // ---------------------------------------------------------------------------------------------
 // A tiny PNG encoder, so every colour type / depth / interlace combination is built in-test.
@@ -120,11 +138,14 @@ interface PngSpec {
   chunks?: [string, Uint8Array][]
   /** Split the zlib stream across this many IDAT chunks. */
   idatParts?: number
+  /** Use this IDAT payload instead of compressing `px`. */
+  idat?: Uint8Array
 }
 
 function makePng(s: PngSpec): { png: Uint8Array; idat: Uint8Array } {
   let raw: number[]
-  if (!s.interlace) raw = scanlines(s.width, s.height, s.bitDepth, s.colorType, s.px)
+  if (s.idat) raw = []
+  else if (!s.interlace) raw = scanlines(s.width, s.height, s.bitDepth, s.colorType, s.px)
   else {
     raw = []
     for (const [x0, y0, dx, dy] of ADAM7) {
@@ -136,7 +157,7 @@ function makePng(s: PngSpec): { png: Uint8Array; idat: Uint8Array } {
       )
     }
   }
-  const idat = zlibSync(new Uint8Array(raw))
+  const idat = s.idat ?? zlibSync(new Uint8Array(raw))
   const ihdr = new Uint8Array([
     ...be32(s.width),
     ...be32(s.height),
@@ -174,6 +195,29 @@ const rgb8 = (x: number, y: number): number[] => [
   (y * 9 + noise(x, y, 1)) & 255,
   ((x + y) * 5 + noise(x, y, 2)) & 255
 ]
+
+/** A minimal ICC profile header: declared size, data colour space and the 'acsp' signature. */
+function iccProfile(space: 'RGB ' | 'GRAY', size: number): Uint8Array {
+  const profile = new Uint8Array(size).map((_, i) => (i * 31) & 255)
+  profile.set(be32(size), 0)
+  profile.set(ascii('mntr'), 12)
+  profile.set(ascii(space), 16)
+  profile.set(ascii('XYZ '), 20)
+  profile.set(ascii('acsp'), 36)
+  return profile
+}
+
+/** An iCCP chunk payload: name, NUL, compression method 0, then `zlibbed` (default: the profile). */
+function iccp(profile: Uint8Array | null, zlibbed = zlibSync(profile!)): Uint8Array {
+  const name = ascii('Test profile')
+  const out = new Uint8Array(name.length + 2 + zlibbed.length)
+  out.set(name)
+  out.set(zlibbed, name.length + 2)
+  return out
+}
+
+const srgbOetf = (l: number): number =>
+  l <= 0.0031308 ? 12.92 * l : 1.055 * Math.pow(l, 1 / 2.4) - 0.055
 
 // ---------------------------------------------------------------------------------------------
 // Inspection helpers.
@@ -436,13 +480,8 @@ describe('embedPngFaithful', () => {
   )
 
   it('emits iCCP as an ICCBased colour space carrying the profile bytes and /N', async () => {
-    const profile = new Uint8Array(300).map((_, i) => (i * 31) & 255)
-    profile.set(ascii('mntr'), 12)
-    profile.set(ascii('RGB '), 16)
-    profile.set(ascii('XYZ '), 20)
-    profile.set(ascii('acsp'), 36)
-    const iccp = new Uint8Array([...ascii('Test profile'), 0, 0, ...zlibSync(profile)])
-    const { png } = makePng({ width: 8, height: 8, colorType: 2, bitDepth: 8, px: rgb8, chunks: [['iCCP', iccp]] }) // prettier-ignore
+    const profile = iccProfile('RGB ', 300)
+    const { png } = makePng({ width: 8, height: 8, colorType: 2, bitDepth: 8, px: rgb8, chunks: [['iCCP', iccp(profile)]] }) // prettier-ignore
     const { doc, image } = await embedOne(png)
     const cs = stream(doc, image.ref).dict.get(PDFName.of('ColorSpace')) as PDFArray
     expect(cs.get(0).toString()).toBe('/ICCBased')
@@ -453,30 +492,70 @@ describe('embedPngFaithful', () => {
   })
 
   it('uses a grayscale profile (N 1) as the base of an iCCP gray image', async () => {
-    const profile = new Uint8Array(200)
-    profile.set(ascii('GRAY'), 16)
-    const iccp = new Uint8Array([...ascii('g'), 0, 0, ...zlibSync(profile)])
-    const { png } = makePng({ width: 4, height: 4, colorType: 0, bitDepth: 8, px: (x) => [x * 60], chunks: [['iCCP', iccp]] }) // prettier-ignore
+    const { png } = makePng({ width: 4, height: 4, colorType: 0, bitDepth: 8, px: (x) => [x * 60], chunks: [['iCCP', iccp(iccProfile('GRAY', 200))]] }) // prettier-ignore
     const { doc, image } = await embedOne(png)
     const cs = stream(doc, image.ref).dict.get(PDFName.of('ColorSpace')) as PDFArray
     expect(num(stream(doc, cs.get(1) as PDFRef).dict, 'N')).toBe(1)
   })
 
   it('ignores an iCCP whose colour space does not match the image (RGB profile on gray)', async () => {
-    const profile = new Uint8Array(200)
-    profile.set(ascii('RGB '), 16)
-    const iccp = new Uint8Array([...ascii('x'), 0, 0, ...zlibSync(profile)])
-    const { png } = makePng({ width: 4, height: 4, colorType: 0, bitDepth: 8, px: (x) => [x], chunks: [['iCCP', iccp]] }) // prettier-ignore
+    const { png } = makePng({ width: 4, height: 4, colorType: 0, bitDepth: 8, px: (x) => [x], chunks: [['iCCP', iccp(iccProfile('RGB ', 200))]] }) // prettier-ignore
     const { doc, image } = await embedOne(png)
     expect(nameOf(stream(doc, image.ref).dict, 'ColorSpace')).toBe('/DeviceGray')
   })
 
-  it('bakes a non-sRGB gAMA into the samples (linear gAMA 1.0 → V^(1/2.2))', async () => {
-    const gama = new Uint8Array(be32(100000)) // gamma 1.0
-    const { png } = makePng({ width: 4, height: 1, colorType: 0, bitDepth: 8, px: (x) => [x * 64], chunks: [['gAMA', gama]] }) // prettier-ignore
+  it("ignores a profile whose header size disagrees with its length, or lacks 'acsp'", async () => {
+    const short = iccProfile('RGB ', 300)
+    short.set(be32(299), 0) // declares one byte less than it inflates to
+    const noMagic = iccProfile('RGB ', 300)
+    noMagic.set(ascii('xxxx'), 36)
+    for (const profile of [short, noMagic]) {
+      const { png } = makePng({ width: 4, height: 4, colorType: 2, bitDepth: 8, px: rgb8, chunks: [['iCCP', iccp(profile)]] }) // prettier-ignore
+      const { doc, image } = await embedOne(png)
+      expect(nameOf(stream(doc, image.ref).dict, 'ColorSpace')).toBe('/DeviceRGB')
+    }
+  })
+
+  it('bakes a non-sRGB gAMA into the samples (linear gAMA 1.0 → sRGB OETF)', async () => {
+    const gama = new Uint8Array(be32(100000)) // gamma 1.0: samples are linear light
+    // Shadows are where V^(1/2.2) and the piecewise sRGB curve part ways (1 → 20 vs 13).
+    const levels = [0, 1, 2, 3, 5, 8, 12, 20, 40, 64, 128, 192, 255]
+    const { png } = makePng({ width: levels.length, height: 1, colorType: 0, bitDepth: 8, px: (x) => [levels[x]], chunks: [['gAMA', gama]] }) // prettier-ignore
+    const px = render(await pagePdf(png, embedPngFaithful), levels.length, 1)
+    levels.forEach((v, x) => {
+      expect(Math.abs(px[3 * x] - Math.round(255 * srgbOetf(v / 255)))).toBeLessThanOrEqual(1)
+    })
+  })
+
+  it('bakes gAMA through the sRGB OETF for 16-bit samples and palette entries too', async () => {
+    const gama = new Uint8Array(be32(100000))
+    const levels = [0, 1, 3, 8, 20, 64, 192] // 8-bit levels, stored as v·257 at 16 bits
+    const want = levels.map((v) => Math.round(255 * srgbOetf(v / 255)))
+    const deep = makePng({ width: levels.length, height: 1, colorType: 0, bitDepth: 16, px: (x) => [levels[x] * 257], chunks: [['gAMA', gama]] }).png // prettier-ignore
+    const px = render(await pagePdf(deep, embedPngFaithful), levels.length, 1)
+    levels.forEach((_, x) => expect(Math.abs(px[3 * x] - want[x])).toBeLessThanOrEqual(1))
+    const plte = new Uint8Array(levels.flatMap((v) => [v, v, v]))
+    const pal = makePng({ width: levels.length, height: 1, colorType: 3, bitDepth: 8, px: (x) => [x], chunks: [['gAMA', gama], ['PLTE', plte]] }).png // prettier-ignore
+    const { doc, image } = await embedOne(pal)
+    const cs = stream(doc, image.ref).dict.get(PDFName.of('ColorSpace')) as PDFArray
+    expect(Array.from((cs.get(3) as PDFHexString).asBytes())).toEqual(
+      want.flatMap((v) => [v, v, v])
+    )
+  })
+
+  it('bakes gAMA on sub-byte gray as /Indexed /DeviceGray, keeping every level distinct', async () => {
+    // Requantising the baked values to 2 bits collapsed 1 and 2 (0,170,170,255); Chromium
+    // shows a linear 2-bit ramp as 0,156,213,255.
+    const gama = new Uint8Array(be32(100000))
+    const { png, idat } = makePng({ width: 4, height: 1, colorType: 0, bitDepth: 2, px: (x) => [x], chunks: [['gAMA', gama]] }) // prettier-ignore
+    const { doc, image } = await embedOne(png)
+    const s = stream(doc, image.ref)
+    expect(num(s.dict, 'BitsPerComponent')).toBe(2)
+    expect(s.getContents()).toEqual(idat) // the original samples, passed through
+    const cs = s.dict.get(PDFName.of('ColorSpace')) as PDFArray
+    expect([cs.get(0).toString(), cs.get(1).toString(), (cs.get(2) as PDFNumber).asNumber()]).toEqual(['/Indexed', '/DeviceGray', 3]) // prettier-ignore
     const px = render(await pagePdf(png, embedPngFaithful), 4, 1)
-    const want = [0, 64, 128, 192].map((v) => Math.round(255 * Math.pow(v / 255, 1 / 2.2)))
-    expect([px[0], px[3], px[6], px[9]]).toEqual(want)
+    ;[0, 156, 213, 255].forEach((v, x) => expect(Math.abs(px[3 * x] - v)).toBeLessThanOrEqual(1))
   })
 
   it('leaves sRGB-like gAMA (and an sRGB chunk) as plain passthrough', async () => {
@@ -535,6 +614,65 @@ describe('embedPngFaithful', () => {
     small[23] = 50
     await embedPngFaithful(doc, small)
     expect(embedPng).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('decompression bombs and malformed chunks', () => {
+  it('ignores an iCCP that inflates past 4 MB, without inflating all of it', async () => {
+    // 64 MiB behind a header that passes every other check (declared size, 'acsp', 'RGB ').
+    const size = 132 + (64 << 20)
+    const bomb = Buffer.alloc(size)
+    bomb.set(iccProfile('RGB ', 132))
+    bomb.writeUInt32BE(size, 0)
+    const zlibbed = new Uint8Array(deflateSync(bomb))
+    const { png } = makePng({ width: 2, height: 2, colorType: 2, bitDepth: 8, px: rgb8, chunks: [['iCCP', iccp(null, zlibbed)]] }) // prettier-ignore
+    expect(png.length).toBeLessThan(128 << 10)
+    inflated.bytes = 0
+    const t0 = performance.now()
+    const pdf = await pagePdf(png, embedPngFaithful)
+    const ms = performance.now() - t0
+    expect(inflated.bytes).toBeLessThan(6 << 20) // the 4 MB cap plus at most one slice
+    expect(ms).toBeLessThan(2000)
+    const doc = await PDFDocument.load(pdf)
+    const xobjects = doc.getPage(0).node.Resources()!.lookup(PDFName.of('XObject')) as PDFDict
+    const image = stream(doc, xobjects.get(xobjects.keys()[0]) as PDFRef)
+    expect(nameOf(image.dict, 'ColorSpace')).toBe('/DeviceRGB') // no /ICCBased: embedded unmanaged
+    expect(pdf.length).toBeLessThan(4096)
+  })
+
+  it('rejects a second IHDR instead of letting the last one win', () => {
+    const big = new Uint8Array([...be32(46341), ...be32(46341), 8, 2, 0, 0, 0])
+    const { png } = makePng({ width: 1, height: 1, colorType: 2, bitDepth: 8, px: rgb8, chunks: [['IHDR', big]] }) // prettier-ignore
+    expect(() => parsePng(png)).toThrow(/duplicate IHDR/)
+  })
+
+  it('stops inflating the IDAT at the image size, and re-encodes one carrying extra output', async () => {
+    // A 1×1 gray image (2 bytes: filter 0, sample 77) followed by 32 MiB of zeros in the stream.
+    const raw = Buffer.alloc(2 + (32 << 20))
+    raw[1] = 77
+    const idat = new Uint8Array(deflateSync(raw))
+    const { png } = makePng({ width: 1, height: 1, colorType: 0, bitDepth: 8, px: () => [0], idat }) // prettier-ignore
+    inflated.bytes = 0
+    const t0 = performance.now()
+    const pdf = await pagePdf(png, embedPngFaithful)
+    expect(performance.now() - t0).toBeLessThan(2000)
+    expect(inflated.bytes).toBeLessThan(2 << 20)
+    expect(pdf.length).toBeLessThan(2048) // the ~32 KB IDAT was not passed through
+    expect(Array.from(render(pdf, 1, 1))).toEqual([77, 77, 77])
+  })
+
+  it('re-encodes an IDAT with junk after its zlib stream instead of passing it through', async () => {
+    const { idat: good } = makePng({ width: 1, height: 1, colorType: 0, bitDepth: 8, px: () => [77] }) // prettier-ignore
+    const idat = new Uint8Array(good.length + 100_000)
+    idat.set(good)
+    idat.set(
+      new Uint8Array(100_000).map((_, i) => (i * 131) & 255),
+      good.length
+    )
+    const { png } = makePng({ width: 1, height: 1, colorType: 0, bitDepth: 8, px: () => [0], idat }) // prettier-ignore
+    const pdf = await pagePdf(png, embedPngFaithful)
+    expect(pdf.length).toBeLessThan(2048)
+    expect(Array.from(render(pdf, 1, 1))).toEqual([77, 77, 77])
   })
 })
 

@@ -34,11 +34,27 @@ function toBlob(data: Uint8Array): Blob {
 const MAX_IMAGE_PIXELS = 100 * 1024 * 1024 // 100 MP cap on a directly-embedded image
 const MAX_RASTER_DIM = 8192 // px on the longest edge when re-encoding through a canvas
 
-// PNG IHDR stores width/height as big-endian uint32 at byte offsets 16 and 20.
+// The IHDR chunk stores width/height as big-endian uint32s at the start of its data (byte offsets
+// 16 and 20 when it is the first chunk, as the spec requires). The chunks are walked up to IEND
+// rather than trusting those offsets: a PNG with a second IHDR is malformed, and decoders disagree
+// on which one wins (pdf-lib, the embed fallback, takes the last, wherever it is) — so a 1×1 IHDR
+// in front of a huge one would slip past the pixel cap. Such a file is rejected outright, before
+// any decoder sees it.
 function pngSize(data: Uint8Array): { width: number; height: number } | null {
   if (data.length < 24 || !isPng(data)) return null
   const dv = new DataView(data.buffer, data.byteOffset, data.byteLength)
-  return { width: dv.getUint32(16), height: dv.getUint32(20) }
+  let at = 16 // where IHDR's data starts, if it is the first chunk
+  let ihdrs = 0
+  for (let pos = 8; pos + 8 <= data.length; ) {
+    const len = dv.getUint32(pos)
+    const type = String.fromCharCode(data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7])
+    if (type === 'IHDR') {
+      if (++ihdrs > 1) throw new Error('Malformed PNG: more than one IHDR chunk')
+      if (pos + 16 <= data.length) at = pos + 8
+    } else if (type === 'IEND') break
+    pos += 12 + len // length + type + data + CRC
+  }
+  return { width: dv.getUint32(at), height: dv.getUint32(at + 4) }
 }
 
 // JPEG dimensions from the first SOF (start-of-frame) marker, WITHOUT decoding pixels — so a
