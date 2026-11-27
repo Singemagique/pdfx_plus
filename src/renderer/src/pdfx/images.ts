@@ -1,5 +1,7 @@
 import { PDFDocument } from 'pdf-lib'
 
+import { jpegOrientation } from './exif'
+
 const IMAGE_EXT = /\.(png|jpe?g|webp|gif|bmp|avif)$/i
 
 export function isImageFile(name: string): boolean {
@@ -71,6 +73,64 @@ export function jpegSize(data: Uint8Array): { width: number; height: number } | 
 const oversizePixels = (d: { width: number; height: number }): boolean =>
   d.width * d.height > MAX_IMAGE_PIXELS
 
+/**
+ * Whether a JPEG must be re-oriented before it is embedded: true when its EXIF orientation is
+ * anything but 1. PDF embedders draw the stored (sensor) frame and ignore EXIF, so a phone photo
+ * shot in portrait would otherwise land sideways. Decided from the header bytes alone — comparing
+ * createImageBitmap(..., { imageOrientation: 'none' }) against the default can't work: Chromium
+ * treats 'none' like 'from-image', and a width comparison misses 180° turns and square images.
+ */
+export function jpegNeedsReorient(data: Uint8Array): boolean {
+  return isJpeg(data) && jpegOrientation(data) !== 1
+}
+
+// Pixels per inch assumed for a placed image stamp. Sizing pixels as points (72 DPI) made small
+// images blurry when printed; 150 DPI keeps them sharp while still landing at a sensible size.
+const STAMP_ASSUMED_DPI = 150
+
+/**
+ * The initial size (PDF points) of an image stamp whose upright pixel size is `natural`: the
+ * image's size at STAMP_ASSUMED_DPI, capped at `widthFrac` of the page width, aspect preserved.
+ */
+export function imageStampSize(
+  natural: { width: number; height: number },
+  pageWidth: number,
+  widthFrac = 0.4
+): { width: number; height: number } {
+  const natW = natural.width > 0 ? natural.width : 1
+  const natH = natural.height > 0 ? natural.height : 1
+  const width = Math.min(pageWidth * widthFrac, (natW * 72) / STAMP_ASSUMED_DPI)
+  return { width, height: (width * natH) / natW }
+}
+
+/**
+ * Normalise an image picked for an image stamp so the editor overlay and the flattened export agree:
+ * returns the bytes/mime to store as the attachment plus the upright pixel size. A JPEG carrying a
+ * non-identity EXIF orientation is decoded (which applies the orientation) and re-encoded as PNG —
+ * flatten's embedJpg would otherwise draw the raw sideways frame squeezed into the upright box.
+ * Everything else passes through untouched. Throws if the image can't be decoded.
+ */
+export async function prepareImageStamp(
+  bytes: Uint8Array,
+  mime: 'image/png' | 'image/jpeg'
+): Promise<{
+  bytes: Uint8Array
+  mime: 'image/png' | 'image/jpeg'
+  width: number
+  height: number
+}> {
+  const bitmap = await createImageBitmap(new Blob([new Uint8Array(bytes)], { type: mime }))
+  try {
+    const { width, height } = bitmap
+    if (mime === 'image/jpeg' && jpegNeedsReorient(bytes)) {
+      return { bytes: await rasterToPng(bitmap), mime: 'image/png', width, height }
+    }
+    return { bytes, mime, width, height }
+  } finally {
+    bitmap.close()
+  }
+}
+
 async function rasterToPng(bitmap: ImageBitmap): Promise<Uint8Array> {
   const scale = Math.min(1, MAX_RASTER_DIM / Math.max(bitmap.width, bitmap.height))
   const canvas = document.createElement('canvas')
@@ -96,12 +156,18 @@ export async function imageToPdf(
   } else if (isJpeg(data)) {
     const dim = jpegSize(data)
     if (dim && oversizePixels(dim)) throw tooLarge // reject the bomb before decoding it
-    const oriented = await createImageBitmap(toBlob(data))
-    const raw = await createImageBitmap(toBlob(data), { imageOrientation: 'none' })
-    const rotated = oriented.width !== raw.width
-    raw.close()
-    image = rotated ? await doc.embedPng(await rasterToPng(oriented)) : await doc.embedJpg(data)
-    oriented.close()
+    if (jpegNeedsReorient(data)) {
+      // createImageBitmap's default ('from-image') applies the EXIF orientation, so re-encoding the
+      // decoded bitmap bakes the upright frame into pixels that embedPng can't misread.
+      const oriented = await createImageBitmap(toBlob(data))
+      try {
+        image = await doc.embedPng(await rasterToPng(oriented))
+      } finally {
+        oriented.close()
+      }
+    } else {
+      image = await doc.embedJpg(data) // already upright: embed the original bytes losslessly
+    }
   } else {
     // WebP/GIF/BMP/AVIF: no cheap header parse here, so cap on the decoded bitmap's dimensions.
     const bitmap = await createImageBitmap(toBlob(data))
