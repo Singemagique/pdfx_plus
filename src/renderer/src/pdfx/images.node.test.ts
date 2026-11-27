@@ -1,7 +1,14 @@
 import { PDFDocument } from 'pdf-lib'
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { imageToPdf, jpegSize } from './images'
+import {
+  imageStampSize,
+  imageToPdf,
+  jpegNeedsReorient,
+  jpegSize,
+  prepareImageStamp
+} from './images'
+import { exifApp1, jpegWith } from './test-utils/jpeg'
 
 // Minimal JPEG: SOI, optional segments, then an SOF0 frame header carrying [precision, H(2), W(2)].
 function jpegWithSof(width: number, height: number, lead: number[] = []): Uint8Array {
@@ -78,5 +85,125 @@ describe('imageToPdf PNG branch (the older half of the pixel cap)', () => {
     const doc = await PDFDocument.load(pdf)
     expect(doc.getPageCount()).toBe(1)
     expect(doc.getPage(0).getSize()).toMatchObject({ width: 612, height: 792 })
+  })
+})
+
+// A phone photo as stored: a 200×100 landscape sensor frame whose EXIF says how to turn it upright.
+const exifJpeg = (orientation: number, little = true): Uint8Array =>
+  jpegWith([exifApp1(orientation, { little })], { width: 200, height: 100 })
+
+describe('jpegNeedsReorient (EXIF orientation decided from the header bytes)', () => {
+  it('is false for an upright JPEG, a JPEG with no EXIF, and a PNG', () => {
+    expect(jpegNeedsReorient(exifJpeg(1))).toBe(false)
+    expect(jpegNeedsReorient(jpegWith([]))).toBe(false)
+    expect(jpegNeedsReorient(ONE_PIXEL_PNG)).toBe(false)
+  })
+
+  it('is true for 90° turns in either byte order', () => {
+    expect(jpegNeedsReorient(exifJpeg(6, true))).toBe(true)
+    expect(jpegNeedsReorient(exifJpeg(8, false))).toBe(true)
+  })
+
+  it('catches what a bitmap width comparison cannot: a 180° turn and a square image', () => {
+    expect(jpegNeedsReorient(exifJpeg(3))).toBe(true) // same width either way up
+    const square = jpegWith([exifApp1(6, { little: true })], { width: 300, height: 300 })
+    expect(jpegNeedsReorient(square)).toBe(true)
+  })
+})
+
+// Node has no createImageBitmap or canvas: stand in for Chromium, where the default decode applies
+// EXIF (so a 200×100 orientation-6 frame decodes to an upright 100×200 bitmap) and — the bug —
+// { imageOrientation: 'none' } is ignored, returning the same upright bitmap.
+function stubBrowserImaging(upright: { width: number; height: number }): {
+  createImageBitmap: ReturnType<typeof vi.fn>
+  canvas: { width: number; height: number; drawn: unknown[] }
+  closed: () => number
+} {
+  let closes = 0
+  const createImageBitmap = vi.fn(async () => ({ ...upright, close: () => void closes++ }))
+  const canvas = {
+    width: 0,
+    height: 0,
+    drawn: [] as unknown[],
+    getContext: () => ({ drawImage: (bmp: unknown) => canvas.drawn.push(bmp) }),
+    toBlob: (cb: (b: Blob | null) => void) => cb(new Blob([ONE_PIXEL_PNG], { type: 'image/png' }))
+  }
+  vi.stubGlobal('createImageBitmap', createImageBitmap)
+  vi.stubGlobal('document', { createElement: () => canvas })
+  return { createImageBitmap, canvas, closed: () => closes }
+}
+
+describe('imageToPdf JPEG branch (EXIF orientation)', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('embeds an upright JPEG as-is, without decoding it', async () => {
+    const { createImageBitmap } = stubBrowserImaging({ width: 200, height: 100 })
+    const doc = await PDFDocument.load(await imageToPdf(exifJpeg(1)))
+    expect(createImageBitmap).not.toHaveBeenCalled()
+    expect(doc.getPage(0).getSize()).toEqual({ width: 200, height: 100 })
+  })
+
+  it('re-encodes an EXIF-rotated JPEG from the oriented bitmap instead of embedding it sideways', async () => {
+    const { createImageBitmap, canvas, closed } = stubBrowserImaging({ width: 100, height: 200 })
+    const doc = await PDFDocument.load(await imageToPdf(exifJpeg(6)))
+    // One default (EXIF-applying) decode, rasterised at its upright size...
+    expect(createImageBitmap).toHaveBeenCalledTimes(1)
+    expect(createImageBitmap.mock.calls[0]).toHaveLength(1)
+    expect([canvas.width, canvas.height]).toEqual([100, 200])
+    expect(canvas.drawn).toHaveLength(1)
+    expect(closed()).toBe(1)
+    // ...and the page is built from that PNG (1×1 stand-in), not the raw 200×100 sideways JPEG.
+    expect(doc.getPage(0).getSize()).toEqual({ width: 1, height: 1 })
+  })
+})
+
+describe('prepareImageStamp (image stamp attachment matches its overlay)', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('stores an EXIF-rotated JPEG as upright PNG bytes, sized by the oriented bitmap', async () => {
+    const { canvas } = stubBrowserImaging({ width: 100, height: 200 })
+    const stamp = await prepareImageStamp(exifJpeg(6), 'image/jpeg')
+    expect(stamp.mime).toBe('image/png')
+    expect(Array.from(stamp.bytes)).toEqual(Array.from(ONE_PIXEL_PNG))
+    expect({ width: stamp.width, height: stamp.height }).toEqual({ width: 100, height: 200 })
+    expect([canvas.width, canvas.height]).toEqual([100, 200])
+  })
+
+  it('passes an upright JPEG and a PNG through untouched', async () => {
+    const { canvas } = stubBrowserImaging({ width: 200, height: 100 })
+    const jpeg = exifJpeg(1)
+    const j = await prepareImageStamp(jpeg, 'image/jpeg')
+    expect(j).toEqual({ bytes: jpeg, mime: 'image/jpeg', width: 200, height: 100 })
+    const p = await prepareImageStamp(ONE_PIXEL_PNG, 'image/png')
+    expect(p.bytes).toBe(ONE_PIXEL_PNG)
+    expect(p.mime).toBe('image/png')
+    expect(canvas.drawn).toHaveLength(0) // nothing was re-encoded
+  })
+})
+
+describe('imageStampSize (initial image-stamp size at an assumed 150 DPI)', () => {
+  it('sizes pixels at 150 DPI rather than as points (72 DPI)', () => {
+    // 300 px at 150 DPI = 2 in = 144 pt (was 300 pt).
+    expect(imageStampSize({ width: 300, height: 150 }, 612)).toEqual({ width: 144, height: 72 })
+  })
+
+  it('caps the width at the page fraction, keeping the aspect ratio', () => {
+    const { width, height } = imageStampSize({ width: 4000, height: 3000 }, 612)
+    expect(width).toBeCloseTo(244.8)
+    expect(height).toBeCloseTo(183.6)
+    expect(imageStampSize({ width: 4000, height: 2000 }, 600, 0.25)).toEqual({
+      width: 150,
+      height: 75
+    })
+  })
+
+  it('treats degenerate dimensions as 1 px instead of dividing by zero', () => {
+    const { width, height } = imageStampSize({ width: 0, height: 0 }, 612)
+    expect(Number.isFinite(width) && Number.isFinite(height)).toBe(true)
+    expect(width).toBeCloseTo(0.48)
   })
 })
