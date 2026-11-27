@@ -265,11 +265,85 @@ describe('fit on viewport resize', () => {
     expect(t.k).toBeCloseTo((900 * FIT_MARGIN) / layout.contentWidth)
   })
 
-  it('leaves a view the user moved alone', async () => {
-    await resize(840)
-    await wheel(200)
+  /** Screen px left of the content and right of it, at the current transform. */
+  const margins = (docs: DocEntry[], vpW: number): { left: number; right: number } => {
+    const t = transform()
+    const cw = layoutOf(docs, vpW).contentWidth
+    return { left: t.x, right: vpW - (t.x + cw * t.k) }
+  }
+
+  it('re-fits a view the user only SCROLLED, keeping their place, on a narrower and a wider pane', async () => {
+    await act(async () => setDocs([a, b]))
+    await settle()
+    await wheel(600)
+    const topWorldY = (FIT_TOP_MARGIN - transform().y) / transform().k
+
+    for (const w of [1000, 1700, 840]) {
+      await resize(w)
+      const t = transform()
+      const cw = layoutOf([a, b], w).contentWidth
+      // The scale follows the pane exactly as an unmoved fit would…
+      expect(t.k).toBeCloseTo(Math.min(1.25, (w * FIT_MARGIN) / cw))
+      // …the content is centred with even margins (none flush against the right edge)…
+      const m = margins([a, b], w)
+      expect(m.left).toBeCloseTo(m.right, 0)
+      expect(m.right).toBeGreaterThan(w * 0.05)
+      // …and the same world y is still at the top of the view.
+      expect((FIT_TOP_MARGIN - t.y) / t.k).toBeCloseTo(topWorldY, 0)
+    }
+  })
+
+  it('keeps a ZOOMED view at its scale but re-centres it horizontally on resize', async () => {
+    await act(async () => setDocs([a, b]))
+    await settle()
+    // Ctrl+wheel out: content narrower than the pane at the user's scale.
+    await act(async () => {
+      viewport().dispatchEvent(
+        new WheelEvent('wheel', { deltaY: 20, ctrlKey: true, bubbles: true, cancelable: true })
+      )
+    })
     const before = transform()
-    await resize(720)
-    expect(transform()).toEqual(before)
+    await resize(1000)
+    const t = transform()
+    expect(t.k).toBeCloseTo(before.k)
+    expect(t.y).toBeCloseTo(before.y)
+    const m = margins([a, b], 1000)
+    expect(m.left).toBeCloseTo(m.right, 0)
+  })
+
+  it('keeps the middle of a zoomed-in view in the middle of the pane on resize', async () => {
+    await act(async () => setDocs([a, b]))
+    await settle()
+    await act(async () => {
+      viewport().dispatchEvent(
+        new WheelEvent('wheel', { deltaY: -30, ctrlKey: true, bubbles: true, cancelable: true })
+      )
+    })
+    const before = transform()
+    const cwBefore = layoutOf([a, b]).contentWidth
+    const midBefore = (VP_W / 2 - before.x) / before.k / cwBefore
+    expect(cwBefore * before.k).toBeGreaterThan(VP_W) // wider than the pane
+
+    await resize(1100)
+    const t = transform()
+    expect(t.k).toBeCloseTo(before.k)
+    const cw = layoutOf([a, b], 1100).contentWidth
+    expect((1100 / 2 - t.x) / t.k / cw).toBeCloseTo(midBefore, 2)
+  })
+
+  it('does not move a scrolled view when only the content height changes', async () => {
+    await act(async () => setDocs([a, b]))
+    await settle()
+    await wheel(250)
+    const before = transform()
+    await act(async () => setDocs([a, b, doc('c', 5)]))
+    // An import re-fits by design; deleting it again is a height-only change.
+    await settle()
+    await wheel(100)
+    const scrolled = transform()
+    await act(async () => setDocs([a, b]))
+    await settle()
+    expect(transform()).toEqual(scrolled)
+    expect(before.k).toBeCloseTo(scrolled.k)
   })
 })
