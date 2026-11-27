@@ -21,5 +21,10 @@ export const FIT_TOP_MARGIN = 72
 export const FIT_BOTTOM_MARGIN = 24
 /** Duration of the animated fit that brings newly imported documents into view. */
 export const FIT_ANIMATION_MS = 250
+/** Screen px kept above a page Find scrolls to: the toolbar plus the find bar under it. */
+export const REVEAL_TOP_MARGIN = FIT_TOP_MARGIN + 52
+export const REVEAL_BOTTOM_MARGIN = FIT_BOTTOM_MARGIN
+export const REVEAL_SIDE_MARGIN = 24
+export const REVEAL_ANIMATION_MS = FIT_ANIMATION_MS
 export const WHEEL_ZOOM_SPEED = 0.03
 export const BUTTON_ZOOM_FACTOR = 1.35

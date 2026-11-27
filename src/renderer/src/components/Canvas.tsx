@@ -8,6 +8,8 @@ export interface CanvasHandle {
   zoomIn(): void
   zoomOut(): void
   reset(): void
+  /** Bring a world rect (a page slot) into view, unless the user is dragging or panning. */
+  revealRect(rect: { x: number; y: number; w: number; h: number }): void
   clientToWorld(clientX: number, clientY: number): { x: number; y: number; k: number } | null
 }
 
@@ -70,7 +72,7 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
     onViewportWidth?.(size.width)
   })
 
-  const { refit } = useAutoFit({
+  const { refit, reveal } = useAutoFit({
     viewportRef,
     zoomRef,
     userMovedRef,
@@ -83,7 +85,17 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
     viewportHeight: viewportSize.height
   })
 
-  useImperativeHandle(ref, () => createCanvasHandle({ viewportRef, zoomRef, userMovedRef, refit }))
+  useImperativeHandle(ref, () =>
+    createCanvasHandle({
+      viewportRef,
+      zoomRef,
+      userMovedRef,
+      refit,
+      draggingRef,
+      reveal,
+      contentHeightRef: dims
+    })
+  )
 
   return (
     <div
