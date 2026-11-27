@@ -77,13 +77,22 @@ jobs:
           key: ${{ runner.os }}-electron-${{ hashFiles('yarn.lock') }}
           restore-keys: ${{ runner.os }}-electron-
 
-      # ubuntu-latest is 24.04: rpmbuild is needed for electron-builder's RPM
-      # target, and the classic AppImage runtime needs FUSE2 (libfuse2t64 on 24.04).
+      # rpmbuild is needed for electron-builder's RPM target, and the classic AppImage runtime
+      # needs FUSE2 (libfuse2t64 on Ubuntu 24.04+).
+      #
+      # fpm comes from RubyGems rather than electron-builder's bundled fpm 1.9.3: rpm >= 4.20
+      # (ubuntu-latest is 26.04 with rpm 6.0) always puts the buildroot at
+      # BUILD/<name>-<version>-build/BUILDROOT unless `rpmbuild --buildroot` is given, and fpm 1.9.3
+      # only passes `--define buildroot`, so every staged file fails with "File not found". fpm
+      # 1.16.0+ passes --buildroot. USE_SYSTEM_FPM on the Linux build step makes electron-builder
+      # use this one (for the deb target too). Drop both once electron-builder bundles a fixed fpm.
       - name: Linux packaging dependencies
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y rpm libfuse2t64
+          sudo gem install --no-document fpm -v 1.17.0
+          fpm --version
 
       - name: Install dependencies
         run: yarn install --frozen-lockfile
@@ -98,6 +107,8 @@ jobs:
 
       - name: Build (Linux)
         if: matrix.os == 'ubuntu-latest'
+        env:
+          USE_SYSTEM_FPM: 'true'
         run: yarn build:linux --publish never
 
       # Installers/packages only. Uploading all of dist/ shipped the full unpacked app trees
