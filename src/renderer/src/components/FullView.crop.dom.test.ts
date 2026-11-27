@@ -115,6 +115,18 @@ function view(): { x: number; y: number; zoom: number } | null {
   return m ? { x: +m[1], y: +m[2], zoom: +m[3] } : null
 }
 
+describe('FullView scrollers stay out of the Tab order', () => {
+  // Chromium makes scroll containers keyboard-focusable on their own; Tab past a page's last form
+  // field then landed on the next document's section and scrolled the view to it.
+  it('gives the scroll container and every document section tabIndex -1', async () => {
+    await render()
+    const scrollers = [...container.querySelectorAll<HTMLElement>('.full-scroll, .full-doc')]
+    expect(scrollers.length).toBeGreaterThanOrEqual(2)
+    // The attribute, not el.tabIndex: jsdom reports -1 for any plain div.
+    for (const el of scrollers) expect(el.getAttribute('tabindex')).toBe('-1')
+  })
+})
+
 describe('FullView zoom/pan clamp at the cropped geometry', () => {
   it('clamps pan to the displayed crop window, not the whole page', async () => {
     await render()
