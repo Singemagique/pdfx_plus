@@ -95,6 +95,7 @@ function DocumentRowImpl({
       y={add.y}
       width={add.w}
       height={add.h}
+      edge={item.addPage.edge}
       onClick={() => onAddPage(doc.id)}
     />
   )

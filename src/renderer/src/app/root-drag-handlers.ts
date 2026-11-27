@@ -1,6 +1,7 @@
 import { computeDropTarget } from '../canvas/layout'
+import { deriveDropGhosts } from '../components/collection/ghost-size'
 import { countDroppableItems, isDroppableFile } from './drop-items'
-import type { CanvasLayout, DropTarget } from '../canvas/layout'
+import type { CanvasLayout, DropTarget, DropView } from '../canvas/layout'
 import type { CanvasHandle } from '../components/Canvas'
 import type { IncomingFile, PageRef } from './types'
 
@@ -37,6 +38,19 @@ export interface RootDragHandlers {
 }
 
 export function createRootDragHandlers(deps: RootDragDeps): RootDragHandlers {
+  // The preview on screen, sized exactly as CollectionCanvas sizes it, so hit tests see the card
+  // heights the into-ghost drew (see computeDropTarget).
+  const view = (): DropView => ({
+    target: deps.dropTarget,
+    ghostWidth: deriveDropGhosts(
+      deps.layout,
+      deps.draggingPage,
+      deps.dropTarget,
+      deps.dragKind,
+      deps.externalCount
+    ).ghostSize.width
+  })
+
   const onDragEnter = (event: React.DragEvent): void => {
     if (event.dataTransfer.types.includes(PAGE_MIME)) return
     if (!event.dataTransfer.types.includes(FILES_TYPE)) return
@@ -58,8 +72,8 @@ export function createRootDragHandlers(deps: RootDragDeps): RootDragHandlers {
     if (!w) return
     deps.updateDropTarget(
       internal
-        ? computeDropTarget(deps.layout, w.x, w.y, w.k, deps.collapsedId, true)
-        : computeDropTarget(deps.layout, w.x, w.y, w.k, null, deps.externalCount <= 1)
+        ? computeDropTarget(deps.layout, w.x, w.y, w.k, deps.collapsedId, true, view())
+        : computeDropTarget(deps.layout, w.x, w.y, w.k, null, deps.externalCount <= 1, view())
     )
   }
 
@@ -78,7 +92,7 @@ export function createRootDragHandlers(deps: RootDragDeps): RootDragHandlers {
     if (internal && deps.draggingPage) {
       const source = deps.draggingPage
       const target = w
-        ? computeDropTarget(deps.layout, w.x, w.y, w.k, source.pageId, true)
+        ? computeDropTarget(deps.layout, w.x, w.y, w.k, source.pageId, true, view())
         : deps.dropTarget
       deps.clearDrag()
       if (target?.kind === 'into') deps.movePageInto(source, target.docId, target.index)
@@ -92,7 +106,7 @@ export function createRootDragHandlers(deps: RootDragDeps): RootDragHandlers {
     const dropped = Array.from(event.dataTransfer.files)
     const paths = dropped.map((f) => window.api.getPathForFile(f))
     const target = w
-      ? computeDropTarget(deps.layout, w.x, w.y, w.k, null, dropped.length <= 1)
+      ? computeDropTarget(deps.layout, w.x, w.y, w.k, null, dropped.length <= 1, view())
       : deps.dropTarget
     deps.clearDrag()
     // Both intake paths can reject (an unreadable path / directory expansion in main, a revoked

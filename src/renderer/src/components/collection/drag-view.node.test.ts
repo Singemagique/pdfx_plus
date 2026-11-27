@@ -1,7 +1,13 @@
 import { describe, expect, it } from 'vitest'
 import { computeDragView, type DragViewInput } from './drag-view'
 import { deriveDropGhosts } from './ghost-size'
-import { BETWEEN_GHOST_SHIFT, computeLayout, docHeightForRows } from '../../canvas/layout'
+import {
+  BETWEEN_GHOST_SHIFT,
+  computeDropTarget,
+  computeLayout,
+  docHeightForRows
+} from '../../canvas/layout'
+import type { DropTarget, DropView } from '../../canvas/layout'
 import { makePageKey } from '../../edit/model'
 import { LANDSCAPE, WRAP_5, doc, page } from '../../canvas/test-utils/layout-fixtures'
 
@@ -44,6 +50,48 @@ describe('computeDragView', () => {
     expect(wide.reflows.get('a')?.height).toBe(docHeightForRows(2))
     const grew = docHeightForRows(2) - docHeightForRows(1)
     expect(wide.shifts).toEqual([0, grew, grew])
+  })
+
+  it('a full row gets no add-page row, so a ghost at its end opens one and pushes cards down', () => {
+    const full = computeLayout([doc('p', 5), doc('q', 1)], undefined, WRAP_5)
+    expect(full.items[0].height).toBe(docHeightForRows(1))
+    const v = computeDragView(full, { ...idle, intoDocId: 'p', intoIndex: 5, intoGhostWidth: 362 })
+    expect(v.reflows.get('p')?.height).toBe(docHeightForRows(2))
+    expect(v.shifts).toEqual([0, docHeightForRows(2) - docHeightForRows(1)])
+  })
+
+  it('the drop hit test agrees with what it draws: on the ghost’s new row, the target holds', () => {
+    // A landscape page dragged out of l and into the end of p, whose portrait row is full.
+    const land = { id: 'l', name: 'l.pdf', pages: [page('l0', LANDSCAPE), page('l1')] }
+    const full = computeLayout([doc('p', 5), land, doc('q', 3)], undefined, WRAP_5)
+    const dragging = { docId: 'l', pageId: 'l0' }
+    const target: DropTarget = { kind: 'into', docId: 'p', index: 5 }
+    const ghosts = deriveDropGhosts(full, dragging, target, 'internal', 0)
+    const v = computeDragView(full, {
+      collapsedId: 'l0',
+      draggingDocId: 'l',
+      intoDocId: ghosts.intoDocId,
+      intoIndex: ghosts.intoIndex,
+      intoGhostWidth: ghosts.ghostSize.width,
+      betweenIndex: ghosts.betweenIndex
+    })
+    const ghost = v.reflows.get('p')?.ghost
+    expect(ghost?.y).toBeGreaterThan(full.items[0].y + full.items[0].height)
+    const drawn: DropView = { target, ghostWidth: ghosts.ghostSize.width }
+    const at = (x: number, y: number): DropTarget =>
+      computeDropTarget(full, x, y, 1, 'l0', true, drawn)
+    // Anywhere on the ghost, and on the rest of its row, keeps dropping into p at the end.
+    for (const fx of [0.1, 0.5, 0.9]) {
+      for (const fy of [0.1, 0.5, 0.9]) {
+        expect(at(ghost!.x + ghost!.w * fx, ghost!.y + ghost!.h * fy)).toEqual(target)
+      }
+    }
+    expect(at(full.items[0].width - 30, ghost!.y + ghost!.h / 2)).toEqual(target)
+    // Each later card is hit where it is drawn: its layout y plus its drag shift.
+    full.items.slice(1).forEach((item, i) => {
+      const y = item.y + v.shifts[i + 1] + item.height / 2
+      expect(at(item.gridX + 1, y)).toMatchObject({ kind: 'into', docId: item.doc.id })
+    })
   })
 
   it('collapses the dragged page out of its own document only', () => {

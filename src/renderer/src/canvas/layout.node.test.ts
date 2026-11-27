@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
+  ADD_PAGE_EDGE_SIZE,
+  ADD_PAGE_MIN_WIDTH,
   ADD_PAGE_WIDTH,
   BASE_PAGE_HEIGHT,
   CARD_PAD_X,
@@ -77,7 +79,8 @@ describe('computeLayout wrapping', () => {
       x: CARD_PAD_X + 2 * (LETTER_W + PAGE_GAP),
       y: PAGES_TOP + 2 * ROW_PITCH,
       w: ADD_PAGE_WIDTH,
-      h: BASE_PAGE_HEIGHT
+      h: BASE_PAGE_HEIGHT,
+      edge: false
     })
     expect(item.height).toBe(docHeightForRows(3))
     expect(item.width).toBe(WRAP_5)
@@ -91,19 +94,60 @@ describe('computeLayout wrapping', () => {
     expect(item.width).toBe(8 * LETTER_W + 7 * PAGE_GAP + 2 * CARD_PAD_X)
   })
 
-  it('puts the add-page slot on a row of its own when the pages exactly fill the rows', () => {
-    const item = computeLayout([doc('a', 5)], undefined, WRAP_5).items[0]
-    expect(item.pages.every((p) => p.row === 0)).toBe(true)
-    expect(item.rows).toBe(2)
-    expect(item.addPage.x).toBe(CARD_PAD_X)
+  it('never opens a row for the add-page slot when the pages exactly fill the rows', () => {
+    for (const [count, rows] of [
+      [5, 1],
+      [10, 2]
+    ]) {
+      const item = computeLayout([doc('a', count)], undefined, WRAP_5).items[0]
+      expect(item.rows).toBe(rows)
+      expect(item.height).toBe(docHeightForRows(rows))
+      // A round button straddling the card's right edge, centred on the last row.
+      expect(item.addPage).toEqual({
+        x: item.width - ADD_PAGE_EDGE_SIZE / 2,
+        y: PAGES_TOP + (rows - 1) * ROW_PITCH + (BASE_PAGE_HEIGHT - ADD_PAGE_EDGE_SIZE) / 2,
+        w: ADD_PAGE_EDGE_SIZE,
+        h: ADD_PAGE_EDGE_SIZE,
+        edge: true
+      })
+    }
+  })
+
+  it('a full last row reserves no width, so adding or removing a page keeps contentWidth', () => {
+    const widths = [4, 5, 9, 10, 11].map(
+      (n) => computeLayout([doc('a', n)], undefined, WRAP_5).contentWidth
+    )
+    expect(new Set(widths)).toEqual(new Set([WRAP_5]))
+    // Three landscape pages leave 30 px of a five-letter wrap: too little for an add-page cell.
+    const land = computeLayout([doc('l', 3, LANDSCAPE)], undefined, WRAP_5)
+    expect(land.contentWidth).toBe(3 * LANDSCAPE_W + 2 * PAGE_GAP + 2 * CARD_PAD_X)
+    expect(land.items[0].addPage.edge).toBe(true)
+  })
+
+  it('narrows the add-page cell beside centred pages rather than wrapping it', () => {
+    // Four pages + a full add cell fill a five-page card; centring the four leaves the cell 99 px.
+    const item = computeLayout([doc('n', 4)], undefined, WRAP_5).items[0]
+    expect(item.width).toBe(WRAP_5)
+    expect(item.rows).toBe(1)
+    const offset = Math.floor((LETTER_W + PAGE_GAP) / 2)
+    expect(item.gridX).toBe(CARD_PAD_X + offset)
+    expect(item.addPage).toEqual({
+      x: item.gridX + 4 * (LETTER_W + PAGE_GAP),
+      y: PAGES_TOP,
+      w: LETTER_W - offset,
+      h: BASE_PAGE_HEIGHT,
+      edge: false
+    })
+    expect(item.addPage.w).toBeGreaterThanOrEqual(ADD_PAGE_MIN_WIDTH)
+    expect(item.addPage.x + item.addPage.w).toBe(item.width - CARD_PAD_X)
   })
 
   it('clamps a wrap narrower than MIN_DOC_WIDTH', () => {
     const layout = computeLayout([doc('a', 12)], undefined, 300)
     expect(layout.wrapWidth).toBe(MIN_DOC_WIDTH)
-    // 12 pages + the add-page slot, three per row.
+    // 12 pages, three per row; the add-page slot rides on the full last row.
     expect(layout.items[0].pages.filter((p) => p.row === 0)).toHaveLength(3)
-    expect(layout.items[0].rows).toBe(5)
+    expect(layout.items[0].rows).toBe(4)
   })
 
   it('gives a page wider than the wrap a row to itself', () => {
@@ -129,7 +173,8 @@ describe('computeLayout wrapping', () => {
     const item = computeLayout([d], rotations, WRAP_5).items[0]
     expect(item.pages[0].w).toBe(LETTER_W)
     expect(item.pages[1].w).toBe(LANDSCAPE_W)
-    expect(item.pages[1].x).toBe(CARD_PAD_X + LETTER_W + PAGE_GAP)
+    expect(item.pages[0].x).toBe(item.gridX)
+    expect(item.pages[1].x).toBe(item.gridX + LETTER_W + PAGE_GAP)
   })
 
   it('stacks cards by their real heights', () => {
@@ -162,6 +207,34 @@ describe('computeLayout wrapping', () => {
     expect(wide.contentWidth).toBeLessThanOrEqual(3000)
     // Every card spans the collection's width, so the right edges line up.
     expect(wide.items[0].width).toBe(wide.contentWidth)
+  })
+
+  it('centres a narrower document’s pages in the shared card width', () => {
+    const layout = computeLayout([doc('n', 2), doc('w', 12)], undefined, WRAP_5)
+    const [n, w] = layout.items
+    expect(n.width).toBe(w.width)
+    const left = n.pages[0].x - n.x
+    const right = n.x + n.width - (n.pages[1].x + n.pages[1].w)
+    expect(Math.abs(left - right)).toBeLessThanOrEqual(1)
+    expect(n.gridX).toBe(n.pages[0].x)
+    // The add-page cell still follows the last page, inside the card.
+    expect(n.addPage.x).toBe(n.pages[1].x + LETTER_W + PAGE_GAP)
+    expect(n.addPage.w).toBe(ADD_PAGE_WIDTH)
+    // The widest card has no slack, so its grid starts at the padding as before.
+    expect(w.gridX).toBe(CARD_PAD_X)
+  })
+
+  it('centres each card on its widest row; shorter rows below stay left-aligned under it', () => {
+    // At a 2000 px wrap: 8 letter pages per row (1854 px) beside 5 landscape ones (1882 px).
+    const layout = computeLayout([doc('s', 10), doc('x', 5, LANDSCAPE)], undefined, 2000)
+    const s = layout.items[0]
+    expect(s.gridX).toBe(CARD_PAD_X + 14)
+    const rowOf = (r: number): typeof s.pages => s.pages.filter((p) => p.row === r)
+    expect(rowOf(1)[0].x).toBe(rowOf(0)[0].x)
+    const last = rowOf(0).at(-1)!
+    const left = rowOf(0)[0].x - s.x
+    const right = s.x + s.width - (last.x + last.w)
+    expect(Math.abs(left - right)).toBeLessThanOrEqual(1)
   })
 
   it('an empty collection has a 1×1 placeholder extent', () => {
@@ -201,6 +274,26 @@ describe('reflowDoc (mid-drag view)', () => {
   it('without exclusion or ghost matches the layout cells', () => {
     const r = reflowDoc(item, null, null)
     expect(r.pages).toEqual(item.pages)
+  })
+
+  it('keeps a centred grid in place while a drag opens and closes gaps', () => {
+    const [n] = computeLayout([doc('n', 2), doc('w', 12)], undefined, WRAP_5).items
+    const collapsed = reflowDoc(n, 'n-p0', null)
+    expect(collapsed.pages[0].x).toBe(n.gridX)
+    const opened = reflowDoc(n, null, { index: 0, w: LETTER_W })
+    expect(opened.ghost?.x).toBe(n.gridX)
+    expect(opened.pages[0].x).toBe(n.gridX + LETTER_W + PAGE_GAP)
+  })
+
+  it('moves a centred grid left only as far as a widened row needs to stay in the card', () => {
+    // Three landscape pages set the card width; two letter pages are centred in it.
+    const layout = computeLayout([doc('l', 3, LANDSCAPE), doc('n', 2)], undefined, WRAP_5)
+    const n = layout.items[1]
+    const r = reflowDoc(n, null, { index: 2, w: LANDSCAPE_W })
+    const right = r.ghost!.x + r.ghost!.w
+    expect(right).toBe(n.x + n.width - CARD_PAD_X)
+    expect(r.pages[0].x).toBeLessThan(n.gridX)
+    expect(r.height).toBe(SINGLE_ROW_DOC_HEIGHT)
   })
 
   it('uses the letter fixture as 216 px', () => {
