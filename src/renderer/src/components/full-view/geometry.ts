@@ -5,10 +5,9 @@ export interface Rect {
   height: number
 }
 
-export interface Size {
-  w: number
-  h: number
-}
+import type { Size } from './page-display'
+export type { Size } from './page-display'
+export { fitInto } from './page-display'
 
 export interface View {
   zoom: number
@@ -29,11 +28,6 @@ export const GAP = 24
 export const TRANSITION_MS = 340
 
 export const clamp = (v: number, lo: number, hi: number): number => Math.min(hi, Math.max(lo, v))
-
-export function fitInto(pw: number, ph: number, vp: Size): Size {
-  const f = Math.min(vp.w / pw, vp.h / ph)
-  return { w: pw * f, h: ph * f }
-}
 
 export function flipTo(fit: Size, vp: Size, rect: Rect): string {
   const left = (vp.w - fit.w) / 2

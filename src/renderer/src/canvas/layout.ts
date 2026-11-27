@@ -1,10 +1,16 @@
 import type { DocEntry, PageEntry } from '../types'
-import { makePageKey } from '../edit/model'
+import { makePageKey, type CropBox } from '../edit/model'
+import { effectiveSize } from '../page-geometry'
 import { FIT_MARGIN, TARGET_FIT_SCALE } from './zoom-constants'
 
 export type Rotations = Map<string, number>
+export type Crops = Map<string, CropBox>
 
-const isRotated = (rot: number | undefined): boolean => rot === 90 || rot === 270
+/** The page edits that change a cell's geometry. */
+export interface LayoutEdits {
+  rotations?: Rotations
+  crops?: Crops
+}
 
 /** World-px height of every page thumbnail. */
 export const BASE_PAGE_HEIGHT = 280
@@ -117,12 +123,28 @@ export function pageDisplayWidth(width: number, height: number): number {
   return Math.max(6, Math.round((BASE_PAGE_HEIGHT * width) / height))
 }
 
-/** Display width at the fixed thumbnail height, accounting for a 90°/270° rotation. */
-export function pageCellWidth(page: PageEntry, rotations?: Rotations): number {
-  const rot = rotations?.get(makePageKey(page.source.id, page.pageIndex))
-  return isRotated(rot)
-    ? pageDisplayWidth(page.height, page.width)
-    : pageDisplayWidth(page.width, page.height)
+/**
+ * The widest a page cell gets. A very wide crop (a single text line is aspect ~25) would otherwise
+ * make a cell thousands of px wide and shrink the whole fit; past this it gets a shorter cell
+ * instead, centred vertically in its row.
+ */
+export const MAX_CELL_WIDTH = 4 * BASE_PAGE_HEIGHT
+
+/**
+ * A page's cell at the fixed thumbnail height: its EFFECTIVE (cropped, then rotated) aspect — the
+ * geometry it exports at. Width is capped at {@link MAX_CELL_WIDTH}, which shortens the cell.
+ */
+export function pageCellSize(page: PageEntry, edits?: LayoutEdits): { w: number; h: number } {
+  const key = makePageKey(page.source.id, page.pageIndex)
+  const size = effectiveSize(page, edits?.rotations?.get(key) ?? 0, edits?.crops?.get(key))
+  const raw = pageDisplayWidth(size.w, size.h)
+  if (raw <= MAX_CELL_WIDTH) return { w: raw, h: BASE_PAGE_HEIGHT }
+  return { w: MAX_CELL_WIDTH, h: Math.max(1, Math.round((MAX_CELL_WIDTH * size.h) / size.w)) }
+}
+
+/** Display width of a page's cell (see {@link pageCellSize}). */
+export function pageCellWidth(page: PageEntry, edits?: LayoutEdits): number {
+  return pageCellSize(page, edits).w
 }
 
 export interface FlowPosition {
@@ -184,26 +206,35 @@ function flowGrid(widths: readonly number[], wrapWidth: number): GridFlow {
   return { positions, rows, extent }
 }
 
-/** World-coordinate cells for `flow` with its grid's left edge at `gridX`, in a card at `docY`. */
+/**
+ * World-coordinate cells for `flow` with its grid's left edge at `gridX`, in a card at `docY`. A
+ * cell shorter than the row band (`heights[i]` < BASE_PAGE_HEIGHT, see MAX_CELL_WIDTH) is centred
+ * in it vertically.
+ */
 function placeCells(
   flow: GridFlow,
   widths: readonly number[],
+  heights: readonly number[],
   gridX: number,
   docY: number
 ): Array<Rect & { row: number }> {
-  return flow.positions.map((p, i) => ({
-    x: gridX + p.x,
-    y: rowTop(docY, p.row),
-    w: widths[i],
-    h: BASE_PAGE_HEIGHT,
-    row: p.row
-  }))
+  return flow.positions.map((p, i) => {
+    const h = heights[i] ?? BASE_PAGE_HEIGHT
+    return {
+      x: gridX + p.x,
+      y: rowTop(docY, p.row) + (BASE_PAGE_HEIGHT - h) / 2,
+      w: widths[i],
+      h,
+      row: p.row
+    }
+  })
 }
 
 /** One document flowed into rows, before the collection's shared card width is known. */
 interface DocFlow {
   doc: DocEntry
   widths: number[]
+  heights: number[]
   flow: GridFlow
   /** Grid-relative x where the add-page slot starts: one gap after the last page. */
   addX: number
@@ -211,8 +242,10 @@ interface DocFlow {
   natural: number
 }
 
-function flowDocument(doc: DocEntry, wrapWidth: number, rotations?: Rotations): DocFlow {
-  const widths = doc.pages.map((p) => pageCellWidth(p, rotations))
+function flowDocument(doc: DocEntry, wrapWidth: number, edits?: LayoutEdits): DocFlow {
+  const sizes = doc.pages.map((p) => pageCellSize(p, edits))
+  const widths = sizes.map((s) => s.w)
+  const heights = sizes.map((s) => s.h)
   const flow = flowGrid(widths, wrapWidth)
   const last = flow.positions.length - 1
   const addX = last >= 0 ? flow.positions[last].x + widths[last] + PAGE_GAP : 0
@@ -222,7 +255,7 @@ function flowDocument(doc: DocEntry, wrapWidth: number, rotations?: Rotations): 
   const fits = addX + ADD_PAGE_WIDTH <= innerWidth(wrapWidth)
   const reach = Math.max(flow.extent, fits ? addX + ADD_PAGE_WIDTH : 0)
   const natural = Math.max(MIN_DOC_WIDTH, reach + CARD_PAD_X * 2)
-  return { doc, widths, flow, addX, natural }
+  return { doc, widths, heights, flow, addX, natural }
 }
 
 /** Place a flowed document as a card `cardWidth` wide at `y`. */
@@ -233,7 +266,7 @@ function placeDoc(f: DocFlow, y: number, cardWidth: number, wrapWidth: number): 
   // a cell up to a page wide, or the round edge button when that is narrower than a usable cell.
   const offset = Math.max(0, Math.floor((span - f.flow.extent) / 2))
   const gridX = CARD_PAD_X + offset
-  const cells = placeCells(f.flow, f.widths, gridX, y)
+  const cells = placeCells(f.flow, f.widths, f.heights, gridX, y)
   const rowY = rowTop(y, f.flow.positions.at(-1)?.row ?? 0)
   const room = span - offset - f.addX
   const addPage: AddPageSlot =
@@ -269,16 +302,18 @@ function placeDoc(f: DocFlow, y: number, cardWidth: number, wrapWidth: number): 
 /**
  * Lay the collection out as a column of document cards, each wrapping its pages into rows no wider
  * than `wrapWidth` world px (clamped to at least MIN_DOC_WIDTH). Card heights follow their row
- * count, and each card's y is the cumulative height of those above it. Every card spans the
- * collection's width (the widest card's) so the edges line up, with its pages centred inside.
+ * count, and each card's y is the cumulative height of those above it. Cells take each page's
+ * effective geometry: its crop (`edits.crops`) and then its rotation (`edits.rotations`). Every
+ * card spans the collection's width (the widest card's) so the edges line up, with its pages
+ * centred inside.
  */
 export function computeLayout(
   docs: DocEntry[],
-  rotations?: Rotations,
+  edits?: LayoutEdits,
   wrapWidth: number = DEFAULT_WRAP_WIDTH
 ): CanvasLayout {
   const wrap = Math.max(MIN_DOC_WIDTH, wrapWidth)
-  const flows = docs.map((doc) => flowDocument(doc, wrap, rotations))
+  const flows = docs.map((doc) => flowDocument(doc, wrap, edits))
   const contentWidth = Math.max(1, ...flows.map((f) => f.natural))
   let y = 0
   const items = flows.map((f) => {
@@ -311,19 +346,23 @@ export interface DocReflow {
 export function reflowDoc(
   item: DocPlacement,
   excludeId: string | null,
-  ghost: { index: number; w: number } | null
+  ghost: { index: number; w: number; h?: number } | null
 ): DocReflow {
   const kept = item.pages.filter((p) => p.pageId !== excludeId)
   const widths = kept.map((p) => p.w)
+  const heights = kept.map((p) => p.h)
   const ghostAt = ghost ? Math.max(0, Math.min(kept.length, ghost.index)) : -1
-  if (ghost) widths.splice(ghostAt, 0, ghost.w)
+  if (ghost) {
+    widths.splice(ghostAt, 0, ghost.w)
+    heights.splice(ghostAt, 0, ghost.h ?? BASE_PAGE_HEIGHT)
+  }
   const flow = flowGrid(widths, item.wrapWidth)
   const inset = item.x + CARD_PAD_X
   const offset = Math.max(
     0,
     Math.min(item.gridX - inset, item.width - CARD_PAD_X * 2 - flow.extent)
   )
-  const cells = placeCells(flow, widths, inset + offset, item.y)
+  const cells = placeCells(flow, widths, heights, inset + offset, item.y)
   const pages: PageSlot[] = []
   let ghostRect: Rect | null = null
   let k = 0

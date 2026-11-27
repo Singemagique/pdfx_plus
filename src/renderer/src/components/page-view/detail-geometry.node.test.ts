@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   BASE_RASTER,
+  baseRasterScale,
   detailCapFactor,
   detailDpr,
   MAX_DETAIL,
@@ -212,6 +213,74 @@ describe('planDetail', () => {
     expect(uh * 2).toBeGreaterThan(baseDevicePx * 1.05)
     expect(planDetail(input(90, rect, { layoutW: uw }))).toBeNull()
     expect(planDetail(input(90, { ...rect, height: uw + 4, width: uh + 6 }))).not.toBeNull()
+  })
+})
+
+describe('planDetail with a crop clip', () => {
+  const ROTS: Rot[] = [0, 90, 180, 270]
+  const CLIP = { x0: 0.25, y0: 0.5, x1: 0.75, y1: 0.9 }
+
+  it.each(ROTS)('renders only the clip of a fully visible page at %i°', (rot) => {
+    // At DPR 2 the half-page crop's denser base raster would suffice; DPR 6 needs a detail pass.
+    expect(planDetail(input(rot, bbox(rot, 10, 10), { clip: CLIP }))).toBeNull()
+    const plan = planDetail(input(rot, bbox(rot, 10, 10), { clip: CLIP, dpr: 6 }))!
+    expect(plan.renderScale).toBeCloseTo((UW / W) * 6, 9)
+    expect(plan.fx).toBeCloseTo(0.25, 9)
+    expect(plan.fy).toBeCloseTo(0.5, 9)
+    expect(plan.css.left).toBeCloseTo(0.25 * LAYOUT_W, 9)
+    expect(plan.css.top).toBeCloseTo(0.5 * LAYOUT_H, 9)
+    expect(plan.css.width).toBeCloseTo(0.5 * LAYOUT_W, 9)
+    expect(plan.css.height).toBeCloseTo(0.4 * LAYOUT_H, 9)
+    expect(plan.backingW).toBe(Math.round(0.5 * UW * 6))
+    expect(plan.backingH).toBe(Math.round(0.4 * UH * 6))
+  })
+
+  it.each(ROTS)('intersects the on-screen region with the clip at %i°', (rot) => {
+    const viewportW = 420
+    const viewportH = 330
+    const rect = bbox(rot, -137, -61)
+    const free = planDetail(input(rot, rect, { viewportW, viewportH }))!
+    const clip = { x0: 0, y0: 0, x1: 1, y1: 1 }
+    // A clip of the whole page changes nothing.
+    expectSamePlan(planDetail(input(rot, rect, { viewportW, viewportH, clip })), free)
+    // A clip ending inside the visible region trims the region to it.
+    const u1 = (free.css.left + free.css.width / 2) / LAYOUT_W
+    const half = planDetail(input(rot, rect, { viewportW, viewportH, clip: { ...clip, x1: u1 } }))!
+    expect(half.css.left).toBeCloseTo(free.css.left, 9)
+    expect(half.css.width).toBeCloseTo(free.css.width / 2, 9)
+    expect(half.css.height).toBeCloseTo(free.css.height, 9)
+    expect(half.fx).toBeCloseTo(free.fx, 9)
+  })
+
+  it('is null when the clip is off screen', () => {
+    // Only the right 20% of the page is on screen; the clip is the left 75%.
+    const rect = bbox(0, -UW * 0.8, 10)
+    expect(planDetail(input(0, rect))).not.toBeNull()
+    expect(planDetail(input(0, rect, { clip: { x0: 0, y0: 0, x1: 0.75, y1: 1 } }))).toBeNull()
+  })
+
+  it('applies the pixel budget to the clipped region, not the whole visible page', () => {
+    const big = { naturalWidth: 1000, naturalHeight: 1000, layoutW: 5000, dpr: 3, rotation: 0 }
+    const rect = { left: -100, top: -100, width: 5000, height: 5000 }
+    const vp = { viewportW: 2700, viewportH: 1440 }
+    // Unclipped, 2700×1440 at DPR 3 is over 32 MP and gets scaled down…
+    expect(planDetail({ ...big, ...vp, rect })!.backingW).toBeLessThan(2700 * 3)
+    // …but only a 1400×1400 css px crop of it is shown: that fits, at the true DPR.
+    const clip = { x0: 0.02, y0: 0.02, x1: 0.3, y1: 0.3 }
+    const plan = planDetail({ ...big, ...vp, rect, clip })!
+    expect(plan.backingW).toBe(1400 * 3)
+    expect(plan.backingH).toBe(1400 * 3)
+    expect(plan.renderScale).toBeCloseTo(5 * 3, 9)
+  })
+
+  it('skips the detail canvas when the clip-dense base raster already suffices', () => {
+    const i = input(0, bbox(0, 10, 10))
+    expect(planDetail(i)).not.toBeNull()
+    // A 10% crop's base raster has ten times the density, so 2× zoom needs no detail pass.
+    const clip = { x0: 0, y0: 0, x1: 0.1, y1: 0.1 }
+    expect(baseRasterScale(W, H, clip)).toBeCloseTo(BASE_RASTER / (0.1 * H), 9)
+    expect(baseRasterScale(W, H)).toBeCloseTo(BASE_RASTER / H, 12)
+    expect(planDetail({ ...i, clip })).toBeNull()
   })
 })
 

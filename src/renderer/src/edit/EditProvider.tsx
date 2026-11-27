@@ -45,6 +45,8 @@ export interface CurrentPage {
   pageKey: string
   width: number
   height: number
+  /** The page's crop, if any: palette actions place things inside the part that is visible. */
+  crop?: CropBox | null
 }
 
 export interface EditStore {

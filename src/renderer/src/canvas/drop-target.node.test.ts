@@ -90,7 +90,7 @@ describe('computeDropTarget into a multi-row document', () => {
   it('uses rotated page widths (the strip used to ignore rotation)', () => {
     const d = { id: 'r', name: 'r.pdf', pages: [page('l0', LANDSCAPE, 0), page('p1')] }
     const rotations = new Map([[makePageKey(d.pages[0].source.id, 0), 90]])
-    const rl = computeLayout([d], rotations, WRAP_5)
+    const rl = computeLayout([d], { rotations }, WRAP_5)
     const gx = rl.items[0].gridX
     // l0 is drawn 216 wide, so p1 is centred at gx + 216 + 18 + 108 = gx + 342. Unrotated (362
     // wide) math would have put p1's centre at gx + 488 and called gx + 358 "before p1".
@@ -101,6 +101,25 @@ describe('computeDropTarget into a multi-row document', () => {
     })
     expect(computeDropTarget(rl, gx + 278, rowMid(0, 0), 1, null, true)).toMatchObject({
       index: 1
+    })
+  })
+
+  it('uses cropped page widths: a cropped page is hit where it is drawn', () => {
+    const d = { id: 'c', name: 'c.pdf', pages: [page('c0'), page('c1')] }
+    // A square crop draws c0 280 wide, so c1 is centred at gx + 280 + 18 + 108 = gx + 406.
+    const crops = new Map([[makePageKey(d.pages[0].source.id, 0), { x: 0, y: 0, w: 300, h: 300 }]])
+    const cl = computeLayout([d], { crops }, WRAP_5)
+    const gx = cl.items[0].gridX
+    expect(cl.items[0].pages[0].w).toBe(BASE_PAGE_HEIGHT)
+    // gx + 378 is left of c1's centre (before c1); uncropped (216 wide) it would be past it.
+    expect(computeDropTarget(cl, gx + 378, rowMid(0, 0), 1, null, true)).toMatchObject({
+      index: 1
+    })
+    expect(computeDropTarget(cl, gx + 418, rowMid(0, 0), 1, null, true)).toMatchObject({
+      index: 2
+    })
+    expect(computeDropTarget(cl, gx + 118, rowMid(0, 0), 1, null, true)).toMatchObject({
+      index: 0
     })
   })
 })

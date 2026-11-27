@@ -8,6 +8,8 @@ export interface DragViewInput {
   intoDocId: string | null
   intoIndex: number
   intoGhostWidth: number
+  /** The into-ghost's height (a page whose cell is shorter than the row, see MAX_CELL_WIDTH). */
+  intoGhostHeight?: number
   betweenIndex: number
 }
 
@@ -38,7 +40,7 @@ export function computeDragView(layout: CanvasLayout, input: DragViewInput): Dra
     const reflow = reflowDoc(
       item,
       excludeId,
-      into ? { index: input.intoIndex, w: input.intoGhostWidth } : null
+      into ? { index: input.intoIndex, w: input.intoGhostWidth, h: input.intoGhostHeight } : null
     )
     reflows.set(id, reflow)
     extra += Math.max(0, reflow.height - item.height)

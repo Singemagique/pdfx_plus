@@ -1,7 +1,8 @@
 import { useCallback, useRef } from 'react'
 import type { DocEntry } from '../../types'
-import type { View } from './geometry'
-import { clamp, fitInto, flipTo, MAX_ZOOM, MIN_ZOOM, TRANSITION_MS } from './geometry'
+import type { Size, View } from './geometry'
+import { clamp, flipTo, MAX_ZOOM, MIN_ZOOM, TRANSITION_MS } from './geometry'
+import { clampPan, zoomAbout } from './page-display'
 
 interface ControlsOptions {
   scrollRef: React.RefObject<HTMLDivElement | null>
@@ -9,6 +10,10 @@ interface ControlsOptions {
   docsRef: React.MutableRefObject<DocEntry[]>
   vpRef: React.MutableRefObject<{ w: number; h: number }>
   curRef: React.MutableRefObject<{ di: number; pi: number }>
+  /** The current page's displayed fit (zoom/pan clamp) and its upright box at the exported
+   *  geometry (open/close FLIP). */
+  fitRef: React.MutableRefObject<Size>
+  boxRef: React.MutableRefObject<Size>
   phaseRef: React.MutableRefObject<'opening' | 'open' | 'closing'>
   /** The in-progress pan of a zoomed page, if any. */
   dragRef?: React.MutableRefObject<unknown>
@@ -38,46 +43,28 @@ export function useFullViewControls(
   opts: ControlsOptions
 ): FullViewControls & FullViewNav & { runPendingGoTo: () => void } {
   const { scrollRef, closingRef, docsRef, vpRef, curRef, phaseRef, dragRef, zoomedRef } = opts
+  const { fitRef, boxRef } = opts
   const { setView, setPhase, setFlip, setFlipTransition, setRevealed, onClose } = opts
 
   const resetView = useCallback(() => setView({ zoom: 1, x: 0, y: 0 }), [])
 
+  // Zoom and pan clamp against the current page's DISPLAYED fit (cropped + rotated), read from the
+  // ref the state hook refreshes every render.
   const applyZoom = useCallback(
     (nextZoom: (z: number) => number, focal?: { x: number; y: number }) => {
       setView((v) => {
         const nz = clamp(nextZoom(v.zoom), MIN_ZOOM, MAX_ZOOM)
         if (nz === v.zoom) return v
-        const vp = vpRef.current
-        const { di: cdi, pi: cpi } = curRef.current
-        const p = docsRef.current[cdi].pages[cpi]
-        const b = fitInto(p.width, p.height, vp)
-        const r = nz / v.zoom
-        const cx = focal ? focal.x : vp.w / 2
-        const cy = focal ? focal.y : vp.h / 2
-        const dx = cx - vp.w / 2
-        const dy = cy - vp.h / 2
-        const maxX = Math.max(0, (b.w * nz - vp.w) / 2)
-        const maxY = Math.max(0, (b.h * nz - vp.h) / 2)
-        return {
-          zoom: nz,
-          x: clamp(dx * (1 - r) + r * v.x, -maxX, maxX),
-          y: clamp(dy * (1 - r) + r * v.y, -maxY, maxY)
-        }
+        return zoomAbout(v, nz, fitRef.current, vpRef.current, focal)
       })
     },
     []
   )
 
   const panBy = useCallback((dx: number, dy: number) => {
+    const fit = fitRef.current
     const vp = vpRef.current
-    const { di: cdi, pi: cpi } = curRef.current
-    const p = docsRef.current[cdi].pages[cpi]
-    const b = fitInto(p.width, p.height, vp)
-    setView((v) => {
-      const maxX = Math.max(0, (b.w * v.zoom - vp.w) / 2)
-      const maxY = Math.max(0, (b.h * v.zoom - vp.h) / 2)
-      return { ...v, x: clamp(v.x + dx, -maxX, maxX), y: clamp(v.y + dy, -maxY, maxY) }
-    })
+    setView((v) => clampPan(v, v.x + dx, v.y + dy, fit, vp))
   }, [])
 
   const navByKey = useCallback((axis: 'x' | 'y', dir: 1 | -1) => {
@@ -109,7 +96,10 @@ export function useFullViewControls(
       return
     }
     const vp = vpRef.current
-    const target = flipTo(fitInto(p.width, p.height, vp), vp, r)
+    // The box the animated `.full-page` really has once 'closing' renders: its upright crop window
+    // (exported geometry, even if the crop tool showed the page whole while open), so it lands on
+    // the cell's cropped aspect.
+    const target = flipTo(boxRef.current, vp, r)
     setView({ zoom: 1, x: 0, y: 0 })
     setPhase('closing')
     setFlip(null)

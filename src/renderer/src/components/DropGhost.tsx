@@ -116,9 +116,10 @@ interface GhostRowProps {
 export function GhostRow({ width, pageHeight, pages }: GhostRowProps): React.JSX.Element {
   return (
     <div className="doc-row ghost" style={{ width, height: GHOST_ROW_HEIGHT }} aria-hidden="true">
-      <div className="ghost-strip">
+      <div className="ghost-strip" style={{ height: pageHeight, alignItems: 'center' }}>
         {pages.map((p, i) => (
-          <GhostPage key={i} width={p.width} height={pageHeight} />
+          // A page whose cell is shorter than the row (a very wide crop) keeps its own height.
+          <GhostPage key={i} width={p.width} height={Math.min(pageHeight, p.height)} />
         ))}
       </div>
     </div>

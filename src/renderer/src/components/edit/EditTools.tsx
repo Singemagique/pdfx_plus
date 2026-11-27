@@ -1,7 +1,8 @@
 import { useEffect, useRef } from 'react'
 import { useEdits, type ToolKind } from '../../edit/EditProvider'
 import { cssColor, newOverlayId, nextZ, type RGB, type ShapeKind } from '../../edit/model'
-import { imageStampSize, prepareImageStamp } from '../../pdfx/images'
+import { prepareImageStamp, stampGeom } from '../../pdfx/images'
+import { visibleBox } from '../../page-geometry'
 
 const SHAPE_KINDS: { kind: ShapeKind; label: string; icon: React.JSX.Element }[] = [
   { kind: 'rect', label: 'Rectangle', icon: <rect x="3" y="5" width="18" height="14" rx="1" /> },
@@ -152,7 +153,8 @@ export function EditTools(): React.JSX.Element {
     } catch {
       /* keep the original bytes at a 1:1 fallback size */
     }
-    const { width: targetW, height: targetH } = imageStampSize(stamp, currentPage.width, widthFrac)
+    // Sized and centred on the part of the page that is shown (a cropped page's crop window).
+    const g = stampGeom(visibleBox(currentPage, currentPage.crop), stamp, widthFrac)
     const attachmentId = newOverlayId()
     addAttachment(attachmentId, stamp.bytes, stamp.mime)
     const id = newOverlayId()
@@ -161,14 +163,7 @@ export function EditTools(): React.JSX.Element {
       pageKey: currentPage.pageKey,
       z: nextZ(overlays, currentPage.pageKey),
       createdAt: Date.now(),
-      geom: {
-        x: (currentPage.width - targetW) / 2,
-        y: (currentPage.height - targetH) / 2,
-        w: targetW,
-        h: targetH,
-        rotation: 0,
-        opacity: 1
-      },
+      geom: { ...g, rotation: 0, opacity: 1 },
       type: 'image',
       attachmentId,
       mime: stamp.mime // image/png when prepareImageStamp re-oriented a JPEG

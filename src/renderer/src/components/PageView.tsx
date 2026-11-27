@@ -2,6 +2,7 @@ import { memo, useEffect, useRef, useState } from 'react'
 import type { PDFDocumentProxy, RenderTask } from 'pdfjs-dist'
 import { logRenderError, renderBase, renderDetail } from './page-view/raster'
 import { detailDpr, planDetail } from './page-view/detail-geometry'
+import type { WindowFractions } from '../page-geometry'
 
 interface PageViewProps {
   pdf: PDFDocumentProxy
@@ -14,6 +15,9 @@ interface PageViewProps {
   /** CSS rotation (degrees) an ancestor applies to this upright page box; the detail canvas
    *  needs it to map the on-screen bounding box back to upright page coordinates. */
   rotation?: number
+  /** The only part of the page that is shown (a crop window), as page fractions. The box still lays
+   *  out the FULL page — an ancestor clips it — so this only says which part needs pixels. */
+  clip?: WindowFractions | null
 }
 
 function PageViewImpl({
@@ -24,13 +28,19 @@ function PageViewImpl({
   version,
   eager = false,
   detail = true,
-  rotation = 0
+  rotation = 0,
+  clip
 }: PageViewProps): React.JSX.Element {
   const rootRef = useRef<HTMLDivElement>(null)
   const baseRef = useRef<HTMLCanvasElement>(null)
   const detailRef = useRef<HTMLCanvasElement>(null)
   const [near, setNear] = useState(eager)
   const [baseReady, setBaseReady] = useState(false)
+  // Effects key on the clip's primitives: callers pass a fresh object every render.
+  const cx0 = clip?.x0
+  const cy0 = clip?.y0
+  const cx1 = clip?.x1
+  const cy1 = clip?.y1
 
   useEffect(() => {
     if (eager) return
@@ -53,12 +63,14 @@ function PageViewImpl({
     if (!near) return
     let cancelled = false
     let task: RenderTask | null = null
+    const c = cx0 === undefined ? null : { x0: cx0, y0: cy0!, x1: cx1!, y1: cy1! }
     void renderBase({
       pdf,
       pageNumber,
       naturalWidth,
       naturalHeight,
       baseRef,
+      clip: c,
       isCancelled: () => cancelled,
       onTask: (t) => (task = t),
       onReady: () => setBaseReady(true)
@@ -67,7 +79,7 @@ function PageViewImpl({
       cancelled = true
       task?.cancel()
     }
-  }, [near, pdf, pageNumber, naturalWidth, naturalHeight])
+  }, [near, pdf, pageNumber, naturalWidth, naturalHeight, cx0, cy0, cx1, cy1])
 
   useEffect(() => {
     if (!near) return
@@ -87,7 +99,8 @@ function PageViewImpl({
       viewportH: window.innerHeight,
       naturalWidth,
       naturalHeight,
-      dpr: detailDpr(window.devicePixelRatio)
+      dpr: detailDpr(window.devicePixelRatio),
+      clip: cx0 === undefined ? null : { x0: cx0, y0: cy0!, x1: cx1!, y1: cy1! }
     })
     if (!plan) {
       detailCanvas.style.display = 'none'
@@ -108,7 +121,20 @@ function PageViewImpl({
       cancelled = true
       task?.cancel()
     }
-  }, [near, version, detail, rotation, pdf, pageNumber, naturalWidth, naturalHeight])
+  }, [
+    near,
+    version,
+    detail,
+    rotation,
+    pdf,
+    pageNumber,
+    naturalWidth,
+    naturalHeight,
+    cx0,
+    cy0,
+    cx1,
+    cy1
+  ])
 
   return (
     <div className="pageview" ref={rootRef}>

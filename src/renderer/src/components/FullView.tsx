@@ -1,5 +1,7 @@
-import { useEffect, useImperativeHandle } from 'react'
-import type { DocEntry } from '../types'
+import { useCallback, useEffect, useImperativeHandle, useRef } from 'react'
+import type { DocEntry, PageEntry } from '../types'
+import { useEdits } from '../edit/EditProvider'
+import { frameOf } from '../page-geometry'
 import type { Rect } from './full-view/geometry'
 import { useFullViewState } from './full-view/use-full-view-state'
 import { useFullViewControls, type FullViewNav } from './full-view/use-full-view-controls'
@@ -29,7 +31,32 @@ export function FullView({
   onClose,
   navRef
 }: FullViewProps): React.JSX.Element {
-  const s = useFullViewState(docs, startDocId, startPageId, originRect)
+  // The current page shows at its exported geometry (crop window, then rotation) — except while the
+  // crop tool is on and the view is open, when it shows whole so the crop can be redrawn wider
+  // (FullViewPage agrees). The open/close FLIP always uses the exported geometry: the collection
+  // cell it animates from/to has the cropped aspect, and a whole-page box scaled to the cell's width
+  // would balloon past it.
+  const { rotations, crops, tool } = useEdits()
+  const currentFrameOf = useCallback(
+    (page: PageEntry, animating: boolean) =>
+      frameOf(page, { rotations, crops }, { ignoreCrop: tool === 'crop' && !animating }),
+    [rotations, crops, tool]
+  )
+  const s = useFullViewState(docs, startDocId, startPageId, originRect, currentFrameOf)
+
+  // Entering/leaving crop editing, or undoing/redoing a crop, changes the displayed frame: a zoom
+  // and pan computed for the old one would be meaningless, so start the new one fitted.
+  const animating = s.phase !== 'open'
+  const editingCrop = tool === 'crop' && !animating
+  const win = currentFrameOf(s.page, animating).window
+  const frameKey = `${editingCrop}|${win.x}|${win.y}|${win.w}|${win.h}`
+  const lastFrameKey = useRef(frameKey)
+  const { setView } = s
+  useEffect(() => {
+    if (lastFrameKey.current === frameKey) return
+    lastFrameKey.current = frameKey
+    setView((v) => (v.zoom === 1 && v.x === 0 && v.y === 0 ? v : { zoom: 1, x: 0, y: 0 }))
+  }, [frameKey, setView])
 
   const controls = useFullViewControls({
     scrollRef: s.scrollRef,
@@ -37,6 +64,8 @@ export function FullView({
     docsRef: s.docsRef,
     vpRef: s.vpRef,
     curRef: s.curRef,
+    fitRef: s.fitRef,
+    boxRef: s.boxRef,
     phaseRef: s.phaseRef,
     dragRef: s.drag,
     zoomedRef: s.zoomedRef,
@@ -91,7 +120,6 @@ export function FullView({
     ...controls
   })
 
-  const animating = s.phase !== 'open'
   const chromeOpacity = s.revealed ? 1 : 0
 
   return (

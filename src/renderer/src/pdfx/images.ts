@@ -120,6 +120,34 @@ export function imageStampSize(
   return { width, height: (width * natH) / natW }
 }
 
+// The tallest a new stamp may start, as a fraction of the visible height: below 1 so its top and
+// bottom resize handles stay inside the shown area (a short, wide crop would otherwise clip them).
+const STAMP_MAX_HEIGHT_FRAC = 0.8
+
+/**
+ * Where a new image stamp lands: sized by the VISIBLE area (a cropped page's crop, else the whole
+ * page) — `widthFrac` of its width, at most STAMP_MAX_HEIGHT_FRAC of its height, aspect preserved —
+ * and centred on it, so no part of it (or of its handles) is placed in a cropped-away margin.
+ * `visible` and the result are in PDF points, bottom-left origin.
+ */
+export function stampGeom(
+  visible: { x: number; y: number; w: number; h: number },
+  natural: { width: number; height: number },
+  widthFrac = 0.4
+): { x: number; y: number; w: number; h: number } {
+  const sized = imageStampSize(natural, visible.w, widthFrac)
+  const maxH = visible.h * STAMP_MAX_HEIGHT_FRAC
+  const f = sized.height > maxH && sized.height > 0 ? maxH / sized.height : 1
+  const width = sized.width * f
+  const height = sized.height * f
+  return {
+    x: visible.x + (visible.w - width) / 2,
+    y: visible.y + (visible.h - height) / 2,
+    w: width,
+    h: height
+  }
+}
+
 /**
  * Normalise an image picked for an image stamp so the editor overlay and the flattened export agree:
  * returns the bytes/mime to store as the attachment plus the upright pixel size. A JPEG carrying a

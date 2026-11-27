@@ -68,6 +68,7 @@ export function CollectionCanvas(props: CollectionCanvasProps): React.JSX.Elemen
 
   const draggingDocId = draggingPage?.docId ?? null
   const ghostWidth = ghostSize.width
+  const ghostHeight = ghostSize.height
   const dragView = useMemo(
     () =>
       computeDragView(layout, {
@@ -76,9 +77,19 @@ export function CollectionCanvas(props: CollectionCanvasProps): React.JSX.Elemen
         intoDocId,
         intoIndex,
         intoGhostWidth: ghostWidth,
+        intoGhostHeight: ghostHeight,
         betweenIndex
       }),
-    [layout, collapsedId, draggingDocId, intoDocId, intoIndex, ghostWidth, betweenIndex]
+    [
+      layout,
+      collapsedId,
+      draggingDocId,
+      intoDocId,
+      intoIndex,
+      ghostWidth,
+      ghostHeight,
+      betweenIndex
+    ]
   )
 
   const onViewportWidth = useCallback(

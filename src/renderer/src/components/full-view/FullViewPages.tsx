@@ -48,6 +48,7 @@ export function FullViewPages(props: FullViewPagesProps): React.JSX.Element {
     <div
       className={`full-scroll${zoomed || animating ? ' locked' : ''}${zoomed ? ' pannable' : ''}`}
       ref={scrollRef}
+      tabIndex={-1}
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
       onPointerUp={endDrag}
@@ -61,7 +62,9 @@ export function FullViewPages(props: FullViewPagesProps): React.JSX.Element {
       }}
     >
       {docs.map((d, ddi) => (
-        <section className="full-doc" key={d.id}>
+        // tabIndex -1: Chromium makes a scroll container keyboard-focusable on its own, so Tab
+        // past the last form field landed on the NEXT document's section and scrolled to it.
+        <section className="full-doc" key={d.id} tabIndex={-1}>
           {d.pages.map((p, ppi) => (
             <FullViewPage
               key={p.id}

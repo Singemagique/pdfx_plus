@@ -6,7 +6,8 @@ import {
   imageToPdf,
   jpegNeedsReorient,
   jpegSize,
-  prepareImageStamp
+  prepareImageStamp,
+  stampGeom
 } from './images'
 import { exifApp1, jpegWith } from './test-utils/jpeg'
 
@@ -238,5 +239,45 @@ describe('imageStampSize (initial image-stamp size at an assumed 150 DPI)', () =
     const { width, height } = imageStampSize({ width: 0, height: 0 }, 612)
     expect(Number.isFinite(width) && Number.isFinite(height)).toBe(true)
     expect(width).toBeCloseTo(0.48)
+  })
+})
+
+describe('stampGeom (where a new image stamp lands)', () => {
+  const natural = { width: 3000, height: 1500 } // 1440 × 720 pt at 150 DPI: capped by the width
+  it('sizes by the visible width and centres on the whole page when uncropped', () => {
+    const g = stampGeom({ x: 0, y: 0, w: 612, h: 792 }, natural)
+    expect(g.w).toBeCloseTo(612 * 0.4)
+    expect(g.h).toBeCloseTo(g.w / 2)
+    expect(g.x).toBeCloseTo((612 - g.w) / 2)
+    expect(g.y).toBeCloseTo((792 - g.h) / 2)
+  })
+
+  it('sizes by the crop width and centres inside the crop', () => {
+    const crop = { x: 100, y: 200, w: 300, h: 400 }
+    const g = stampGeom(crop, natural)
+    expect(g.w).toBeCloseTo(300 * 0.4)
+    expect(g.x + g.w / 2).toBeCloseTo(100 + 150)
+    expect(g.y + g.h / 2).toBeCloseTo(200 + 200)
+    expect(g.x).toBeGreaterThanOrEqual(crop.x)
+    expect(g.y + g.h).toBeLessThanOrEqual(crop.y + crop.h)
+  })
+
+  it('caps the height on a short, wide crop so the stamp stays inside it (aspect kept)', () => {
+    const crop = { x: 50, y: 400, w: 500, h: 50 }
+    const g = stampGeom(crop, { width: 300, height: 600 }) // portrait: 144 × 288 pt at 150 DPI
+    expect(g.h).toBeCloseTo(50 * 0.8)
+    expect(g.w / g.h).toBeCloseTo(300 / 600)
+    expect(g.y).toBeGreaterThan(crop.y)
+    expect(g.y + g.h).toBeLessThan(crop.y + crop.h)
+    expect(g.x).toBeGreaterThan(crop.x)
+    expect(g.x + g.w).toBeLessThan(crop.x + crop.w)
+    expect(g.x + g.w / 2).toBeCloseTo(300)
+    expect(g.y + g.h / 2).toBeCloseTo(425)
+  })
+
+  it('leaves an image that already fits the visible height at its width-capped size', () => {
+    const g = stampGeom({ x: 0, y: 0, w: 612, h: 792 }, { width: 300, height: 600 })
+    expect(g.w).toBeCloseTo(144)
+    expect(g.h).toBeCloseTo(288)
   })
 })

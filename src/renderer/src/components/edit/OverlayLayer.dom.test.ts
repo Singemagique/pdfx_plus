@@ -18,10 +18,11 @@ import type { PageEntry } from '../../types'
 const PAGE_W = 600
 const PAGE_H = 800
 
-// pdf.js stub: OverlayLayer only asks a page for its widget annotations (there are none here).
+// pdf.js stub: OverlayLayer only asks a page for its widget annotations (none unless a test sets some).
+let annotations: unknown[] = []
 const pdfStub = {
   getPage: () =>
-    Promise.resolve({ rotate: 0, view: [0, 0, PAGE_W, PAGE_H], getAnnotations: () => Promise.resolve([]) })
+    Promise.resolve({ rotate: 0, view: [0, 0, PAGE_W, PAGE_H], getAnnotations: () => Promise.resolve(annotations) })
 } // prettier-ignore
 
 const page: PageEntry = {
@@ -246,5 +247,75 @@ describe('OverlayLayer currentPage reporting', () => {
       root.render(createElement(Harness, { show: false }))
     })
     expect(store.currentPage).toBeNull()
+  })
+})
+
+describe('OverlayLayer crop mask and currentPage crop', () => {
+  const CROP = { x: 100, y: 200, w: 300, h: 400 }
+
+  it('reports the crop with the current page, so a stamp lands inside it', async () => {
+    expect(store.currentPage?.crop ?? null).toBeNull()
+    await act(async () => store.setCrop('src-1#0', CROP))
+    expect(store.currentPage?.crop).toEqual(CROP)
+  })
+
+  it('outlines the crop only while the crop tool is on (the page shows whole then)', async () => {
+    await act(async () => store.setCrop('src-1#0', CROP))
+    expect(container.querySelector('.ov-crop-mask')).toBeNull()
+    await act(async () => store.setTool('crop'))
+    const rect = container.querySelector('.ov-crop-rect')
+    expect(rect?.getAttribute('x')).toBe('100')
+    expect(rect?.getAttribute('y')).toBe(String(PAGE_H - 200 - 400))
+    await act(async () => store.setTool('browse'))
+    expect(container.querySelector('.ov-crop-mask')).toBeNull()
+  })
+})
+
+describe('OverlayLayer form widgets on a cropped page', () => {
+  const CROP = { x: 100, y: 200, w: 300, h: 400 }
+  const widget = (fieldName: string, fieldType: string, rect: number[], extra = {}): unknown => ({
+    fieldName,
+    fieldType,
+    rect,
+    ...extra
+  })
+
+  beforeEach(async () => {
+    annotations = [
+      widget('inside', 'Tx', [150, 300, 300, 330]),
+      widget('straddles', 'Tx', [50, 250, 200, 280]),
+      widget('outside', 'Tx', [20, 20, 90, 50]),
+      widget('tick-out', 'Btn', [450, 700, 470, 720], { checkBox: true }),
+      widget('pick', 'Ch', [420, 100, 560, 130], { combo: true, options: [] }),
+      widget('opt', 'Btn', [150, 400, 170, 420], { radioButton: true, buttonValue: 'a' }),
+      widget('opt', 'Btn', [500, 400, 520, 420], { radioButton: true, buttonValue: 'b' })
+    ]
+    // Re-mount so the annotation effect reads the new stub data.
+    await act(async () => root.render(createElement(Harness, { show: false })))
+    await act(async () => root.render(createElement(Harness, { show: true })))
+  })
+  afterEach(() => {
+    annotations = []
+  })
+
+  const names = (): string[] =>
+    [...container.querySelectorAll<HTMLElement>('.ov-form-input, .ov-form-check, .ov-form-radio')]
+      .map((el) => el.getAttribute('placeholder') ?? el.getAttribute('title') ?? '')
+      .sort()
+
+  it('renders no focusable widget wholly outside the crop window, so Tab cannot scroll to it', async () => {
+    await act(async () => store.setTool('form'))
+    expect(names()).toEqual([
+      'inside',
+      'opt: a',
+      'opt: b',
+      'outside',
+      'pick',
+      'straddles',
+      'tick-out'
+    ])
+
+    await act(async () => store.setCrop('src-1#0', CROP))
+    expect(names()).toEqual(['inside', 'opt: a', 'straddles'])
   })
 })

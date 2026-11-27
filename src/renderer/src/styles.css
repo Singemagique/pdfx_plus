@@ -620,6 +620,12 @@ body {
   inset: 0;
 }
 
+/* The FULL page, positioned inside a clipping crop window (page-geometry.ts fullPageInWindow) so
+   PageView, overlays and Find highlights keep working in whole-page coordinates. */
+.page-frame {
+  position: absolute;
+}
+
 .pageview-base {
   position: absolute;
   inset: 0;
@@ -930,7 +936,10 @@ body {
   flex: none;
   background: var(--surface);
   border-radius: 4px;
-  overflow: hidden;
+  /* `clip`, not `hidden`: a cropped page's `.full-page` is the crop window over a larger
+     `.page-frame`, and a `hidden` box is still a scroll container — focusing a form field in the
+     cropped-away margin (Tab) would scroll it and show a region other than the crop. */
+  overflow: clip;
   box-shadow: 0 10px 40px rgba(0, 0, 0, 0.35);
 }
 
@@ -1250,18 +1259,8 @@ body {
   background: rgba(59, 130, 246, 0.22);
 }
 
-/* Crop preview on a collection thumbnail (dims the cropped-away area). */
-.cell-crop-mask {
-  position: absolute;
-  top: 0;
-  left: 0;
-  pointer-events: none;
-}
-.cell-crop-mask path {
-  fill: rgba(15, 17, 21, 0.5);
-}
-
-/* Crop preview: dim the margins outside the kept region, outline the crop rect. */
+/* Crop-tool editing (full view, whole page shown): dim the margins outside the kept region, outline
+   the crop rect. Elsewhere a cropped page is shown only at its crop window (see .page-frame). */
 .ov-crop-mask {
   position: absolute;
   top: 0;
