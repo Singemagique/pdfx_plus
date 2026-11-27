@@ -208,6 +208,17 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
   const capturing = drawing || placing || cropping || signing
   const cropBox = edits.crops.get(pageKey)
   const scale = pageScale(page, fit)
+  // While a cropped page shows only its crop window (any tool but crop), a form or signature widget
+  // lying wholly outside that window is clipped out of sight but would still take focus — and Tab
+  // to it makes Chromium scroll the full view's outer scrollers to reveal it, jumping to another
+  // document. Don't render those widgets at all.
+  const showsCropWindow = cropBox !== undefined && edits.tool !== 'crop'
+  const inView = (g: Geom): boolean =>
+    !showsCropWindow ||
+    (g.x < cropBox.x + cropBox.w &&
+      g.x + g.w > cropBox.x &&
+      g.y < cropBox.y + cropBox.h &&
+      g.y + g.h > cropBox.y)
 
   const formValueOf = (name: string): string | boolean | undefined => {
     const o = pageOverlays.find((ov) => ov.type === 'formValue' && ov.field === name)
@@ -977,60 +988,63 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
           ? cropMask(geomToCss({ ...cropBox, rotation: 0, opacity: 1 }, page, fit), false)
           : null}
       {formMode &&
-        formFields.map((f) => {
-          const r = geomToCss(f.geom, page, fit)
-          const cur = formValueOf(f.name)
-          const style = { left: r.left, top: r.top, width: r.width, height: r.height }
-          const stop = (e: React.PointerEvent): void => e.stopPropagation()
-          if (f.kind === 'checkbox') {
-            const checked = cur === undefined ? f.initial === true : cur === true
-            return (
+        formFields
+          .filter((f) => inView(f.geom))
+          .map((f) => {
+            const r = geomToCss(f.geom, page, fit)
+            const cur = formValueOf(f.name)
+            const style = { left: r.left, top: r.top, width: r.width, height: r.height }
+            const stop = (e: React.PointerEvent): void => e.stopPropagation()
+            if (f.kind === 'checkbox') {
+              const checked = cur === undefined ? f.initial === true : cur === true
+              return (
+                <input
+                  key={f.name}
+                  type="checkbox"
+                  className="ov-form-check"
+                  style={style}
+                  checked={checked}
+                  title={f.name}
+                  onPointerDown={stop}
+                  onChange={(e) => edits.setFormValue(pageKey, f.name, e.target.checked, f.geom)}
+                />
+              )
+            }
+            const value = cur === undefined ? String(f.initial ?? '') : String(cur)
+            const inputStyle = { ...style, fontSize: Math.min(14, r.height * 0.62) }
+            const onChange = (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>): void =>
+              edits.setFormValue(pageKey, f.name, e.target.value, f.geom)
+            return f.multiline ? (
+              <textarea
+                key={f.name}
+                className="ov-form-input"
+                style={inputStyle}
+                value={value}
+                placeholder={f.name}
+                spellCheck={false}
+                onPointerDown={stop}
+                onChange={onChange}
+              />
+            ) : (
               <input
                 key={f.name}
-                type="checkbox"
-                className="ov-form-check"
-                style={style}
-                checked={checked}
-                title={f.name}
+                className="ov-form-input"
+                style={inputStyle}
+                value={value}
+                placeholder={f.name}
+                spellCheck={false}
                 onPointerDown={stop}
-                onChange={(e) => edits.setFormValue(pageKey, f.name, e.target.checked, f.geom)}
+                onChange={onChange}
               />
             )
-          }
-          const value = cur === undefined ? String(f.initial ?? '') : String(cur)
-          const inputStyle = { ...style, fontSize: Math.min(14, r.height * 0.62) }
-          const onChange = (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>): void =>
-            edits.setFormValue(pageKey, f.name, e.target.value, f.geom)
-          return f.multiline ? (
-            <textarea
-              key={f.name}
-              className="ov-form-input"
-              style={inputStyle}
-              value={value}
-              placeholder={f.name}
-              spellCheck={false}
-              onPointerDown={stop}
-              onChange={onChange}
-            />
-          ) : (
-            <input
-              key={f.name}
-              className="ov-form-input"
-              style={inputStyle}
-              value={value}
-              placeholder={f.name}
-              spellCheck={false}
-              onPointerDown={stop}
-              onChange={onChange}
-            />
-          )
-        })}
+          })}
       {/* Radio groups: one circle per option; picking one moves the selected dot exclusively. */}
       {formMode &&
         radioGroups.flatMap((g) => {
           const cur = formValueOf(g.name)
           const sel = cur === undefined ? g.initial : String(cur)
-          return g.options.map((opt, i) => {
+          return g.options.flatMap((opt, i) => {
+            if (!inView(opt.geom)) return []
             const r = geomToCss(opt.geom, page, fit)
             const checked = sel === opt.value
             return (
@@ -1051,45 +1065,48 @@ export function OverlayLayer({ page, fit, rot, active }: OverlayLayerProps): Rea
       {/* Choice fields: a dropdown (combo) or single/multi-select list box; the chosen label(s) are
           painted on flatten (multi-select joins them with newlines). */}
       {formMode &&
-        choiceFields.map((c) => {
-          const r = geomToCss(c.geom, page, fit)
-          const cur = formValueOf(c.name)
-          const raw = cur === undefined ? c.initial : String(cur)
-          const size = c.combo
-            ? 1
-            : Math.max(2, Math.min(c.options.length, Math.floor(r.height / 18)))
-          const onChange = (e: React.ChangeEvent<HTMLSelectElement>): void => {
-            const v = c.multi
-              ? Array.from(e.target.selectedOptions)
-                  .map((o) => o.value)
-                  .join('\n')
-              : e.target.value
-            edits.setFormValue(pageKey, c.name, v, c.geom)
-          }
-          return (
-            <select
-              key={c.name}
-              className="ov-form-input ov-form-select"
-              style={{ left: r.left, top: r.top, width: r.width, height: r.height, fontSize: Math.min(14, (r.height / size) * 0.7) }} // prettier-ignore
-              value={c.multi ? raw.split('\n').filter(Boolean) : raw}
-              multiple={c.multi}
-              size={size}
-              title={c.name}
-              onPointerDown={(e) => e.stopPropagation()}
-              onChange={onChange}
-            >
-              {!c.multi && <option value="">— {c.name} —</option>}
-              {c.options.map((o, i) => (
-                <option key={i} value={o.label}>
-                  {o.label}
-                </option>
-              ))}
-            </select>
-          )
-        })}
+        choiceFields
+          .filter((c) => inView(c.geom))
+          .map((c) => {
+            const r = geomToCss(c.geom, page, fit)
+            const cur = formValueOf(c.name)
+            const raw = cur === undefined ? c.initial : String(cur)
+            const size = c.combo
+              ? 1
+              : Math.max(2, Math.min(c.options.length, Math.floor(r.height / 18)))
+            const onChange = (e: React.ChangeEvent<HTMLSelectElement>): void => {
+              const v = c.multi
+                ? Array.from(e.target.selectedOptions)
+                    .map((o) => o.value)
+                    .join('\n')
+                : e.target.value
+              edits.setFormValue(pageKey, c.name, v, c.geom)
+            }
+            return (
+              <select
+                key={c.name}
+                className="ov-form-input ov-form-select"
+                style={{ left: r.left, top: r.top, width: r.width, height: r.height, fontSize: Math.min(14, (r.height / size) * 0.7) }} // prettier-ignore
+                value={c.multi ? raw.split('\n').filter(Boolean) : raw}
+                multiple={c.multi}
+                size={size}
+                title={c.name}
+                onPointerDown={(e) => e.stopPropagation()}
+                onChange={onChange}
+              >
+                {!c.multi && <option value="">— {c.name} —</option>}
+                {c.options.map((o, i) => (
+                  <option key={i} value={o.label}>
+                    {o.label}
+                  </option>
+                ))}
+              </select>
+            )
+          })}
       {/* Click a detected (unsigned) signature field to place the signature there. */}
       {signing &&
         sigFields.map((f, i) => {
+          if (!inView(f.geom)) return null
           const r = geomToCss(f.geom, page, fit)
           const named = f.name ? `field “${f.name}”` : 'signature field'
           return (
