@@ -11,7 +11,12 @@ workflow and the repository's PR rules.
   `corepack enable` or migrate to Yarn Berry without a separate, deliberate change.
 - Platform build toolchains are only needed if you intend to package installers
   (`electron-builder`). On macOS the native vibrancy addon is compiled; on Windows
-  and Linux it cleanly no-ops, so a plain `yarn install` works everywhere.
+  and Linux it cleanly no-ops, so a plain `yarn install` works everywhere. Linux
+  packaging prerequisites and the `.deb`/`.rpm` sandbox-helper setup are in
+  [docs/LINUX_SETUP.md](docs/LINUX_SETUP.md).
+- Electron and electron-builder binaries download from their default upstream. Do not
+  commit an `.npmrc` mirror override; set `ELECTRON_MIRROR` in your own environment if
+  you need one.
 
 ## Install
 

@@ -76,6 +76,14 @@ linux:
   icon: build/icon.png
   mimeTypes:
     - application/x-pdfx
+# The stock after-install only makes chrome-sandbox setuid when ROOT (running apt/dnf) cannot create
+# a user namespace. Hosts that restrict UNPRIVILEGED user namespaces (Ubuntu 24.04+ AppArmor) pass
+# that probe as root, leave the helper 0755, and then the app aborts at launch for the real user.
+# This template always sets root:root 4755; see docs/LINUX_SETUP.md.
+deb:
+  afterInstall: &after-install build/linux/after-install.tpl
+rpm:
+  afterInstall: *after-install
 nsis:
   artifactName: ${name}-${version}-setup.${ext}
   shortcutName: ${productName}
