@@ -10,17 +10,32 @@
 // left in place underneath.
 
 import {
+  LineCapStyle,
+  LineJoinStyle,
   PDFDocument,
   PDFFont,
   PDFImage,
+  PDFName,
+  PDFOperator,
   PDFPage,
   StandardFonts,
   degrees,
+  lineTo,
+  moveTo,
+  popGraphicsState,
+  pushGraphicsState,
   rgb,
+  setGraphicsState,
+  setLineCap,
+  setLineJoin,
+  setLineWidth,
+  setStrokingColor,
+  stroke,
   type Color
 } from 'pdf-lib'
 
 import type { Overlay, RGB, StandardFontName, TextAlign } from '../edit/model'
+import { embedUnicodeFont, resolveTextFont } from './fonts'
 
 export interface Attachment {
   bytes: Uint8Array
@@ -30,6 +45,8 @@ export interface Attachment {
 export interface FlattenResources {
   embedImage(attachmentId: string): Promise<PDFImage>
   getFont(name: StandardFontName): Promise<PDFFont>
+  /** The embedded Unicode fallback font (./fonts), or null if it could not be loaded. */
+  getUnicodeFont(): Promise<PDFFont | null>
 }
 
 const STD_FONT: Record<StandardFontName, StandardFonts> = {
@@ -50,6 +67,7 @@ export function createFlattenResources(
 ): FlattenResources {
   const images = new Map<string, Promise<PDFImage>>()
   const fonts = new Map<StandardFontName, Promise<PDFFont>>()
+  let unicode: Promise<PDFFont | null> | null = null
   return {
     embedImage(attachmentId) {
       let p = images.get(attachmentId)
@@ -68,17 +86,17 @@ export function createFlattenResources(
         fonts.set(name, p)
       }
       return p
+    },
+    getUnicodeFont() {
+      // Embedded at most once per output document, and only when some text actually needs it. A
+      // load failure degrades to the Standard-14 font + replacement characters, never a failed export.
+      unicode ??= embedUnicodeFont(doc).catch((e: unknown) => {
+        console.warn('Unicode fallback font unavailable; replacing unsupported characters', e)
+        return null
+      })
+      return unicode
     }
   }
-}
-
-/** Split a flat [x0,y0,x1,y1,…] polyline into consecutive [x0,y0,x1,y1] segments. */
-export function polylineSegments(path: number[]): Array<[number, number, number, number]> {
-  const out: Array<[number, number, number, number]> = []
-  for (let i = 0; i + 3 < path.length; i += 2) {
-    out.push([path[i], path[i + 1], path[i + 2], path[i + 3]])
-  }
-  return out
 }
 
 /** Left edge for a line of width `textWidth` within a box [x, x+boxW] given alignment. */
@@ -88,6 +106,34 @@ export function alignedX(x: number, boxW: number, textWidth: number, align: Text
   return x
 }
 
+/**
+ * Content-stream operators for one ink stroke: a SINGLE path (moveTo + lineTo…) stroked once with
+ * round caps and joins, like the editor's round-joined polyline. Drawing each segment separately
+ * left notches at the joints and darker overlap dots where translucent segments met. `gs` names an
+ * ExtGState carrying the stroke opacity (omitted when opaque). Strokes with fewer than two points
+ * produce nothing.
+ */
+export function inkStrokeOperators(
+  path: number[],
+  width: number,
+  color: RGB,
+  gs?: PDFName
+): PDFOperator[] {
+  if (path.length < 4) return []
+  const ops: PDFOperator[] = [pushGraphicsState()]
+  if (gs) ops.push(setGraphicsState(gs))
+  ops.push(
+    setStrokingColor(toColor(color)),
+    setLineWidth(width),
+    setLineCap(LineCapStyle.Round),
+    setLineJoin(LineJoinStyle.Round),
+    moveTo(path[0], path[1])
+  )
+  for (let i = 2; i + 1 < path.length; i += 2) ops.push(lineTo(path[i], path[i + 1]))
+  ops.push(stroke(), popGraphicsState())
+  return ops
+}
+
 function drawInk(
   page: PDFPage,
   paths: number[][],
@@ -95,18 +141,15 @@ function drawInk(
   color: RGB,
   opacity: number
 ): void {
-  const c = toColor(color)
-  for (const path of paths) {
-    for (const [x1, y1, x2, y2] of polylineSegments(path)) {
-      page.drawLine({
-        start: { x: x1, y: y1 },
-        end: { x: x2, y: y2 },
-        thickness: width,
-        color: c,
-        opacity
-      })
-    }
-  }
+  // One ExtGState per ink overlay, applied once per stroke (not per segment).
+  const gs =
+    opacity < 1
+      ? page.node.newExtGState(
+          'GS',
+          page.doc.context.obj({ Type: 'ExtGState', CA: opacity, ca: opacity })
+        )
+      : undefined
+  for (const path of paths) page.pushOperators(...inkStrokeOperators(path, width, color, gs))
 }
 
 async function drawTextOverlay(
@@ -114,11 +157,16 @@ async function drawTextOverlay(
   o: Extract<Overlay, { type: 'text' }>,
   res: FlattenResources
 ): Promise<void> {
-  const font = await res.getFont(o.font)
+  // Never throws on text the chosen font can't encode: Unicode fallback, then replacement chars.
+  const { font, text } = await resolveTextFont(
+    await res.getFont(o.font),
+    () => res.getUnicodeFont(),
+    o.text
+  )
   const { x, y, w, h } = o.geom
   const color = toColor(o.color)
   const lineHeight = o.fontSize * 1.2
-  const lines = o.text.split('\n')
+  const lines = text.split('\n')
   let lineTop = y + h - o.fontSize // first baseline near the top of the box
   for (const line of lines) {
     if (lineTop < y) break // don't spill text below the box (e.g. a tiny signature appearance)
@@ -234,8 +282,12 @@ async function drawFormValue(
     return
   }
   if (!o.value) return
-  const font = await res.getFont('Helvetica')
-  const lines = String(o.value).split('\n')
+  const { font, text } = await resolveTextFont(
+    await res.getFont('Helvetica'),
+    () => res.getUnicodeFont(),
+    String(o.value)
+  )
+  const lines = text.split('\n')
   const size = Math.min(12, Math.max(6, (h / Math.max(lines.length, 1)) * 0.7))
   const lineHeight = size * 1.18
   const color = rgb(0.1, 0.1, 0.12)

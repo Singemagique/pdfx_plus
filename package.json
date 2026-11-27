@@ -38,6 +38,7 @@
   },
   "devDependencies": {
     "@electron-toolkit/tsconfig": "1.0.1",
+    "@pdf-lib/fontkit": "1.1.1",
     "@types/d3-selection": "3.0.11",
     "@types/d3-zoom": "3.0.8",
     "@types/node": "22.19.21",
@@ -48,6 +49,7 @@
     "@vitest/coverage-v8": "4.1.9",
     "d3-selection": "3.0.0",
     "d3-zoom": "3.0.0",
+    "dejavu-fonts-ttf": "2.37.3",
     "electron": "38.8.6",
     "electron-builder": "25.1.8",
     "electron-vite": "4.0.1",

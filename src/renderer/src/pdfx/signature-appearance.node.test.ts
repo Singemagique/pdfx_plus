@@ -1,7 +1,10 @@
-import { describe, expect, it } from 'vitest'
-import { withSignatureAppearance } from './signature-appearance'
-import type { EditLayer } from './build'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { PDFDocument } from 'pdf-lib'
+
+import { withSignatureAppearance, type AppearanceOptions } from './signature-appearance'
+import { buildPdf, type EditLayer } from './build'
 import type { Overlay, SignaturePlacement } from '../edit/model'
+import { pageFonts, stubUnicodeFontFetch } from '../test-utils/fonts'
 
 function baseLayer(): EditLayer {
   return { overlays: new Map(), attachments: new Map(), rotations: new Map(), crops: new Map() }
@@ -92,5 +95,61 @@ describe('withSignatureAppearance', () => {
     expect(added[0]).toBe(existing) // existing kept first (lowest)
     expect(added.length).toBe(4) // + bg fill + border + text
     expect(added.slice(1).every((o) => o.z > existing.z)).toBe(true)
+  })
+
+  it('budgets wider glyphs for a non-Latin name so the line still fits the box', async () => {
+    const textOf = async (name: string): Promise<Extract<Overlay, { type: 'text' }>> => {
+      const out = await withSignatureAppearance(baseLayer(), placement, {
+        name,
+        date: new Date(2026, 0, 1)
+      })
+      return (out.overlays.get('doc#0') ?? []).find((o) => o.type === 'text') as Extract<
+        Overlay,
+        { type: 'text' }
+      >
+    }
+    // Same length; the Greek one is drawn with the (wider) DejaVu Sans fallback.
+    const latin = await textOf('Eleni Papadopoulou Konstantinou Alexandrou')
+    const greek = await textOf('Ελένη Παπαδοπούλου Κωνσταντίνου Αλεξάνδρου')
+    expect(greek.fontSize).toBeLessThan(latin.fontSize)
+  })
+
+  describe('flattened into a sign-ready PDF', () => {
+    afterEach(() => {
+      vi.unstubAllGlobals()
+    })
+
+    async function signReady(name: string, signer?: AppearanceOptions['signer']) {
+      const src = await PDFDocument.create()
+      src.addPage([400, 400])
+      const bytes = await src.save()
+      const layer = await withSignatureAppearance(baseLayer(), placement, {
+        name,
+        reason: 'Согласовано',
+        date: new Date(2026, 0, 1),
+        signer
+      })
+      // buildPdf used to throw "WinAnsi cannot encode" here, failing the whole signing flow.
+      const out = await buildPdf([{ bytes, sourceKey: 'doc', pageIndex: 0 }], layer, {
+        stripSignatureFields: true
+      })
+      return PDFDocument.load(out)
+    }
+
+    it('builds with a non-Latin signer name, drawn with the embedded Unicode font', async () => {
+      stubUnicodeFontFetch()
+      const doc = await signReady('Ελένη Παπαδοπούλου')
+      const fonts = pageFonts(doc, 0)
+      expect(fonts.some((f) => f.embeddedTrueType && f.baseFont.includes('DejaVuSans'))).toBe(true)
+    })
+
+    it('builds with a non-Latin certificate CN', async () => {
+      stubUnicodeFontFetch()
+      const doc = await signReady('', {
+        subject: 'CN=Иванов Иван Иванович, O=Пример, C=RU',
+        issuer: 'CN=Тестовый УЦ, C=RU'
+      })
+      expect(pageFonts(doc, 0).some((f) => f.embeddedTrueType)).toBe(true)
+    })
   })
 })

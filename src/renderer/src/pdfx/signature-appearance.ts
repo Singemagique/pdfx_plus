@@ -146,7 +146,11 @@ export async function withSignatureAppearance(
   const lines = appearanceLines(opts)
   const maxLen = Math.max(...lines.map((l) => l.length), 1)
   const sizeByHeight = textBoxH / lines.length / 1.25
-  const sizeByWidth = innerW / (maxLen * 0.52)
+  // Average advance per character, in em. Helvetica Latin text averages ~0.5em; text beyond
+  // Latin-1 (a Greek/Cyrillic name, say) is drawn with the wider DejaVu Sans fallback (~0.55em,
+  // see ./fonts), so budget more per character or the longest line overruns the box.
+  const avgAdvance = lines.some((l) => /[^\u0000-ÿ]/.test(l)) ? 0.6 : 0.52
+  const sizeByWidth = innerW / (maxLen * avgAdvance)
   // Floor at 3.5pt (tiny but legible) so more lines fit before drawTextOverlay clips any overflow.
   const fontSize = Math.max(3.5, Math.min(10, sizeByHeight, sizeByWidth))
   extra.push({
