@@ -68,6 +68,15 @@ export function CloseIcon(props: IconProps): React.JSX.Element {
   )
 }
 
+export function SearchIcon(props: IconProps): React.JSX.Element {
+  return (
+    <Icon {...props}>
+      <circle cx="11" cy="11" r="7" />
+      <path d="m20 20-4-4" />
+    </Icon>
+  )
+}
+
 export function PlusIcon(props: IconProps): React.JSX.Element {
   return (
     <Icon {...props}>

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, type RefObject } from 
 import { select } from 'd3-selection'
 import { zoomIdentity, zoomTransform, type ZoomBehavior, type ZoomTransform } from 'd3-zoom'
 import { animateZoomTo } from './animate-transform'
-import { FIT_ANIMATION_MS, FIT_TOP_MARGIN, PAN_MARGIN } from './zoom-constants'
+import { FIT_ANIMATION_MS, FIT_TOP_MARGIN, PAN_MARGIN, REVEAL_ANIMATION_MS } from './zoom-constants'
 
 /** A request to bring world y `y` (the top of a just-imported document) to the top of the view. */
 export interface FitFocus {
@@ -50,13 +50,20 @@ export function useAutoFit({
   focus,
   viewportWidth,
   viewportHeight
-}: AutoFitArgs): { refit: (focusY: number) => void } {
+}: AutoFitArgs): {
+  refit: (focusY: number) => void
+  reveal: (target: ZoomTransform) => void
+  /** Where the running fit or reveal tween will leave the view, or null when none is running. */
+  pendingTarget: () => ZoomTransform | null
+} {
   const fitted = useRef(false)
   const lastDims = useRef({ w: 0, h: 0, vw: 0, vh: 0 })
   const lastFocus = useRef<FitFocus | null>(null)
   /** The world y the running animation (if any) is heading for. */
   const animAnchor = useRef<number | null>(null)
   const cancelAnim = useRef<(() => void) | null>(null)
+  /** The transform the running animation (if any) ends at. */
+  const animTarget = useRef<ZoomTransform | null>(null)
   /** The scale the last fit set — if the view is still at it, the user has scrolled, not zoomed. */
   const fitK = useRef<number | null>(null)
 
@@ -64,6 +71,7 @@ export function useAutoFit({
     cancelAnim.current?.()
     cancelAnim.current = null
     animAnchor.current = null
+    animTarget.current = null
   }
 
   const animateTo = (focusY: number): void => {
@@ -74,6 +82,7 @@ export function useAutoFit({
     animAnchor.current = focusY
     userMovedRef.current = false
     const target = fitTransform(focusY)
+    animTarget.current = target
     fitK.current = target.k
     cancelAnim.current = animateZoomTo(
       vp,
@@ -84,6 +93,7 @@ export function useAutoFit({
       () => {
         cancelAnim.current = null
         animAnchor.current = null
+        animTarget.current = null
       }
     )
   }
@@ -196,5 +206,37 @@ export function useAutoFit({
   useEffect(() => stopAnim, [])
 
   const refit = useCallback((focusY: number) => animateTo(focusY), [])
-  return { refit }
+
+  /**
+   * Animate to `target` (Find bringing a page into view). It shares the fit's tween slot, so the
+   * two never run at once; a wheel or drag mid-tween marks the view user-moved, which aborts it.
+   * It ends marked user-moved too, so a later content change doesn't re-fit away from the page.
+   */
+  const reveal = useCallback((target: ZoomTransform) => {
+    const vp = viewportRef.current
+    const zoom = zoomRef.current
+    if (!vp || !zoom) return
+    stopAnim()
+    userMovedRef.current = false
+    animTarget.current = target
+    cancelAnim.current = animateZoomTo(
+      vp,
+      zoom,
+      target,
+      REVEAL_ANIMATION_MS,
+      () => userMovedRef.current,
+      () => {
+        cancelAnim.current = null
+        animTarget.current = null
+        userMovedRef.current = true
+      }
+    )
+  }, [])
+
+  // A tween the user aborted (wheel/drag) has not reached its target: only a live one counts.
+  const pendingTarget = useCallback(
+    () => (cancelAnim.current && !userMovedRef.current ? animTarget.current : null),
+    []
+  )
+  return { refit, reveal, pendingTarget }
 }

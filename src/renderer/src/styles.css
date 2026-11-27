@@ -23,6 +23,12 @@
   --scrollbar-thumb-hover: rgba(255, 255, 255, 0.3);
   --radius: 10px;
   --page-shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 8px 24px rgba(0, 0, 0, 0.36);
+  /* Find: rings around matching thumbnails, fills over matches in full view. The page surface is
+     white in both themes, so the fills are shared. */
+  --find-ring: rgba(255, 196, 0, 0.85);
+  --find-ring-current: #ff8a00;
+  --find-fill: rgba(255, 200, 0, 0.38);
+  --find-fill-current: rgba(255, 138, 0, 0.55);
 }
 
 @media (prefers-color-scheme: light) {
@@ -46,6 +52,7 @@
     --scrollbar-thumb: rgba(22, 22, 26, 0.16);
     --scrollbar-thumb-hover: rgba(22, 22, 26, 0.32);
     --page-shadow: 0 1px 2px rgba(20, 20, 24, 0.07), 0 6px 20px rgba(20, 20, 24, 0.06);
+    --find-ring: #d99a00;
   }
 }
 
@@ -421,6 +428,21 @@ body {
 .page.selected {
   outline: 3px solid var(--select);
   outline-offset: 2px;
+}
+
+/* Find hits. box-shadow, not outline: .page.selected owns the outline, so both stay visible (and a
+   box's own shadow is not clipped by its overflow: hidden). */
+.page.find-hit {
+  box-shadow:
+    0 0 0 2px var(--find-ring),
+    var(--page-shadow);
+}
+
+.page.find-current {
+  box-shadow:
+    0 0 0 4px var(--find-ring-current),
+    0 0 18px var(--find-ring-current),
+    var(--page-shadow);
 }
 
 .page.collapsing {
@@ -895,6 +917,27 @@ body {
   border-radius: 4px;
   overflow: hidden;
   box-shadow: 0 10px 40px rgba(0, 0, 0, 0.35);
+}
+
+/* Find matches over the full-view page: under the overlay layer (z 2), so a redaction box still
+   covers what it hides. */
+.find-hl-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+}
+
+.find-hl {
+  position: absolute;
+  border-radius: 2px;
+  background: var(--find-fill);
+  mix-blend-mode: multiply;
+}
+
+.find-hl.current {
+  background: var(--find-fill-current);
+  box-shadow: 0 0 0 1.5px var(--find-ring-current);
 }
 
 /* Live edit overlays, drawn over the page canvas inside .full-page. */
@@ -1604,4 +1647,75 @@ body {
     opacity: 1;
     transform: translate(-50%, 0);
   }
+}
+
+/* The find bar: under the toolbar on the right, above full view (30) and the edit tools (30), below
+   the dialogs (50/60) and the toast (100). */
+.findbar {
+  position: fixed;
+  top: 64px;
+  right: 20px;
+  z-index: 40;
+  -webkit-app-region: no-drag;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: calc(100vw - 32px);
+  padding: 6px 8px;
+  background: var(--overlay-strong);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius);
+  box-shadow: var(--page-shadow);
+  color: var(--ink);
+  font-size: 13px;
+}
+
+/* Moved to the left edge while the current match (full view) is under its usual spot. */
+.findbar.dodge {
+  right: auto;
+  left: 20px;
+}
+
+.findbar-icon {
+  display: inline-flex;
+  color: var(--ink-faint);
+  padding-left: 2px;
+}
+
+.findbar-input {
+  width: 220px;
+  min-width: 80px;
+  flex: 1 1 auto;
+  font: inherit;
+  color: var(--ink);
+  background: var(--control);
+  border: 1px solid var(--hairline);
+  border-radius: 6px;
+  padding: 4px 8px;
+  outline: none;
+}
+
+.findbar-input::placeholder {
+  color: var(--ink-faint);
+}
+
+.findbar-input:focus {
+  border-color: var(--select);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--select) 35%, transparent);
+}
+
+.findbar-count {
+  min-width: 0;
+  color: var(--ink-soft);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.findbar-count:empty {
+  display: none;
+}
+
+.findbar-status {
+  color: var(--ink-faint);
+  white-space: nowrap;
 }

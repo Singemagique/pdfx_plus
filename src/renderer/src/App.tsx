@@ -16,6 +16,12 @@ import { EditProvider, useEditStore } from './edit/EditProvider'
 import { EditTools } from './components/edit/EditTools'
 import { SignaturePad } from './components/edit/SignaturePad'
 import { makePageKey } from './edit/model'
+import { useFind } from './search/useFind'
+import { useFindShortcuts } from './search/useFindShortcuts'
+import { FindProvider } from './search/FindContext'
+import type { FindMatch } from './search/find-controller'
+import { FindBarHost } from './components/FindBar'
+import type { FullViewNav } from './components/full-view/use-full-view-controls'
 
 const TOAST_MS = 4000
 
@@ -172,6 +178,46 @@ export default function App(): React.JSX.Element {
     onClearSelection: collection.clearSelection
   })
 
+  // Find. Its controller is created once and never re-renders App: the bar, the page cells and the
+  // full-view highlights subscribe to it directly.
+  const layoutRef = useRef(layout)
+  layoutRef.current = layout
+  const selectedRef = useRef(collection.selected)
+  selectedRef.current = collection.selected
+  const hiddenPageIdRef = useRef(fullViewState.hiddenPageId)
+  hiddenPageIdRef.current = fullViewState.hiddenPageId
+  const fullViewNavRef = useRef<FullViewNav | null>(null)
+  const modalOpen = (signOpen && !placing) || padOpen
+  const modalOpenRef = useRef(modalOpen)
+  modalOpenRef.current = modalOpen
+  const getAnchorPageId = useCallback(
+    () =>
+      fullViewState.fullViewRef.current
+        ? hiddenPageIdRef.current
+        : (selectedRef.current?.pageId ?? null),
+    [fullViewState.fullViewRef]
+  )
+  const onFindNavigate = useCallback(
+    (m: FindMatch) => {
+      if (fullViewState.fullViewRef.current) {
+        fullViewNavRef.current?.goTo(m.docId, m.pageId)
+        return
+      }
+      const slot = layoutRef.current.items
+        ?.find((i) => i.doc.id === m.docId)
+        ?.pages.find((p) => p.pageId === m.pageId)
+      if (slot) canvasRef.current?.revealRect(slot)
+    },
+    [fullViewState.fullViewRef]
+  )
+  const find = useFind({
+    docs,
+    overlays: editStore.overlays,
+    getAnchorPageId,
+    onNavigate: onFindNavigate
+  })
+  useFindShortcuts({ controller: find, enabled: !modalOpen })
+
   const onScaleChange = useCallback((next: number) => setScale(next), [])
   const onSettle = useCallback(() => setRenderVersion((v) => v + 1), [])
 
@@ -198,118 +244,124 @@ export default function App(): React.JSX.Element {
       else if (action === 'export-pdfx') void exportCollection('pdfx')
       else if (action === 'export-pdf') void exportCollection('pdf')
       else if (action === 'export-zip') void exportZip()
+      else if (action === 'find' && !modalOpenRef.current) find.open()
     })
-  }, [openViaDialog, exportCollection, exportZip])
+  }, [openViaDialog, exportCollection, exportZip, find])
 
   const totalPages = docs.reduce((sum, d) => sum + d.pages.length, 0)
   const fullViewDoc = fullView ? docs.find((d) => d.id === fullView.docId) : undefined
 
   return (
     <EditProvider store={editStore}>
-      <div
-        className={
-          'app' + (drag.committing ? ' committing' : '') + (drag.dragKind ? ' dragging' : '')
-        }
-        onDragEnter={drag.handlers.onDragEnter}
-        onDragOver={drag.handlers.onDragOver}
-        onDragLeave={drag.handlers.onDragLeave}
-        onDrop={drag.handlers.onDrop}
-      >
-        <Toolbar
-          documentCount={docs.length}
-          pageCount={totalPages}
-          busy={busy}
-          zoom={scale}
-          onZoomIn={() => canvasRef.current?.zoomIn()}
-          onZoomOut={() => canvasRef.current?.zoomOut()}
-          onZoomReset={() => canvasRef.current?.reset()}
-          onOpen={openViaDialog}
-          onExport={() => exportCollection('pdfx')}
-          onExportPdf={() => exportCollection('pdf')}
-          onExportZip={exportZip}
-          onSign={() => setSignOpen(true)}
-        />
-
-        <CollectionCanvas
-          docs={docs}
-          layout={layout}
-          busy={busy}
-          pagesDraggable={totalPages >= 2}
-          renderVersion={renderVersion}
-          selected={collection.selected}
-          hiddenPageId={fullViewState.hiddenPageId}
-          dragKind={drag.dragKind}
-          draggingPage={drag.draggingPage}
-          dropTarget={drag.dropTarget}
-          collapsedId={drag.collapsedId}
-          externalCount={drag.externalCount}
-          canvasRef={canvasRef}
-          onScaleChange={onScaleChange}
-          onSettle={onSettle}
-          onBackgroundClick={collection.clearSelection}
-          onWrapWidthChange={setWrapWidth}
-          onOpen={openViaDialog}
-          onSelectPage={collection.selectPage}
-          onOpenPage={fullViewState.openPage}
-          onPageDragStart={drag.startPageDrag}
-          onPageDragEnd={drag.clearDrag}
-          onAddPage={addPagesToDoc}
-          onMoveDoc={collection.moveDoc}
-          onRemoveDoc={collection.removeDoc}
-          onRenameDoc={collection.renameDoc}
-        />
-
-        {fullView && fullViewDoc && (
-          <>
-            <FullView
-              docs={docs}
-              startDocId={fullView.docId}
-              startPageId={fullView.pageId}
-              originRect={fullView.originRect}
-              onActivePageChange={fullViewState.setHiddenPageId}
-              onClose={fullViewState.closeFullView}
-            />
-            <EditTools />
-          </>
-        )}
-
-        {signOpen && (
-          <SignDialog
+      <FindProvider value={find}>
+        <div
+          className={
+            'app' + (drag.committing ? ' committing' : '') + (drag.dragKind ? ' dragging' : '')
+          }
+          onDragEnter={drag.handlers.onDragEnter}
+          onDragOver={drag.handlers.onDragOver}
+          onDragLeave={drag.handlers.onDragLeave}
+          onDrop={drag.handlers.onDrop}
+        >
+          <Toolbar
+            documentCount={docs.length}
+            pageCount={totalPages}
             busy={busy}
-            hidden={placing}
-            onSign={signAndExport}
-            onSignCard={signWithCardAndExport}
-            listTokens={(modulePath) => window.api.listCardTokens(modulePath)}
-            findModules={() => window.api.findCardModules()}
-            listWindowsCerts={() => window.api.listWindowsCerts()}
-            onSignWindowsCert={signWithWindowsCertAndExport}
-            platform={window.api.platform}
-            pathForFile={(file) => window.api.getPathForFile(file)}
-            placementLabel={editStore.signaturePlacement?.label ?? null}
-            onClearPlacement={() => editStore.setSignaturePlacement(null)}
-            onPlaceRequest={requestPlacement}
-            hasSavedSignature={!!editStore.savedSignature}
-            onDrawSignature={() => setPadOpen(true)}
-            onClose={() => {
-              awaitingPlacement.current = false
-              setPlacing(false)
-              setSignOpen(false)
-            }}
+            zoom={scale}
+            onZoomIn={() => canvasRef.current?.zoomIn()}
+            onZoomOut={() => canvasRef.current?.zoomOut()}
+            onZoomReset={() => canvasRef.current?.reset()}
+            onOpen={openViaDialog}
+            onExport={() => exportCollection('pdfx')}
+            onExportPdf={() => exportCollection('pdf')}
+            onExportZip={exportZip}
+            onSign={() => setSignOpen(true)}
           />
-        )}
 
-        {padOpen && (
-          <SignaturePad
-            onSave={(bytes) => {
-              editStore.setSavedSignature(bytes)
-              setPadOpen(false)
-            }}
-            onClose={() => setPadOpen(false)}
+          <CollectionCanvas
+            docs={docs}
+            layout={layout}
+            busy={busy}
+            pagesDraggable={totalPages >= 2}
+            renderVersion={renderVersion}
+            selected={collection.selected}
+            hiddenPageId={fullViewState.hiddenPageId}
+            dragKind={drag.dragKind}
+            draggingPage={drag.draggingPage}
+            dropTarget={drag.dropTarget}
+            collapsedId={drag.collapsedId}
+            externalCount={drag.externalCount}
+            canvasRef={canvasRef}
+            onScaleChange={onScaleChange}
+            onSettle={onSettle}
+            onBackgroundClick={collection.clearSelection}
+            onWrapWidthChange={setWrapWidth}
+            onOpen={openViaDialog}
+            onSelectPage={collection.selectPage}
+            onOpenPage={fullViewState.openPage}
+            onPageDragStart={drag.startPageDrag}
+            onPageDragEnd={drag.clearDrag}
+            onAddPage={addPagesToDoc}
+            onMoveDoc={collection.moveDoc}
+            onRemoveDoc={collection.removeDoc}
+            onRenameDoc={collection.renameDoc}
           />
-        )}
 
-        {toast && <div className="toast">{toast}</div>}
-      </div>
+          {fullView && fullViewDoc && (
+            <>
+              <FullView
+                docs={docs}
+                startDocId={fullView.docId}
+                startPageId={fullView.pageId}
+                originRect={fullView.originRect}
+                onActivePageChange={fullViewState.setHiddenPageId}
+                onClose={fullViewState.closeFullView}
+                navRef={fullViewNavRef}
+              />
+              <EditTools />
+            </>
+          )}
+
+          {signOpen && (
+            <SignDialog
+              busy={busy}
+              hidden={placing}
+              onSign={signAndExport}
+              onSignCard={signWithCardAndExport}
+              listTokens={(modulePath) => window.api.listCardTokens(modulePath)}
+              findModules={() => window.api.findCardModules()}
+              listWindowsCerts={() => window.api.listWindowsCerts()}
+              onSignWindowsCert={signWithWindowsCertAndExport}
+              platform={window.api.platform}
+              pathForFile={(file) => window.api.getPathForFile(file)}
+              placementLabel={editStore.signaturePlacement?.label ?? null}
+              onClearPlacement={() => editStore.setSignaturePlacement(null)}
+              onPlaceRequest={requestPlacement}
+              hasSavedSignature={!!editStore.savedSignature}
+              onDrawSignature={() => setPadOpen(true)}
+              onClose={() => {
+                awaitingPlacement.current = false
+                setPlacing(false)
+                setSignOpen(false)
+              }}
+            />
+          )}
+
+          {padOpen && (
+            <SignaturePad
+              onSave={(bytes) => {
+                editStore.setSavedSignature(bytes)
+                setPadOpen(false)
+              }}
+              onClose={() => setPadOpen(false)}
+            />
+          )}
+
+          <FindBarHost controller={find} />
+
+          {toast && <div className="toast">{toast}</div>}
+        </div>
+      </FindProvider>
     </EditProvider>
   )
 }

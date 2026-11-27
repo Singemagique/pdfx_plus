@@ -1,6 +1,7 @@
 import type { PageEntry } from '../../types'
 import { PageView } from '../PageView'
 import { OverlayLayer } from '../edit/OverlayLayer'
+import { FindHighlights } from './FindHighlights'
 import { useEdits } from '../../edit/EditProvider'
 import { makePageKey } from '../../edit/model'
 import type { View } from './geometry'
@@ -82,6 +83,7 @@ export function FullViewPage(props: FullViewPageProps): React.JSX.Element {
           eager={isCurrent}
           rotation={cssRotation}
         />
+        {isCurrent && !animating && <FindHighlights page={p} box={box} />}
         {isCurrent && (
           <OverlayLayer page={p} fit={box} rot={rot} active={interactive && !animating} />
         )}

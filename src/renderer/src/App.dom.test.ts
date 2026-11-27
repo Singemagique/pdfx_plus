@@ -20,7 +20,9 @@ const stubs = vi.hoisted(() => {
       state.docs.push(...docs)
     },
     oneDoc,
-    noop: (): void => {}
+    noop: (): void => {},
+    /** The renderer's menu listener, as registered through window.api.onMenu. */
+    menu: null as ((action: string) => void) | null
   }
   // jsdom ships no `CSS` global, and useFullView.openPage escapes the page id with CSS.escape.
   const host = globalThis as { CSS?: { escape?: (s: string) => string } }
@@ -38,7 +40,10 @@ const stubs = vi.hoisted(() => {
       // Non-Windows keeps SignDialog on the certificate-file tab, so no cert-store probe runs.
       platform: 'linux',
       onZoom: () => state.noop,
-      onMenu: () => state.noop,
+      onMenu: (cb: (action: string) => void) => {
+        state.menu = cb
+        return state.noop
+      },
       getPathForFile: () => '',
       listCardTokens: async () => [],
       findCardModules: async () => [],
@@ -186,5 +191,39 @@ describe('App · abandoning a signature placement', () => {
     expect(container.querySelector('.fv-close')).toBeNull()
     expect(overlay()).not.toBeNull()
     expect(overlay()!.classList.contains('hidden')).toBe(false)
+  })
+})
+
+describe('App · Find', () => {
+  it('opens the find bar from the menu and closes it with Escape', async () => {
+    await act(async () => root.render(createElement(App)))
+    expect(container.querySelector('.findbar')).toBeNull()
+
+    await act(async () => stubs.menu?.('find'))
+    const input = container.querySelector('.findbar-input') as HTMLInputElement | null
+    expect(input).not.toBeNull()
+    expect(document.activeElement).toBe(input)
+
+    await act(async () => {
+      input!.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+    })
+    expect(container.querySelector('.findbar')).toBeNull()
+  })
+
+  it('opens the find bar with Ctrl+F', async () => {
+    await act(async () => root.render(createElement(App)))
+    await act(async () => {
+      document.body.dispatchEvent(
+        new KeyboardEvent('keydown', { key: 'f', ctrlKey: true, bubbles: true, cancelable: true })
+      )
+    })
+    expect(container.querySelector('.findbar')).not.toBeNull()
+  })
+
+  it('ignores the menu while the Sign dialog is open', async () => {
+    await act(async () => root.render(createElement(App)))
+    await click(button(/^Sign$/))
+    await act(async () => stubs.menu?.('find'))
+    expect(container.querySelector('.findbar')).toBeNull()
   })
 })

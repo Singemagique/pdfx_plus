@@ -1,4 +1,4 @@
-import { useCallback } from 'react'
+import { useCallback, useRef } from 'react'
 import type { DocEntry } from '../../types'
 import type { View } from './geometry'
 import { clamp, fitInto, flipTo, MAX_ZOOM, MIN_ZOOM, TRANSITION_MS } from './geometry'
@@ -10,6 +10,9 @@ interface ControlsOptions {
   vpRef: React.MutableRefObject<{ w: number; h: number }>
   curRef: React.MutableRefObject<{ di: number; pi: number }>
   phaseRef: React.MutableRefObject<'opening' | 'open' | 'closing'>
+  /** The in-progress pan of a zoomed page, if any. */
+  dragRef?: React.MutableRefObject<unknown>
+  zoomedRef?: React.MutableRefObject<boolean>
   setView: React.Dispatch<React.SetStateAction<View>>
   setPhase: (phase: 'opening' | 'open' | 'closing') => void
   setFlip: (flip: string | null) => void
@@ -26,8 +29,15 @@ export interface FullViewControls {
   runClose: () => void
 }
 
-export function useFullViewControls(opts: ControlsOptions): FullViewControls {
-  const { scrollRef, closingRef, docsRef, vpRef, curRef, phaseRef } = opts
+export interface FullViewNav {
+  /** Scroll to a page (Find's next/prev); deferred until the open animation has finished. */
+  goTo: (docId: string, pageId: string) => void
+}
+
+export function useFullViewControls(
+  opts: ControlsOptions
+): FullViewControls & FullViewNav & { runPendingGoTo: () => void } {
+  const { scrollRef, closingRef, docsRef, vpRef, curRef, phaseRef, dragRef, zoomedRef } = opts
   const { setView, setPhase, setFlip, setFlipTransition, setRevealed, onClose } = opts
 
   const resetView = useCallback(() => setView({ zoom: 1, x: 0, y: 0 }), [])
@@ -112,5 +122,44 @@ export function useFullViewControls(opts: ControlsOptions): FullViewControls {
     window.setTimeout(onClose, TRANSITION_MS + 20)
   }, [onClose])
 
-  return { resetView, applyZoom, panBy, navByKey, runClose }
+  const pendingGoTo = useRef<{ docId: string; pageId: string } | null>(null)
+
+  const goTo = useCallback((docId: string, pageId: string) => {
+    const di = docsRef.current.findIndex((d) => d.id === docId)
+    const pi = di >= 0 ? docsRef.current[di].pages.findIndex((p) => p.id === pageId) : -1
+    if (pi < 0) return
+    if (phaseRef.current !== 'open') {
+      if (phaseRef.current === 'opening') pendingGoTo.current = { docId, pageId }
+      return
+    }
+    pendingGoTo.current = null
+    const cur = curRef.current
+    if (cur.di === di && cur.pi === pi) return
+    // Mid-pan of a zoomed page: leave the user where they are.
+    if (dragRef?.current) return
+    const reduced =
+      typeof window.matchMedia === 'function' &&
+      window.matchMedia('(prefers-reduced-motion: reduce)').matches
+    const behavior: ScrollBehavior = reduced ? 'auto' : 'smooth'
+    const scroll = (): void => {
+      const sc = scrollRef.current
+      const docEl = sc?.children[di] as HTMLElement | undefined
+      const slide = docEl?.children[pi] as HTMLElement | undefined
+      if (!sc || !docEl || !slide) return
+      docEl.scrollTo?.({ left: slide.offsetLeft, behavior })
+      sc.scrollTo?.({ top: docEl.offsetTop, behavior })
+    }
+    if (zoomedRef?.current) {
+      // The scrollers are locked while zoomed: reset first, scroll once they are free again.
+      resetView()
+      requestAnimationFrame(scroll)
+    } else scroll()
+  }, [])
+
+  const runPendingGoTo = useCallback(() => {
+    const p = pendingGoTo.current
+    if (p) goTo(p.docId, p.pageId)
+  }, [goTo])
+
+  return { resetView, applyZoom, panBy, navByKey, runClose, goTo, runPendingGoTo }
 }

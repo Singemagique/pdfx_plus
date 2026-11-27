@@ -4,6 +4,7 @@ import { useEdits } from '../edit/EditProvider'
 import { makePageKey, type CropBox } from '../edit/model'
 import { PageView } from './PageView'
 import { buildPageDragImage } from './page-drag-image'
+import { usePageFindStatus } from '../search/FindContext'
 
 /** Dim the cropped-away area of a thumbnail (crop is in unrotated page points, origin bottom-left;
  *  the box w×h is the unrotated PageView size, so this rotates with the page rotor). */
@@ -78,10 +79,16 @@ function PageCellImpl({
   const rotated = rot === 90 || rot === 270
   const cellW = width
   const crop = crops.get(pageKey)
+  const find = usePageFindStatus(page.id)
   return (
     <div
       data-page-id={page.id}
-      className={'page' + (selected ? ' selected' : '') + (collapsed ? ' collapsing' : '')}
+      className={
+        'page' +
+        (selected ? ' selected' : '') +
+        (collapsed ? ' collapsing' : '') +
+        (find === 'current' ? ' find-current' : find === 'hit' ? ' find-hit' : '')
+      }
       style={
         collapsed
           ? {
