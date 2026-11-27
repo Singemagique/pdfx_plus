@@ -1,6 +1,7 @@
-import { forwardRef, useImperativeHandle, useLayoutEffect, useRef } from 'react'
-import { select } from 'd3-selection'
-import { useZoomBehavior, PAN_MARGIN } from '../canvas/use-zoom-behavior'
+import { forwardRef, useImperativeHandle, useRef } from 'react'
+import { useZoomBehavior } from '../canvas/use-zoom-behavior'
+import { useAutoFit, type FitFocus } from '../canvas/use-auto-fit'
+import { useViewportWidth } from '../canvas/use-viewport-width'
 import { createCanvasHandle } from '../canvas/canvas-handle'
 
 export interface CanvasHandle {
@@ -13,11 +14,14 @@ export interface CanvasHandle {
 interface CanvasProps {
   contentWidth: number
   contentHeight: number
-  slotHeight: number
+  /** Set (a fresh object) when documents were just imported: fit and scroll to world y `focus.y`. */
+  focus?: FitFocus | null
   dragging?: boolean
   onScaleChange?: (scale: number) => void
   onSettle?: () => void
   onBackgroundClick?: () => void
+  /** The viewport's css width — on mount, then on (debounced) resize; held back mid-drag. */
+  onViewportWidth?: (width: number) => void
   children: React.ReactNode
   overlay?: React.ReactNode
 }
@@ -26,11 +30,12 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
   {
     contentWidth,
     contentHeight,
-    slotHeight,
+    focus = null,
     dragging,
     onScaleChange,
     onSettle,
     onBackgroundClick,
+    onViewportWidth,
     children,
     overlay
   },
@@ -40,8 +45,8 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
   const worldRef = useRef<HTMLDivElement>(null)
   const overlayRef = useRef<HTMLDivElement>(null)
   const userMovedRef = useRef(false)
-  const dims = useRef({ contentWidth, contentHeight, slotHeight })
-  dims.current = { contentWidth, contentHeight, slotHeight }
+  const dims = useRef({ contentWidth, contentHeight })
+  dims.current = { contentWidth, contentHeight }
   const draggingRef = useRef(dragging)
   draggingRef.current = dragging
 
@@ -55,26 +60,20 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
     onSettle
   })
 
-  useLayoutEffect(() => {
-    const vp = viewportRef.current
-    const zoomBehavior = zoomRef.current
-    if (!vp || !zoomBehavior) return
-    zoomBehavior.extent([
-      [0, 0],
-      [vp.clientWidth, vp.clientHeight]
-    ])
-    const mx = contentWidth * PAN_MARGIN
-    const my = contentHeight * PAN_MARGIN
-    zoomBehavior.translateExtent([
-      [-mx, -my],
-      [contentWidth + mx, contentHeight + my]
-    ])
-    if (!userMovedRef.current && !draggingRef.current && contentWidth > 1 && contentHeight > 1) {
-      select(vp).call(zoomBehavior.transform, fitTransform())
-    }
-  }, [contentWidth, contentHeight])
+  useViewportWidth(viewportRef, !!dragging, onViewportWidth)
 
-  useImperativeHandle(ref, () => createCanvasHandle({ viewportRef, zoomRef, fitTransform }))
+  const { refit } = useAutoFit({
+    viewportRef,
+    zoomRef,
+    userMovedRef,
+    draggingRef,
+    fitTransform,
+    contentWidth,
+    contentHeight,
+    focus
+  })
+
+  useImperativeHandle(ref, () => createCanvasHandle({ viewportRef, zoomRef, userMovedRef, refit }))
 
   return (
     <div

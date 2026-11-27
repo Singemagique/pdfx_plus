@@ -34,6 +34,9 @@ function Harness(): ReactNode {
   const child = createElement(PageCell, {
     docId: 'doc-1',
     page,
+    x: 0,
+    y: 0,
+    width: 155,
     pageHeight: 200,
     renderVersion: 0,
     selected: false,

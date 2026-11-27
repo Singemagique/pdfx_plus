@@ -1,8 +1,7 @@
 import { BASE_PAGE_HEIGHT, pageDisplayWidth } from '../../canvas/layout'
-import type { DropTarget } from '../../canvas/layout'
+import type { CanvasLayout, DropTarget } from '../../canvas/layout'
 import type { GhostSize } from '../DropGhost'
 import type { PageRef } from '../../app/types'
-import type { DocEntry, PageEntry } from '../../types'
 
 type DragKind = 'internal' | 'external' | null
 
@@ -14,12 +13,14 @@ export const LETTER_GHOST: GhostSize = {
   height: BASE_PAGE_HEIGHT
 }
 
-export function pageGhostSize(page: PageEntry): GhostSize {
-  return { width: pageDisplayWidth(page.width, page.height), height: BASE_PAGE_HEIGHT }
+/** A page's ghost: the size its cell is drawn at in the layout (rotation included). */
+function slotGhostSize(layout: CanvasLayout, docId: string, pageId: string): GhostSize | null {
+  const slot = layout.items.find((i) => i.doc.id === docId)?.pages.find((p) => p.pageId === pageId)
+  return slot ? { width: slot.w, height: slot.h } : null
 }
 
 export function intoGhostSize(
-  docs: DocEntry[],
+  layout: CanvasLayout,
   intoDocId: string | null,
   intoIndex: number,
   dragKind: DragKind,
@@ -27,9 +28,9 @@ export function intoGhostSize(
 ): GhostSize {
   if (!intoDocId) return LETTER_GHOST
   if (dragKind === 'internal' && draggedSize) return draggedSize
-  const target = docs.find((d) => d.id === intoDocId)
+  const target = layout.items.find((i) => i.doc.id === intoDocId)
   const ref = target?.pages[Math.min(intoIndex, target.pages.length - 1)]
-  return ref ? pageGhostSize(ref) : LETTER_GHOST
+  return ref ? { width: ref.w, height: ref.h } : LETTER_GHOST
 }
 
 export function betweenGhostPages(
@@ -51,16 +52,15 @@ export interface DropGhosts {
 }
 
 export function deriveDropGhosts(
-  docs: DocEntry[],
+  layout: CanvasLayout,
   draggingPage: PageRef | null,
   dropTarget: DropTarget | null,
   dragKind: DragKind,
   externalCount: number
 ): DropGhosts {
-  const draggedEntry = draggingPage
-    ? docs.find((d) => d.id === draggingPage.docId)?.pages.find((p) => p.id === draggingPage.pageId)
-    : undefined
-  const draggedSize = draggedEntry ? pageGhostSize(draggedEntry) : null
+  const draggedSize = draggingPage
+    ? slotGhostSize(layout, draggingPage.docId, draggingPage.pageId)
+    : null
   const intoDocId = dropTarget?.kind === 'into' ? dropTarget.docId : null
   const intoIndex = dropTarget?.kind === 'into' ? dropTarget.index : -1
   const betweenIndex = dropTarget?.kind === 'between' ? dropTarget.docIndex : -1
@@ -68,7 +68,7 @@ export function deriveDropGhosts(
     intoDocId,
     intoIndex,
     betweenIndex,
-    ghostSize: intoGhostSize(docs, intoDocId, intoIndex, dragKind, draggedSize),
+    ghostSize: intoGhostSize(layout, intoDocId, intoIndex, dragKind, draggedSize),
     betweenPages: betweenGhostPages(dragKind, draggedSize, externalCount)
   }
 }

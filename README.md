@@ -33,7 +33,7 @@ PDFx is an open, backwards compatible extension of PDF that bundles many documen
 
 A `.pdfx` file is a fully valid PDF: open it anywhere and every page shows in sequence. Open it in PDFx and it splits back into the original documents. Plain single PDFs work as they are.
 
-Drag and drop `.pdf` or `.pdfx` files anywhere in the window. Each document renders as a horizontal strip of pages, and documents stack vertically. Reorder or remove them, then **Export .pdfx** to save the whole collection as one file.
+Drag and drop `.pdf` or `.pdfx` files anywhere in the window. Each document renders as a card of pages that wrap into rows to fit the window, and documents stack vertically; newly added documents are zoomed to fit and scrolled into view. Reorder or remove them, then **Export .pdfx** to save the whole collection as one file.
 
 Beyond bundling, PDFx is a full editor: page transforms (rotate/crop), PNG stamps, annotations (text, ink, highlight, shapes), AcroForm form filling, **true** content redaction, and digital signatures — visual/ink plus cryptographic **PAdES** (baseline B-B through long-term **B-LT/B-LTA**) from a `.p12`/PFX file, a PKCS#11 smart card, or the Windows certificate store. Edits flatten into the PDF so any viewer sees them, and are mirrored in a backward-compatible manifest so a `.pdfx` reopens fully editable.
 

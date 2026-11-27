@@ -1,6 +1,5 @@
 import { memo } from 'react'
 import type { PageEntry } from '../types'
-import { pageCellWidth } from '../canvas/layout'
 import { useEdits } from '../edit/EditProvider'
 import { makePageKey, type CropBox } from '../edit/model'
 import { PageView } from './PageView'
@@ -38,6 +37,10 @@ function CropMask({
 interface PageCellProps {
   docId: string
   page: PageEntry
+  /** Card-relative position and size of the cell, straight from the layout. */
+  x: number
+  y: number
+  width: number
   pageHeight: number
   renderVersion: number
   selected: boolean
@@ -54,6 +57,9 @@ interface PageCellProps {
 function PageCellImpl({
   docId,
   page,
+  x,
+  y,
+  width,
   pageHeight,
   renderVersion,
   selected,
@@ -70,7 +76,7 @@ function PageCellImpl({
   const pageKey = makePageKey(page.source.id, page.pageIndex)
   const rot = rotations.get(pageKey) ?? 0
   const rotated = rot === 90 || rot === 270
-  const cellW = pageCellWidth(page, rotations)
+  const cellW = width
   const crop = crops.get(pageKey)
   return (
     <div
@@ -79,13 +85,18 @@ function PageCellImpl({
       style={
         collapsed
           ? {
+              position: 'absolute',
+              left: x,
+              top: y,
               width: 0,
               height: pageHeight,
-              position: 'absolute',
               opacity: 0,
               pointerEvents: 'none'
             }
           : {
+              position: 'absolute',
+              left: x,
+              top: y,
               width: cellW,
               height: pageHeight,
               visibility: hidden ? 'hidden' : undefined
