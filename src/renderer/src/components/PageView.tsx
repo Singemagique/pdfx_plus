@@ -1,6 +1,7 @@
 import { memo, useEffect, useRef, useState } from 'react'
 import type { PDFDocumentProxy, RenderTask } from 'pdfjs-dist'
-import { BASE_RASTER, dpr, logRenderError, renderBase, renderDetail } from './page-view/raster'
+import { logRenderError, renderBase, renderDetail } from './page-view/raster'
+import { detailDpr, planDetail } from './page-view/detail-geometry'
 
 interface PageViewProps {
   pdf: PDFDocumentProxy
@@ -10,6 +11,9 @@ interface PageViewProps {
   version: number
   eager?: boolean
   detail?: boolean
+  /** CSS rotation (degrees) an ancestor applies to this upright page box; the detail canvas
+   *  needs it to map the on-screen bounding box back to upright page coordinates. */
+  rotation?: number
 }
 
 function PageViewImpl({
@@ -19,7 +23,8 @@ function PageViewImpl({
   naturalHeight,
   version,
   eager = false,
-  detail = true
+  detail = true,
+  rotation = 0
 }: PageViewProps): React.JSX.Element {
   const rootRef = useRef<HTMLDivElement>(null)
   const baseRef = useRef<HTMLCanvasElement>(null)
@@ -74,19 +79,17 @@ function PageViewImpl({
       return
     }
 
-    const rect = root.getBoundingClientRect()
-    const layoutW = root.offsetWidth
-    const winW = window.innerWidth
-    const winH = window.innerHeight
-    const visLeft = Math.max(0, rect.left)
-    const visTop = Math.max(0, rect.top)
-    const visRight = Math.min(winW, rect.right)
-    const visBottom = Math.min(winH, rect.bottom)
-    const visW = visRight - visLeft
-    const visH = visBottom - visTop
-
-    const baseDevicePx = (BASE_RASTER / Math.max(naturalWidth, naturalHeight)) * naturalWidth
-    if (visW <= 0 || visH <= 0 || rect.width * dpr() <= baseDevicePx * 1.05) {
+    const plan = planDetail({
+      rect: root.getBoundingClientRect(),
+      layoutW: root.offsetWidth,
+      rotation,
+      viewportW: window.innerWidth,
+      viewportH: window.innerHeight,
+      naturalWidth,
+      naturalHeight,
+      dpr: detailDpr(window.devicePixelRatio)
+    })
+    if (!plan) {
       detailCanvas.style.display = 'none'
       return
     }
@@ -96,8 +99,7 @@ function PageViewImpl({
     void renderDetail({
       pdf,
       pageNumber,
-      naturalWidth,
-      geometry: { rect, layoutW, visLeft, visTop, visW, visH },
+      plan,
       detailCanvas,
       isCancelled: () => cancelled,
       onTask: (t) => (task = t)
@@ -106,7 +108,7 @@ function PageViewImpl({
       cancelled = true
       task?.cancel()
     }
-  }, [near, version, detail, pdf, pageNumber, naturalWidth, naturalHeight])
+  }, [near, version, detail, rotation, pdf, pageNumber, naturalWidth, naturalHeight])
 
   return (
     <div className="pageview" ref={rootRef}>
