@@ -1,4 +1,73 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron'
+import {
+  OCR_CONNECT_CHANNEL,
+  OCR_DISCONNECTED_CHANNEL,
+  OCR_DISCONNECT_REASONS,
+  OCR_PORT_CHANNEL,
+  type FromOcr,
+  type OcrDisconnectReason,
+  type OcrLinkEvent,
+  type ToOcr
+} from '../shared/ocr/protocol'
+import type { Settings } from '../shared/settings'
+
+export type { FromOcr, OcrLinkEvent, Settings, ToOcr }
+
+/** What `ocr.onMessage` delivers: protocol messages from the port, plus link events. */
+export type OcrMessage = FromOcr | OcrLinkEvent
+
+// The OCR port (DESIGN.md §3.3.1). Main hands this preload the renderer's end of a fresh
+// MessageChannelMain on 'ocr:port'; the port itself never crosses contextBridge, only the three
+// functions in `api.ocr` do. Posts never use a transfer list: a renderer-side transfer delivers
+// `null` to the utility process and detaches the source (PR0).
+let ocrPort: MessagePort | null = null
+let ocrConnecting = false
+const ocrQueue: ToOcr[] = []
+const ocrListeners = new Set<(message: OcrMessage) => void>()
+
+function ocrEmit(message: OcrMessage): void {
+  for (const listener of [...ocrListeners]) {
+    try {
+      listener(message)
+    } catch (error) {
+      console.error(error)
+    }
+  }
+}
+
+function ocrDrop(reason: OcrDisconnectReason): void {
+  const hadLink = ocrPort !== null || ocrConnecting
+  ocrPort?.close()
+  ocrPort = null
+  ocrConnecting = false
+  ocrQueue.length = 0
+  if (hadLink) ocrEmit({ link: { state: 'disconnected', reason } })
+}
+
+ipcRenderer.on(OCR_PORT_CHANNEL, (event) => {
+  const port = event.ports[0]
+  if (!port) return
+  // A port is never reused: a new one replaces the old one outright.
+  ocrPort?.close()
+  ocrPort = port
+  ocrConnecting = false
+  port.onmessage = (e: MessageEvent): void => {
+    if (ocrPort === port) ocrEmit(e.data as FromOcr)
+  }
+  port.addEventListener('close', () => {
+    if (ocrPort === port) ocrDrop('closed')
+  })
+  port.start()
+  ocrEmit({ link: { state: 'connected' } })
+  for (const message of ocrQueue.splice(0)) port.postMessage(message)
+})
+
+ipcRenderer.on(OCR_DISCONNECTED_CHANNEL, (_event, info: { reason?: unknown } | null) => {
+  const reason = (OCR_DISCONNECT_REASONS as readonly unknown[]).includes(info?.reason)
+    ? (info!.reason as OcrDisconnectReason)
+    : 'closed'
+  ocrDrop(reason)
+})
 
 export interface OpenedFile {
   name: string
@@ -136,6 +205,48 @@ const api = {
       callback(action)
     ipcRenderer.on('pdfx:menu', listener)
     return () => ipcRenderer.removeListener('pdfx:menu', listener)
+  },
+  /** App settings (userData/settings.json), validated in main. */
+  getSettings: (): Promise<Settings> => ipcRenderer.invoke('pdfx:settings-get'),
+  /** Merge a patch; main rejects unknown keys or invalid values. Resolves with the new settings. */
+  setSettings: (patch: Partial<Settings>): Promise<Settings> =>
+    ipcRenderer.invoke('pdfx:settings-set', patch),
+  /** Text recognition: a port to the "pdfx-ocr" utility process, kept inside this preload. */
+  ocr: {
+    /**
+     * Ask main for a fresh port (spawns the OCR process if needed). Posts queue until it arrives.
+     * A port already held is closed first: the coordinator voids the old port's session when the
+     * new one arrives, so a post sent on it in between would be lost. The `connected` event that
+     * follows means a fresh session (sources must be opened again).
+     */
+    connect: (): void => {
+      if (ocrPort) {
+        const old = ocrPort
+        ocrPort = null
+        old.close()
+      }
+      ocrConnecting = true
+      ipcRenderer.send(OCR_CONNECT_CHANNEL)
+    },
+    /** Post a protocol message. False if there is no port and no connect in flight. */
+    post: (message: ToOcr): boolean => {
+      if (ocrPort) {
+        ocrPort.postMessage(message)
+        return true
+      }
+      if (ocrConnecting) {
+        ocrQueue.push(message)
+        return true
+      }
+      return false
+    },
+    /** Subscribe to protocol messages and link events. Returns an unsubscribe function. */
+    onMessage: (callback: (message: OcrMessage) => void): (() => void) => {
+      ocrListeners.add(callback)
+      return () => {
+        ocrListeners.delete(callback)
+      }
+    }
   }
 }
 

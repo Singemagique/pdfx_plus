@@ -7,6 +7,7 @@ import { collectFileArgs } from './file-intake'
 import { createWindow, getMainWindow, getRendererReady, sendOpenPaths } from './window'
 import { buildMenu } from './menu'
 import { registerIpc } from './register-ipc'
+import { registerOcr, runOcrSelftest } from './ocr/host'
 
 app.setName('PDFx')
 
@@ -15,6 +16,24 @@ if (process.env.PDFX_USER_DATA) {
 }
 
 let pendingOpenPaths: string[] = []
+
+// `pdfx --ocr-selftest <out.json>` (DESIGN.md §3.9.3 tier 1c): run the OCR utility-process self-test
+// instead of the app (no window, no single-instance lock), write the JSON report and exit 0 or 1.
+const selftestAt = process.argv.indexOf('--ocr-selftest')
+const OCR_SELFTEST = selftestAt >= 0
+if (OCR_SELFTEST) {
+  app.whenReady().then(async () => {
+    const watchdog = setTimeout(() => app.exit(3), 180_000)
+    let code = 2
+    try {
+      code = await runOcrSelftest(process.argv[selftestAt + 1])
+    } catch (e) {
+      console.error(e)
+    }
+    clearTimeout(watchdog)
+    app.exit(code)
+  })
+}
 
 app.on('open-file', (event, path) => {
   event.preventDefault()
@@ -27,8 +46,10 @@ app.on('open-file', (event, path) => {
   }
 })
 
-const gotLock = app.requestSingleInstanceLock()
-if (!gotLock) {
+const gotLock = OCR_SELFTEST || app.requestSingleInstanceLock()
+if (OCR_SELFTEST) {
+  // The self-test runs instead of the app (above).
+} else if (!gotLock) {
   app.quit()
 } else {
   app.on('second-instance', (_event, argv) => {
@@ -63,6 +84,7 @@ if (!gotLock) {
       }
     )
 
+    registerOcr()
     buildMenu()
     createWindow()
 
@@ -84,5 +106,5 @@ if (!gotLock) {
 }
 
 app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') app.quit()
+  if (process.platform !== 'darwin' && !OCR_SELFTEST) app.quit()
 })
