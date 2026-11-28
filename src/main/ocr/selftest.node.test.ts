@@ -41,6 +41,39 @@ describe('selftestSession', () => {
   })
 })
 
+describe('selftestSession when OCR goes away', () => {
+  // Nothing answers on the other end, so without the abort each step would wait STEP_TIMEOUT_MS
+  // (60 s) and report only "timed out waiting for opened" (PR5 review).
+  const noHeartbeat = async (): Promise<Heartbeat> => {
+    throw new Error('no heartbeat')
+  }
+
+  it('ends at once with the reason when the supervisor goes fatal', async () => {
+    const [, mainEnd] = portPair()
+    let fail!: (e: Error) => void
+    const abort = new Promise<never>((_, reject) => {
+      fail = reject
+    })
+    const why = 'OCR became unavailable: fatal init error: traineddata fra: SHA-256 mismatch'
+    setTimeout(() => fail(new Error(why)), 10)
+    const t0 = Date.now()
+    const report = await selftestSession(mainEnd, noHeartbeat, undefined, abort)
+    expect(Date.now() - t0).toBeLessThan(2000)
+    expect(report.ok).toBe(false)
+    expect(report.failures).toEqual([why])
+    expect(report.opened).toBeNull()
+  })
+
+  it('ends at once when the utility process closes the port', async () => {
+    const [coordinatorEnd, mainEnd] = portPair()
+    setTimeout(() => coordinatorEnd.close(), 10)
+    const t0 = Date.now()
+    const report = await selftestSession(mainEnd, noHeartbeat)
+    expect(Date.now() - t0).toBeLessThan(2000)
+    expect(report.failures).toEqual(['the utility process closed the port'])
+  })
+})
+
 describe('childTripwireFailures (what the packaged self-test asks of the child realm)', () => {
   const net = ['fetch', 'request', 'resolveHost', 'isOnline']
   const all = { checked: [...REQUIRED_CHILD_CHECKS], failed: [] }

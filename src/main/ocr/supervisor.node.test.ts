@@ -806,13 +806,27 @@ describe('exits (the PR0 Windows matrix)', () => {
   it('the child reporting an init failure is fatal (deterministic: respawning would loop)', async () => {
     const ctx = setup()
     const { wc, child } = await connected(ctx)
-    child.say({ fatal: { code: 'init', message: 'CompileError' } })
+    const seen: unknown[] = []
+    ctx.sup.onFatal((f) => seen.push(f))
+    child.say({ fatal: { code: 'init', message: 'traineddata fra: SHA-256 mismatch' } })
     await tick()
     expect(child.killed).toBe(true)
     await vi.advanceTimersByTimeAsync(60_000)
     expect(ctx.sup.state).toBe('fatal')
     expect(ctx.children).toHaveLength(1)
     expect(wc.disconnects()).toEqual([{ reason: 'fatal' }])
+    // Which file and which check (the coordinator's path-free text) is kept, logged and told to
+    // whoever waits on it (the packaged self-test fails at once with it).
+    const fatal = { code: 'init', message: 'traineddata fra: SHA-256 mismatch' }
+    expect(ctx.sup.lastFatal).toEqual(fatal)
+    expect(seen).toEqual([fatal])
+    expect(ctx.logs).toContainEqual(
+      'ocr: utility process reported a fatal init error: traineddata fra: SHA-256 mismatch'
+    )
+    // Asking afterwards answers at once.
+    const late: unknown[] = []
+    ctx.sup.onFatal((f) => late.push(f))
+    expect(late).toEqual([fatal])
   })
 
   it('a crash with nobody connected does not respawn (lazy)', async () => {

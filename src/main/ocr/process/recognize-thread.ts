@@ -12,14 +12,9 @@
 // The tripwire import must stay first: each thread is its own realm (§3.3.1).
 import { tripwireCount, tripwireSelfCheck } from './no-network'
 import { parentPort } from 'node:worker_threads'
-import {
-  createTess,
-  TessError,
-  type Tess,
-  type TessFactory
-} from '../../../shared/ocr/engine/tess-core'
+import { createTess, type Tess, type TessFactory } from '../../../shared/ocr/engine/tess-core'
 import { gunzipTraineddata, loadGlue } from './engine-node'
-import { recognizePage } from './recognize-core'
+import { describeRecognizeError, recognizePage } from './recognize-core'
 import type { EngineAssets, FromRecognize, ToRecognize } from './thread-messages'
 
 const port = parentPort
@@ -49,17 +44,6 @@ async function engineFor(langs: readonly string[]): Promise<Tess> {
   tess = await createTess({ factory, wasmModule: assets.module, traineddata }, langs)
   tessKey = key
   return tess
-}
-
-/** Name and message for the coordinator's failure policy; never page content. */
-function describe(e: unknown): { name: string; message: string } {
-  if (e instanceof TessError) {
-    // The coordinator treats these as OOM-shaped (respawn, re-queue once, halve n).
-    if (e.kind === 'oom') return { name: 'OcrOutOfMemory', message: `out of memory: ${e.message}` }
-    return { name: e.kind === 'abort' ? 'RuntimeError' : 'TessError', message: e.message }
-  }
-  const err = e instanceof Error ? e : new Error('non-Error throw')
-  return { name: err.name, message: err.message.slice(0, 300) }
 }
 
 async function handle(msg: ToRecognize): Promise<void> {
@@ -96,7 +80,12 @@ async function handle(msg: ToRecognize): Promise<void> {
       tripwire: tripwireCount()
     })
   } catch (e) {
-    post({ type: 'error', taskId: msg.taskId, ...describe(e), tripwire: tripwireCount() })
+    post({
+      type: 'error',
+      taskId: msg.taskId,
+      ...describeRecognizeError(e),
+      tripwire: tripwireCount()
+    })
   }
 }
 

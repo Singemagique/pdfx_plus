@@ -9,6 +9,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
   OCR_HEARTBEAT_INTERVAL_MS,
+  OcrError,
   type FromOcr,
   type Heartbeat,
   type PageResult
@@ -652,6 +653,36 @@ describe('raster failure policy (§3.3.4)', () => {
       { code: 'init', message: 'raster thread failed to start' }
     ])
     expect(results(port).map((r) => r.page.status)).toEqual(['failed', 'failed'])
+  })
+
+  it('an engine file that fails its manifest check is fatal to main, naming the file and check', async () => {
+    // loadEngine's OcrError messages are built path-free; they are what main logs and the packaged
+    // self-test reports (PR5 review: only "OcrError" arrived, and the self-test waited 60 s).
+    const h0 = harness()
+    const c = new Coordinator({
+      ...h0.deps,
+      loadEngine: async () => {
+        throw new OcrError('init', 'traineddata fra: SHA-256 mismatch')
+      }
+    })
+    live.push(c)
+    h0.parent.send(INIT)
+    await settle()
+    expect(h0.parent.of('fatal')).toEqual([
+      { code: 'init', message: 'traineddata fra: SHA-256 mismatch' }
+    ])
+    // Any other error (a failed read of the PDFium .wasm, say) may carry a path: its name only.
+    const h1 = harness()
+    const c1 = new Coordinator({
+      ...h1.deps,
+      loadPdfium: async () => {
+        throw new Error("ENOENT: no such file or directory, open 'C:\\Users\\someone\\pdfium.wasm'")
+      }
+    })
+    live.push(c1)
+    h1.parent.send(INIT)
+    await settle()
+    expect(h1.parent.of('fatal')).toEqual([{ code: 'init', message: 'Error' }])
   })
 
   it('reports a source PDFium cannot open and forgets it', async () => {

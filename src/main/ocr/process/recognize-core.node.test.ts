@@ -4,8 +4,12 @@
 
 import { describe, expect, it } from 'vitest'
 
+import { TessError, type TessErrorKind } from '../../../shared/ocr/engine/tess-core'
+import { HocrError } from '../../../shared/ocr/hocr'
 import { decodeEntry, readEntryById } from '../test-utils/ocr-cache'
+import { isOomShaped } from './coordinator'
 import {
+  describeRecognizeError,
   firstPass,
   nextPass,
   passScore,
@@ -46,6 +50,33 @@ describe('recognizePage', () => {
 
   it('a malformed hOCR fails the page', () => {
     expect(() => recognizePage({ recognize: () => ({ hocr: '<div>' }) }, IMG, 300)).toThrow()
+  })
+
+  it('what the thread posts for a failure, and whether the coordinator halves n for it', () => {
+    // The chain DESIGN §3.9 tier 0 asks for: a WASM OOM (TessError 'oom': rc −1 with empty hOCR,
+    // an abort naming an allocation failure, a failed Wasm memory reservation) must arrive
+    // OOM-shaped; nothing else may.
+    const oom = describeRecognizeError(new TessError('oom', 'Recognize returned -1'))
+    expect(oom).toEqual({ name: 'OcrOutOfMemory', message: 'out of memory: Recognize returned -1' })
+    expect(isOomShaped(oom.name, oom.message)).toBe(true)
+    const other: Array<[TessErrorKind, string]> = [
+      ['abort', 'RuntimeError'],
+      ['exit', 'TessError'],
+      ['empty', 'TessError'],
+      ['init', 'TessError'],
+      ['params', 'TessError']
+    ]
+    for (const [kind, name] of other) {
+      const d = describeRecognizeError(new TessError(kind, 'Aborted(native code called abort())'))
+      expect(d, kind).toEqual({ name, message: 'Aborted(native code called abort())' })
+      expect(isOomShaped(d.name, d.message), kind).toBe(false)
+    }
+    // A strict-parse failure is a failed page, never memory; a long message is cut.
+    const h = describeRecognizeError(new HocrError('x'.repeat(400)))
+    expect(h.name).toBe('HocrError')
+    expect(h.message).toHaveLength(300)
+    expect(isOomShaped(h.name, h.message)).toBe(false)
+    expect(describeRecognizeError('boom')).toEqual({ name: 'Error', message: 'non-Error throw' })
   })
 
   it('scores a pass as Σ(conf × chars)', () => {

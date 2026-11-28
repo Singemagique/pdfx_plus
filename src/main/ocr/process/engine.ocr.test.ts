@@ -79,6 +79,14 @@ afterAll(async () => {
   }
   const report = process.env.PDFX_OCR_REPORT
   if (report) writeFileSync(report, JSON.stringify({ measured, replayMismatches }, null, 2))
+  // Outside strict mode drift is not a failure (the tier-0 suites keep replaying the recording),
+  // but it is never silent: name every spec whose live hOCR no longer equals its entry. A stale
+  // INPUT (synth changed) fails tier 0 outright (ocr-cache.node.test.ts).
+  if (!RECORD && replayMismatches.length > 0)
+    console.warn(
+      `OCR replay cache drift (live hOCR differs from the recording; re-run \`yarn ocr:record\`, ` +
+        `PDFX_OCR_CACHE_STRICT=1 makes this fail): ${replayMismatches.join(', ')}`
+    )
 }, 120_000)
 
 async function input(

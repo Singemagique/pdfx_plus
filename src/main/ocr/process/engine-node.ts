@@ -20,7 +20,7 @@ import { gunzipSync } from 'fflate'
 import { OcrError, type OcrPaths } from '../../../shared/ocr/protocol'
 import type { TessFactory } from '../../../shared/ocr/engine/tess-core'
 import type { LoadedEngine } from './coordinator'
-import { ENGINE_CORE, ENGINE_DATA, type ManifestFile } from './engine-manifest'
+import { ENGINE_CORE, ENGINE_DATA, type ManifestData, type ManifestFile } from './engine-manifest'
 
 export function sha256Hex(bytes: Uint8Array): string {
   return createHash('sha256').update(bytes).digest('hex')
@@ -104,14 +104,25 @@ export async function loadEngine(paths: OcrPaths): Promise<LoadedEngine> {
   return { assets: { module, coreDir: paths.ocrCore, data }, dataHashes }
 }
 
-/** Gunzip a verified .traineddata.gz and check the raw bytes too (in the thread that uses them). */
-export function gunzipTraineddata(lang: string, gz: Uint8Array): Uint8Array {
-  const want = Object.hasOwn(ENGINE_DATA, lang) ? ENGINE_DATA[lang] : undefined
+/**
+ * Gunzip a verified .traineddata.gz and check the raw bytes too (in the thread that uses them).
+ * `want` defaults to the manifest's entry (tests pass their own to reach the raw check).
+ */
+export function gunzipTraineddata(
+  lang: string,
+  gz: Uint8Array,
+  want: ManifestData | undefined = Object.hasOwn(ENGINE_DATA, lang) ? ENGINE_DATA[lang] : undefined
+): Uint8Array {
   if (!want) throw new OcrError('init', `no manifest entry for ${lang}`)
   verifyBytes(gz, want, `traineddata ${lang}`)
   // fflate's gunzipSync wants a plain Uint8Array; a SharedArrayBuffer view is copied first.
   const plain = gz.buffer instanceof SharedArrayBuffer ? new Uint8Array(gz) : gz
-  const raw = gunzipSync(plain)
+  let raw: Uint8Array
+  try {
+    raw = gunzipSync(plain)
+  } catch {
+    throw new OcrError('init', `traineddata ${lang}: not a valid gzip`)
+  }
   verifyBytes(raw, { bytes: want.rawBytes, sha256: want.rawSha256 }, `traineddata ${lang} (raw)`)
   return raw
 }

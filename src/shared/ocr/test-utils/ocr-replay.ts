@@ -47,7 +47,7 @@ const synth = (preset: string, langs = ['eng']): CacheSpec => ({
   langs
 })
 
-/** Every PR1 preset at seed 1 (the tier-1 gate set), eng unless the text needs others. */
+/** Every PR1 preset at seed 1 plus PR5's, the tier-1 gate set; eng unless the text needs others. */
 export const TIER1_SPECS: CacheSpec[] = [
   synth('clean300'),
   synth('skew2'),
@@ -62,7 +62,12 @@ export const TIER1_SPECS: CacheSpec[] = [
   synth('twocol'),
   synth('smallprint6pt'),
   synth('numbers-table'),
-  synth('latin-diacritics', ['deu', 'fra', 'spa'])
+  synth('latin-diacritics', ['deu', 'fra', 'spa']),
+  // PR5 review: sub-1° skew (the snapped angle must not move words off their ink) and vertical
+  // textangle lines on an upright page.
+  synth('skew0p6'),
+  synth('skewm0p6'),
+  synth('margin-label')
 ]
 
 export const HOCR_PAGE_SPECS: CacheSpec[] = HOCR_PAGE_IDS.map((id) => ({

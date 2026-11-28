@@ -23,8 +23,10 @@ import { SELFTEST, selftestPdf } from './selftest-fixture'
 
 /**
  * SHA-256 over everything a packed page says about its words: status, DPI, text and every array
- * (little-endian on every platform PDFx ships for), plus the line languages. Two runs agree on it
- * only if they produced the same words at the same Float32 positions.
+ * (little-endian on every platform PDFx ships for), plus the line languages, and its provenance and
+ * confidence: the languages and data hashes it was recognised with (sorted), the calibrated mean
+ * and its source. Two runs agree on it only if they produced the same words at the same Float32
+ * positions, stamped with the same manifest hashes.
  */
 export function packedDigest(p: PackedOcrPage): string {
   const h = createHash('sha256')
@@ -34,6 +36,19 @@ export function packedDigest(p: PackedOcrPage): string {
     h.update('|')
   }
   h.update(JSON.stringify(p.lineLang ?? null))
+  const hashes = Object.keys(p.dataHashes)
+    .sort()
+    .map((l) => [l, p.dataHashes[l]])
+  h.update(
+    JSON.stringify({
+      langs: p.langs,
+      dataHashes: hashes,
+      meanConfCal: p.meanConfCal,
+      confSource: p.confSource,
+      pipelineVersion: p.pipelineVersion,
+      pageClass: p.pageClass
+    })
+  )
   return h.digest('hex')
 }
 
@@ -60,6 +75,8 @@ export interface SelftestPageSummary {
 /** The renderer end of the port, as main holds it (a MessagePortMain). */
 export interface SelftestPort {
   on(event: 'message', listener: (e: { data: unknown }) => void): unknown
+  /** The other end went away (the utility process died or was killed). */
+  on(event: 'close', listener: () => void): unknown
   postMessage(msg: unknown): void
   start(): void
   close(): void
@@ -138,16 +155,49 @@ function summarise(p: PageResult): SelftestPageSummary {
   return s
 }
 
+/**
+ * Run the session over `port`. Every step fails at once, instead of after STEP_TIMEOUT_MS, when
+ * `abort` rejects (host.ts: the supervisor went fatal, e.g. an engine file failed its manifest
+ * check) or the port's other end closes; the failure is that reason.
+ */
 export async function selftestSession(
   port: SelftestPort,
   heartbeat: () => Promise<Heartbeat>,
-  now: () => number = () => performance.now()
+  now: () => number = () => performance.now(),
+  abort?: Promise<never>
 ): Promise<SelftestReport> {
   const failures: string[] = []
   const timingsMs: Record<string, number> = {}
   const received: FromOcr[] = []
   let messagesValid = true
   const waiters: Array<{ pred: (m: FromOcr) => boolean; resolve: (m: FromOcr) => void }> = []
+  let aborted: Error | null = null
+  const onAbort = new Set<(e: Error) => void>()
+  let closing = false
+  const fail = (e: Error): void => {
+    if (aborted || closing) return
+    aborted = e
+    for (const r of [...onAbort]) r(e)
+  }
+  abort?.catch((e: unknown) => fail(e instanceof Error ? e : new Error('aborted')))
+  port.on('close', () => fail(new Error('the utility process closed the port')))
+  /** `p`, unless the session is aborted first. */
+  const unlessAborted = <T>(p: Promise<T>): Promise<T> =>
+    new Promise<T>((resolve, reject) => {
+      if (aborted) return reject(aborted)
+      const off = (e: Error): void => reject(e)
+      onAbort.add(off)
+      p.then(
+        (v) => {
+          onAbort.delete(off)
+          resolve(v)
+        },
+        (e: unknown) => {
+          onAbort.delete(off)
+          reject(e)
+        }
+      )
+    })
 
   port.on('message', (e) => {
     let m: FromOcr
@@ -170,17 +220,30 @@ export async function selftestSession(
     new Promise((resolve, reject) => {
       const found = received.find(pred)
       if (found) return resolve(found)
-      const timer = setTimeout(
-        () => reject(new Error(`timed out waiting for ${what}`)),
-        STEP_TIMEOUT_MS
-      )
-      waiters.push({
+      if (aborted) return reject(aborted)
+      const done = (): void => {
+        clearTimeout(timer)
+        onAbort.delete(off)
+        const i = waiters.indexOf(waiter)
+        if (i >= 0) waiters.splice(i, 1)
+      }
+      const off = (e: Error): void => {
+        done()
+        reject(e)
+      }
+      const waiter = {
         pred,
-        resolve: (m) => {
-          clearTimeout(timer)
+        resolve: (m: FromOcr) => {
+          done()
           resolve(m)
         }
-      })
+      }
+      const timer = setTimeout(() => {
+        done()
+        reject(new Error(`timed out waiting for ${what}`))
+      }, STEP_TIMEOUT_MS)
+      onAbort.add(off)
+      waiters.push(waiter)
     })
   const send = (m: ToOcr): void => port.postMessage(m)
   const errorOf = (m: FromOcr): string | null => ('error' in m ? m.error.code : null)
@@ -233,7 +296,7 @@ export async function selftestSession(
     }
 
     t = now()
-    hb = await heartbeat()
+    hb = await unlessAborted(heartbeat())
     timingsMs.heartbeat = now() - t
     const tw = hb.tripwire
     if (tw.process !== 0 || tw.raster !== 0 || tw.recognize !== 0)
@@ -242,6 +305,7 @@ export async function selftestSession(
   } catch (e) {
     failures.push(e instanceof Error ? e.message : 'session failed')
   } finally {
+    closing = true
     port.close()
   }
   if (!messagesValid) failures.push('a message failed the protocol validator')

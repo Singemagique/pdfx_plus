@@ -40,8 +40,13 @@ export interface RawLine {
   xHeight: number
   /** hOCR `x_size`: the line's em height in px (ascender to descender), 0 when unknown. */
   size: number
-  /** hOCR `textangle` (degrees, counter-clockwise), when given. */
+  /**
+   * hOCR `textangle` (degrees, counter-clockwise), when given: 90/180/270 for a turned block (its
+   * lines then have no baseline; map.ts places them along the rotated reading direction).
+   */
   angle?: number
+  /** hOCR `x_descenders` (px, across the reading direction), when given. */
+  descenders?: number
   /** The enclosing paragraph's language (Tesseract code), when given. */
   lang?: string
   /** The hOCR class the line came from (all four are lines in Tesseract 5). */

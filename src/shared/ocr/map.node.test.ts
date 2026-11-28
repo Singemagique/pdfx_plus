@@ -17,6 +17,7 @@ import {
   CJK_CHAR_EM,
   charEdges,
   dropReason,
+  lineOrientation,
   lineSizePx,
   mapRawOcr,
   mapRawOcrPage,
@@ -25,7 +26,8 @@ import {
 } from './map'
 import { decodeEntry, readEntryById } from './test-utils/ocr-replay'
 import { loadNodeSynthDeps } from './test-utils/node-deps'
-import { scorePage } from './test-utils/ocr-eval'
+import { iou } from './test-utils/metrics'
+import { emBox, scorePage } from './test-utils/ocr-eval'
 import { synthesize } from './test-utils/synth'
 import { unpack, wordCount } from './types'
 
@@ -126,6 +128,159 @@ describe('mapRawOcrPage geometry', () => {
     const p = mapRawOcrPage(raw(line([word('a', 100, 200)], { baseline: null })), CTX)
     expect(p.lines[0].words[0].y).toBeCloseTo(180 - 134 * 0.24, 6)
   })
+
+  it('a snapped line keeps every word on its OWN baseline (only the angle snaps)', () => {
+    // 0.01 < tan 1°: angle 0. The last word starts 800 px right of the first, so its baseline is
+    // 8 px (1.92 pt) lower on screen; a shared y would put it off its ink by that much.
+    const p = mapRawOcrPage(
+      raw(
+        line([word('first', 100, 200), word('last', 900, 1000, 95, 108, 142)], {
+          baseline: { slope: 0.01, intercept: -8 }
+        })
+      ),
+      CTX
+    )
+    const [a, b] = p.lines[0].words
+    expect(p.lines[0].angle).toBe(0)
+    expect(a.y).toBeCloseTo(180 - 126 * 0.24, 6)
+    expect(b.y).toBeCloseTo(180 - (126 + 0.01 * 800) * 0.24, 6)
+    expect(a.y - b.y).toBeCloseTo(1.92, 6)
+    // Horizontal: the width is the box's run along x.
+    expect(b.w).toBeCloseTo(100 * 0.24, 6)
+  })
+})
+
+describe('rotated lines (textangle, or vertical text without a baseline)', () => {
+  // A 9 pt label reading bottom to top: Tesseract's textangle-90 shape (no baseline, words in
+  // reading order, cinfo boxes degenerate at x = 0).
+  const rot = (over: Partial<RawLine> = {}, words?: RawWord[]): RawLine =>
+    line(
+      words ?? [
+        {
+          text: 'Rain',
+          bbox: { x0: 56, y0: 620, x1: 84, y1: 700 },
+          conf: 96,
+          chars: [0, 1, 2, 3].map((i) => ({ x0: 0, y0: 600 + i, x1: 0, y1: 600 + i }))
+        },
+        { text: 'delayed', bbox: { x0: 56, y0: 480, x1: 91, y1: 600 }, conf: 96 }
+      ],
+      {
+        bbox: { x0: 56, y0: 100, x1: 91, y1: 700 },
+        baseline: null,
+        angle: 90,
+        descenders: 7,
+        xHeight: 21,
+        size: 35,
+        ...over
+      }
+    )
+
+  it('textangle 90: up the page, anchored at each box bottom on the descender-side baseline', () => {
+    const p = mapRawOcrPage(raw(rot()), CTX)
+    const [l] = p.lines
+    expect(l.angle).toBeCloseTo(Math.PI / 2, 12)
+    // x-height 21 px / 0.5 = 42 px, within [35, 70] (the line box WIDTH, not its 600 px height).
+    expect(l.size).toBeCloseTo(42 * 0.24, 6)
+    const [a, b] = l.words
+    expect(a).toMatchObject({ t: 'Rain' })
+    expect(a.x).toBeCloseTo((91 - 7) * 0.24, 6)
+    expect(a.y).toBeCloseTo(180 - 700 * 0.24, 6)
+    expect(a.w).toBeCloseTo(80 * 0.24, 6)
+    expect(b.x).toBeCloseTo(a.x, 9)
+    expect(b.y).toBeCloseTo(180 - 600 * 0.24, 6)
+    expect(b.w).toBeCloseTo(120 * 0.24, 6)
+    // Degenerate cinfo boxes are never used: the layer spaces the word evenly.
+    expect(a.chars).toBeUndefined()
+    // The em box covers the word's ink box (x 56..84 px, y 620..700 px).
+    const em = emBox(a, l)
+    expect(em.x).toBeLessThanOrEqual(56 * 0.24)
+    expect(em.x + em.w).toBeGreaterThanOrEqual(84 * 0.24)
+    expect(em.y).toBeCloseTo(180 - 700 * 0.24, 6)
+    expect(em.y + em.h).toBeCloseTo(180 - 620 * 0.24, 6)
+  })
+
+  it('textangle 270: down the page from each box top, baseline on the left side', () => {
+    const p = mapRawOcrPage(
+      raw(
+        rot({ angle: 270 }, [
+          { text: 'down', bbox: { x0: 56, y0: 100, x1: 84, y1: 200 }, conf: 96 },
+          { text: 'here', bbox: { x0: 56, y0: 220, x1: 84, y1: 300 }, conf: 96 }
+        ])
+      ),
+      CTX
+    )
+    const [l] = p.lines
+    expect(l.angle).toBeCloseTo(-Math.PI / 2, 12)
+    expect(l.words.map((w) => [w.x, w.y, w.w].map((v) => +v.toFixed(4)))).toEqual([
+      [(56 + 7) * 0.24, 180 - 100 * 0.24, 100 * 0.24].map((v) => +v.toFixed(4)),
+      [(56 + 7) * 0.24, 180 - 220 * 0.24, 80 * 0.24].map((v) => +v.toFixed(4))
+    ])
+  })
+
+  it('textangle 180: right to left from each box right edge, char edges from that edge', () => {
+    const w: RawWord = {
+      text: 'ab',
+      bbox: { x0: 300, y0: 100, x1: 340, y1: 134 },
+      conf: 95,
+      // Reading order: 'a' is the RIGHT box.
+      chars: [
+        { x0: 322, y0: 100, x1: 340, y1: 134 },
+        { x0: 300, y0: 100, x1: 318, y1: 134 }
+      ]
+    }
+    const p = mapRawOcrPage(
+      raw(line([w], { baseline: null, angle: 180, descenders: 8, bbox: w.bbox })),
+      CTX
+    )
+    const [l] = p.lines
+    expect(l.angle).toBeCloseTo(Math.PI, 12)
+    const [a] = l.words
+    expect(a.x).toBeCloseTo(340 * 0.24, 6)
+    expect(a.y).toBeCloseTo(180 - 108 * 0.24, 6)
+    expect(a.w).toBeCloseTo(40 * 0.24, 6)
+    // The boundary is the gap's midpoint (320 px), 20 px from the start edge.
+    expect([...a.chars!].map((v) => +v.toFixed(4))).toEqual([0, 4.8, 9.6])
+  })
+
+  it('a tall line with neither baseline nor textangle is vertical: top to bottom unless it runs up', () => {
+    const down = rot({ angle: undefined }, [
+      { text: 'x', bbox: { x0: 56, y0: 100, x1: 84, y1: 200 }, conf: 96 },
+      { text: 'y', bbox: { x0: 56, y0: 220, x1: 84, y1: 300 }, conf: 96 }
+    ])
+    expect(lineOrientation(down)).toBe(270)
+    expect(lineOrientation({ ...down, words: [...down.words].reverse() })).toBe(90)
+    expect(lineOrientation(rot({ angle: undefined }))).toBe(90)
+    // Wide lines without a baseline stay horizontal (the word-bottom fallback).
+    expect(lineOrientation(line([word('a', 100, 200)], { baseline: null }))).toBe(0)
+    const p = mapRawOcrPage(raw(down), CTX)
+    expect(p.lines[0].angle).toBeCloseTo(-Math.PI / 2, 12)
+    // Distinct words, distinct places (the old mapping put every word of such a line on one point).
+    const ys = p.lines[0].words.map((w) => w.y)
+    expect(new Set(ys).size).toBe(2)
+  })
+
+  it('an oblique textangle is dropped, never mapped as if horizontal', () => {
+    expect(lineOrientation(rot({ angle: 45 }))).toBeNull()
+    expect(lineOrientation(rot({ angle: 90.5 }))).toBeNull()
+    expect(lineOrientation(rot({ angle: -90 }))).toBe(270)
+    expect(lineOrientation(rot({ angle: 450 }))).toBe(90)
+    expect(mapRawOcrPage(raw(rot({ angle: 45 })), CTX).lines).toEqual([])
+  })
+
+  it('the filter measures a vertical word ACROSS the line (a long word is not "tall")', () => {
+    const long: RawWord = {
+      text: 'temperature',
+      bbox: { x0: 56, y0: 100, x1: 84, y1: 500 },
+      conf: 96
+    }
+    const short: RawWord = { text: 'a', bbox: { x0: 60, y0: 520, x1: 80, y1: 540 }, conf: 96 }
+    expect(dropReason(long, 'temperature', 24, true)).toBeNull()
+    expect(dropReason(long, 'temperature', 24)).toBe('tall')
+    expect(mapRawOcrPage(raw(rot({}, [short, long])), CTX).lines[0].words.map((w) => w.t)).toEqual([
+      'a',
+      'temperature'
+    ])
+  })
 })
 
 describe('font size by script', () => {
@@ -213,6 +368,40 @@ describe('filter and text', () => {
     expect(charEdges(w, 'abd', 14.4)).toBeUndefined() // cleaned text differs
     expect(charEdges({ ...w, chars: w.chars!.slice(0, 2) }, 'abc', 14.4)).toBeUndefined()
     expect(charEdges({ ...w, chars: undefined }, 'abc', 14.4)).toBeUndefined()
+    // Untrustworthy boxes: degenerate (what rotated lines carry), or outside the word's box.
+    const degenerate = w.chars!.map((c) => ({ ...c, x0: 0, x1: 0 }))
+    expect(charEdges({ ...w, chars: degenerate }, 'abc', 14.4)).toBeUndefined()
+    const outside = w.chars!.map((c, i) => (i === 1 ? { ...c, y0: 900, y1: 934 } : c))
+    expect(charEdges({ ...w, chars: outside }, 'abc', 14.4)).toBeUndefined()
+    const leftOf = w.chars!.map((c, i) => (i === 0 ? { ...c, x0: 90 } : c))
+    expect(charEdges({ ...w, chars: leftOf }, 'abc', 14.4)).toBeUndefined()
+    const rightOf = w.chars!.map((c, i) => (i === 2 ? { ...c, x1: 170 } : c))
+    expect(charEdges({ ...w, chars: rightOf }, 'abc', 14.4)).toBeUndefined()
+    // Within the slack (2 px) they are still used.
+    const snug = w.chars!.map((c, i) => (i === 0 ? { ...c, x0: 99 } : c))
+    expect(charEdges({ ...w, chars: snug }, 'abc', 14.4)).toBeDefined()
+    // Never on a vertical line, whatever the boxes say.
+    expect(charEdges(w, 'abc', 14.4, 90)).toBeUndefined()
+    expect(charEdges(w, 'abc', 14.4, 270)).toBeUndefined()
+  })
+
+  it('the page mean is weighted by characters, so long words count for more', () => {
+    // 'abcdefghij' at 70 and 'xyz' at 32: per character (0.7·10 + 0.32·3) / 13 = 0.612 is above
+    // the 0.6 flag (ok); a per-word mean, (0.7 + 0.32) / 2 = 0.51, would flag the page.
+    const p = mapRawOcrPage(
+      raw(line([word('abcdefghij', 100, 400, 70), word('xyz', 420, 500, 32)])),
+      CTX
+    )
+    expect(p.meanConfCal).toBeCloseTo((0.7 * 10 + 0.32 * 3) / 13, 9)
+    expect(calibrate(TESS_CORE7_PLACEHOLDER, RAW_THRESHOLDS.flag)).toBeCloseTo(0.6, 9)
+    expect(p.status).toBe('ok')
+    // Swap the confidences and the same rule flags it: (0.32·10 + 0.7·3) / 13 = 0.408.
+    const q = mapRawOcrPage(
+      raw(line([word('abcdefghij', 100, 400, 32), word('xyz', 420, 500, 70)])),
+      CTX
+    )
+    expect(q.meanConfCal).toBeCloseTo((0.32 * 10 + 0.7 * 3) / 13, 9)
+    expect(q.status).toBe('low-confidence')
   })
 
   it('carries line languages and packs', () => {
@@ -273,6 +462,63 @@ describe('calibration placeholder', () => {
         ])
       )
     ).toThrow()
+  })
+})
+
+describe('replayed recordings: sub-1° skew and rotated lines (PR5 review)', () => {
+  async function replay(id: string) {
+    const deps = await loadNodeSynthDeps()
+    const { gt } = await synthesize({ preset: id, seed: 1 }, deps)
+    const page = mapRawOcrPage(hocrToRaw(parseHocr(decodeEntry(readEntryById(id)))), {
+      ...CTX,
+      page: gt.page,
+      raster: gt.raster,
+      renderDpi: gt.dpi
+    })
+    return { gt, page, s: await scorePage(page, gt) }
+  }
+
+  for (const id of ['skew0p6', 'skewm0p6'])
+    it(`${id}: angle snapped to 0, every word still on its own ink`, async () => {
+      const { page, s } = await replay(id)
+      expect(page.lines.every((l) => l.angle === 0)).toBe(true)
+      expect(s.cer).toBe(0)
+      // A shared per-line y gave hmean 0.72 / median IoU 0.67 / recall 0.73 at −0.6° [measured].
+      expect(s.recall).toBe(1)
+      expect(s.hmean).toBeGreaterThan(0.95)
+      expect(s.medianIou).toBeGreaterThan(0.78)
+    })
+
+  it('margin-label: the textangle-90 labels lie along the margins, each word on its own box', async () => {
+    const { gt, page, s } = await replay('margin-label')
+    const vertical = page.lines.filter((l) => Math.abs(l.angle - Math.PI / 2) < 1e-9)
+    expect(vertical).toHaveLength(2)
+    // The left label reads bottom to top and is recognised: word for word on its GT box.
+    const [left] = vertical
+    const gtLeft = gt.lines.find((l) => l.rotate === 90)!
+    expect(left.words.map((w) => w.t).join(' ')).toBe(gtLeft.text)
+    left.words.forEach((w, i) => {
+      const g = gt.words[gtLeft.words[i]]
+      expect(iou(emBox(w, left), g.box), w.t).toBeGreaterThan(0.5)
+    })
+    // The right one Tesseract reads upside down (garbage text) but places in the right margin.
+    const right = vertical[1]
+    for (const w of right.words) expect(emBox(w, right).x).toBeGreaterThan(400)
+    // The old mapping put every word of a vertical line on one point: hmean 0.906 [measured].
+    expect(s.hmean).toBeGreaterThan(0.98)
+  })
+
+  it('rot90page: Tesseract lines without baseline or textangle run down the page, uncollapsed', async () => {
+    const { page, s } = await replay('rot90page')
+    expect(page.lines.length).toBeGreaterThan(0)
+    for (const l of page.lines) {
+      expect(l.angle).toBeCloseTo(-Math.PI / 2, 12)
+      const ys = l.words.map((w) => w.y)
+      expect(new Set(ys).size, 'one point per word').toBe(ys.length)
+    }
+    // Orientation is PR6 (the text is garbage until the page is turned), but every box is in
+    // place: 0.07 before (all words of a line on one point) [measured].
+    expect(s.hmean).toBeGreaterThan(0.95)
   })
 })
 

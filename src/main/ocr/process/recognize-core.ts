@@ -7,8 +7,23 @@
 // at most 3 recognitions per page plus the adaptive re-render.
 
 import type { RawOcr, GrayImage } from '../../../shared/ocr/engine/types'
-import { fullPageParams, type TessParams } from '../../../shared/ocr/engine/tess-core'
+import { TessError, fullPageParams, type TessParams } from '../../../shared/ocr/engine/tess-core'
 import { hocrToRaw, parseHocr } from '../../../shared/ocr/hocr'
+
+/**
+ * The name and message a recognize thread posts for a failed page (`{ type: 'error' }`), for the
+ * coordinator's failure policy (`isOomShaped`); never page content. A WASM OOM (TessError kind
+ * 'oom') becomes `OcrOutOfMemory`, which the coordinator treats as OOM-shaped (respawn, re-queue
+ * once, halve n); an abort is a `RuntimeError`; every other kind stays a `TessError`.
+ */
+export function describeRecognizeError(e: unknown): { name: string; message: string } {
+  if (e instanceof TessError) {
+    if (e.kind === 'oom') return { name: 'OcrOutOfMemory', message: `out of memory: ${e.message}` }
+    return { name: e.kind === 'abort' ? 'RuntimeError' : 'TessError', message: e.message }
+  }
+  const err = e instanceof Error ? e : new Error('non-Error throw')
+  return { name: err.name, message: err.message.slice(0, 300) }
+}
 
 export interface RecognizeEngine {
   recognize(img: GrayImage, params: TessParams): { hocr: string }

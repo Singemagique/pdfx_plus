@@ -27,7 +27,8 @@ files:
   - '!electron.vite.config.{js,ts,mjs,cjs}'
   - '!{.prettierignore,.prettierrc.yaml,.editorconfig,dev-app-update.yml,README.md,SPEC.md}'
   - '!{.env,.env.*,.npmrc,pnpm-lock.yaml,yarn.lock}'
-  - '!{tsconfig.json,tsconfig.node.json,tsconfig.web.json}'
+  # Every TypeScript project file (tsconfig.shared.json came with PR1 and slipped past a list).
+  - '!tsconfig*.json'
   - '!scripts/**'
   # Development-only artifacts that must never ship inside the app.
   - '!{CONTRIBUTING.md,vitest.config.mts,.gitattributes,vitest.config.mjs}'

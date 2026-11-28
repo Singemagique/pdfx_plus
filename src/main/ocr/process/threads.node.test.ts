@@ -1,8 +1,10 @@
-// The REAL thread entries, bundled the way `?modulePath` bundles them and run as worker_threads
+// The REAL raster thread entry, bundled the way `?modulePath` bundles it and run as a worker_thread
 // under the coordinator: PDFium WASM inside a worker_thread opening a SharedArrayBuffer source with
 // FPDF_LoadCustomDocument (PR0 only ran PDFium on a main thread; DESIGN.md §3.3.1 step 3 names this
-// as PR4a's first test), the posted WebAssembly.Module reaching the recognize thread, transferred
-// grey bitmaps, and every thread's tripwire counter at 0.
+// as PR4a's first test), transferred grey bitmaps whose CONTENT reaches the recognize side, and the
+// tripwire counters at 0. Tier 0 is engine-free: the recognize side here is a scripted thread that
+// measures the bitmap it is given. The real recognize thread and engine on the same path (with
+// text, /Rotate 0 and 90) run in tier 1: threads.ocr.test.ts.
 
 import { spawnSync } from 'node:child_process'
 import { readFile } from 'node:fs/promises'
@@ -12,7 +14,6 @@ import { Worker } from 'node:worker_threads'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { PDFDocument, degrees, rgb } from 'pdf-lib'
 
-import { ENGINE_ID } from '../../../shared/ocr/engine/tess-core'
 import {
   parseFromOcr,
   type FromOcr,
@@ -22,21 +23,27 @@ import {
 import { THREAD_RESOURCE_LIMITS, threadOptions } from './budget'
 import { Coordinator, isThreadOom } from './coordinator'
 import { DEFAULT_RASTER_LIMITS } from './raster-core'
-import { loadEngine } from './engine-node'
 import type { FromRaster, ToRaster } from './thread-messages'
 import { isV8FatalOom } from '../supervisor'
 import { bundleEntry, type Bundled } from '../test-utils/bundle'
-import { FakeParent, FakePort, INIT } from '../test-utils/fake-threads'
-import { nodeModulesEnginePaths } from '../test-utils/engine-harness'
+import {
+  FakeParent,
+  FakePort,
+  FakeRecognizer,
+  INIT,
+  STUB_MODULE,
+  recognized
+} from '../test-utils/fake-threads'
 import { PDFIUM_WASM_PATH } from '../test-utils/pdfium-node'
 
 const here = (p: string): string => fileURLToPath(new URL(p, import.meta.url))
 
 let raster: Bundled
-let recognize: Bundled
 let parent: FakeParent
 let port: FakePort
 let coordinator: Coordinator
+/** What the scripted recognize side measured on each bitmap it was given. */
+const seen: Array<{ width: number; height: number; dpi: number; inkFrac: number }> = []
 
 function waitFor<T>(pred: () => T | undefined, ms = 15_000): Promise<T> {
   return new Promise((resolve, reject) => {
@@ -60,15 +67,24 @@ beforeAll(async () => {
   raster = await bundleEntry(here('./raster-thread.ts'), {
     alias: { '@embedpdf/pdfium': here('../../../../node_modules/@embedpdf/pdfium/dist/index.cjs') }
   })
-  recognize = await bundleEntry(here('./recognize-thread.ts'))
   parent = new FakeParent()
   coordinator = new Coordinator({
     parent,
-    // The production heap caps: the real threads must work under them.
+    // The production heap caps: the real raster thread must work under them.
     spawnRaster: () => new Worker(raster.file, threadOptions()),
-    spawnRecognize: () => new Worker(recognize.file, threadOptions()),
+    spawnRecognize: () =>
+      new FakeRecognizer((m, t) => {
+        const px = new Uint8Array(m.data)
+        let ink = 0
+        for (const v of px) if (v < 128) ink++
+        seen.push({ width: m.width, height: m.height, dpi: m.dpi, inkFrac: ink / px.length })
+        return recognized(m, t)
+      }),
     loadPdfium: async () => WebAssembly.compile(await readFile(PDFIUM_WASM_PATH)),
-    loadEngine,
+    loadEngine: async (paths) => ({
+      assets: { module: STUB_MODULE, coreDir: paths.ocrCore, data: {} },
+      dataHashes: { eng: 'e'.repeat(64) }
+    }),
     system: () => ({
       totalmem: totalmem(),
       availableMemory: totalmem() / 2,
@@ -81,7 +97,7 @@ beforeAll(async () => {
     rss: () => process.memoryUsage.rss(),
     exit: () => {}
   })
-  parent.send({ init: { ...INIT.init, paths: nodeModulesEnginePaths() } })
+  parent.send(INIT)
   port = new FakePort()
   parent.send({ port: {} }, [port])
 }, 60_000)
@@ -89,11 +105,10 @@ beforeAll(async () => {
 afterAll(() => {
   coordinator?.dispose()
   raster?.dispose()
-  recognize?.dispose()
 })
 
-describe('real raster and recognize threads', () => {
-  it('opens, renders grey and recognises with the real engine', async () => {
+describe('the real raster thread under the coordinator', () => {
+  it('opens, renders grey and hands the recognize side the right pixels in the page frame', async () => {
     const doc = await PDFDocument.create()
     const p0 = doc.addPage([612, 792])
     // Top tenth of the page solid black: inkFrac ≈ 0.1 whatever the DPI.
@@ -123,13 +138,14 @@ describe('real raster and recognize threads', () => {
       .map((m) => m.result)
       .sort((a, b) => a.index - b.index)
     const [r0, r1] = results.map((r) => r.page) as PageResult[]
-    // Text-free pages through the real engine: recognised, mapped and packed in the page's frame.
-    expect(r0).toMatchObject({ renderDpi: 100, raster: { width: 850, height: 1100 } })
-    expect(r1).toMatchObject({ raster: { width: 1100, height: 850 } })
-    for (const r of [r0, r1]) {
-      expect(['ok', 'low-confidence', 'no-text']).toContain(r.status)
-      expect(r.recognition).toMatchObject({ engineId: ENGINE_ID, renderDpi: 100, langs: ['eng'] })
-    }
+    expect(r0).toMatchObject({ status: 'ok', renderDpi: 100, raster: { width: 850, height: 1100 } })
+    expect(r1).toMatchObject({ status: 'ok', raster: { width: 1100, height: 850 } })
+    // The pixels themselves: page 0's black top tenth, page 1's black half (its /Rotate 90 applied:
+    // the bitmap is 1100 × 850, in the page's display frame).
+    const byShape = (w: number, h: number) => seen.find((s) => s.width === w && s.height === h)
+    expect(byShape(850, 1100)?.inkFrac).toBeCloseTo(0.1, 2)
+    expect(byShape(1100, 850)?.inkFrac).toBeCloseTo(0.5, 2)
+    expect(seen.every((s) => s.dpi === 100)).toBe(true)
     expect(sent().find((m) => 'jobDone' in m)).toEqual({
       jobDone: { jobId: 'j1', done: 2, failed: 0, cancelled: false }
     })

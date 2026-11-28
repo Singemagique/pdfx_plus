@@ -5,7 +5,7 @@
 // pins match.
 
 import { createHash } from 'node:crypto'
-import { existsSync, readFileSync, statSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
@@ -154,5 +154,12 @@ describe('OCR packaging', () => {
     expect(Object.keys(pkg.dependencies).filter((d) => /tesseract/.test(d))).toEqual([])
     const yml = readFileSync(join(ROOT, 'electron-builder.yml'), 'utf8')
     expect(yml).toContain("'!{THIRD_PARTY_NOTICES.md,build/licenses/**,bench/**,types/**}'")
+  })
+
+  it('keeps every tsconfig*.json out of the asar (one glob, so a new project file cannot slip in)', () => {
+    const yml = readFileSync(join(ROOT, 'electron-builder.yml'), 'utf8')
+    expect(yml).toContain("- '!tsconfig*.json'")
+    const tsconfigs = readdirSync(ROOT).filter((f) => /^tsconfig.*\.json$/.test(f))
+    expect(tsconfigs).toEqual(expect.arrayContaining(['tsconfig.json', 'tsconfig.shared.json']))
   })
 })

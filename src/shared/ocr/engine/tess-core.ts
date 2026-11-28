@@ -16,6 +16,9 @@
 //   glue call that quits, the exit code is reset so the thread does not exit with it.
 // - A WASM OOM is not an abort: `Recognize` returns −1 and hOCR is empty, with Leptonica
 //   "…malloc fail…" lines on printErr. That is an OOM-shaped failure (respawn, re-queue, halve n).
+//   So is an abort whose message or printErr lines name an allocation failure, and a failed
+//   instantiate of the posted Module that is one (V8 "Out of memory: Cannot allocate Wasm memory").
+//   An instantiate failure rejects `createTess` (the glue alone would wait forever).
 // - simd and relaxed-simd give byte-identical hOCR; only simd-lstm ships.
 
 import type { GrayImage } from './types'
@@ -142,9 +145,21 @@ export class TessError extends Error {
   }
 }
 
-/** Lines on printErr that mean an allocation failed inside the WASM heap. */
+/**
+ * Text (a printErr line or an error message) that means an allocation failed: Leptonica's
+ * "…malloc fail…" lines, V8's "Out of memory: Cannot allocate Wasm memory…" and "Array buffer
+ * allocation failed". "Cannot enlarge memory" never occurs in this core's glue (no ASSERTIONS; PR5
+ * review: 0 occurrences); it stays as defence for another core build.
+ */
 export const ALLOC_FAILURE_RE =
-  /malloc fail|alloc(?:ation)? fail|failed to allocate|Cannot enlarge memory|out of memory/i
+  /malloc fail|alloc(?:ation)? fail|failed to allocate|(?:could not|cannot) allocate|Cannot enlarge memory|out of memory/i
+
+/** Is this error (from the glue or WebAssembly) an allocation failure? */
+function isAllocFailure(e: unknown): boolean {
+  if (e instanceof RangeError) return !/Maximum call stack size exceeded/i.test(e.message)
+  const message = e instanceof Error ? e.message : ''
+  return ALLOC_FAILURE_RE.test(message)
+}
 
 /** A bounded ring of the last `max` lines (each cut to 200 chars). */
 export class LineRing {
@@ -231,20 +246,36 @@ export async function createTess(deps: TessCoreDeps, langs: readonly string[]): 
   let broken = false
   let ended = false
 
-  const m = await deps.factory({
+  // The 7.0.0 glue wraps instantiateWasm in a promise with no reject path, so a failed instantiate
+  // (a LinkError, or V8's RangeError "Out of memory: Cannot allocate Wasm memory" under memory
+  // pressure) would leave the factory pending forever and the thread hung until the watchdog. The
+  // failure is raced against the factory instead: OOM-shaped when it is an allocation failure.
+  let instantiateFailed!: (e: TessError) => void
+  const instantiateFailure = new Promise<never>((_, reject) => {
+    instantiateFailed = reject
+  })
+  const failInit = (e: unknown, what: string): TessError => {
+    broken = true
+    resetExitCode()
+    const name = e instanceof Error ? e.name : 'error'
+    return new TessError(isAllocFailure(e) ? 'oom' : 'init', `${what} failed: ${name}`)
+  }
+
+  const emOpts: EmscriptenOpts = {
     instantiateWasm: (imports, done) => {
-      WebAssembly.instantiate(deps.wasmModule, imports).then(
-        (inst) => {
+      WebAssembly.instantiate(deps.wasmModule, imports)
+        .then((inst) => {
           memory =
             (Object.values(inst.exports).find((x) => x instanceof WebAssembly.Memory) as
               | WebAssembly.Memory
               | undefined) ?? null
           done(inst, deps.wasmModule)
-        },
-        (e: unknown) => {
+        })
+        // A rejected instantiate, or the glue's own receiveInstance throwing.
+        .catch((e: unknown) => {
           ring.push(`instantiate failed: ${e instanceof Error ? e.name : 'error'}`)
-        }
-      )
+          instantiateFailed(failInit(e, 'instantiate'))
+        })
       return {}
     },
     // Tripwire: only the wasmBinary/fetch path calls it (PR0), and that path must never run.
@@ -260,11 +291,32 @@ export async function createTess(deps: TessCoreDeps, langs: readonly string[]): 
     onAbort: () => {
       broken = true
     }
-  })
+  }
+  // Called at once (inside the async wrapper, so a synchronous throw becomes a rejection).
+  const factoryDone = (async (): Promise<TessModule> => deps.factory(emOpts))()
+  void factoryDone.catch(() => {}) // after a loss to `instantiateFailure`, never unhandled
+  let m: TessModule
+  try {
+    m = await Promise.race([factoryDone, instantiateFailure])
+  } catch (e) {
+    if (e instanceof TessError) throw e
+    if (isExitStatus(e)) {
+      broken = true
+      resetExitCode()
+      throw new TessError('exit', `engine quit (${e.status})`)
+    }
+    throw failInit(e, 'engine start')
+  }
 
-  /** Every call into the glue: a quit resets the exit code, an abort poisons the module. */
+  /**
+   * Every call into the glue: a quit resets the exit code, an abort poisons the module. An abort is
+   * OOM-shaped when its message OR a printErr line since the call began names an allocation
+   * failure: in this build (no ASSERTIONS) a failed `operator new` ends in a bare
+   * "Aborted(...)" RuntimeError, and only Leptonica's own "…malloc fail…" line says why.
+   */
   const call = <T>(fn: () => T): T => {
     if (broken) throw new TessError('abort', 'engine module is no longer trusted')
+    const mark = ring.mark()
     try {
       return fn()
     } catch (e) {
@@ -275,10 +327,12 @@ export async function createTess(deps: TessCoreDeps, langs: readonly string[]): 
       }
       resetExitCode()
       if (e instanceof WebAssembly.RuntimeError) {
-        const oom = ALLOC_FAILURE_RE.test(e.message)
+        const oom =
+          ALLOC_FAILURE_RE.test(e.message) || ring.since(mark).some((l) => ALLOC_FAILURE_RE.test(l))
         throw new TessError(oom ? 'oom' : 'abort', e.message.slice(0, 200))
       }
-      if (e instanceof RangeError) throw new TessError('oom', e.message.slice(0, 200))
+      if (e instanceof RangeError)
+        throw new TessError(isAllocFailure(e) ? 'oom' : 'abort', e.message.slice(0, 200))
       throw e
     }
   }

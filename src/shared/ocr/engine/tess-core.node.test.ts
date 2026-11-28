@@ -5,7 +5,7 @@
 // classification (rc −1, or empty hOCR with an allocation failure on printErr). The real core runs
 // in tier 1 (engine.ocr.test.ts).
 
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
   ALLOC_FAILURE_RE,
@@ -32,6 +32,10 @@ interface FakeScript {
   stderrDuringRecognize?: string[]
   quitIn?: 'Init' | 'Recognize'
   abortIn?: 'Recognize'
+  /** The RuntimeError message of `abortIn` (default: the bare abort this build throws). */
+  abortMessage?: string
+  /** Recognize throws this instead (e.g. a RangeError from the glue). */
+  throwInRecognize?: Error
 }
 
 function fake(script: FakeScript = {}) {
@@ -68,8 +72,18 @@ function fake(script: FakeScript = {}) {
         calls.push('recognize')
         for (const l of script.stderrDuringRecognize ?? []) o.printErr(l)
         if (script.quitIn === 'Recognize') quit(7)
-        if (script.abortIn === 'Recognize')
-          throw new WebAssembly.RuntimeError('Aborted(native code called abort())')
+        if (script.abortIn === 'Recognize') {
+          // Whatever the glue left in the exit code must not survive the call.
+          ;(process as { exitCode?: number }).exitCode = 7
+          throw new WebAssembly.RuntimeError(
+            script.abortMessage ??
+              'Aborted(native code called abort()). Build with -sASSERTIONS for more info.'
+          )
+        }
+        if (script.throwInRecognize) {
+          ;(process as { exitCode?: number }).exitCode = 7
+          throw script.throwInRecognize
+        }
         return script.recognizeRc ?? 0
       }
       GetHOCRText(): string {
@@ -238,6 +252,139 @@ describe('createTess', () => {
     )
   })
 
+  it('rc −1 alone (no printErr line at all) is OOM-shaped, never "empty"', async () => {
+    const f = fake({ recognizeRc: -1 })
+    const tess = await createTess(
+      { factory: f.factory, wasmModule: EMPTY_WASM, traineddata: DATA },
+      ['eng']
+    )
+    expect(() => tess.recognize(IMG, fullPageParams(300))).toThrow(
+      expect.objectContaining({ kind: 'oom', name: 'OcrOutOfMemory' })
+    )
+    expect(tess.broken).toBe(true)
+  })
+
+  const thrown = async (script: FakeScript): Promise<TessError> => {
+    const f = fake(script)
+    const tess = await createTess(
+      { factory: f.factory, wasmModule: EMPTY_WASM, traineddata: DATA },
+      ['eng']
+    )
+    try {
+      tess.recognize(IMG, fullPageParams(300))
+    } catch (e) {
+      expect(tess.broken).toBe(true)
+      return e as TessError
+    }
+    throw new Error('recognize did not throw')
+  }
+
+  it('an abort or glue error that is an allocation failure is OOM-shaped (and resets the exit code)', async () => {
+    const cases: Array<[string, FakeScript]> = [
+      // A failed operator new: the bare abort, but Leptonica said why on printErr first.
+      [
+        'printErr malloc fail, then a bare Aborted()',
+        {
+          abortIn: 'Recognize',
+          stderrDuringRecognize: ['Error in pixCreateNoInit: pixdata_malloc fail for data']
+        }
+      ],
+      [
+        'abort message names it',
+        { abortIn: 'Recognize', abortMessage: 'Aborted(Cannot enlarge memory arrays)' }
+      ],
+      [
+        'abort message: Leptonica',
+        { abortIn: 'Recognize', abortMessage: 'Aborted(pixdata_malloc fail for data)' }
+      ],
+      [
+        'RangeError from the glue',
+        { throwInRecognize: new RangeError('Array buffer allocation failed') }
+      ]
+    ]
+    for (const [what, script] of cases) {
+      ;(process as { exitCode?: number }).exitCode = undefined
+      const e = await thrown(script)
+      expect(e, what).toBeInstanceOf(TessError)
+      expect(e, what).toMatchObject({ kind: 'oom', name: 'OcrOutOfMemory' })
+      expect(process.exitCode, what).toBe(0)
+    }
+  })
+
+  it('an abort without an allocation failure stays an abort; a stack overflow is not memory', async () => {
+    // A printErr line before the call does not count: only lines since the call began.
+    const bare = await thrown({ abortIn: 'Recognize' })
+    expect(bare).toMatchObject({ kind: 'abort', name: 'TessError' })
+    expect(process.exitCode).toBe(0)
+    const unrelated = await thrown({
+      abortIn: 'Recognize',
+      stderrDuringRecognize: ['Warning: Invalid resolution 0 dpi. Using 70 instead.']
+    })
+    expect(unrelated.kind).toBe('abort')
+    const stack = await thrown({
+      throwInRecognize: new RangeError('Maximum call stack size exceeded')
+    })
+    expect(stack.kind).toBe('abort')
+  })
+
+  it('a failed instantiate of the posted Module rejects createTess instead of hanging', async () => {
+    // The fake factory, like the real 7.0.0 glue, only ever resolves through instantiateWasm's
+    // success callback: before the race, this promise never settled (PR5 review).
+    // A module importing a function the imports object does not provide: instantiate rejects.
+    const importing = new WebAssembly.Module(
+      new Uint8Array([
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x04, 0x01, 0x60, 0x00, 0x00, 0x02,
+        0x08, 0x01, 0x02, 0x7a, 0x7a, 0x01, 0x66, 0x00, 0x00
+      ])
+    )
+    const f = fake()
+    const settled = await Promise.race([
+      createTess({ factory: f.factory, wasmModule: importing, traineddata: DATA }, ['eng']).then(
+        () => 'resolved',
+        (e: unknown) => e
+      ),
+      new Promise((r) => setTimeout(() => r('still pending'), 2000))
+    ])
+    expect(settled).toBeInstanceOf(TessError)
+    expect(settled).toMatchObject({ kind: 'init', message: expect.stringMatching(/instantiate/) })
+    expect(f.calls.some((c) => c.startsWith('instantiated'))).toBe(false)
+
+    // V8's out-of-memory shape for a failed Wasm memory reservation is OOM-shaped.
+    const spy = vi
+      .spyOn(WebAssembly, 'instantiate')
+      .mockRejectedValueOnce(
+        new RangeError(
+          'WebAssembly.instantiate(): Out of memory: Cannot allocate Wasm memory for new instance'
+        )
+      )
+    try {
+      await expect(
+        createTess({ factory: fake().factory, wasmModule: EMPTY_WASM, traineddata: DATA }, ['eng'])
+      ).rejects.toMatchObject({ kind: 'oom', name: 'OcrOutOfMemory' })
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  it('a factory that throws or rejects becomes an init error', async () => {
+    const sync = (() => {
+      throw new Error('glue exploded')
+    }) as unknown as Parameters<typeof createTess>[0]['factory']
+    await expect(
+      createTess({ factory: sync, wasmModule: EMPTY_WASM, traineddata: DATA }, ['eng'])
+    ).rejects.toMatchObject({ kind: 'init' })
+    await expect(
+      createTess(
+        {
+          factory: async () => Promise.reject(new TypeError('x')),
+          wasmModule: EMPTY_WASM,
+          traineddata: DATA
+        },
+        ['eng']
+      )
+    ).rejects.toMatchObject({ kind: 'init' })
+  })
+
   it('counts printErr lines per call (a successful page normally has none)', async () => {
     const f = fake({ stderrDuringRecognize: ['Warning: x'] })
     const tess = await createTess(
@@ -292,7 +439,11 @@ describe('helpers', () => {
       true
     )
     expect(ALLOC_FAILURE_RE.test('Cannot enlarge memory, requested 1 bytes')).toBe(true)
+    expect(
+      ALLOC_FAILURE_RE.test('Out of memory: Cannot allocate Wasm memory for new instance')
+    ).toBe(true)
     expect(ALLOC_FAILURE_RE.test('Estimating resolution as 368')).toBe(false)
+    expect(ALLOC_FAILURE_RE.test('Aborted(native code called abort())')).toBe(false)
   })
 
   it('configHash input: sorted data, pipeline version, params without the per-page DPI', () => {

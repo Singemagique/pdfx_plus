@@ -435,9 +435,20 @@ export class Coordinator {
         },
         () => {}
       )
+      // An OcrError's message is built path-free ("traineddata fra: SHA-256 mismatch") and says
+      // which file and which check failed, so main can log it and the self-test report it. Any
+      // other error (e.g. a read of the PDFium .wasm) may carry a path: only its name.
       const fatal = (e: unknown): void =>
         this.toParent({
-          fatal: { code: 'init', message: e instanceof Error ? e.name : 'init failed' }
+          fatal: {
+            code: 'init',
+            message:
+              e instanceof OcrError
+                ? e.message.slice(0, 500)
+                : e instanceof Error
+                  ? e.name
+                  : 'init failed'
+          }
         })
       this.pdfiumModule.catch(fatal)
       this.engineModule.catch(fatal)

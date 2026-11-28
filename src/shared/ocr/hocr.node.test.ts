@@ -111,6 +111,7 @@ describe('hocrToRaw', () => {
         xHeight: 11,
         size: 20,
         angle: 90,
+        descenders: 4,
         lang: 'eng',
         words: [
           {
@@ -195,6 +196,47 @@ describe('parseHocr refuses anything else', () => {
   for (const [what, src] of bad)
     it(what, () => {
       expect(() => parseHocr(src)).toThrow(HocrError)
+    })
+
+  // Each refused for its own reason (the message pins which check fired).
+  const cinfo = (x0: number, x1: number, t: string): string =>
+    `<span class='ocrx_cinfo' title='x_bboxes ${x0} 10 ${x1} 30; x_conf 99'>${t}</span>`
+  const exact: Array<[string, string, RegExp]> = [
+    [
+      'text between char boxes',
+      mini(
+        `<span class='ocrx_word' id='w' title='bbox 10 10 40 30'>${cinfo(10, 20, 'a')}X${cinfo(21, 40, 'b')}</span>`
+      ),
+      /text between char boxes/
+    ],
+    [
+      'attributes on a closing tag',
+      mini(`<span class='ocrx_word' id='w' title='bbox 10 10 40 30'>a</span class='x'>`),
+      /attributes on a closing tag/
+    ],
+    [
+      'an inline tag between lines',
+      mini(word).replace("<span class='ocr_line'", "<b></b><span class='ocr_line'"),
+      /unexpected <b>/
+    ],
+    [
+      'a number that overflows to Infinity',
+      mini(`<span class='ocrx_word' id='w' title='bbox 10 10 1e999 30'>a</span>`),
+      /bad number/
+    ],
+    ['a bad dir', mini(word).replace("lang='eng'", "lang='eng' dir='up'"), /bad dir/],
+    [
+      'a word nested in a word',
+      mini(
+        `<span class='ocrx_word' id='a' title='bbox 10 10 40 30'><span class='ocrx_word' id='b' title='bbox 10 10 40 30'>a</span></span>`
+      ),
+      /misplaced ocrx_word/
+    ]
+  ]
+  for (const [what, src, why] of exact)
+    it(what, () => {
+      expect(() => parseHocr(src)).toThrow(HocrError)
+      expect(() => parseHocr(src)).toThrow(why)
     })
 
   it('refuses inputs over the size cap and deep nesting', () => {

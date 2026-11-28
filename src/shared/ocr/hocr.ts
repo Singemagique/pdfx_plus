@@ -428,6 +428,7 @@ export function hocrToRaw(page: HocrPage): RawOcr {
           words
         }
         if (l.textangle !== null) raw.angle = l.textangle
+        if (l.xDescenders !== null) raw.descenders = l.xDescenders
         if (par.lang !== null) raw.lang = par.lang
         lines.push(raw)
       }

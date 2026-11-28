@@ -337,6 +337,9 @@ export class OcrSupervisor {
   /** The current child's in-realm tripwire self-check (from its `ready`). */
   childSelfCheck: TripwireSelfCheck | null = null
   lastHeartbeat: Heartbeat | null = null
+  /** What the child's last `fatal` said (its path-free OcrError text), if it sent one. */
+  lastFatal: { code: string; message: string } | null = null
+  private fatalListeners: Array<(fatal: { code: string; message: string } | null) => void> = []
   spawnCount = 0
 
   constructor(private readonly deps: SupervisorDeps) {
@@ -632,7 +635,12 @@ export class OcrSupervisor {
       }
       for (const w of this.heartbeatWaiters.splice(0)) w.resolve(msg.heartbeat)
     } else if ('fatal' in msg) {
-      this.deps.log(`ocr: utility process reported a fatal ${msg.fatal.code} error`)
+      // The message is the coordinator's path-free OcrError text (e.g. "traineddata fra: SHA-256
+      // mismatch"): which file and which check, never document content.
+      this.lastFatal = { code: msg.fatal.code, message: msg.fatal.message }
+      this.deps.log(
+        `ocr: utility process reported a fatal ${msg.fatal.code} error: ${msg.fatal.message}`
+      )
       this.kill('fatal')
       this.becomeFatal()
     }
@@ -940,8 +948,25 @@ export class OcrSupervisor {
     }, delay)
   }
 
+  /**
+   * Call `listener` once when OCR becomes unavailable for the session ('fatal': a fatal report from
+   * the child, or a launch failure), at once if it already is. Returns a disposer.
+   */
+  onFatal(listener: (fatal: { code: string; message: string } | null) => void): () => void {
+    if (this.stateValue === 'fatal') {
+      listener(this.lastFatal)
+      return () => {}
+    }
+    this.fatalListeners.push(listener)
+    return () => {
+      const i = this.fatalListeners.indexOf(listener)
+      if (i >= 0) this.fatalListeners.splice(i, 1)
+    }
+  }
+
   private becomeFatal(): void {
     this.stateValue = 'fatal'
+    for (const l of this.fatalListeners.splice(0)) l(this.lastFatal)
     this.notifyOwner('fatal')
     if (this.owner?.kind === 'local') this.owner.reject(new Error('OCR is unavailable'))
     if (this.owner?.kind === 'wc') this.owner.detach()
