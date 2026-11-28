@@ -34,6 +34,19 @@
 //         recognize request for a page triage refused (`protected`, a refused JPX image, over the
 //         pixel caps) is answered `skipped-protected` / `failed` `image-format` / `too-large`
 //         without a render or the engine, whether triage answered before or after the request.
+// §3.4.2  PR6: each page renders at the DPI triage chose from its dominant image (the request's
+// §3.4.3  renderDpi overrides it; 300 for a page nobody asked to triage), with page-plan.ts's
+//         render flags, and a near-scanned page without its visible native text (maskText). A
+//         page whose triage is still open waits for its verdict (its pages go to the front of the
+//         triage queue), and the verdict a page first rendered with is the one its result is
+//         mapped with. A first result that asks for the adaptive pass is kept while the page
+//         renders again at the higher DPI (capped) and is recognised once more with the same
+//         geometry and recipe; the better of the two is the page's result, and any failure in
+//         that phase (render, heap, raster or recognize crash/OOM, timeout, mapping) ends the
+//         page with the first result at once, with no retry.
+//         The recognize message carries the page's edit rotation, the orientation tried first.
+// §3.4.6  Results map through their OCR copy's affine (pad, quarter turns, deskew); a near-scanned
+//         page's OCR words lying on its native text are dropped; `rotateBy` = (θ − r_edit) mod 360.
 
 import {
   ELECTRON_NET_MEMBERS,
@@ -60,10 +73,18 @@ import {
   type Budgets,
   type SystemInfo
 } from './budget'
-import { TESS_CORE7_PLACEHOLDER } from '../../../shared/ocr/calibration'
+import { TESS_CORE7 } from '../../../shared/ocr/calibration'
 import { ENGINE_ID, PIPELINE_VERSION } from '../../../shared/ocr/engine/tess-core'
 import { mapRawOcr } from '../../../shared/ocr/map'
-import type { PackedOcrPage } from '../../../shared/ocr/types'
+import { rotationDelta } from '../../../shared/ocr/preprocess/orientation'
+import type { OcrRect, PackedOcrPage } from '../../../shared/ocr/types'
+import {
+  DEFAULT_RENDER_DPI,
+  adaptiveRender,
+  keepAdaptive,
+  overlayAffine,
+  renderFlagsFor
+} from './page-plan'
 import { fitRaster } from './raster-core'
 import type { RecognizeOutcome } from './recognize-core'
 import type {
@@ -149,7 +170,8 @@ interface Job {
   done: number
   failed: number
   langs: string[]
-  dpi: number
+  /** The request's DPI override; null = each page's triage DPI (§3.4.3). */
+  dpi: number | null
   tasks: Set<Task>
   progressDirty: boolean
 }
@@ -168,6 +190,24 @@ interface Task {
   bitmap: ArrayBuffer | null
   raster: { width: number; height: number; dpi: number } | null
   startedAt: number
+  /**
+   * 'adaptive' after the first recognition asked for the §3.4.3 re-render: the page is rendered
+   * again at `adaptiveDpi` and recognised once more with the first result's geometry. Any failure
+   * in that phase ends the page with the first result instead (`fail`), never a retry.
+   */
+  phase: 'first' | 'adaptive'
+  adaptiveDpi: number | null
+  first: {
+    outcome: RecognizeOutcome
+    raster: { width: number; height: number; dpi: number }
+  } | null
+  /**
+   * What triage had said about the page when its first render started (`v` undefined: nothing).
+   * The render DPI, flags and mask, the adaptive caps and the mapping (physDpi, class, the native
+   * overlap drop) all read this snapshot, so a verdict arriving mid-page cannot mix two states.
+   * Only a refusal is still taken from the live verdict (its words are dropped whenever it comes).
+   */
+  triage: { v: TriageVerdict | undefined } | null
 }
 
 interface Source {
@@ -183,13 +223,26 @@ interface Source {
   triageCrashedPages: number
   /**
    * What triage said about each page it answered for (the class, any refusal): a recognized page
-   * carries its class, and a page triage refused is answered without the engine. Only these
-   * fields are kept, never the native words.
+   * carries its class, and a page triage refused is answered without the engine. Its render DPI,
+   * dominant-image facts and, on near-scanned pages, the native word boxes (never their text) set
+   * the render and the overlap drop (§3.4.3, §3.4.6).
    */
   triaged: Map<number, TriageVerdict>
 }
 
-type TriageVerdict = Pick<TriagePage, 'pageClass' | 'refused' | 'failure'>
+type TriageVerdict = Pick<
+  TriagePage,
+  | 'pageClass'
+  | 'refused'
+  | 'failure'
+  | 'renderDpi'
+  | 'effectiveDpi'
+  | 'bitsPerPixel'
+  | 'imageOrigin'
+> & {
+  /** A near-scanned page's visible native word BOXES (no text), for the §3.4.6 overlap drop. */
+  native?: OcrRect[]
+}
 
 /** A renderer `triage` request (§3.4.1). */
 interface TriageTask {
@@ -236,7 +289,6 @@ interface RecognizeSlot extends Slot<ToRecognize> {
   big: boolean
 }
 
-const DEFAULT_RENDER_DPI = 300
 /** Pages per triage message (PDFium triage takes milliseconds per page). */
 export const TRIAGE_CHUNK = 32
 /** A triage chunk that takes longer than this is treated like a hung render. */
@@ -674,6 +726,20 @@ export class Coordinator {
   }
 
   private startTriage(r: RasterSlot, task: TriageTask): void {
+    // Pages a recognize request is waiting on go first, in the order they would render (§3.3.6:
+    // the focused page first); the rest keep their order.
+    const waitingTasks = [...this.tasks].filter(
+      (t) => t.state === 'queued' && t.job.src === task.src && this.awaitingTriage(t)
+    )
+    if (waitingTasks.length > 0) {
+      const ranked = waitingTasks
+        .map((t) => ({ index: t.req.index, rank: this.rank(t) }))
+        .sort((a, b) => a.rank[0] - b.rank[0] || a.rank[1] - b.rank[1] || a.rank[2] - b.rank[2])
+      const inPending = new Set(task.pending!)
+      const first = [...new Set(ranked.map((x) => x.index))].filter((p) => inPending.has(p))
+      const lead = new Set(first)
+      task.pending = [...first, ...task.pending!.filter((p) => !lead.has(p))]
+    }
     const pending = task.pending!
     const chunk: number[] = []
     if (task.solo.has(pending[0])) chunk.push(pending[0])
@@ -726,7 +792,15 @@ export class Coordinator {
     const source = this.sources.get(src)
     if (!source) return
     for (const p of pages) {
-      const v: TriageVerdict = { pageClass: p.pageClass }
+      const v: TriageVerdict = {
+        pageClass: p.pageClass,
+        renderDpi: p.renderDpi,
+        effectiveDpi: p.effectiveDpi,
+        bitsPerPixel: p.bitsPerPixel,
+        imageOrigin: p.imageOrigin
+      }
+      if (p.pageClass === 'near-scanned' && p.nativeWords)
+        v.native = p.nativeWords.map(({ x0, y0, x1, y1 }) => ({ x0, y0, x1, y1 }))
       if (p.refused) v.refused = p.refused
       if (p.failure) v.failure = p.failure
       source.triaged.set(p.index, v)
@@ -832,7 +906,7 @@ export class Coordinator {
       done: 0,
       failed: 0,
       langs: req.opts.langs,
-      dpi: req.opts.renderDpi ?? DEFAULT_RENDER_DPI,
+      dpi: req.opts.renderDpi ?? null,
       tasks: new Set(),
       progressDirty: true
     }
@@ -851,7 +925,11 @@ export class Coordinator {
         recognizeFailures: 0,
         bitmap: null,
         raster: null,
-        startedAt: 0
+        startedAt: 0,
+        phase: 'first',
+        adaptiveDpi: null,
+        first: null,
+        triage: null
       }
       job.tasks.add(t)
       this.tasks.add(t)
@@ -926,6 +1004,8 @@ export class Coordinator {
     status: 'failed' | 'too-large' | 'timeout',
     reason: PageResult['reason']
   ): void {
+    // The adaptive re-render or its recognition failed: the page keeps its first result.
+    if (t.first && this.finishWith(t, t.first.outcome, t.first.raster)) return
     this.finalize(t, {
       status,
       reason,
@@ -953,11 +1033,11 @@ export class Coordinator {
     return [focusRank, t.job.seq, t.order]
   }
 
-  private pick(state: TaskState): Task | null {
+  private pick(state: TaskState, eligible?: (t: Task) => boolean): Task | null {
     let best: Task | null = null
     let bestRank: [number, number, number] | null = null
     for (const t of this.tasks) {
-      if (t.state !== state) continue
+      if (t.state !== state || (eligible && !eligible(t))) continue
       const r = this.rank(t)
       if (
         !bestRank ||
@@ -997,8 +1077,11 @@ export class Coordinator {
       const r = this.ensureRaster()
       if (r.ready && !r.task && !r.triage) {
         // The gate before PDFium: a page triage refused is never rendered, whatever re-queued it.
-        let t = this.pick('queued')
-        while (t && this.refuseIfTriaged(t)) t = this.pick('queued')
+        // A page whose triage is still open waits for it (the triage then takes the thread), so
+        // its DPI, flags and mask never depend on which message happened to come first.
+        const ready = (x: Task): boolean => !this.awaitingTriage(x)
+        let t = this.pick('queued', ready)
+        while (t && this.refuseIfTriaged(t)) t = this.pick('queued', ready)
         if (t) {
           if (r.lastSrc !== null && r.lastSrc !== t.job.src && r.heap > this.b.rasterRecycleHeap) {
             // Between documents and the heap only grows: hand the memory back (§3.3.3).
@@ -1100,20 +1183,60 @@ export class Coordinator {
     job.progressDirty = true
     r.task = t
     r.lastSrc = job.src
-    const fit = fitRaster(t.req.width, t.req.height, job.dpi, this.b.raster)
+    // The first render fixes what the page is recognised and mapped with (see Task.triage).
+    t.triage ??= { v: this.verdict(t) }
+    const v = t.triage.v
+    const dpi = this.renderDpiOf(t)
+    const fit = fitRaster(t.req.width, t.req.height, dpi, this.b.raster)
     r.watchdog = setTimeout(
       () => this.guard(() => this.onRasterHang(r)),
       rasterWatchdogMs(fit.width * fit.height)
     )
-    this.sendRaster(r, {
+    const msg: Extract<ToRaster, { type: 'render' }> = {
       type: 'render',
       taskId: t.id,
       src: job.src,
       index: t.req.index,
-      dpi: job.dpi,
+      dpi,
       userUnit: t.req.userUnit,
       frame: { width: t.req.width, height: t.req.height }
-    })
+    }
+    const flags = renderFlagsFor(v, fit.dpi)
+    if (flags) msg.flags = flags
+    if (v?.pageClass === 'near-scanned') msg.maskText = true
+    this.sendRaster(r, msg)
+  }
+
+  /** What triage has said about `t`'s page so far (live; see Task.triage for the snapshot). */
+  private verdict(t: Task): TriageVerdict | undefined {
+    return this.sources.get(t.job.src)?.triaged.get(t.req.index)
+  }
+
+  /** The verdict `t` is rendered and mapped with: the snapshot once it has rendered. */
+  private pageVerdict(t: Task): TriageVerdict | undefined {
+    return t.triage ? t.triage.v : this.verdict(t)
+  }
+
+  /**
+   * A queued page with no verdict yet whose triage the renderer has asked for (its page is still
+   * pending in an open triage request, or that request is still waiting for the page count): it
+   * waits for the verdict rather than render at the 300 DPI fallback. A page nobody asked to triage
+   * renders at once, at 300; a page that has rendered once never waits again.
+   */
+  private awaitingTriage(t: Task): boolean {
+    if (t.triage || this.verdict(t)) return false
+    // A chunk at the raster thread is still a prefix of its request's `pending`.
+    return this.triages.some(
+      (x) => x.src === t.job.src && (x.pending === null || x.pending.includes(t.req.index))
+    )
+  }
+
+  /**
+   * The DPI a task renders at (§3.4.3): the adaptive pass's, else the request's override, else the
+   * DPI triage chose from the page's dominant image, else 300.
+   */
+  private renderDpiOf(t: Task): number {
+    return t.adaptiveDpi ?? t.job.dpi ?? this.pageVerdict(t)?.renderDpi ?? DEFAULT_RENDER_DPI
   }
 
   private takeRasterTask(slot: RasterSlot, taskId: number | null): Task | null {
@@ -1209,7 +1332,8 @@ export class Coordinator {
         const t = this.takeRasterTask(slot, m.taskId)
         if (t) {
           t.heapFailures++
-          if (t.heapFailures >= 2) this.fail(t, 'too-large', 'heap')
+          // The adaptive re-render is not retried: the page keeps its first result (fail).
+          if (t.heapFailures >= 2 || t.phase === 'adaptive') this.fail(t, 'too-large', 'heap')
           else this.requeue(t)
         }
         this.retireRaster()
@@ -1321,7 +1445,7 @@ export class Coordinator {
 
   private rasterFailure(t: Task): void {
     t.rasterFailures++
-    if (t.rasterFailures >= 2) this.fail(t, 'failed', 'raster-crash')
+    if (t.rasterFailures >= 2 || t.phase === 'adaptive') this.fail(t, 'failed', 'raster-crash')
     else this.requeue(t)
   }
 
@@ -1404,7 +1528,7 @@ export class Coordinator {
       () => this.guard(() => this.onRecognizeHang(slot)),
       recognizeWatchdogMs(raster.width * raster.height)
     )
-    const msg: ToRecognize = {
+    const msg: Extract<ToRecognize, { type: 'recognize' }> = {
       type: 'recognize',
       taskId: t.id,
       width: raster.width,
@@ -1413,6 +1537,10 @@ export class Coordinator {
       data,
       langs: t.job.langs
     }
+    if (t.phase === 'adaptive' && t.first)
+      msg.reuse = { plan: t.first.outcome.plan, recipe: t.first.outcome.recipe }
+    // §3.4.5 priors: the orientation the user already gave the page is tried first.
+    else if (t.req.editRotation) msg.editRotation = t.req.editRotation
     if (slot.ready) slot.worker.postMessage(msg, [data])
     else slot.outbox.push({ msg, transfer: [data] })
   }
@@ -1437,22 +1565,15 @@ export class Coordinator {
       const raster = t.raster!
       // Triage answered while the page was at the engine, and refuses it: its words are dropped.
       const refusal = this.triageRefusal(t)
-      let page: PackedOcrPage | null = null
-      try {
-        if (!refusal) page = this.toPage(t, m.result)
-      } catch {
-        // A mapping bug or an impossible engine result: this page fails, the thread is fine.
-        page = null
-      }
       if (refusal) this.finalize(t, refusal)
-      else if (page)
-        this.finalize(t, {
-          status: page.status,
-          renderDpi: raster.dpi,
-          raster: { width: raster.width, height: raster.height },
-          recognition: page
-        })
-      else this.fail(t, 'failed', 'recognize-crash')
+      else if (t.phase === 'adaptive' && t.first) {
+        const first = t.first
+        const second = keepAdaptive(first.outcome, m.result)
+        if (!this.finishWith(t, second ? m.result : first.outcome, second ? raster : first.raster))
+          this.fail(t, 'failed', 'recognize-crash')
+      } else if (!this.startAdaptive(t, m.result, raster)) {
+        if (!this.finishWith(t, m.result, raster)) this.fail(t, 'failed', 'recognize-crash')
+      }
       // The WASM heap never shrinks: recycle after 50 pages, or after any page over 12 MP.
       if (slot.pages >= this.b.recyclePages || slot.big) this.retireRecognizer(slot)
       slot.big = false
@@ -1464,28 +1585,93 @@ export class Coordinator {
   }
 
   /**
-   * A thread's RawOcr → the packed OcrPage in the overlay frame (map.ts). The raster covers the
-   * request's page frame exactly (the raster thread checked it against PDFium's), so the frame
-   * and the raster size give the mapping.
+   * The first recognition asked for the adaptive pass (§3.4.3) and a re-render gains real pixels:
+   * keep the result, queue the page to render again at the higher DPI. False = finish now.
    */
-  private toPage(t: Task, outcome: RecognizeOutcome): PackedOcrPage {
-    const raster = t.raster!
+  private startAdaptive(
+    t: Task,
+    outcome: RecognizeOutcome,
+    raster: { width: number; height: number; dpi: number }
+  ): boolean {
+    if (!outcome.adaptive) return false
+    const next = adaptiveRender(
+      outcome.adaptive,
+      raster.dpi,
+      { width: t.req.width, height: t.req.height },
+      this.pageVerdict(t),
+      this.b.raster
+    )
+    if (!next) return false
+    t.first = { outcome, raster }
+    t.phase = 'adaptive'
+    t.adaptiveDpi = next.dpi
+    this.requeue(t)
+    t.raster = null
+    return true
+  }
+
+  /** Finalize `t` with a recognition; false when mapping it failed (the caller fails the page). */
+  private finishWith(
+    t: Task,
+    outcome: RecognizeOutcome,
+    raster: { width: number; height: number; dpi: number }
+  ): boolean {
+    let page: PackedOcrPage
+    try {
+      page = this.toPage(t, outcome, raster)
+    } catch {
+      // A mapping bug or an impossible engine result: this page fails, the thread is fine.
+      return false
+    }
+    const result: PageResult = {
+      status: page.status,
+      renderDpi: raster.dpi,
+      raster: { width: raster.width, height: raster.height },
+      recognition: page
+    }
+    const delta = rotationDelta(page.orientation, t.req.editRotation ?? 0)
+    if (delta !== 0) result.rotateBy = delta
+    this.finalize(t, result)
+    return true
+  }
+
+  /**
+   * A thread's RawOcr → the packed OcrPage in the overlay frame (map.ts). The raster covers the
+   * request's page frame exactly (the raster thread checked it against PDFium's), so the frame,
+   * the raster size and the result's map back from its OCR copy (`toSource`: the pad, the quarter
+   * turns and the deskew) give the mapping.
+   */
+  private toPage(
+    t: Task,
+    outcome: RecognizeOutcome,
+    raster: { width: number; height: number; dpi: number }
+  ): PackedOcrPage {
+    const frame = { width: t.req.width, height: t.req.height }
+    // The verdict the page was rendered with, never one that arrived while it was at the engine.
+    const v = this.pageVerdict(t)
     const langs = t.job.langs
     const hashes = this.engine?.dataHashes ?? {}
     const dataHashes: Record<string, string> = {}
     for (const l of langs) if (Object.hasOwn(hashes, l)) dataHashes[l] = hashes[l]
+    const dEff = v?.effectiveDpi ?? null
     return mapRawOcr(outcome.raw, {
-      page: { width: t.req.width, height: t.req.height },
+      page: frame,
       raster: { width: raster.width, height: raster.height },
       renderDpi: raster.dpi,
+      // The physical estimate: the dominant image's own density when it is a sane one.
+      physDpi: dEff !== null && dEff > 0 && dEff <= 10_000 ? dEff : raster.dpi,
       engineId: ENGINE_ID,
       dataHashes,
       langs,
       pipelineVersion: PIPELINE_VERSION,
       // The class triage gave the page (§3.4.1). A page recognised without triage, or one triage
       // could not classify, is treated as a scan.
-      pageClass: this.sources.get(t.job.src)?.triaged.get(t.req.index)?.pageClass ?? 'scanned',
-      calibration: TESS_CORE7_PLACEHOLDER
+      pageClass: v?.pageClass ?? 'scanned',
+      calibration: TESS_CORE7,
+      orientation: outcome.orientation,
+      skewDeg: outcome.plan.skewDeg,
+      toOverlay: overlayAffine(outcome, frame, raster),
+      native: v?.native
     })
   }
 
@@ -1496,7 +1682,10 @@ export class Coordinator {
     // (PDFium must never render a page whose image the JPX pre-check refused).
     if (this.refuseIfTriaged(t)) return
     t.recognizeFailures++
-    if (t.recognizeFailures >= 2) this.fail(t, 'failed', 'recognize-crash')
+    // A crash or OOM on the adaptive pass's bigger raster is not retried (it would render and
+    // recognise ~20 MP again): the page keeps its first result (fail).
+    if (t.recognizeFailures >= 2 || t.phase === 'adaptive')
+      this.fail(t, 'failed', 'recognize-crash')
     else this.requeue(t) // the bitmap went with the thread: render again
   }
 

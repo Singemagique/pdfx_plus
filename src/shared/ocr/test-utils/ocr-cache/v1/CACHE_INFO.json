@@ -14,6 +14,6 @@
     "hocr_char_boxes": 1,
     "thresholding_method": 0
   },
-  "PIPELINE_VERSION": 1,
-  "configHash": "fda0decb5953d4b09b7e09d809b5ea21b7f6a2d3dfe7199ff94b0efe7f4057d7"
+  "PIPELINE_VERSION": 2,
+  "configHash": "1635d501f443dbe49f17f8655621ebb1a14044aadc7aaf1cd6de2c3130cd776c"
 }

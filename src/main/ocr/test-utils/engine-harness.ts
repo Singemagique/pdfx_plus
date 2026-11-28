@@ -38,13 +38,20 @@ export interface RecognizeReply {
   tripwire: number
 }
 
+/** The recognize message's optional fields a test sets (thread-messages.ts). */
+export type RecognizeExtra = Pick<
+  Extract<ToRecognize, { type: 'recognize' }>,
+  'reuse' | 'adaptive' | 'rawPass1' | 'editRotation' | 'calibration'
+>
+
 export interface EngineThread {
   engine: LoadedEngine
   recognize(
     img: GrayImage,
     dpi: number,
     langs: string[],
-    returnHocr?: boolean
+    returnHocr?: boolean,
+    extra?: RecognizeExtra
   ): Promise<RecognizeReply>
   /** The thread's tripwire counter as of its last message. */
   readonly tripwire: number
@@ -117,7 +124,7 @@ export async function startEngineThread(engine?: LoadedEngine): Promise<EngineTh
     get tripwire() {
       return tripwire
     },
-    recognize(img, dpi, langs, returnHocr = false) {
+    recognize(img, dpi, langs, returnHocr = false, extra = {}) {
       if (failed) return Promise.reject(failed)
       const taskId = ++seq
       const copy = new Uint8Array(img.width * img.height)
@@ -132,7 +139,8 @@ export async function startEngineThread(engine?: LoadedEngine): Promise<EngineTh
           dpi,
           data: copy.buffer,
           langs,
-          returnHocr
+          returnHocr,
+          ...extra
         }
         worker.postMessage(msg, [copy.buffer])
       })

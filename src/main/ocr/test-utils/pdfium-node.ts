@@ -6,14 +6,14 @@ import { init } from '@embedpdf/pdfium'
 import { PDFDict, PDFDocument, PDFName, PDFNumber, degrees, rgb } from 'pdf-lib'
 
 import type { PdfiumRaster } from '../process/raster-core'
-import type { PdfiumTriage } from '../process/triage-pdfium'
+import type { PdfiumMask } from '../process/triage-pdfium'
 
 export const PDFIUM_WASM_PATH = fileURLToPath(
   new URL('../../../../node_modules/@embedpdf/pdfium/dist/pdfium.wasm', import.meta.url)
 )
 
 export type TestPdfium = PdfiumRaster &
-  PdfiumTriage & {
+  PdfiumMask & {
     PDFiumExt_Init(): void
     FPDF_LoadMemDocument(ptr: number, size: number, password: string): number
   }

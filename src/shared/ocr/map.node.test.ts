@@ -15,13 +15,17 @@ import type { RawLine, RawOcr, RawWord } from './engine/types'
 import { hocrToRaw, parseHocr } from './hocr'
 import {
   CJK_CHAR_EM,
+  XHEIGHT_EM,
   charEdges,
   dropReason,
   lineOrientation,
   lineSizePx,
   mapRawOcr,
   mapRawOcrPage,
+  nativeOverlap,
   noXHeightScript,
+  pixelToOverlay,
+  splitWideGaps,
   type MapContext
 } from './map'
 import { decodeEntry, readEntryById } from './test-utils/ocr-replay'
@@ -74,8 +78,8 @@ describe('mapRawOcrPage geometry', () => {
     expect(p.lines).toHaveLength(1)
     const [l] = p.lines
     expect(l.angle).toBe(0)
-    // xh 25 px / 0.5 = 50 px em = 12 pt (within the clamp [34, 68] px).
-    expect(l.size).toBeCloseTo(12, 6)
+    // xh 25 px / XHEIGHT_EM (0.56) = 44.6 px em = 10.7 pt (within the clamp [34, 68] px).
+    expect(l.size).toBeCloseTo((25 / XHEIGHT_EM) * 0.24, 6)
     const [a, b] = l.words
     expect(a.x).toBeCloseTo(24, 6)
     // Baseline = bbox.y1 + intercept = 126 px → 180 − 126 · 0.24 = 149.76 pt.
@@ -179,8 +183,9 @@ describe('rotated lines (textangle, or vertical text without a baseline)', () =>
     const p = mapRawOcrPage(raw(rot()), CTX)
     const [l] = p.lines
     expect(l.angle).toBeCloseTo(Math.PI / 2, 12)
-    // x-height 21 px / 0.5 = 42 px, within [35, 70] (the line box WIDTH, not its 600 px height).
-    expect(l.size).toBeCloseTo(42 * 0.24, 6)
+    // x-height 21 px / XHEIGHT_EM = 37.5 px, within [35, 70] (the line box WIDTH, not its 600 px
+    // height).
+    expect(l.size).toBeCloseTo((21 / XHEIGHT_EM) * 0.24, 6)
     const [a, b] = l.words
     expect(a).toMatchObject({ t: 'Rain' })
     expect(a.x).toBeCloseTo((91 - 7) * 0.24, 6)
@@ -284,9 +289,15 @@ describe('rotated lines (textangle, or vertical text without a baseline)', () =>
 })
 
 describe('font size by script', () => {
-  it('Latin: x-height / 0.5, clamped to [line ink height, 2× it]', () => {
+  it('Latin: x-height / XHEIGHT_EM, clamped to [line ink height, 2× it]', () => {
     const l = line([word('ab', 100, 200)])
-    expect(lineSizePx(l, 'ab')).toBeCloseTo(50, 6)
+    expect(lineSizePx(l, 'ab')).toBeCloseTo(25 / XHEIGHT_EM, 6)
+    // The PR6 refit (0.56); a context can sweep it (the calibration run).
+    expect(XHEIGHT_EM).toBe(0.56)
+    expect(lineSizePx(l, 'ab', false, { xHeightEm: 0.5, cjkCharEm: CJK_CHAR_EM })).toBeCloseTo(
+      50,
+      6
+    )
     expect(lineSizePx({ ...l, xHeight: 10 }, 'ab')).toBe(34) // floor: the line box
     expect(lineSizePx({ ...l, xHeight: 40 }, 'ab')).toBe(68) // ceiling: 2× the line box
     expect(lineSizePx({ ...l, xHeight: 0 }, 'ab')).toBe(34) // unknown: the line box
@@ -296,7 +307,7 @@ describe('font size by script', () => {
     const tall = line([word('a', 100, 200, 95, 100, 130), word('b', 300, 400, 95, 120, 150)], {
       bbox: { x0: 100, y0: 100, x1: 400, y1: 200 }
     })
-    expect(lineSizePx({ ...tall, xHeight: 25 }, 'ab')).toBe(50)
+    expect(lineSizePx({ ...tall, xHeight: 25 }, 'ab')).toBeCloseTo(25 / XHEIGHT_EM, 9)
     expect(lineSizePx({ ...tall, xHeight: 5 }, 'ab')).toBe(30)
   })
 
@@ -549,5 +560,96 @@ describe('replayed clean300 recording', () => {
         for (let i = 1; i < w.chars!.length; i++)
           expect(w.chars![i]).toBeGreaterThanOrEqual(w.chars![i - 1])
       }
+  })
+})
+
+describe('PR6 post-processing', () => {
+  const charred = (text: string, x0: number, gaps: number[]): RawWord => {
+    // One 20 px box per char; gaps[i] px between char i and i + 1.
+    const chars: { x0: number; y0: number; x1: number; y1: number }[] = []
+    let x = x0
+    for (let i = 0; i < [...text].length; i++) {
+      chars.push({ x0: x, y0: 100, x1: x + 20, y1: 134 })
+      x += 20 + (gaps[i] ?? 2)
+    }
+    return { text, bbox: { x0, y0: 100, x1: x - (gaps.at(-1) ?? 2), y1: 134 }, conf: 90, chars }
+  }
+
+  it('splits a word at a space-wide gap between its char boxes (a missed space)', () => {
+    // Words 30 px apart; "€97" has a 24 px gap after the €.
+    const l = line([
+      charred('Invoice', 100, []),
+      charred('€97', 270, [24, 2]),
+      charred('due', 400, []),
+      charred('today', 500, [])
+    ])
+    const out = splitWideGaps(l)
+    expect(out.words.map((w) => w.text)).toEqual(['Invoice', '€', '97', 'due', 'today'])
+    expect(out.words[1].bbox).toEqual({ x0: 270, y0: 100, x1: 290, y1: 134 })
+    expect(out.words[2].chars).toHaveLength(2)
+    expect(out.words[2].conf).toBe(90)
+  })
+
+  it('leaves ordinary words, short lines and words without char boxes alone', () => {
+    const l = line([charred('one', 100, []), charred('two', 200, []), charred('six', 300, [])])
+    expect(splitWideGaps(l)).toBe(l)
+    const k = line([
+      charred('alpha', 100, [3, 3, 3, 3]),
+      word('beta', 260, 340),
+      charred('gamma', 380, []),
+      charred('delta', 520, [])
+    ])
+    expect(splitWideGaps(k)).toBe(k)
+  })
+
+  it('an upside-down copy (180° affine) gives lines at angle π, words running right to left', () => {
+    const turn: MapContext = {
+      ...CTX,
+      toOverlay: [-0.24, 0, 0, 0.24, 432, 0],
+      orientation: 180
+    }
+    const p = mapRawOcrPage(raw(line([word('Hello', 100, 220), word('world', 250, 400)])), turn)
+    const [l] = p.lines
+    expect(l.angle).toBe(Math.PI)
+    expect(p.orientation).toBe(180)
+    // "Hello" starts at the copy's x = 100 → page x = 432 − 24 and runs left 28.8 pt.
+    expect(l.words[0].x).toBeCloseTo(432 - 24, 6)
+    expect(l.words[0].w).toBeCloseTo(28.8, 6)
+    expect(pixelToOverlay(CTX.page, CTX.raster)).toEqual([0.24, 0, 0, -0.24, 0, 180])
+  })
+
+  it('near-scanned: drops OCR words lying mostly on native visible text', () => {
+    const l = line([word('Hello', 100, 220), word('world', 250, 400)])
+    const base = mapRawOcrPage(raw(l), CTX)
+    const [hello, world] = base.lines[0].words
+    const quad = { angle: 0, size: base.lines[0].size }
+    const box = { x0: hello.x - 1, y0: hello.y - 5, x1: hello.x + hello.w + 1, y1: hello.y + 20 }
+    expect(nativeOverlap(hello, quad, [box])).toBeGreaterThan(0.9)
+    expect(nativeOverlap(world, quad, [box])).toBe(0)
+    const p = mapRawOcrPage(raw(l), { ...CTX, native: [box] })
+    expect(p.lines[0].words.map((w) => w.t)).toEqual(['world'])
+    // Every word on native text: the line goes.
+    const both = { x0: 0, y0: 0, x1: 432, y1: 180 }
+    expect(mapRawOcrPage(raw(l), { ...CTX, native: [both] }).lines).toHaveLength(0)
+  })
+
+  it('near-scanned: the drop is "more than half covered" (60% goes, 40% stays)', () => {
+    const l = line([word('Hello', 100, 220), word('world', 250, 400)])
+    const base = mapRawOcrPage(raw(l), CTX)
+    const [hello] = base.lines[0].words
+    const quad = { angle: 0, size: base.lines[0].size }
+    // A native box over the full height of the word's em box and a share of its width.
+    const cover = (share: number) => ({
+      x0: hello.x,
+      y0: hello.y - 50,
+      x1: hello.x + share * hello.w,
+      y1: hello.y + 50
+    })
+    expect(nativeOverlap(hello, quad, [cover(0.6)])).toBeCloseTo(0.6, 9)
+    expect(nativeOverlap(hello, quad, [cover(0.4)])).toBeCloseTo(0.4, 9)
+    const kept = (share: number): string[] =>
+      mapRawOcrPage(raw(l), { ...CTX, native: [cover(share)] }).lines[0].words.map((w) => w.t)
+    expect(kept(0.6)).toEqual(['world'])
+    expect(kept(0.4)).toEqual(['Hello', 'world'])
   })
 })

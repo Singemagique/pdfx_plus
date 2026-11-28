@@ -1,8 +1,9 @@
 // A recognize worker_thread (DESIGN.md §3.3.1, §3.4.5–§3.4.6). It receives, once, the
 // coordinator's compiled core (a WebAssembly.Module, SHA-checked there), the glue's directory and
 // the verified .traineddata.gz files (SharedArrayBuffers), then one transferred grey bitmap per
-// page. Per page: tess-core → hOCR → strict parse → RawOcr, posted back as small JSON; the
-// coordinator maps it to a packed OcrPage (map.ts). The watchdog, cancel-by-terminate, recycling
+// page. Per page: the PR6 pipeline (recognize-core.ts: preprocessing, orientation, deskew, the pass
+// plan and retries over tess-core → hOCR → strict parse → RawOcr), posted back as small JSON with
+// the copy's affine; the coordinator maps it to a packed OcrPage (map.ts). The watchdog, cancel-by-terminate, recycling
 // (50 pages / any page > 12 MP) and the failure policy live in the coordinator.
 //
 // Engines are built per language set: a page whose job wants other languages ends the current
@@ -14,7 +15,7 @@ import { tripwireCount, tripwireSelfCheck } from './no-network'
 import { parentPort } from 'node:worker_threads'
 import { createTess, type Tess, type TessFactory } from '../../../shared/ocr/engine/tess-core'
 import { gunzipTraineddata, loadGlue } from './engine-node'
-import { describeRecognizeError, recognizePage } from './recognize-core'
+import { describeRecognizeError, recognizePage, recognizeRawPass1 } from './recognize-core'
 import type { EngineAssets, FromRecognize, ToRecognize } from './thread-messages'
 
 const port = parentPort
@@ -59,18 +60,26 @@ async function handle(msg: ToRecognize): Promise<void> {
     if (data.length !== msg.width * msg.height) throw new RangeError('bitmap size mismatch')
     const engine = await engineFor(msg.langs)
     let stderrLines = 0
-    const result = recognizePage(
-      {
-        recognize: (img, params) => {
-          const r = engine.recognize(img, params)
-          stderrLines += r.stderrLines
-          return r
-        }
-      },
-      { width: msg.width, height: msg.height, data },
-      msg.dpi,
-      { returnHocr: msg.returnHocr === true }
-    )
+    const counted = {
+      recognize: (
+        img: Parameters<Tess['recognize']>[0],
+        params: Parameters<Tess['recognize']>[1]
+      ) => {
+        const r = engine.recognize(img, params)
+        stderrLines += r.stderrLines
+        return r
+      }
+    }
+    const img = { width: msg.width, height: msg.height, data }
+    const result = msg.rawPass1
+      ? recognizeRawPass1(counted, img, msg.dpi, msg.returnHocr === true)
+      : recognizePage(counted, img, msg.dpi, {
+          returnHocr: msg.returnHocr === true,
+          reuse: msg.reuse,
+          adaptive: msg.adaptive,
+          prior: msg.editRotation,
+          calibration: msg.calibration
+        })
     post({
       type: 'result',
       taskId: msg.taskId,
