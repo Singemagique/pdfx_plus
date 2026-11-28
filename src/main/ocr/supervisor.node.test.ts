@@ -259,7 +259,11 @@ function setup(
     },
     init: () => ({
       limits: { onBattery: false, thermal: 'nominal', speedLimit: 100, divisor: 1 },
-      paths: { pdfiumWasm: '/app.asar/node_modules/@embedpdf/pdfium/dist/pdfium.wasm' }
+      paths: {
+        pdfiumWasm: '/app.asar/node_modules/@embedpdf/pdfium/dist/pdfium.wasm',
+        ocrCore: '/resources/ocr',
+        tessdata: { eng: '/resources/ocr/tessdata/eng.traineddata.gz' }
+      }
     }),
     platform: 'win32',
     env: {
@@ -393,7 +397,11 @@ describe('spawning', () => {
       {
         init: {
           limits: { onBattery: false, thermal: 'nominal', speedLimit: 100, divisor: 1 },
-          paths: { pdfiumWasm: '/app.asar/node_modules/@embedpdf/pdfium/dist/pdfium.wasm' }
+          paths: {
+            pdfiumWasm: '/app.asar/node_modules/@embedpdf/pdfium/dist/pdfium.wasm',
+            ocrCore: '/resources/ocr',
+            tessdata: { eng: '/resources/ocr/tessdata/eng.traineddata.gz' }
+          }
         }
       }
     ])
@@ -798,13 +806,27 @@ describe('exits (the PR0 Windows matrix)', () => {
   it('the child reporting an init failure is fatal (deterministic: respawning would loop)', async () => {
     const ctx = setup()
     const { wc, child } = await connected(ctx)
-    child.say({ fatal: { code: 'init', message: 'CompileError' } })
+    const seen: unknown[] = []
+    ctx.sup.onFatal((f) => seen.push(f))
+    child.say({ fatal: { code: 'init', message: 'traineddata fra: SHA-256 mismatch' } })
     await tick()
     expect(child.killed).toBe(true)
     await vi.advanceTimersByTimeAsync(60_000)
     expect(ctx.sup.state).toBe('fatal')
     expect(ctx.children).toHaveLength(1)
     expect(wc.disconnects()).toEqual([{ reason: 'fatal' }])
+    // Which file and which check (the coordinator's path-free text) is kept, logged and told to
+    // whoever waits on it (the packaged self-test fails at once with it).
+    const fatal = { code: 'init', message: 'traineddata fra: SHA-256 mismatch' }
+    expect(ctx.sup.lastFatal).toEqual(fatal)
+    expect(seen).toEqual([fatal])
+    expect(ctx.logs).toContainEqual(
+      'ocr: utility process reported a fatal init error: traineddata fra: SHA-256 mismatch'
+    )
+    // Asking afterwards answers at once.
+    const late: unknown[] = []
+    ctx.sup.onFatal((f) => late.push(f))
+    expect(late).toEqual([fatal])
   })
 
   it('a crash with nobody connected does not respawn (lazy)', async () => {
@@ -841,6 +863,37 @@ describe('idle, power and progress', () => {
     ctx.sup.connect(wc)
     await tick()
     expect(ctx.children).toHaveLength(2)
+  })
+
+  it('open triage holds off the idle kill, and the 3 minutes count from its end (PR4b)', async () => {
+    const ctx = setup()
+    const { wc, child } = await connected(ctx)
+    await vi.advanceTimersByTimeAsync(IDLE_KILL_MS - 1_000)
+    child.say({ activity: { busy: false, done: 0, total: 0, triage: true } })
+    await vi.advanceTimersByTimeAsync(IDLE_KILL_MS * 2)
+    expect(child.killed).toBe(false) // triaging: never idle-killed mid-triage
+    // Background work: no power blocker, no taskbar progress.
+    expect(ctx.blockers.started).toEqual([])
+    expect(ctx.progress.filter((p) => p.frac >= 0)).toEqual([])
+    child.say({ activity: { busy: false, done: 0, total: 0, triage: false } })
+    await vi.advanceTimersByTimeAsync(IDLE_KILL_MS - 1)
+    expect(child.killed).toBe(false)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(child.killed).toBe(true)
+    expect(wc.disconnects()).toEqual([{ reason: 'idle' }])
+  })
+
+  it('a batch that ends while triage is still open does not arm the idle kill', async () => {
+    const ctx = setup()
+    const { child } = await connected(ctx)
+    child.say({ activity: { busy: true, done: 0, total: 2, triage: true } })
+    child.say({ activity: { busy: false, done: 0, total: 0, triage: true } })
+    expect(ctx.blockers.stopped).toEqual([1])
+    await vi.advanceTimersByTimeAsync(IDLE_KILL_MS * 2)
+    expect(child.killed).toBe(false)
+    child.say({ activity: { busy: false, done: 0, total: 0, triage: false } })
+    await vi.advanceTimersByTimeAsync(IDLE_KILL_MS)
+    expect(child.killed).toBe(true)
   })
 
   it('kills an idle process that was never used', async () => {

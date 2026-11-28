@@ -6,13 +6,19 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { parseFromOcr, type FromOcr, type TriagePage } from '../../../shared/ocr/protocol'
+import {
+  parseFromOcr,
+  type FromOcr,
+  type PageResult,
+  type TriagePage
+} from '../../../shared/ocr/protocol'
 import { Coordinator, TRIAGE_CHUNK, triageWatchdogMs } from './coordinator'
 import type { FromRaster } from './thread-messages'
 import {
   FakePort,
   INIT,
   harness,
+  recognized,
   rendered,
   settle,
   triaged,
@@ -394,5 +400,241 @@ describe('triage requests (§3.4.1)', () => {
     await settle(60)
     expect(port.of('error')).toEqual([expect.objectContaining({ code: 'open-failed', src: 's1' })])
     expect(triagedOf(port)).toEqual([])
+  })
+})
+
+describe('triage activity (the idle kill)', () => {
+  it('tells main while triage requests are open', async () => {
+    let release: (() => void) | null = null
+    const { h, port } = await start({
+      rasterTriage: (msg, thread) => {
+        release = () => thread.reply(triaged(msg, thread))
+        return 'hang'
+      }
+    })
+    await open(port, 's1')
+    port.send({ triage: { src: 's1', pages: [0] } })
+    await settle()
+    expect(h.parent.of('activity')).toEqual([{ busy: false, done: 0, total: 0, triage: true }])
+    release!()
+    await settle(60)
+    expect(h.parent.of('activity').at(-1)).toEqual({
+      busy: false,
+      done: 0,
+      total: 0,
+      triage: false
+    })
+    // Closing a source with triage still open ends it too.
+    port.send({ triage: { src: 's1', pages: [1] } })
+    await settle()
+    expect(h.parent.of('activity').at(-1)).toMatchObject({ triage: true })
+    port.send({ close: 's1' })
+    await settle()
+    expect(h.parent.of('activity').at(-1)).toMatchObject({ triage: false })
+  })
+})
+
+// ---------------------------------------------------------------------------------------------
+// Triage meets recognition (PR4b × PR5).
+
+/** A triage script that answers each page with `verdict(index)` on top of the default page. */
+const verdicts =
+  (verdict: (index: number) => Partial<TriagePage>): HarnessOptions['rasterTriage'] =>
+  (msg, thread) => {
+    const out = triaged(msg, thread) as Extract<FromRaster, { type: 'triaged' }>
+    out.pages = out.pages.map((p) => ({ ...p, ...verdict(p.index) }))
+    return out
+  }
+
+/** The verdicts the refusal tests use: 1 protected, 2 a refused JPX, 3 over the pixel caps. */
+const REFUSING = verdicts((i): Partial<TriagePage> => {
+  if (i === 0) return { pageClass: 'near-scanned' }
+  if (i === 1) return { pageClass: 'protected', renderDpi: null, raster: null }
+  if (i === 2) return { refused: 'jpx-subsampled' }
+  if (i === 3)
+    return {
+      pageClass: null,
+      failure: 'too-large',
+      renderDpi: null,
+      raster: null,
+      effectiveDpi: null,
+      bitsPerPixel: null
+    }
+  return {}
+})
+
+type Result = { jobId: string; src: string; index: number; page: PageResult }
+const resultsOf = (port: FakePort): Map<number, PageResult> =>
+  new Map((port.of('result') as Result[]).map((r) => [r.index, r.page]))
+
+describe('triage results drive recognition', () => {
+  it('stamps each recognised page with its triage class; unclassified pages stay `scanned`', async () => {
+    const { port } = await start({
+      rasterTriage: verdicts((i) =>
+        i === 0
+          ? { pageClass: 'near-scanned' }
+          : i === 1
+            ? { pageClass: 'mixed' }
+            : { pageClass: null, failure: 'render' }
+      )
+    })
+    await open(port, 's1')
+    port.send({ triage: { src: 's1', pages: [0, 1, 2] } })
+    await settle(60)
+    port.send(job('j1', [0, 1, 2, 4]))
+    await settle(120)
+    const r = resultsOf(port)
+    expect(r.get(0)?.recognition?.pageClass).toBe('near-scanned')
+    expect(r.get(1)?.recognition?.pageClass).toBe('mixed')
+    // Triage could not classify 2, and never saw 4: both are treated as scans.
+    expect(r.get(2)?.recognition?.pageClass).toBe('scanned')
+    expect(r.get(4)?.recognition?.pageClass).toBe('scanned')
+    for (const m of port.sent) expect(() => parseFromOcr(m as FromOcr)).not.toThrow()
+  })
+
+  it('answers pages triage refused without a render or the engine', async () => {
+    const { h, port } = await start({ rasterTriage: REFUSING })
+    await open(port, 's1')
+    port.send({ triage: { src: 's1', pages: [0, 1, 2, 3] } })
+    await settle(60)
+    port.send(job('j1', [0, 1, 2, 3]))
+    await settle(120)
+    const r = resultsOf(port)
+    expect(r.get(1)).toEqual({
+      status: 'skipped-protected',
+      renderDpi: null,
+      raster: null,
+      recognition: null
+    })
+    expect(r.get(2)).toMatchObject({ status: 'failed', reason: 'image-format', recognition: null })
+    expect(r.get(3)).toMatchObject({
+      status: 'too-large',
+      reason: 'page-too-large',
+      recognition: null
+    })
+    expect(r.get(0)).toMatchObject({ status: 'ok' })
+    // Only page 0 reached PDFium's renderer and an engine.
+    expect(h.rasters.flatMap((t) => t.renders.map((m) => m.index))).toEqual([0])
+    expect(h.recognizers.flatMap((t) => t.jobs)).toHaveLength(1)
+    expect(port.of('jobDone')).toEqual([
+      { jobId: 'j1', done: 2, failed: 2, cancelled: false } // skipped-protected counts as done
+    ])
+    for (const m of port.sent) expect(() => parseFromOcr(m as FromOcr)).not.toThrow()
+  })
+
+  it('refuses queued pages when triage answers after the recognize request', async () => {
+    let release: (() => void) | null = null
+    const { h, port } = await start({
+      rasterTriage: (msg, thread) => {
+        release = () => thread.reply(REFUSING!(msg, thread) as FromRaster)
+        return 'hang'
+      }
+    })
+    await open(port, 's1')
+    port.send({ triage: { src: 's1', pages: [0, 1, 2, 3] } })
+    await settle()
+    // The thread is busy with the chunk: these pages wait in the queue.
+    port.send(job('j1', [1, 2, 3, 5]))
+    await settle()
+    expect(h.rasters[0].renders).toHaveLength(0)
+    release!()
+    await settle(120)
+    const r = resultsOf(port)
+    expect(r.get(1)?.status).toBe('skipped-protected')
+    expect(r.get(2)).toMatchObject({ status: 'failed', reason: 'image-format' })
+    expect(r.get(3)).toMatchObject({ status: 'too-large', reason: 'page-too-large' })
+    expect(r.get(5)?.status).toBe('ok')
+    expect(h.rasters[0].renders.map((m) => m.index)).toEqual([5])
+  })
+
+  it('drops the words of a page triage refuses while it is at the engine', async () => {
+    let finish: (() => void) | null = null
+    let release: (() => void) | null = null
+    const { h, port } = await start({
+      recognize: (msg, thread) => {
+        finish = () => thread.reply(recognized(msg, thread))
+        return 'hang'
+      },
+      rasterTriage: (msg, thread) => {
+        release = () => thread.reply(REFUSING!(msg, thread) as FromRaster)
+        return 'hang'
+      }
+    })
+    await open(port, 's1')
+    // Renders go first: page 1 is rendered and at the engine before triage reaches the thread.
+    port.send(job('j1', [1]))
+    port.send({ triage: { src: 's1', pages: [1] } })
+    await settle(60)
+    expect(h.recognizers.flatMap((t) => t.jobs)).toHaveLength(1)
+    release!()
+    await settle(60)
+    expect(port.of('result')).toEqual([])
+    finish!()
+    await settle(60)
+    expect(resultsOf(port).get(1)).toMatchObject({
+      status: 'skipped-protected',
+      recognition: null
+    })
+  })
+
+  it('never re-renders a page triage refused while its recognize thread died', async () => {
+    // The page is at the engine when triage refuses its JPX image; the thread then dies. A
+    // recognize failure re-queues the page for a fresh render, but PDFium must never render a
+    // page whose image the JPX pre-check refused: the refusal answers it instead.
+    let crash: (() => void) | null = null
+    let release: (() => void) | null = null
+    const { h, port } = await start({
+      recognize: (_msg, thread) => {
+        crash = () => thread.crash()
+        return 'hang'
+      },
+      rasterTriage: (msg, thread) => {
+        release = () => thread.reply(REFUSING!(msg, thread) as FromRaster)
+        return 'hang'
+      }
+    })
+    await open(port, 's1')
+    port.send(job('j1', [2]))
+    port.send({ triage: { src: 's1', pages: [2] } })
+    await settle(60)
+    expect(h.recognizers.flatMap((t) => t.jobs)).toHaveLength(1)
+    release!()
+    await settle(60)
+    crash!()
+    await settle(120)
+    expect(h.rasters.flatMap((t) => t.renders.map((m) => m.index))).toEqual([2])
+    expect(h.recognizers.flatMap((t) => t.jobs)).toHaveLength(1)
+    expect(resultsOf(port).get(2)).toMatchObject({
+      status: 'failed',
+      reason: 'image-format',
+      recognition: null
+    })
+    expect(port.of('jobDone')).toEqual([{ jobId: 'j1', done: 0, failed: 1, cancelled: false }])
+  })
+
+  it('answers the refusal, not a timeout, when the engine hangs on a page triage refused', async () => {
+    vi.useFakeTimers()
+    let release: (() => void) | null = null
+    const { h, port } = await start({
+      recognize: () => 'hang',
+      rasterTriage: (msg, thread) => {
+        release = () => thread.reply(REFUSING!(msg, thread) as FromRaster)
+        return 'hang'
+      }
+    })
+    await open(port, 's1')
+    port.send(job('j1', [1]))
+    port.send({ triage: { src: 's1', pages: [1] } })
+    await settle(60)
+    expect(h.recognizers.flatMap((t) => t.jobs)).toHaveLength(1)
+    release!()
+    await settle(60)
+    await vi.advanceTimersByTimeAsync(10 * 60_000)
+    await settle(60)
+    expect(resultsOf(port).get(1)).toMatchObject({
+      status: 'skipped-protected',
+      recognition: null
+    })
+    expect(h.rasters.flatMap((t) => t.renders.map((m) => m.index))).toEqual([1])
   })
 })

@@ -27,10 +27,13 @@ files:
   - '!electron.vite.config.{js,ts,mjs,cjs}'
   - '!{.prettierignore,.prettierrc.yaml,.editorconfig,dev-app-update.yml,README.md,SPEC.md}'
   - '!{.env,.env.*,.npmrc,pnpm-lock.yaml,yarn.lock}'
-  - '!{tsconfig.json,tsconfig.node.json,tsconfig.web.json}'
+  # Every TypeScript project file (tsconfig.shared.json came with PR1 and slipped past a list).
+  - '!tsconfig*.json'
   - '!scripts/**'
   # Development-only artifacts that must never ship inside the app.
   - '!{CONTRIBUTING.md,vitest.config.mts,.gitattributes,vitest.config.mjs}'
+  # Shipped as extraResources (resources/licenses/), and the OCR accuracy baseline is test data.
+  - '!{THIRD_PARTY_NOTICES.md,build/licenses/**,bench/**,types/**}'
   - '!docs/**'
   - '!.github/**'
   - '!coverage/**'
@@ -61,6 +64,32 @@ extraResources:
     to: licenses/DejaVu-Fonts-LICENSE.txt
   - from: node_modules/pdfjs-dist/LICENSE
     to: licenses/pdfjs-dist-LICENSE.txt
+  # OCR engine (DESIGN.md §3.2.1): ONLY the simd-lstm core and the four 4.0.0_best_int languages,
+  # outside the asar. The utility process checks every byte against
+  # src/main/ocr/process/engine-manifest.ts, and engine-manifest.node.test.ts checks these sources.
+  - from: node_modules/tesseract.js-core/tesseract-core-simd-lstm.js
+    to: ocr/tesseract-core-simd-lstm.js
+  - from: node_modules/tesseract.js-core/tesseract-core-simd-lstm.wasm
+    to: ocr/tesseract-core-simd-lstm.wasm
+  - from: node_modules/@tesseract.js-data/eng/4.0.0_best_int/eng.traineddata.gz
+    to: ocr/tessdata/eng.traineddata.gz
+  - from: node_modules/@tesseract.js-data/deu/4.0.0_best_int/deu.traineddata.gz
+    to: ocr/tessdata/deu.traineddata.gz
+  - from: node_modules/@tesseract.js-data/fra/4.0.0_best_int/fra.traineddata.gz
+    to: ocr/tessdata/fra.traineddata.gz
+  - from: node_modules/@tesseract.js-data/spa/4.0.0_best_int/spa.traineddata.gz
+    to: ocr/tessdata/spa.traineddata.gz
+  # OCR notices (§3.2.8): every library linked into tesseract-core-simd-lstm.wasm, per the
+  # tesseract.js-core v7.0.0 build scripts (THIRD_PARTY_NOTICES.md lists each with the upstream
+  # commit its text came from), the tessdata models and THIRD_PARTY_NOTICES.md itself.
+  - from: node_modules/tesseract.js-core/LICENSE
+    to: licenses/tesseract.js-core-LICENSE.txt
+  - from: build/licenses
+    to: licenses
+    filter:
+      - '*.txt'
+  - from: THIRD_PARTY_NOTICES.md
+    to: licenses/THIRD_PARTY_NOTICES.md
 fileAssociations:
   - ext: pdfx
     name: PDFX Collection

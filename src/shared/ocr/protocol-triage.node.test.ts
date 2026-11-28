@@ -7,8 +7,10 @@ import {
   JPX_REFUSALS,
   PAGE_CLASSES,
   PAGE_REASONS,
+  TRIAGE_FAILURES,
   TRIAGE_WORD_LIMITS,
   parseFromOcr,
+  parseOcrToMain,
   parseToOcr,
   type TriagePage
 } from './protocol'
@@ -56,7 +58,21 @@ describe('triage messages', () => {
       imageOrigin: false
     }
     expect(parseFromOcr(triaged([failed], false))).toEqual(triaged([failed], false))
+    for (const failure of TRIAGE_FAILURES)
+      expect(() => parseFromOcr(triaged([{ ...failed, failure }]))).not.toThrow()
+    expect(TRIAGE_FAILURES).toContain('too-large')
+    // What a recognize request for a refused page ends with (the coordinator, PR4b × PR5).
     expect(PAGE_REASONS).toContain('image-format')
+    expect(PAGE_REASONS).toContain('page-too-large')
+  })
+
+  it("main's activity message carries an optional triage flag", () => {
+    const a = { busy: false, done: 0, total: 0 }
+    expect(parseOcrToMain({ activity: a })).toEqual({ activity: a })
+    expect(parseOcrToMain({ activity: { ...a, triage: true } })).toEqual({
+      activity: { ...a, triage: true }
+    })
+    expect(() => parseOcrToMain({ activity: { ...a, triage: 1 } })).toThrow()
   })
 
   it('refuses unknown classes, keys, oversize words and out-of-range numbers', () => {

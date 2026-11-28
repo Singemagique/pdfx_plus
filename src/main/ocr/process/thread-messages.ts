@@ -8,8 +8,9 @@
 // SharedArrayBuffer so a recycled or crashed raster thread can reopen it without the renderer
 // sending the file again.
 
-import type { PageReason, StubRecognition } from '../../../shared/ocr/protocol'
+import type { PageReason } from '../../../shared/ocr/protocol'
 import type { TriagePage } from '../../../shared/ocr/triage'
+import type { RecognizeOutcome } from './recognize-core'
 
 export interface RasterLimits {
   /** The PDFium WASM memory cap (the module declares 32,768 pages = 2 GiB; PR0). */
@@ -80,8 +81,19 @@ export type FromRaster =
   /** A RuntimeError (trap or abort) or any other throw: the module is never trusted again. */
   | { type: 'fatal'; taskId: number | null; error: string; tripwire: number }
 
+/**
+ * What a recognize thread needs to build engines: the coordinator's compiled core (one artifact,
+ * SHA-checked once), the directory holding the glue (the thread checks the glue's SHA itself, right
+ * before it require()s it) and each verified .traineddata.gz, shared without a copy.
+ */
+export interface EngineAssets {
+  module: WebAssembly.Module
+  coreDir: string
+  data: Record<string, SharedArrayBuffer>
+}
+
 export type ToRecognize =
-  | { type: 'init'; engine: WebAssembly.Module }
+  | { type: 'init'; engine: EngineAssets }
   | {
       type: 'recognize'
       taskId: number
@@ -90,9 +102,23 @@ export type ToRecognize =
       dpi: number
       data: ArrayBuffer
       langs: string[]
+      /**
+       * Tests only (the tier-1 harness records the replay cache): also return each pass's raw hOCR.
+       * The coordinator never sets it; hOCR is page content and never leaves the process.
+       */
+      returnHocr?: boolean
     }
 
 export type FromRecognize =
   | { type: 'ready'; tripwire: number; selfCheckFailed: string[] }
-  | { type: 'result'; taskId: number; result: StubRecognition; tripwire: number }
+  | {
+      type: 'result'
+      taskId: number
+      result: RecognizeOutcome
+      /** WASM heap after the page (it only grows; §3.3.3). */
+      heap: number
+      /** Engine stderr lines during the page (counted, never forwarded: they can carry content). */
+      stderrLines: number
+      tripwire: number
+    }
   | { type: 'error'; taskId: number; name: string; message: string; tripwire: number }

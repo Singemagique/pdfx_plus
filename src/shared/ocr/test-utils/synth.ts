@@ -23,7 +23,8 @@
 //   cover), not ink boxes. `srcInk`/`ink` add the dark-pixel bounds measured on the clean raster,
 //   clipped to that box, for comparing against engines that report ink boxes.
 // - Reading order is the `words` array order (`order` = index). Lines are in reading order and
-//   `line` indexes `gt.lines`; within a line words run left to right (in the source frame).
+//   `line` indexes `gt.lines`; within a line words run left to right (in the source frame), or
+//   along a vertical line's reading direction (`GtLine.rotate`, LayoutContext.verticalLine).
 
 import fontkit from '@pdf-lib/fontkit'
 import { zlibSync } from 'fflate'
@@ -32,6 +33,7 @@ import {
   PDFDocument,
   StandardFonts,
   concatTransformationMatrix,
+  degrees,
   drawObject,
   popGraphicsState,
   pushGraphicsState,
@@ -260,10 +262,18 @@ export interface GtLine {
   words: number[]
   /** Words joined by single spaces. */
   text: string
-  /** Font size (pt) and baseline y in the source frame. */
+  /**
+   * Font size (pt) and baseline in the source frame: its y, or for a vertical line (`rotate`) its
+   * x.
+   */
   size: number
   baseline: number
   font: FontId
+  /**
+   * A vertical line (LayoutContext.verticalLine): 90 = turned counter-clockwise, reading bottom to
+   * top; −90 = clockwise, top to bottom. Absent for horizontal lines.
+   */
+  rotate?: 90 | -90
 }
 
 export interface SynthGt {
@@ -348,6 +358,18 @@ export interface LayoutContext {
   wrap(words: readonly string[], maxWidth: number, size: number): string[][]
   /** Draw one GT line of words starting at x (pt) on `baseline`, one space between words. */
   line(words: readonly string[], x: number, baseline: number, size: number): void
+  /**
+   * Draw one GT line turned by `rotate` (90: counter-clockwise, reading bottom to top from y; −90:
+   * clockwise, reading top to bottom from y) on the vertical baseline x = `baselineX`. Each word's
+   * box is its advance × ascent..descent, turned with it (still axis-aligned).
+   */
+  verticalLine(
+    words: readonly string[],
+    baselineX: number,
+    y: number,
+    size: number,
+    rotate: 90 | -90
+  ): void
   /** Draw a ruling (not text: not in the GT). */
   rule(x1: number, y1: number, x2: number, y2: number, thickness?: number): void
   ascent(size: number): number
@@ -651,6 +673,54 @@ BUILTIN.push(
     ops: []
   }
 )
+
+// PR5 review: geometry the PR1 set never exercised. A residual skew below the 1° angle snap (scans
+// commonly carry 0.3–0.9°): each word must keep its own baseline. And an upright page with a
+// vertical label in each margin (hOCR `textangle` lines on a page whose orientation is fine).
+for (const deg of [0.6, -0.6])
+  BUILTIN.push({
+    id: deg > 0 ? 'skew0p6' : 'skewm0p6',
+    description: `${deg > 0 ? '+' : '−'}${Math.abs(deg)}° tilt (below the 1° angle snap)`,
+    font: 'helvetica',
+    page: PAGE,
+    renderDpi: 300,
+    layout: body,
+    ops: [{ op: 'rotate', deg }]
+  })
+
+/**
+ * 11 pt body between 48 pt margins; a 9 pt label up the left margin and down the right one. GT
+ * order is left label, body, right label: the order Tesseract 5 (PSM 3) emits the three blocks in.
+ * (It reads the right label as `textangle 90` too, i.e. upside down: garbage text, right place.)
+ */
+function marginLabelLayout(ctx: LayoutContext): void {
+  const size = 11
+  const leading = 15
+  const side = 48
+  const edge = 24
+  const label = 9
+  const body = ctx.wrap(ctx.bankWords(), ctx.width - 2 * side, size)
+  const labels = ctx.wrap(ctx.bankWords(), ctx.height - 2 * edge, label)
+  // Mirror images of each other: the left box spans [20 − ascent, 20 + descent].
+  ctx.verticalLine(labels[0], 20, edge, label, 90)
+  let baseline = ctx.height - edge - ctx.ascent(size)
+  for (const words of body) {
+    if (baseline - ctx.descent(size) < edge) break
+    ctx.line(words, side, baseline, size)
+    baseline -= leading
+  }
+  ctx.verticalLine(labels[1], ctx.width - 20, ctx.height - edge, label, -90)
+}
+
+BUILTIN.push({
+  id: 'margin-label',
+  description: 'upright 11 pt body with 9 pt vertical labels in both margins (up left, down right)',
+  font: 'helvetica',
+  page: { width: 432, height: 216 },
+  renderDpi: 300,
+  layout: marginLabelLayout,
+  ops: []
+})
 for (const def of BUILTIN) registerPreset(def)
 
 // ---------------------------------------------------------------------------------------------
@@ -797,6 +867,38 @@ export async function synthesize(spec: SynthSpec, deps: SynthDeps): Promise<Synt
         size,
         baseline,
         font: fontId
+      })
+    },
+    verticalLine: (ws, bx, y, size, rotate) => {
+      const { ascent, descent } = vMetrics(size)
+      const space = advance(' ', size)
+      const li = lines.length
+      const idx: number[] = []
+      let cy = y
+      for (const raw of ws) {
+        const t = raw.normalize('NFC')
+        assertCovers(t)
+        const w = advance(t, size)
+        page.drawText(t, { x: bx, y: cy, size, font, color: rgb(0, 0, 0), rotate: degrees(rotate) })
+        idx.push(srcWords.length)
+        // Turned +90°, glyph tops point to −x and the advance runs up; turned −90°, the reverse.
+        srcWords.push({
+          t,
+          line: li,
+          srcBox:
+            rotate === 90
+              ? { x: bx - ascent, y: cy, w: ascent + descent, h: w }
+              : { x: bx - descent, y: cy - w, w: ascent + descent, h: w }
+        })
+        cy += rotate === 90 ? w + space : -(w + space)
+      }
+      lines.push({
+        words: idx,
+        text: ws.map((s) => s.normalize('NFC')).join(' '),
+        size,
+        baseline: bx,
+        font: fontId,
+        rotate
       })
     },
     rule: (x1, y1, x2, y2, thickness = 0.75) =>

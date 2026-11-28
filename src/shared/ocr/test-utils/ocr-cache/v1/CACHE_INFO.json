@@ -1,0 +1,19 @@
+{
+  "engineId": "tess-lstm/core-7.0.0/simd/fork-2a9c1c4",
+  "coreSha256": "34e8d50cac216427d86bf397d610fdd9f49492539bbcdfbfccc4eda20c810bea",
+  "glueSha256": "e48e2f02ddae3716c8dd24bf41cd290d4efa96892d689cdc4013c2545d63f469",
+  "dataSha256": {
+    "eng": "45b4cb346724ac1774f1c36f42f182b887bcdb28ebe63e6fff90ac41f3fcff91",
+    "deu": "306c4280d0cbed46fbff727486bd43b92730181bae80f56941a091f363bdf28b",
+    "fra": "d611139672b3752c7097e671e4a1d9209dfd37f2aeb081ef6487fba3351e9255",
+    "spa": "40be52f97b5d4eb7460073dc1f94cd546b27150333c0bf854ed7e7132db6bceb"
+  },
+  "params": {
+    "tessedit_pageseg_mode": 3,
+    "preserve_interword_spaces": 1,
+    "hocr_char_boxes": 1,
+    "thresholding_method": 0
+  },
+  "PIPELINE_VERSION": 1,
+  "configHash": "fda0decb5953d4b09b7e09d809b5ea21b7f6a2d3dfe7199ff94b0efe7f4057d7"
+}

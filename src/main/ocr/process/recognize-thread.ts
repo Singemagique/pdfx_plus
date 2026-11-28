@@ -1,61 +1,89 @@
-// A recognize worker_thread (DESIGN.md §3.3.1). PR4a SKELETON: it receives the coordinator's
-// compiled WebAssembly.Module once (the same posting path the Tesseract core will use: one artifact,
-// SHA-checked once in the coordinator; §3.2.2) and a transferred grey bitmap per page, instantiates
-// the module to prove it arrived usable, and returns a stub result describing the bitmap. PR5
-// replaces the body of `recognize` with tess-core + preprocess + hOCR parse + map; the watchdog,
-// terminate-on-cancel and recycling plumbing already lives in the coordinator.
+// A recognize worker_thread (DESIGN.md §3.3.1, §3.4.5–§3.4.6). It receives, once, the
+// coordinator's compiled core (a WebAssembly.Module, SHA-checked there), the glue's directory and
+// the verified .traineddata.gz files (SharedArrayBuffers), then one transferred grey bitmap per
+// page. Per page: tess-core → hOCR → strict parse → RawOcr, posted back as small JSON; the
+// coordinator maps it to a packed OcrPage (map.ts). The watchdog, cancel-by-terminate, recycling
+// (50 pages / any page > 12 MP) and the failure policy live in the coordinator.
+//
+// Engines are built per language set: a page whose job wants other languages ends the current
+// engine and builds a new one (gunzip + Init, ~0.1–0.25 s; PR0). After an abort, a quit or a WASM
+// OOM the module is never trusted again: the error goes back and the coordinator retires the thread.
 //
 // The tripwire import must stay first: each thread is its own realm (§3.3.1).
 import { tripwireCount, tripwireSelfCheck } from './no-network'
 import { parentPort } from 'node:worker_threads'
-import type { StubRecognition } from '../../../shared/ocr/protocol'
-import type { FromRecognize, ToRecognize } from './thread-messages'
+import { createTess, type Tess, type TessFactory } from '../../../shared/ocr/engine/tess-core'
+import { gunzipTraineddata, loadGlue } from './engine-node'
+import { describeRecognizeError, recognizePage } from './recognize-core'
+import type { EngineAssets, FromRecognize, ToRecognize } from './thread-messages'
 
 const port = parentPort
 if (!port) throw new Error('recognize-thread must run in a worker_thread')
 
-let instance: WebAssembly.Instance | null = null
+let assets: EngineAssets | null = null
+let factory: TessFactory | null = null
+let tess: Tess | null = null
+let tessKey = ''
 
 function post(msg: FromRecognize): void {
   port!.postMessage(msg)
 }
 
-/** What the stub "recognises": the bitmap's mean grey and ink fraction (proves the pixels arrived). */
-function describeBitmap(width: number, height: number, data: Uint8Array): StubRecognition {
-  let sum = 0
-  let ink = 0
-  for (let i = 0; i < data.length; i++) {
-    const v = data[i]
-    sum += v
-    if (v < 128) ink++
+async function engineFor(langs: readonly string[]): Promise<Tess> {
+  if (!assets || !factory) throw new Error('engine not initialised')
+  const key = langs.join('+')
+  if (tess && !tess.broken && tessKey === key) return tess
+  tess?.end()
+  tess = null
+  const traineddata: Record<string, Uint8Array> = {}
+  for (const l of langs) {
+    const gz = Object.hasOwn(assets.data, l) ? assets.data[l] : undefined
+    if (!gz) throw new Error(`language ${l} is not available`)
+    traineddata[l] = gunzipTraineddata(l, new Uint8Array(gz))
   }
-  const n = Math.max(1, data.length)
-  return { stub: true, width, height, meanGrey: sum / n, inkFrac: ink / n }
+  tess = await createTess({ factory, wasmModule: assets.module, traineddata }, langs)
+  tessKey = key
+  return tess
 }
 
 async function handle(msg: ToRecognize): Promise<void> {
   if (msg.type === 'init') {
-    instance = await WebAssembly.instantiate(msg.engine, {})
+    assets = msg.engine
+    // SHA-checked here, in the realm that runs it, immediately before the require.
+    factory = loadGlue(assets.coreDir)
     post({ type: 'ready', tripwire: tripwireCount(), selfCheckFailed: tripwireSelfCheck().failed })
     return
   }
   try {
-    if (!instance) throw new Error('engine not initialised')
     const data = new Uint8Array(msg.data)
     if (data.length !== msg.width * msg.height) throw new RangeError('bitmap size mismatch')
+    const engine = await engineFor(msg.langs)
+    let stderrLines = 0
+    const result = recognizePage(
+      {
+        recognize: (img, params) => {
+          const r = engine.recognize(img, params)
+          stderrLines += r.stderrLines
+          return r
+        }
+      },
+      { width: msg.width, height: msg.height, data },
+      msg.dpi,
+      { returnHocr: msg.returnHocr === true }
+    )
     post({
       type: 'result',
       taskId: msg.taskId,
-      result: describeBitmap(msg.width, msg.height, data),
+      result,
+      heap: engine.heapBytes(),
+      stderrLines,
       tripwire: tripwireCount()
     })
   } catch (e) {
-    const err = e instanceof Error ? e : new Error('non-Error throw')
     post({
       type: 'error',
       taskId: msg.taskId,
-      name: err.name,
-      message: err.message.slice(0, 300),
+      ...describeRecognizeError(e),
       tripwire: tripwireCount()
     })
   }

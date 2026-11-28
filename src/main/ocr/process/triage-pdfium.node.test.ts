@@ -534,11 +534,16 @@ describe('every page triage emits passes the port validator', () => {
     expect(() => parseTriagePage(t)).not.toThrow()
   })
 
-  it('a page too large for any raster under the caps fails `render` instead of renderDpi 0', async () => {
+  it('a page too large for any raster under the caps fails `too-large` instead of renderDpi 0', async () => {
     const doc = await PDFDocument.create()
     doc.addPage([1e8, 10])
     const t = triage(await doc.save()).pages[0]
-    expect(t).toMatchObject({ pageClass: null, failure: 'render', renderDpi: null, raster: null })
+    expect(t).toMatchObject({
+      pageClass: null,
+      failure: 'too-large',
+      renderDpi: null,
+      raster: null
+    })
     expect(() => parseTriagePage(t)).not.toThrow()
   })
 })

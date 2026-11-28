@@ -4,7 +4,44 @@
 
 import { describe, expect, it } from 'vitest'
 
-import type { OcrStatus } from './types'
+import { pack, type OcrStatus, type PackedOcrPage } from './types'
+
+/** A real-shaped packed page: two lines, char edges on one word, a line language. */
+const PACKED: PackedOcrPage = pack({
+  v: 1,
+  engineId: 'tess-lstm/core-7.0.0/simd/fork-2a9c1c4',
+  dataHashes: { eng: 'a'.repeat(64) },
+  langs: ['eng'],
+  pipelineVersion: 1,
+  pageClass: 'scanned',
+  renderDpi: 300,
+  physDpi: 300,
+  orientation: 0,
+  skewDeg: 0,
+  meanConfCal: 0.93,
+  confSource: 'word',
+  status: 'ok',
+  lines: [
+    {
+      angle: 0,
+      size: 11,
+      lang: 'eng',
+      words: [
+        {
+          t: 'Hello',
+          x: 24,
+          y: 700,
+          w: 27.5,
+          conf: 96,
+          confCal: 0.96,
+          chars: new Float32Array([0, 5, 10, 15, 20, 27.5])
+        },
+        { t: 'world', x: 55, y: 700, w: 30, conf: null, confCal: null }
+      ]
+    },
+    { angle: 0.05, size: 9, words: [{ t: 'two', x: 24, y: 680, w: 15, conf: 80, confCal: 0.8 }] }
+  ]
+})
 import {
   OCR_STATUSES,
   OcrError,
@@ -180,7 +217,7 @@ describe('parseFromOcr (coordinator → renderer)', () => {
     status: 'ok',
     renderDpi: 150,
     raster: { width: 1275, height: 1650 },
-    recognition: { stub: true, width: 1275, height: 1650, meanGrey: 240.5, inkFrac: 0.04 }
+    recognition: PACKED
   }
 
   it('accepts every well-formed message', () => {
@@ -229,6 +266,39 @@ describe('parseFromOcr (coordinator → renderer)', () => {
       ).toMatchObject({ result: { page: { status } } })
   })
 
+  it('checks every array, offset and number of a packed page (it is baked into PDFs)', () => {
+    const msg = (recognition: unknown): unknown => ({
+      result: { jobId: 'j1', src: 's1', index: 0, page: { ...result, recognition } }
+    })
+    // Round-trips through structured clone (what the port delivers).
+    expect(parseFromOcr(structuredClone(msg(PACKED)))).toEqual(msg(PACKED))
+    const bad: Array<[string, Partial<Record<keyof PackedOcrPage, unknown>>]> = [
+      ['text shorter than the offsets', { text: 'Hi' }],
+      ['offsets not monotone', { wordOff: new Uint32Array([0, 6, 5, 13]) }],
+      ['plain array for offsets', { wordOff: [0, 5, 10, 13] }],
+      ['geometry length', { wordGeom: new Float32Array(10) }],
+      ['NaN position', { wordGeom: PACKED.wordGeom.map((v, i) => (i === 0 ? NaN : v)) }],
+      ['conf out of range', { wordGeom: PACKED.wordGeom.map((v, i) => (i === 3 ? 400 : v)) }],
+      ['line offsets past the words', { wordLine: new Uint32Array([0, 2, 4]) }],
+      ['line geometry length', { lineGeom: new Float32Array(3) }],
+      ['infinite size', { lineGeom: new Float32Array([0, Infinity, 0, 9]) }],
+      ['line languages length', { lineLang: ['eng'] }],
+      ['char offsets without edges', { charEdges: undefined }],
+      ['char offsets past the edges', { charOff: new Uint32Array([0, 6, 6, 9]) }],
+      ['bad data hash', { dataHashes: { eng: 'xyz' } }],
+      ['bad language', { langs: ['../'] }],
+      ['bad orientation', { orientation: 45 }],
+      ['bad class', { pageClass: 'whatever' }],
+      ['bad engine id', { engineId: 'a b' }],
+      ['unknown field', { extra: 1 } as never]
+    ]
+    for (const [what, patch] of bad) {
+      const p: Record<string, unknown> = { ...PACKED, ...patch }
+      for (const [k, v] of Object.entries(patch)) if (v === undefined) delete p[k]
+      expect(() => parseFromOcr(msg(p)), what).toThrow()
+    }
+  })
+
   it('rejects unknown statuses, reasons and error codes', () => {
     rejects(() =>
       parseFromOcr({
@@ -248,11 +318,21 @@ describe('parseFromOcr (coordinator → renderer)', () => {
 describe('main ⇄ coordinator', () => {
   const limits = { onBattery: false, thermal: 'nominal', speedLimit: 100, divisor: 1 }
   const wasm = process.platform === 'win32' ? 'C:\\app\\pdfium.wasm' : '/app/pdfium.wasm'
+  const dir = process.platform === 'win32' ? 'C:\\app\\ocr\\tessdata\\' : '/app/ocr/tessdata/'
+  const engine = {
+    ocrCore: process.platform === 'win32' ? 'C:\\app\\ocr' : '/app/ocr',
+    tessdata: { eng: `${dir}eng.traineddata.gz`, deu: `${dir}deu.traineddata.gz` }
+  }
 
   it('accepts init with an absolute pdfium.wasm path and the control messages', () => {
     const good = [
-      { init: { limits, paths: { pdfiumWasm: wasm } } },
-      { init: { limits, paths: { pdfiumWasm: '/opt/PDFx/resources/app.asar/x/pdfium.wasm' } } },
+      { init: { limits, paths: { pdfiumWasm: wasm, ...engine } } },
+      {
+        init: {
+          limits,
+          paths: { pdfiumWasm: '/opt/PDFx/resources/app.asar/x/pdfium.wasm', ...engine }
+        }
+      },
       { port: {} },
       { limits: { ...limits, onBattery: true, divisor: 4 } },
       { heartbeat: {} },
@@ -263,7 +343,24 @@ describe('main ⇄ coordinator', () => {
 
   it('rejects a relative or foreign init path and payload on the empty messages', () => {
     for (const p of ['pdfium.wasm', './pdfium.wasm', '/app/evil.wasm', '/app/pdfium.wasm\0'])
-      rejects(() => parseMainToOcr({ init: { limits, paths: { pdfiumWasm: p } } }))
+      rejects(() => parseMainToOcr({ init: { limits, paths: { pdfiumWasm: p, ...engine } } }))
+    // The engine paths: absolute, and each language only its own <lang>.traineddata.gz.
+    for (const tessdata of [
+      { eng: 'eng.traineddata.gz' },
+      { eng: `${dir}deu.traineddata.gz` },
+      { eng: `${dir}xeng.traineddata.gz` },
+      { 'e/g': `${dir}e/g.traineddata.gz` },
+      { eng: `${dir}eng.traineddata` }
+    ])
+      rejects(() =>
+        parseMainToOcr({
+          init: { limits, paths: { pdfiumWasm: wasm, ocrCore: engine.ocrCore, tessdata } }
+        })
+      )
+    rejects(() =>
+      parseMainToOcr({ init: { limits, paths: { pdfiumWasm: wasm, ...engine, ocrCore: 'ocr' } } })
+    )
+    rejects(() => parseMainToOcr({ init: { limits, paths: { pdfiumWasm: wasm } } }))
     rejects(() => parseMainToOcr({ port: { src: 's1' } }))
     rejects(() => parseMainToOcr({ limits: { ...limits, divisor: 0 } }))
     rejects(() => parseMainToOcr({ limits: { ...limits, thermal: 'hot' } }))

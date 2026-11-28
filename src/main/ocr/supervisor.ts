@@ -49,7 +49,8 @@
 // - The port belongs to one webContents. Window closed, render-process-gone and a main-frame
 //   navigation (a reload) cancel everything and kill the process; every ocr.connect() gets a FRESH
 //   MessageChannelMain and a port is never reused.
-// - Idle kill after 3 minutes (WASM memory never shrinks; killing is how it returns to the OS).
+// - Idle kill after 3 minutes (WASM memory never shrinks; killing is how it returns to the OS),
+//   counted from the end of the last batch AND the last triage request: open triage holds it off.
 //   BELOW_NORMAL priority at spawn. The power blocker is held only while a batch runs; the taskbar
 //   progress follows the batch.
 
@@ -60,6 +61,7 @@ import {
   parseOcrToMain,
   type Heartbeat,
   type MainToOcr,
+  type OcrActivity,
   type OcrDisconnectReason,
   type OcrHostLimits,
   type OcrInit,
@@ -337,6 +339,9 @@ export class OcrSupervisor {
   /** The current child's in-realm tripwire self-check (from its `ready`). */
   childSelfCheck: TripwireSelfCheck | null = null
   lastHeartbeat: Heartbeat | null = null
+  /** What the child's last `fatal` said (its path-free OcrError text), if it sent one. */
+  lastFatal: { code: string; message: string } | null = null
+  private fatalListeners: Array<(fatal: { code: string; message: string } | null) => void> = []
   spawnCount = 0
 
   constructor(private readonly deps: SupervisorDeps) {
@@ -632,7 +637,12 @@ export class OcrSupervisor {
       }
       for (const w of this.heartbeatWaiters.splice(0)) w.resolve(msg.heartbeat)
     } else if ('fatal' in msg) {
-      this.deps.log(`ocr: utility process reported a fatal ${msg.fatal.code} error`)
+      // The message is the coordinator's path-free OcrError text (e.g. "traineddata fra: SHA-256
+      // mismatch"): which file and which check, never document content.
+      this.lastFatal = { code: msg.fatal.code, message: msg.fatal.message }
+      this.deps.log(
+        `ocr: utility process reported a fatal ${msg.fatal.code} error: ${msg.fatal.message}`
+      )
       this.kill('fatal')
       this.becomeFatal()
     }
@@ -660,7 +670,7 @@ export class OcrSupervisor {
     owner.wc.postMessage(OCR_PORT_CHANNEL, null, [port1])
   }
 
-  private onActivity(a: { busy: boolean; done: number; total: number }): void {
+  private onActivity(a: OcrActivity): void {
     const wc = this.owner?.kind === 'wc' ? this.owner.wc : null
     if (a.busy) {
       this.clearIdle()
@@ -668,10 +678,13 @@ export class OcrSupervisor {
         this.blockerId = this.deps.powerSaveBlocker.start('prevent-app-suspension')
       if (wc && !wc.isDestroyed())
         this.deps.setProgress(wc, a.total > 0 ? Math.min(1, a.done / a.total) : 0)
-    } else {
-      this.endBatch()
-      this.armIdle()
+      return
     }
+    this.endBatch()
+    // Open triage is work too (background: no power blocker, no progress), so the idle kill waits
+    // for it and its IDLE_KILL_MS count starts again when the last triage request ends.
+    if (a.triage) this.clearIdle()
+    else this.armIdle()
   }
 
   private endBatch(): void {
@@ -940,8 +953,25 @@ export class OcrSupervisor {
     }, delay)
   }
 
+  /**
+   * Call `listener` once when OCR becomes unavailable for the session ('fatal': a fatal report from
+   * the child, or a launch failure), at once if it already is. Returns a disposer.
+   */
+  onFatal(listener: (fatal: { code: string; message: string } | null) => void): () => void {
+    if (this.stateValue === 'fatal') {
+      listener(this.lastFatal)
+      return () => {}
+    }
+    this.fatalListeners.push(listener)
+    return () => {
+      const i = this.fatalListeners.indexOf(listener)
+      if (i >= 0) this.fatalListeners.splice(i, 1)
+    }
+  }
+
   private becomeFatal(): void {
     this.stateValue = 'fatal'
+    for (const l of this.fatalListeners.splice(0)) l(this.lastFatal)
     this.notifyOwner('fatal')
     if (this.owner?.kind === 'local') this.owner.reject(new Error('OCR is unavailable'))
     if (this.owner?.kind === 'wc') this.owner.detach()
