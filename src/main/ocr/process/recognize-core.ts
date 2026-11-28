@@ -3,7 +3,7 @@
 //
 // One call recognises one raster:
 //  1. Preprocess the OCR copy (never the page): background normalisation when the page looks like
-//     a photo, border removal, conditional despeckle (src/shared/ocr/preprocess/*; none of these
+//     a photo (or, for a photo placed on a white page, inside the photo's box), border removal, conditional despeckle (src/shared/ocr/preprocess/*; none of these
 //     moves a pixel).
 //  2. Geometry: the 90° projection test, then deskew (sweep and search on the 1/4-scale binary
 //     copy), then a 16 px white pad. `toSource` maps the copy's pixels back to the raster's, so
@@ -27,7 +27,7 @@ import type { CalibrationTable, GrayImage, RawOcr } from '../../../shared/ocr/en
 import { TessError, fullPageParams, type TessParams } from '../../../shared/ocr/engine/tess-core'
 import { hocrToRaw, parseHocr } from '../../../shared/ocr/hocr'
 import { noXHeightScript } from '../../../shared/ocr/map'
-import { looksLikePhoto, normalizeBackground } from '../../../shared/ocr/preprocess/background'
+import { normalizeRegion, photoRegion } from '../../../shared/ocr/preprocess/background'
 import { BORDER_PAD, removeBorder } from '../../../shared/ocr/preprocess/border'
 import { despeckle } from '../../../shared/ocr/preprocess/despeckle'
 import {
@@ -414,8 +414,9 @@ export function recognizePage(
 
   // 1. Preprocess (§3.4.4).
   const src = packed(img)
-  const photo = looksLikePhoto(src)
-  let base = photo ? normalizeBackground(src, dpi) : src
+  const photoBox = photoRegion(src)
+  const photo = photoBox !== null
+  let base = photoBox ? normalizeRegion(src, photoBox, dpi) : src
   const border = removeBorder(base)
   base = border.image
   const ds = despeckle(base, dpi)

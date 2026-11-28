@@ -9,6 +9,11 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Nothing here writes to the repository (builds use --publish never; artifacts go through the
+# Actions runtime, not this token), so the token stays read-only whatever the repo default is.
+permissions:
+  contents: read
+
 jobs:
   check:
     name: Lint, typecheck, test
@@ -26,6 +31,8 @@ jobs:
       # skips lifecycle scripts: no Electron binary download and no native build
       # (the mac-only glass addon, which self-skips off macOS anyway). Faster and
       # more robust than a full install. The build matrix below does a full install.
+      # The OCR engine and its bundled languages are plain npm packages (tesseract.js-core,
+      # @tesseract.js-data/*) with no install scripts, so tier 1 runs on this install too.
       - name: Install dependencies
         run: yarn install --frozen-lockfile --ignore-scripts
 
@@ -35,8 +42,21 @@ jobs:
       - name: Prettier check
         run: yarn format:check
 
+      # `yarn test:run` would also run the ocr project, which the next step runs (strict), so only
+      # the other two projects here. Strict too: the node project checks the replay cache's
+      # recorded engine info (ocr-cache.node.test.ts) only with PDFX_OCR_CACHE_STRICT=1.
       - name: Unit tests
-        run: yarn test:run
+        env:
+          PDFX_OCR_CACHE_STRICT: '1'
+        run: yarn test:run --project node --project jsdom
+
+      # OCR tier 1 (DESIGN.md §3.9.3): the real Tesseract core and data on the synth presets,
+      # gated against bench/ocr-baseline.json, with every live recognition required to equal its
+      # replay-cache entry (strict: a stale cache or an engine drift fails here, not later).
+      - name: OCR tier 1 (real engine, strict replay cache)
+        env:
+          PDFX_OCR_CACHE_STRICT: '1'
+        run: yarn test:ocr
 
   build:
     name: Build (${{ matrix.os }})
@@ -57,6 +77,7 @@ jobs:
       # directory with `files: '**/*'`, so a cache restored inside it ends up inside the app's asar.
       # `runner.temp` is not available in job-level `env` (workflow parse error), so export from a
       # step; this must run before Install dependencies (its postinstall downloads Electron).
+      # The OCR self-test and tier-1b outputs below go under RUNNER_TEMP for the same reason.
       - name: Keep Electron caches out of the workspace
         shell: bash
         run: |
@@ -86,11 +107,14 @@ jobs:
       # only passes `--define buildroot`, so every staged file fails with "File not found". fpm
       # 1.16.0+ passes --buildroot. USE_SYSTEM_FPM on the Linux build step makes electron-builder
       # use this one (for the deb target too). Drop both once electron-builder bundles a fixed fpm.
+      #
+      # xvfb, xauth and iproute2 are for the packaged OCR self-test below (a display for the app,
+      # and `ip` to show its network namespace has only `lo`).
       - name: Linux packaging dependencies
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y rpm libfuse2t64
+          sudo apt-get install --no-install-recommends -y rpm libfuse2t64 xvfb xauth iproute2
           sudo gem install --no-document fpm -v 1.17.0
           fpm --version
 
@@ -126,3 +150,115 @@ jobs:
             dist/*.deb
             dist/*.rpm
           if-no-files-found: error
+
+      # OCR tier 1c (DESIGN.md §3.9.3): the PACKAGED app's `--ocr-selftest`, from electron-builder's
+      # unpacked tree: the utility process forked from the asar, the engine from resources/ocr, the
+      # clean300 page matched exactly against its recorded replay, every tripwire at 0, nothing on
+      # the child's stdout/stderr, a crash phase (a process.crash()ed child detected and respawned)
+      # and the Ctrl/Cmd+Shift+R check on a hidden window (required on all three OSes: Cmd on macOS,
+      # Ctrl elsewhere, exactly one 'recognize-text' send).
+      # scripts/ocr-selftest-run.mjs asserts all of it and writes the reports.
+      #
+      # Linux needs the setuid chrome-sandbox the deb's after-install sets (Ubuntu restricts
+      # unprivileged user namespaces); the installers above are already built, so this touches
+      # only the unpacked tree.
+      - name: Linux setuid chrome-sandbox (as the deb after-install does)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo chown root:root dist/linux-unpacked/chrome-sandbox
+          sudo chmod 4755 dist/linux-unpacked/chrome-sandbox
+
+      - name: Packaged OCR self-test
+        shell: bash
+        run: |
+          mode=direct
+          if [ "$RUNNER_OS" = "Linux" ]; then mode=xvfb; fi
+          node scripts/ocr-selftest-run.mjs "$RUNNER_TEMP/ocr-selftest" "$mode"
+
+      # The same self-test with NO network at all, exactly as PR0b ran it (§3.9.3 1c, revision 4):
+      # a root-created network namespace, back to the runner user with HOME, PATH and
+      # PDFX_USER_DATA passed explicitly (sudo resets the environment), Xvfb started inside the
+      # namespace. The script builds the command (src/main/ocr/ci/selftest-verdict.ts):
+      #   sudo unshare --net -- sh -c 'ip -o link > "$1" …; shift; exec "$@"' sh <netns.txt> \
+      #     sudo -u runner env HOME=... PATH=... PDFX_USER_DATA=<fresh dir> \
+      #     xvfb-run -a dist/linux-unpacked/pdfx --ocr-selftest <out.json>
+      # so the link listing comes from the namespace the app itself runs in (it must be `lo` only),
+      # and records /proc/sys/kernel/core_pattern (R23).
+      - name: Packaged OCR self-test with no network (unshare --net)
+        if: ${{ !cancelled() && matrix.os == 'ubuntu-latest' }}
+        run: node scripts/ocr-selftest-run.mjs "$RUNNER_TEMP/ocr-selftest" unshare
+
+      # §3.9.4: the Windows installer may grow by at most 15 MB over v1.1.3's 103,070,739 B.
+      - name: NSIS size gate (at most +15 MB over v1.1.3)
+        if: ${{ !cancelled() && matrix.os == 'windows-latest' }}
+        shell: bash
+        run: node scripts/ocr-nsis-size.mjs
+
+      - name: Upload OCR self-test reports
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ocr-selftest-${{ matrix.os }}
+          path: ${{ runner.temp }}/ocr-selftest
+          if-no-files-found: error
+
+      # OCR tier 1b (§3.9.3): the tier-1 project on this OS with vitest's JSON report, and every
+      # case's recognised text, boxes, hOCR and input-pixel hashes (PDFX_OCR_XOS_DIR,
+      # src/main/ocr/test-utils/xos-dump.ts). The ocr-diff job compares the three OSes. Runs even
+      # if a step above failed, so the diff always has all three outputs to compare.
+      - name: OCR tier 1b (records for the cross-OS diff)
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          PDFX_OCR_CACHE_STRICT: '1'
+          PDFX_OCR_XOS_DIR: ${{ runner.temp }}/ocr-xos/out
+        run: |
+          mkdir -p "$RUNNER_TEMP/ocr-xos"
+          yarn test:ocr --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/ocr-xos/vitest.json"
+
+      - name: Upload OCR tier-1b records
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ocr-xos-${{ matrix.os }}
+          path: ${{ runner.temp }}/ocr-xos
+          if-no-files-found: error
+
+  # Tier 1b's gate (§3.9.3, R11): the three OSes' tier-1 outputs must be identical, text, boxes,
+  # engine output and input pixels alike. A pinned non-relaxed SIMD core and a WASM rasteriser have
+  # no legitimate source of divergence, so any difference is a bug to root-cause, never a tolerance.
+  # It runs whenever the matrix ran (a skipped job would read as passing to branch protection), and
+  # a missing OS output fails it. It gates merges once `OCR cross-OS diff` is a required check.
+  ocr-diff:
+    name: OCR cross-OS diff
+    needs: build
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # The diff script imports src/main/ocr/ci/xos-diff.ts directly (Node 24 strips the types).
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ocr-xos-*
+          path: ${{ runner.temp }}/ocr-xos
+
+      # --min-cases: tier 1 writes 53 records per OS today; records lost the same way on every OS
+      # would otherwise compare as identical. Lower it only in the change that removes cases.
+      - name: Diff the three OSes' tier-1 outputs
+        run: >-
+          node scripts/ocr-xos-diff.mjs "$RUNNER_TEMP/ocr-xos" "$RUNNER_TEMP/ocr-xos-diff.json"
+          --expect macos-latest,windows-latest,ubuntu-latest --min-cases 53
+
+      - name: Upload the diff report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ocr-diff-report
+          path: ${{ runner.temp }}/ocr-xos-diff.json
+          if-no-files-found: warn

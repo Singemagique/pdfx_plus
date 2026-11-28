@@ -29,6 +29,8 @@ import {
   type SupervisorDeps,
   type WebContentsLike
 } from './supervisor'
+import { CRASH_DETECT_SLACK_MS, crashPhase } from './selftest'
+import { OCR_SELFTEST_CRASH_ARG } from './process/selftest-arg'
 
 /**
  * What kill() does. 'win32' (PR0): 'exit' 0 at once and no child-process-gone. 'linux' (PR0b): the
@@ -1401,5 +1403,218 @@ describe('heartbeat', () => {
     child.say(bad)
     expect(ctx.logs.filter((l) => l.includes('TRIPWIRE'))).toHaveLength(1)
     expect(ctx.sup.lastHeartbeat?.tripwire.raster).toBe(1)
+  })
+})
+
+describe('the packaged self-test crash phase (selftest.ts crashPhase)', () => {
+  const NAME = `${SERVICE_NAME}-selftest-crash`
+  const crashCtx = (killMode: KillMode = 'win32'): Ctx & { args: string[][] } => {
+    const ctx = setup(
+      { serviceName: NAME, forkArgs: (n) => (n === 0 ? [OCR_SELFTEST_CRASH_ARG] : []) },
+      { killMode }
+    )
+    const args: string[][] = []
+    const fork = ctx.deps.fork
+    ctx.deps.fork = (m, a, o) => {
+      args.push(a)
+      return fork(m, a, o)
+    }
+    return { ...ctx, args }
+  }
+  /** Let crashPhase's 50 ms polling see what just happened. */
+  const poll = async (): Promise<void> => {
+    await vi.advanceTimersByTimeAsync(200)
+  }
+
+  it('forks the crash argument once, under its own service name, and ignores the other name', async () => {
+    const ctx = crashCtx()
+    const phase = crashPhase(ctx.sup, () => {})
+    await tick()
+    ctx.children[0].say(READY)
+    await poll()
+    expect(ctx.children[0].options.serviceName).toBe(NAME)
+    // The app supervisor's (late) gone event for its own child is not this one's.
+    ctx.gone({ reason: 'killed', exitCode: 9, name: SERVICE_NAME })
+    await tick()
+    expect(ctx.sup.state).toBe('running')
+    // Windows (PR0b): process.crash() → exit as the uint64 wrap, child-process-gone 'crashed' −36861.
+    ctx.children[0].exit(18446744073709515000)
+    ctx.gone({ reason: 'crashed', exitCode: -36861, name: NAME })
+    await vi.advanceTimersByTimeAsync(BACKOFF_MS[0] + 100)
+    ctx.children[1].say(READY)
+    await poll()
+    ctx.children[1].say(HB)
+    const r = await phase
+    expect(ctx.args).toEqual([[OCR_SELFTEST_CRASH_ARG], []])
+    expect(r).toMatchObject({
+      ok: true,
+      failures: [],
+      firstExit: { reason: 'crashed', exitCode: -36861 },
+      disconnects: ['crashed'],
+      spawnCount: 2,
+      respawned: true,
+      heartbeat: HB.heartbeat
+    })
+    // Disposed: the respawned child is killed and nothing respawns after.
+    expect(ctx.children[1].killed).toBe(true)
+  })
+
+  it('a crashed Linux child that never exits is caught by the liveness check as hung', async () => {
+    const ctx = crashCtx('linux')
+    const phase = crashPhase(ctx.sup, () => {})
+    await tick()
+    ctx.children[0].say(READY)
+    await poll()
+    ctx.children[0].hang() // PR0b: no exit, no child-process-gone, state D/S/I
+    await vi.advanceTimersByTimeAsync(LIVENESS_MS + BACKOFF_MS[0] + 1_000)
+    ctx.children[1].say(READY)
+    await poll()
+    ctx.children[1].say(HB)
+    const r = await phase
+    expect(r.failures).toEqual([])
+    expect(r.firstExit?.reason).toBe('hung')
+    expect(r.disconnects).toEqual(['crashed'])
+  })
+
+  it('fails when the child does not crash, or the respawned child trips the wire', async () => {
+    const quiet = crashCtx()
+    const p1 = crashPhase(quiet.sup, () => {})
+    await tick()
+    quiet.children[0].say(READY)
+    await vi.advanceTimersByTimeAsync(LIVENESS_MS + CRASH_DETECT_SLACK_MS + 1_000)
+    const r1 = await p1
+    expect(r1.ok).toBe(false)
+    expect(r1.failures).toContain('timed out waiting for the supervisor to notice the crash')
+
+    const dirty = crashCtx()
+    const p2 = crashPhase(dirty.sup, () => {})
+    await tick()
+    dirty.children[0].say(READY)
+    await poll()
+    dirty.children[0].exit(11) // macOS (PR0b)
+    await vi.advanceTimersByTimeAsync(GONE_GRACE_MS + BACKOFF_MS[0] + 100)
+    dirty.children[1].say(READY)
+    await poll()
+    dirty.children[1].say({
+      heartbeat: { ...HB.heartbeat, tripwire: { process: 1, raster: 0, recognize: 0 } }
+    })
+    const r2 = await p2
+    expect(r2.firstExit).toMatchObject({ reason: 'abnormal-exit', exitCode: 11 })
+    expect(r2.failures.join('\n')).toMatch(/network tripwire fired in the respawned child/)
+  })
+
+  // PR11 review: each of crashPhase's checks fails on its own (the cases above pass or trip only
+  // the process wire, so a weakened check survived them).
+
+  /** Crash the first child (macOS-style exit 11) and let the supervisor respawn it. */
+  const crashFirst = async (ctx: Ctx): Promise<void> => {
+    await tick()
+    ctx.children[0].say(READY)
+    await poll()
+    ctx.children[0].exit(11)
+    await vi.advanceTimersByTimeAsync(GONE_GRACE_MS + BACKOFF_MS[0] + 100)
+  }
+
+  it.each(['process', 'raster', 'recognize'] as const)(
+    'fails when the respawned child trips the %s wire',
+    async (wire) => {
+      const ctx = crashCtx()
+      const phase = crashPhase(ctx.sup, () => {})
+      await crashFirst(ctx)
+      ctx.children[1].say(READY)
+      await poll()
+      ctx.children[1].say({
+        heartbeat: {
+          ...HB.heartbeat,
+          tripwire: { process: 0, raster: 0, recognize: 0, [wire]: 1 }
+        }
+      })
+      const r = await phase
+      expect(r.failures).toEqual([
+        `network tripwire fired in the respawned child: ${JSON.stringify({
+          process: 0,
+          raster: 0,
+          recognize: 0,
+          [wire]: 1
+        })}`
+      ])
+    }
+  )
+
+  it("fails when the owner is told anything but 'crashed'", async () => {
+    const ctx = crashCtx()
+    // The owner's view: every ocr:disconnected it receives reads 'killed'.
+    const connect = ctx.sup.connect.bind(ctx.sup)
+    ctx.sup.connect = (wc) =>
+      connect({
+        ...wc,
+        send: (channel, ...args) =>
+          wc.send(channel, ...(channel === 'ocr:disconnected' ? [{ reason: 'killed' }] : args))
+      })
+    const phase = crashPhase(ctx.sup, () => {})
+    await crashFirst(ctx)
+    ctx.children[1].say(READY)
+    await poll()
+    ctx.children[1].say(HB)
+    const r = await phase
+    expect(r.failures).toEqual([`the owner was told ["killed"], expected 'crashed'`])
+  })
+
+  it('fails when the respawned child is handed the old port again', async () => {
+    const ctx = crashCtx()
+    const same = { port1: { close() {} }, port2: { close() {} } }
+    ctx.deps.createChannel = () => same
+    const phase = crashPhase(ctx.sup, () => {})
+    await crashFirst(ctx)
+    ctx.children[1].say(READY)
+    await poll()
+    ctx.children[1].say(HB)
+    const r = await phase
+    expect(r.failures).toEqual(['the respawned child reused the old port'])
+  })
+
+  it('fails when it took more than one respawn (a respawned child crashed before it was ready)', async () => {
+    const ctx = crashCtx()
+    const phase = crashPhase(ctx.sup, () => {})
+    await crashFirst(ctx)
+    ctx.children[1].exit(11) // before READY: no port from it
+    await vi.advanceTimersByTimeAsync(GONE_GRACE_MS + BACKOFF_MS[1] + 100)
+    ctx.children[2].say(READY)
+    await poll()
+    ctx.children[2].say(HB)
+    const r = await phase
+    expect(r.respawned).toBe(true)
+    expect(r.failures).toEqual(['3 child(ren) forked, expected 2'])
+  })
+
+  it('fails on a crash loop, and still counts the children when a step threw', async () => {
+    const ctx = crashCtx()
+    const phase = crashPhase(ctx.sup, () => {})
+    await crashFirst(ctx)
+    // Every respawn crashes before it is ready: 4 crashes in the window is a crash loop.
+    for (let i = 1; i <= MAX_RESPAWNS; i++) {
+      ctx.children[i].exit(11)
+      await vi.advanceTimersByTimeAsync(GONE_GRACE_MS + BACKOFF_MS[BACKOFF_MS.length - 1] + 100)
+    }
+    await vi.advanceTimersByTimeAsync(BACKOFF_MS[0] + 31_000)
+    const r = await phase
+    expect(r.disconnects).toContain('crash-loop')
+    expect(r.failures).toEqual([
+      'timed out waiting for the respawned child to hand over a fresh port',
+      `${MAX_RESPAWNS + 1} child(ren) forked, expected 2`,
+      'the supervisor reported a crash loop'
+    ])
+
+    // A heartbeat that throws (the ready child died under it) still gets the count checked.
+    const died = crashCtx()
+    const p2 = crashPhase(died.sup, () => {})
+    await crashFirst(died)
+    died.children[1].exit(11)
+    await vi.advanceTimersByTimeAsync(GONE_GRACE_MS + BACKOFF_MS[1] + 100)
+    died.children[2].say(READY)
+    died.children[2].exit(11)
+    await poll()
+    const r2 = await p2
+    expect(r2.failures).toEqual(['OCR process not running', '3 child(ren) forked, expected 2'])
   })
 })

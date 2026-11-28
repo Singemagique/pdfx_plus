@@ -19,6 +19,7 @@ import recognizeThreadPath from './recognize-thread?modulePath'
 import { threadOptions } from './budget'
 import { Coordinator, type ParentLike, type WorkerLike } from './coordinator'
 import { loadEngine, loadLanguage } from './engine-node'
+import { OCR_SELFTEST_CRASH_ARG, OCR_SELFTEST_CRASH_DELAY_MS } from './selftest-arg'
 
 // The only files a worker_thread may be started from in this realm (no-network.ts guards Worker).
 allowThreadEntries([rasterThreadPath, recognizeThreadPath])
@@ -63,3 +64,7 @@ new Coordinator({
   rss: () => process.memoryUsage.rss(),
   exit: (code) => process.exit(code)
 })
+
+// The self-test's crash phase only (selftest-arg.ts): main forked this child to crash.
+if (process.argv.includes(OCR_SELFTEST_CRASH_ARG))
+  setTimeout(() => (process as unknown as { crash(): void }).crash(), OCR_SELFTEST_CRASH_DELAY_MS)

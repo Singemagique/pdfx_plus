@@ -40,13 +40,31 @@ yarn install --frozen-lockfile
 
 ## Tests
 
-Tests use [Vitest](https://vitest.dev). The suite is split into two projects in
+Tests use [Vitest](https://vitest.dev). The suite is split into three projects in
 `vitest.config.mts`:
 
 - a **node** project for pure logic (PDFX manifest build, format partitioning,
   doc-ops reducers, name de-duplication, main-process file intake) — files named
   `*.node.test.ts`;
-- a **jsdom** project for DOM/browser-dependent code — files named `*.dom.test.ts`.
+- a **jsdom** project for DOM/browser-dependent code — files named `*.dom.test.ts`;
+- an **ocr** project that runs the real OCR engine (the same Tesseract WebAssembly core and
+  language data the app ships) on synthetic scans — files named `*.ocr.test.ts`. Run it alone
+  with `yarn test:ocr`. Every live recognition must match its recorded replay entry
+  (`src/shared/ocr/test-utils/ocr-cache/`); `PDFX_OCR_CACHE_STRICT=1` (what CI sets) fails on any
+  mismatch, and `yarn ocr:record` re-records after a deliberate engine or pipeline change.
+
+OCR maintenance scripts (none of them runs in the app):
+
+- `yarn ocr:record` rewrites the replay cache and the packaged self-test's expected result.
+- `yarn ocr:calibrate` refits the confidence calibration
+  (`src/shared/ocr/calibration/tess-core7-simd.json`) from the synthetic sweep.
+- `yarn ocr:lang-catalogue` regenerates `src/main/ocr/lang-manifest.json`, the compiled catalogue
+  of downloadable languages: for each one it checks the npm tarball of `@tesseract.js-data/<code>`
+  against the registry's integrity hash, records the size and SHA-256 of the `.traineddata.gz`
+  and of the unpacked `.traineddata`, and checks that cdn.jsdelivr.net serves the same bytes.
+  `--check` fails if the committed file differs. The app never fetches the catalogue; every hash
+  it trusts for a downloaded or installed language file comes from this reviewed, committed file.
+  Right-to-left languages are left out on purpose until the text layer supports them.
 
 Place a test next to the code it covers (e.g. `src/renderer/src/pdfx/build.node.test.ts`).
 The `@renderer` alias resolves the same way it does in the app, so you can import
@@ -93,10 +111,40 @@ must be green before merging. Each PR therefore lands as exactly one commit on
 
 Every push to `main` and every PR runs `.github/workflows/ci.yml`:
 
-1. **Lint, typecheck, test** on Ubuntu — `yarn typecheck`, `yarn format:check`,
-   `yarn test:run`.
+1. **Lint, typecheck, test** on Ubuntu — `yarn typecheck`, `yarn format:check`, the node and
+   jsdom projects (`yarn test:run --project node --project jsdom`), then the ocr project
+   (`yarn test:ocr`), both with `PDFX_OCR_CACHE_STRICT=1`. Locally, `yarn test:run` runs all
+   three projects.
 2. **Build** matrix on macOS, Windows, and Ubuntu — packages the app with
-   code-signing disabled so forks build without secrets.
+   code-signing disabled so forks build without secrets, then:
+   - runs the packaged app's OCR self-test (`pdfx --ocr-selftest out.json`, via
+     `scripts/ocr-selftest-run.mjs`): a scanned page recognized exactly as recorded, every
+     network tripwire at 0, nothing printed by the engine, a crashed OCR process detected and
+     restarted, and the Recognize Text shortcut pressed on a hidden app window, which must make
+     the main process send the Recognize Text action to the renderer exactly once (Cmd+Shift+R on
+     macOS, Ctrl+Shift+R on Windows and Linux; required on all three, never skipped; the send is
+     counted, not delivered, so nothing starts recognizing), with the Document menu's **Recognize
+     Text…** item showing that shortcut. On Ubuntu it runs twice, the second time with no network
+     at all (`unshare --net`);
+   - on Windows, checks the installer grew by at most 15 MB over v1.1.3 (`scripts/ocr-nsis-size.mjs`);
+   - runs the `ocr` project again and uploads what it recognized.
+3. **OCR cross-OS diff** — compares the three OSes' recognized text, word boxes, engine output and
+   input pixels, and fails on any difference, or if an OS produced fewer records than
+   `--min-cases` in `ci.yml` (`scripts/ocr-xos-diff.mjs`). Lower that number only in a change
+   that removes tier-1 cases.
 
 The build job depends on the check job, so lint/typecheck/test failures stop the
 matrix early.
+
+Which checks block a merge is set by `main`'s branch protection, which matches checks by job
+name. It requires **Lint, typecheck, test**. Until a maintainer also adds **Build (macos-latest)**,
+**Build (windows-latest)**, **Build (ubuntu-latest)** and **OCR cross-OS diff** there, GitHub
+shows a PR as mergeable without them, so check them by hand: a red packaged self-test, size gate
+or cross-OS diff blocks the merge all the same. (`OCR cross-OS diff` runs even when a build
+failed, because GitHub counts a skipped required check as passing.)
+
+`.github/workflows/ocr-bench.yml` runs the slower OCR bench nightly, on demand, and on pull
+requests labelled `ocr`: the seeds × presets × fonts sweep, the calibration check, per-page timing
+on all three OSes (on Windows it fails if a full Letter page of 10 pt text takes more than 6 s, or
+one filled with 6 pt text more than 16 s), and the 1,000-page and 1.5 GiB scale tests. It never
+blocks a merge. Scheduled runs start only from the default branch.

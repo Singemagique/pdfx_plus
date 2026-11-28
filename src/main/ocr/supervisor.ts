@@ -213,6 +213,18 @@ export interface SupervisorDeps {
   log(line: string): void
   /** Silence before a child counts as hung (default LIVENESS_MS). */
   livenessMs?: number
+  /**
+   * The utility process's serviceName and child-process-gone filter (default SERVICE_NAME). The
+   * packaged self-test's crash phase runs a second supervisor under its own name, so neither one
+   * takes the other's child-process-gone events.
+   */
+  serviceName?: string
+  /**
+   * The fork's arguments for the `n`-th spawn of this supervisor (0-based; default none). Only the
+   * self-test's crash phase passes one (OCR_SELFTEST_CRASH_ARG, first spawn only); the renderer can
+   * never reach it.
+   */
+  forkArgs?: (n: number) => string[]
 }
 
 export type SupervisorState =
@@ -350,6 +362,10 @@ export class OcrSupervisor {
 
   get state(): SupervisorState {
     return this.stateValue
+  }
+
+  private get serviceName(): string {
+    return this.deps.serviceName ?? SERVICE_NAME
   }
 
   get concurrencyDivisor(): number {
@@ -534,8 +550,8 @@ export class OcrSupervisor {
       env.SystemRoot = this.deps.env.SystemRoot
     let child: ChildLike
     try {
-      child = this.deps.fork(this.deps.modulePath, [], {
-        serviceName: SERVICE_NAME,
+      child = this.deps.fork(this.deps.modulePath, this.deps.forkArgs?.(this.spawnCount) ?? [], {
+        serviceName: this.serviceName,
         stdio: 'pipe',
         env
       })
@@ -846,7 +862,7 @@ export class OcrSupervisor {
 
   private onGone(d: ProcessGoneDetails): void {
     // Every utility process reports serviceName 'node.mojom.NodeService'; ours is in `name`.
-    if (d.name !== SERVICE_NAME) return
+    if (d.name !== this.serviceName) return
     // The details carry no pid. A launch failure belongs to the oldest child that never launched
     // (one torn down while starting may fail to launch after its successor did).
     if (d.reason === 'launch-failed') {

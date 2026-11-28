@@ -39,6 +39,78 @@ Beyond bundling, PDFx is a full editor: page transforms (rotate/crop), PNG stamp
 
 See [SPEC.md](SPEC.md) for the format. It is short: the entire trick is one embedded JSON manifest.
 
+## Text recognition (OCR)
+
+PDFx can recognize the text in scanned pages and photos, so you can find words in them with Find
+(Ctrl/Cmd+F), copy their text, and export PDFs that other apps can search too.
+
+- **Runs on this computer. Nothing is uploaded.** Recognition uses the Tesseract engine, compiled to
+  WebAssembly and bundled with the app, in a separate background process whose network functions
+  are disabled (CI also runs it with no network at all). Your pages never leave your machine. The
+  only download is language data you add yourself (see **Languages**).
+- **Recognizing text does not change your pages.** It never changes or re-encodes the page images;
+  an invisible text layer is added when you export (PDF, ZIP or .pdfx). (Redaction does rewrite a
+  scan image: see below.) **Document ▸ Include Recognized Text When Exporting** (on by default)
+  turns that off. When you sign, the Sign dialog shows **Include recognized text
+  (machine-generated, not reviewed)** if the signed pages have recognized text; it is unticked by
+  default, because the signature would also cover that text.
+- **Searchable, not "accessible".** The text layer makes a scanned PDF searchable and its text
+  copyable. It does not add the structure (tags, reading order, alternative text) that accessible
+  PDFs need, so PDFx never calls its output an accessible PDF.
+- **What it is for.** Recognizes printed text. Handwriting, curved book pages and photos with heavy
+  perspective may give poor results. Right-to-left scripts (Arabic, Hebrew, Persian) are not
+  supported yet.
+- **When it runs.** Photos you import as images are recognized automatically (**Recognize imported
+  photos automatically**, on by default). Scanned PDFs are recognized when you ask, unless you tick
+  **Recognize scanned pages when I open PDFs** (off by default); both settings are in the Recognize
+  Text dialog. To start it: **Document ▸ Recognize Text…** (Ctrl/Cmd+Shift+R), **Document ▸
+  Recognize Text on All Scanned Pages**, the **Recognize Text** toolbar button (shown while scanned
+  pages are waiting), the **Scanned · Recognize text** chip on a document, the **Recognize text**
+  prompt in Find, or the banner in the full-page view. Pages that already have searchable text,
+  including text another OCR tool added, are skipped and say so.
+- **Checking the result.** **Document ▸ Show Recognized Text** draws the recognized words over the
+  page in the full-page view, with a dotted underline under low-confidence words; press `]` and `[`
+  to step through them. **Document ▸ Copy Page Text** copies a page's searchable text, the same
+  text Find searches: its own text and/or the recognized words, without words under a redaction.
+  **Replace
+  Recognized Text…** recognizes pages again (for example with other languages) and **Remove
+  Recognized Text** takes the text off; both work on text PDFx recognized, including a layer PDFx
+  saved in a file you reopen, and both can be undone.
+- **Keeping it.** Recognition is kept while the file is open. Export or save as .pdfx to keep it.
+  Word confidence is kept only while the file is open: after reopening, the saved words show
+  without underlines.
+- **Redaction.** Redacting part of a scan always removes the recognized words under the box; how
+  much of the image goes depends on how the image is stored. Black-and-white scans (fax/CCITT,
+  JBIG2) and losslessly compressed grey or colour scans usually keep everything but the covered
+  pixels, which are blanked in a lossless copy of the image. Colour and greyscale JPEG scans and
+  photos, including photos imported into PDFx, usually lose the whole image and its recognized
+  text instead, because a lossless copy of a JPEG is more than twice its size. Images in CMYK or
+  with a colour profile, transparency or JPEG 2000 compression, images drawn tilted on the page,
+  very large images and images in encrypted PDFs are always removed whole. Either way nothing under
+  the box survives, and the note next to the Redact tool says so when the whole image goes.
+  Redacting a page of a PDF that
+  PDFx already made searchable removes that page's recognized text; run Recognize Text again to
+  restore it.
+- **Languages.** English, German, French and Spanish are included. 31 more can be added from the
+  language picker in the Recognize Text dialog: Bulgarian, Catalan, Chinese (Simplified and
+  Traditional), Croatian, Czech, Danish, Dutch, Estonian, Finnish, Greek, Hindi, Hungarian,
+  Indonesian, Italian, Japanese, Korean, Latvian, Lithuanian, Norwegian, Polish, Portuguese,
+  Romanian, Russian, Serbian (Cyrillic), Slovak, Slovenian, Swedish, Turkish, Ukrainian and
+  Vietnamese. Nothing is downloaded until you press **Download** on a prompt that names the
+  language, its size and the host, **cdn.jsdelivr.net** (jsDelivr, serving the
+  `@tesseract.js-data` packages). The file is checked against a size and SHA-256 hash built into
+  the app, then stored on this computer and used offline after that. **Install from file…** (in
+  the picker, and offered when a download can't finish) installs a `.traineddata` or
+  `.traineddata.gz` file under 100 MB only if it is exactly one of those catalogue files, checked
+  against the same built-in hashes; any other file is refused. An administrator can place the same
+  files in the app's `resources/ocr/tessdata/` folder; they are checked the same way.
+- **Licences.** The engine, the libraries linked into it and the language data have their own
+  licences. Their texts ship with the app in `resources/licenses/` (Windows:
+  `<install folder>\resources\licenses\`; macOS: `PDFx.app/Contents/Resources/licenses/`; Linux
+  .deb and .rpm: `/opt/PDFx/resources/licenses/`; the AppImage carries the same folder inside its
+  image), with
+  [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) listing each component.
+
 ## How to run
 
 Built with Electron, Vite, TypeScript, and React. PDF rendering by [pdf.js](https://mozilla.github.io/pdf.js/), assembly by [pdf-lib](https://pdf-lib.js.org/).
@@ -49,6 +121,8 @@ yarn dev          # run in development
 yarn build:mac    # package for macOS
 yarn build:win    # package for Windows
 yarn build:linux  # package for Linux (AppImage, deb, rpm)
+yarn test:run     # all tests
+yarn test:ocr     # the OCR tests that run the real engine (see CONTRIBUTING.md)
 ```
 
 ## License

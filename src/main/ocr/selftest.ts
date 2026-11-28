@@ -2,8 +2,8 @@
 // port into the real utility process: open the embedded clean300 scan, triage it with PDFium in the
 // raster thread (it must be `scanned`), render it, recognise it with the real engine from
 // resources/ocr, and require the packed result (stamped with triage's class) to match the recorded
-// replay exactly (selftest-fixture.ts), then check every tripwire counter is 0. PR11 adds the
-// shortcut check and the 3-OS CI wiring.
+// replay exactly (selftest-fixture.ts), then check every tripwire counter is 0. The shortcut check
+// and the crash phase below run alongside it, on all three OSes in CI.
 //
 // This file is the session logic only (no Electron import), so it also runs in vitest against the
 // coordinator; host.ts `runOcrSelftest` wires it to the packaged app and writes the report.
@@ -11,6 +11,8 @@
 import { createHash } from 'node:crypto'
 
 import {
+  OCR_DISCONNECTED_CHANNEL,
+  OCR_PORT_CHANNEL,
   OCR_PROTOCOL_VERSION,
   parseFromOcr,
   type FromOcr,
@@ -21,6 +23,13 @@ import {
 } from '../../shared/ocr/protocol'
 import { unpack, type PackedOcrPage } from '../../shared/ocr/types'
 import { SELFTEST, selftestPdf } from './selftest-fixture'
+import {
+  BACKOFF_MS,
+  LIVENESS_MS,
+  type ExitInfo,
+  type OcrSupervisor,
+  type WebContentsLike
+} from './supervisor'
 
 /**
  * SHA-256 over everything a packed page says about its words: status, DPI, text and every array
@@ -371,5 +380,230 @@ export async function selftestSession(
     heartbeat: hb,
     messagesValid,
     messageCount: received.length
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The shortcut check (§3.8, §3.9.3 1c): Ctrl/Cmd+Shift+R sent to a HIDDEN app window with
+// webContents.sendInputEvent must make main send `pdfx:menu` 'recognize-text' to the renderer
+// exactly once, through window.ts's own before-input-event handler (the toolkit's
+// watchWindowShortcuts preventDefaults every Ctrl/Cmd+R in packaged builds, and menu accelerators
+// do not fire on a hidden window, PR0/PR0b). The driver counts that send at webContents.send and
+// does not forward it (nothing should start recognising in a hidden window), so what passes is
+// "main sent it once", not "the renderer handled it". selftest-shortcut.ts drives the real window;
+// this is the verdict.
+
+/** The chord menu.ts shows on Recognize Text… (shown only: window.ts delivers the key). */
+export const RECOGNIZE_ACCELERATOR = 'CommandOrControl+Shift+R'
+
+/** The parts of an Electron MenuItem the check reads. */
+export interface MenuItemLike {
+  id?: string
+  label?: string
+  accelerator?: string
+  registerAccelerator?: boolean
+  submenu?: { items: MenuItemLike[] } | null
+}
+
+/**
+ * menu.ts's Document item, anywhere in the menu: id 'recognize-text' (the MenuAction), labelled
+ * "Recognize Text…", SHOWING Ctrl/Cmd+Shift+R and NOT registering it (a registered accelerator
+ * would fire a second Recognize in dev builds, menu.ts).
+ */
+export function hasRecognizeMenuItem(items: readonly MenuItemLike[] | undefined): boolean {
+  for (const i of items ?? []) {
+    if (
+      i.id === 'recognize-text' &&
+      i.label === 'Recognize Text…' &&
+      i.accelerator === RECOGNIZE_ACCELERATOR &&
+      i.registerAccelerator === false
+    )
+      return true
+    if (hasRecognizeMenuItem(i.submenu?.items)) return true
+  }
+  return false
+}
+
+/** What the driver saw on the hidden window. */
+export interface ShortcutObservation {
+  /**
+   * The application menu has the Recognize Text… item, showing Ctrl/Cmd+Shift+R without
+   * registering it (`hasRecognizeMenuItem`).
+   */
+  menuItem: boolean
+  /** `pdfx:menu` 'recognize-text' sends for the platform's chord (meta on darwin, control elsewhere). */
+  sends: number
+  /** Ctrl+Shift+R on darwin (must not fire; Cmd is the chord there); null elsewhere. */
+  wrongModifierSends: number | null
+  /** KeyR keyDowns our probe listener saw on the window (the input reached it). */
+  keyDowns: number
+  /** The window loaded the renderer before the keys were sent. */
+  loaded: boolean
+}
+
+export interface ShortcutReport extends ShortcutObservation {
+  status: 'pass' | 'fail'
+  message: string
+}
+
+/**
+ * Required on every OS (window.ts has the handler, menu.ts the item): pass only on exactly one
+ * 'recognize-text' per press of the platform's chord (Cmd+Shift+R on darwin, Ctrl+Shift+R
+ * elsewhere), none for Ctrl+Shift+R on darwin, and the Document menu's Recognize Text… item
+ * present. Anything else fails; there is no skip.
+ */
+export function shortcutVerdict(o: ShortcutObservation): ShortcutReport {
+  const chord = 'Ctrl/Cmd+Shift+R'
+  const seen = `the key reached the hidden window ${o.keyDowns} time(s)`
+  const fail = (why: string): ShortcutReport => ({ ...o, status: 'fail', message: why })
+  if (!o.loaded) return fail(`the hidden window never loaded the renderer; ${seen}`)
+  if (!o.menuItem)
+    return fail(
+      `the application menu has no Recognize Text… item showing ${RECOGNIZE_ACCELERATOR} ` +
+        `(unregistered); ${seen}`
+    )
+  if (o.keyDowns === 0) return fail(`sendInputEvent never reached the hidden window`)
+  if (o.sends !== 1)
+    return fail(`${chord} sent 'recognize-text' ${o.sends} time(s) for one press, expected 1`)
+  if (o.wrongModifierSends)
+    return fail(`Ctrl+Shift+R on darwin sent 'recognize-text' ${o.wrongModifierSends} time(s)`)
+  return {
+    ...o,
+    status: 'pass',
+    message: `${chord} made main send 'recognize-text' to the renderer once; ${seen}`
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The crash phase (§4 PR11, R22, R23): a second supervisor (its own serviceName) forks one child
+// that crashes itself with process.crash() (process/selftest-arg.ts). The supervisor must notice
+// it (an exit, a child-process-gone, or on Linux a silent hang its liveness check kills), tell the
+// owner 'crashed', respawn a clean child after the backoff and hand over a fresh port, and that
+// child must answer a heartbeat with every tripwire at 0.
+
+export interface CrashPhaseReport {
+  ok: boolean
+  failures: string[]
+  /** How the supervisor classified the crashed child ('hung' on a Linux child that never exits). */
+  firstExit: ExitInfo | null
+  /** What the owner was told (`ocr:disconnected` reasons). */
+  disconnects: string[]
+  spawnCount: number
+  /** A second port arrived (the respawned child was ready). */
+  respawned: boolean
+  heartbeat: Heartbeat | null
+  /** From connect to the crash being classified, and to the respawned child's heartbeat. */
+  detectMs: number | null
+  totalMs: number
+}
+
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
+
+/** Slack over the liveness window for the hung-child path: the kill, the backoff and a respawn. */
+export const CRASH_DETECT_SLACK_MS = 20_000
+
+/**
+ * Run the crash phase on `sup`, which must fork its FIRST child with OCR_SELFTEST_CRASH_ARG and
+ * every later one without (SupervisorDeps.forkArgs). Disposes `sup` before it returns.
+ */
+export async function crashPhase(
+  sup: OcrSupervisor,
+  closePort: (port: unknown) => void = (p) => (p as { close(): void }).close()
+): Promise<CrashPhaseReport> {
+  const t0 = Date.now()
+  const failures: string[] = []
+  const ports: unknown[] = []
+  const disconnects: string[] = []
+  // The owner is a stand-in renderer: the supervisor hands it ports and tells it about the crash,
+  // exactly as it would the app window (the real window path is the shortcut check's).
+  const wc: WebContentsLike = {
+    id: -1,
+    isDestroyed: () => false,
+    postMessage: (channel, _message, transfer) => {
+      if (channel === OCR_PORT_CHANNEL) ports.push(transfer?.[0])
+    },
+    send: (channel, ...args) => {
+      if (channel === OCR_DISCONNECTED_CHANNEL)
+        disconnects.push(String((args[0] as { reason?: unknown } | undefined)?.reason))
+    },
+    on: () => wc,
+    removeListener: () => wc
+  }
+  const until = async (what: string, pred: () => boolean, ms: number): Promise<boolean> => {
+    const end = Date.now() + ms
+    while (!pred()) {
+      if (sup.state === 'fatal') {
+        failures.push(`OCR went fatal while waiting for ${what}`)
+        return false
+      }
+      if (Date.now() > end) {
+        failures.push(`timed out waiting for ${what}`)
+        return false
+      }
+      await sleep(50)
+    }
+    return true
+  }
+  let firstExit: ExitInfo | null = null
+  let heartbeat: Heartbeat | null = null
+  let detectMs: number | null = null
+  try {
+    await crashAndRespawn()
+  } catch (e) {
+    failures.push(e instanceof Error ? e.message : 'crash phase failed')
+  } finally {
+    // Whatever happened above (a heartbeat that threw included): exactly one respawn, no loop.
+    if (sup.spawnCount !== 2) failures.push(`${sup.spawnCount} child(ren) forked, expected 2`)
+    if (disconnects.includes('crash-loop')) failures.push('the supervisor reported a crash loop')
+    sup.dispose()
+    for (const p of ports)
+      try {
+        closePort(p)
+      } catch {
+        // Already closed with its child.
+      }
+  }
+  return {
+    ok: failures.length === 0,
+    failures,
+    firstExit,
+    disconnects,
+    spawnCount: sup.spawnCount,
+    respawned: ports.length >= 2,
+    heartbeat,
+    detectMs,
+    totalMs: Date.now() - t0
+  }
+
+  // Connect, see the first child crash and be classified, then the respawned child's fresh port
+  // and heartbeat. (A function declaration: hoisted above the try that calls it.)
+  async function crashAndRespawn(): Promise<void> {
+    sup.connect(wc)
+    if (await until('the crashing child to hand over its port', () => ports.length >= 1, 30_000)) {
+      // A crashed Linux child may never exit (R23); the liveness check then kills it as 'hung'.
+      const noticed = await until(
+        'the supervisor to notice the crash',
+        () => sup.lastExit !== null,
+        LIVENESS_MS + CRASH_DETECT_SLACK_MS
+      )
+      if (noticed) {
+        detectMs = Date.now() - t0
+        firstExit = { ...sup.lastExit! }
+        if (!disconnects.includes('crashed'))
+          failures.push(`the owner was told ${JSON.stringify(disconnects)}, expected 'crashed'`)
+        const back = await until(
+          'the respawned child to hand over a fresh port',
+          () => ports.length >= 2,
+          BACKOFF_MS[0] + 30_000
+        )
+        if (back) {
+          if (ports[1] === ports[0]) failures.push('the respawned child reused the old port')
+          heartbeat = await sup.requestHeartbeat()
+          const tw = heartbeat.tripwire
+          if (tw.process !== 0 || tw.raster !== 0 || tw.recognize !== 0)
+            failures.push(`network tripwire fired in the respawned child: ${JSON.stringify(tw)}`)
+        }
+      }
+    }
   }
 }
