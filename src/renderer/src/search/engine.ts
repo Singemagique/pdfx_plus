@@ -16,6 +16,7 @@
 
 import type { Geom, Overlay } from '../edit/model'
 import { makePageKey } from '../edit/model'
+import { stripRedactedOverlays } from '../pdfx/mirror'
 import type { DocEntry, PdfSource } from '../types'
 import {
   asPageTextItem,
@@ -67,7 +68,10 @@ export interface FindEngine {
   prioritize(key: string): void
   /** Track the live pages: drop removed ones, queue new ones (once active). */
   reconcile(docs: readonly DocEntry[]): void
-  /** Track the searchable overlay texts (a no-op for the same array). */
+  /**
+   * Track the searchable overlay texts (a no-op for the same array). A text or form value a
+   * redaction covers (drawn above it, footprints touching: what export drops) is not searchable.
+   */
   setOverlays(overlays: readonly Overlay[]): void
   /** Matches per live page key for a normalized query and its compiled regex. */
   search(norm: string, re: RegExp): ReadonlyMap<string, PageMatches | null>
@@ -346,9 +350,20 @@ export function createFindEngine({
     const refs = new Map<string, Overlay[]>()
     const nextTexts = new Map<string, OverlayText[]>()
     const nextById = new Map<string, OverlayText>()
+    const redactionsOf = new Map<string, Overlay[]>()
+    for (const o of overlays) {
+      if (o.type !== 'redaction') continue
+      const list = redactionsOf.get(o.pageKey)
+      if (list) list.push(o)
+      else redactionsOf.set(o.pageKey, [o])
+    }
     for (const o of overlays) {
       const raw = overlaySearchText(o)
       if (raw === null) continue
+      // An overlay a redaction drawn above it covers is dropped from every export (mirror.ts's
+      // stripRedactedOverlays, the very rule used here), so Find does not report it either.
+      const reds = redactionsOf.get(o.pageKey)
+      if (reds && stripRedactedOverlays([...reds, o]).length === 0) continue
       let norm = overlayNorm.get(o)
       if (norm === undefined) {
         norm = normalizeQuery(raw)

@@ -69,7 +69,7 @@ describe('filterRedacted: native (pdf.js) items', () => {
     expect(r.w).toBeCloseTo(25, 6)
   })
 
-  it('pads by one average character width along the run: a facing neighbour character goes', () => {
+  it('pads along the run: a facing neighbour character goes', () => {
     const out = filterRedacted([item('ab secret cd')], [charsBox(3, 9)], VT)
     expect(norm(out)).toBe('a d')
   })
@@ -85,10 +85,10 @@ describe('filterRedacted: native (pdf.js) items', () => {
   it('keeps the line break of a fully redacted line end', () => {
     const items = [item('first line', 50, { hasEOL: true }), item('second', 50, { t: [10, 0, 0, 10, 50, 680] })] // prettier-ignore
     const out = filterRedacted(items, [charsBox(6, 10)], VT)
-    expect(strs(out)).toEqual(['firs', ' ', 'second'])
+    expect(strs(out)).toEqual(['first ', ' ', 'second'])
     expect(out[0].hasEOL).toBe(false)
     expect(out[1].hasEOL).toBe(true)
-    expect(norm(out)).toBe('firs second')
+    expect(norm(out)).toBe('first second')
   })
 
   it('handles negative-size boxes (drawn right to left)', () => {
@@ -134,6 +134,13 @@ describe('filterRedacted: native (pdf.js) items', () => {
     // The run reads down from y = 700: "cd" is user y 680..660 → display 112..132.
     const out = filterRedacted([v], [{ x: 102, y: 792 - 678, w: 6, h: 16 }], VT)
     expect(norm(out)).toBe('a f')
+    // The kept "f" is highlighted where it was drawn: user y 650..640 → display 142..152.
+    const pt = buildPageText(out, VT)
+    const at = pt.norm.indexOf('f')
+    const [r] = textMatchRects(pt, at, at + 1)
+    expect(r.y).toBeCloseTo(142, 6)
+    expect(r.h).toBeCloseTo(10, 6)
+    expect(r.x).toBeCloseTo(100, 6)
   })
 })
 

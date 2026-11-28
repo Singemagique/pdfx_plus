@@ -271,6 +271,9 @@ describe('charEdges (OCR words): exact partial-word highlights', () => {
     const bad = item('Wilma', [10, 0, 0, 10, 100, 700], 40, { mono: true, charEdges: [0, 10, 40] })
     const pt = buildPageText([bad], UPRIGHT)
     close(textMatchRects(pt, 1, 4)[0], { x: 108, y: 792 - 708, w: 24, h: 10 })
+    // Too MANY edges (7 for 5 characters): ignored as well, not read up to the 5th.
+    const extra = { ...bad, charEdges: [0, 10, 20, 25, 30, 35, 40] }
+    close(textMatchRects(buildPageText([extra], UPRIGHT), 1, 4)[0], { x: 108, y: 792 - 708, w: 24, h: 10 }) // prettier-ignore
   })
 })
 

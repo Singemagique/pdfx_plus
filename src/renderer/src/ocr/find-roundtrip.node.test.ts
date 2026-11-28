@@ -11,6 +11,7 @@ import { getDocument } from 'pdfjs-dist/legacy/build/pdf.mjs'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
 import { buildPageText, extractPageText } from '../search/extract'
+import { nativeRuns } from '../search/redact-filter'
 
 import { copyFidelity, iou, type FindGtWord } from '../../../shared/ocr/test-utils/metrics'
 import { loadNodeSynthDeps } from '../../../shared/ocr/test-utils/node-deps'
@@ -198,6 +199,64 @@ describe('reopened OCR page (ocr-ours): native text that is OCR text', () => {
       expect(replaced.search(q).length, q).toBe(n)
       expect(appended.search(q).length, q).toBe(2 * n)
     }
+  })
+})
+
+describe('reopened OCR page (ocr-ours): boxing any word removes every character of it', () => {
+  // pdf.js merges the layer's per-word Tj's into one item per line and flags the glyphless font
+  // FixedPitch, although each word was stretched by its own Tz: an even split of the line
+  // misplaces characters by more than a character width [measured: "little" and "after" kept a
+  // letter on clean300 / rot90page seed 7 before the redaction filter took the union of its
+  // estimates]. Every GT word of each page, boxed in turn with its exact box.
+  const cases = [
+    ...['clean300', 'skew2', 'rot90page', 'twocol', 'latin-diacritics'].flatMap((preset) =>
+      [7, 11].map((seed) => ({ name: `${preset} seed ${seed}`, preset, seed, font: undefined }))
+    ),
+    ...['times', 'dejavu-serif'].map((font) => ({ name: `clean300 seed 7 in ${font}`, preset: 'clean300', seed: 7, font })) // prettier-ignore
+  ]
+
+  it.each(cases)('$name', async ({ preset, seed, font }) => {
+    const deps = await loadNodeSynthDeps()
+    const s = await synthesize({ preset, seed, ...(font ? { font } : {}) } as never, deps)
+    const baked = await bakeLayer(s.pdfBytes, [ocrPageFromGt(s.gt)])
+    const pdf = await getDocument({ data: baked.bytes.slice(), verbosity: 0 }).promise
+    const pt = await extractPageText(pdf as never, 0)
+    await pdf.destroy()
+    expect(pt.items.some((i) => i.mono)).toBe(true)
+    const all = pt.items.map((i) => i.str).join('')
+    const starts: number[] = []
+    let at = 0
+    for (const it of pt.items) {
+      starts.push(at)
+      at += it.str.length
+    }
+    // Each GT word's offsets in the items' text (reading order = the layer's order).
+    let from = 0
+    const words = s.gt.lines.flatMap((l) =>
+      l.words.map((wi) => {
+        const w = s.gt.words[wi]
+        const lo = all.indexOf(w.t, from)
+        expect(lo, w.t).toBeGreaterThanOrEqual(0)
+        expect(all.slice(from, lo).trim(), w.t).toBe('')
+        from = lo + w.t.length
+        return { t: w.t, lo, hi: from, rect: toPageRect(w.box, s.gt.page.height) }
+      })
+    )
+    const leaks: string[] = []
+    let over = 0
+    for (const w of words) {
+      const removed = new Uint8Array(all.length)
+      pt.items.forEach((it, k) => {
+        for (const r of nativeRuns(it, [w.rect], pt.vt) ?? [])
+          if (r.removed) removed.fill(1, starts[k] + r.lo, starts[k] + r.hi)
+      })
+      for (let i = w.lo; i < w.hi; i++) if (!removed[i]) leaks.push(`${w.t}[${i - w.lo}]`)
+      for (let i = 0; i < all.length; i++)
+        if (removed[i] && all[i] !== ' ' && (i < w.lo || i >= w.hi)) over++
+    }
+    expect(leaks).toEqual([])
+    // [measured, this commit] 1.9–2.4 neighbouring characters per boxed word go too.
+    expect(over / words.length).toBeLessThan(3.5)
   })
 })
 

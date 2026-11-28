@@ -511,6 +511,155 @@ describe('find controller', () => {
       expect(ctl.getBarState().total).toBe(0)
     })
 
+    it('a redacted page deleted and brought back (undo) never counts or shows its match', async () => {
+      const docs = [docOf('a', ['alpha   secret   omega', 'other'])]
+      setup(docs)
+      ctl.open()
+      await settle()
+      const box = await boxOf('secret', 'a-p0')
+      ctl.setOverlays([redaction('r1', 'src-a#0', box)])
+      await settle()
+      expect(ctl.getBarState().total).toBe(0)
+      const totals: number[] = []
+      ctl.subscribe(() => totals.push(ctl.getBarState().total))
+      navigations.length = 0
+      const [a] = docs
+      ctl.setDocs([{ ...a, pages: a.pages.slice(1) }]) // page 0 deleted
+      await settle()
+      // Undo: the page comes back. Its proxy is still live (page 1), so its text is back at once
+      // and the search reruns synchronously: the boxes must already be there.
+      ctl.setDocs([{ ...a }])
+      await settle()
+      expect(totals).not.toHaveLength(0)
+      expect(totals.filter((t) => t !== 0)).toEqual([])
+      expect(navigations).toEqual([])
+      expect(ctl.getBarState().total).toBe(0)
+      await search('omega')
+      expect(ctl.getBarState().total).toBe(1)
+    })
+
+    it('a page arriving with its text already known is filtered from its first search', async () => {
+      // A document re-added under a new source id but the same pdf.js proxy (undo of a removal):
+      // the engine has the proxy's text, so the new key is indexed inside setDocs, and a search
+      // reruns right there. Its redaction (already in the edit layer) must apply at once.
+      const a = docOf('a', ['alpha   secret   omega'])
+      setup([a])
+      ctl.open()
+      await settle()
+      const box = await boxOf('secret', 'a-p0')
+      ctl.setOverlays([redaction('r1', 'src-b#0', box)]) // page not in the collection yet
+      const totals: number[] = []
+      ctl.subscribe(() => totals.push(ctl.getBarState().total))
+      navigations.length = 0
+      const src = { ...a.pages[0].source, id: 'src-b' }
+      const b: DocEntry = { id: 'b', name: 'b.pdf', pages: [{ ...a.pages[0], id: 'b-p0', source: src }] } // prettier-ignore
+      ctl.setDocs([a, b])
+      await settle()
+      expect(Math.max(...totals)).toBe(1) // a's own match only
+      expect(navigations.filter((m) => m.pageId === 'b-p0')).toEqual([])
+      expect(ctl.getBarState().total).toBe(1)
+    })
+
+    it('a moved redaction filters its new place and gives the old one back', async () => {
+      setup([docOf('a', ['alpha   middle   secret'])])
+      ctl.open()
+      await settle()
+      const alpha = await boxOf('alpha', 'a-p0')
+      const secret = await boxOf('secret', 'a-p0')
+      ctl.setOverlays([redaction('r1', 'src-a#0', alpha)])
+      await search('alpha')
+      expect(ctl.getBarState().total).toBe(0)
+      // The user drags the box onto "secret" (same overlay, new geom).
+      ctl.setOverlays([redaction('r1', 'src-a#0', secret)])
+      await settle()
+      expect(ctl.getBarState().total).toBe(1)
+      await search('secret')
+      expect(ctl.getBarState().total).toBe(0)
+      await search('middle')
+      expect(ctl.getBarState().total).toBe(1)
+    })
+
+    it('uses the rotated footprint export redacts, not just the unrotated box', async () => {
+      // "cccc" is user x 100..120 on the 700 baseline (ascent 8). The box itself lies above the
+      // text (y 710..730), but rotated -90° about its origin it also paints x 100..120,
+      // y 700..710 (mirror.ts `footprint`; only reachable from a hand-edited .pdfx).
+      setup([docOf('a', ['aaaa bbbb cccc'])])
+      ctl.open()
+      await settle()
+      await search('cccc')
+      expect(ctl.getBarState().total).toBe(1)
+      const rotated: Overlay = {
+        ...redaction('r1', 'src-a#0', { x: 0, y: 0, w: 1, h: 1 }),
+        geom: { x: 100, y: 710, w: 10, h: 20, rotation: -90, opacity: 1 }
+      }
+      ctl.setOverlays([{ ...rotated, geom: { ...rotated.geom, rotation: 0 } }])
+      await settle()
+      expect(ctl.getBarState().total).toBe(1) // unrotated, it misses the text
+      ctl.setOverlays([rotated])
+      await settle()
+      expect(ctl.getBarState().total).toBe(0)
+      await search('aaaa')
+      expect(ctl.getBarState().total).toBe(1)
+    })
+
+    it('does not find a text overlay a redaction drawn above it covers (export drops it)', async () => {
+      setup([docOf('a', ['page text'])])
+      ctl.open()
+      await settle()
+      const geom = { x: 100, y: 600, w: 120, h: 30, rotation: 0, opacity: 1 }
+      const note = (z: number, createdAt: number): Overlay => ({
+        id: 'ov1',
+        pageKey: 'src-a#0',
+        z,
+        createdAt,
+        geom,
+        type: 'text',
+        text: 'SECRETNAME',
+        fontSize: 12,
+        color: { r: 0, g: 0, b: 0 },
+        font: 'Helvetica',
+        align: 'left'
+      })
+      const box = (z: number, createdAt: number): Overlay => ({
+        ...redaction('r1', 'src-a#0', { x: 0, y: 0, w: 1, h: 1 }),
+        z,
+        createdAt,
+        geom
+      })
+      ctl.setOverlays([note(0, 0)])
+      await search('secretname')
+      expect(ctl.getBarState().total).toBe(1)
+      // Redaction above the note: covered, dropped from export, not found.
+      ctl.setOverlays([note(0, 0), box(1, 1)])
+      await settle()
+      expect(ctl.getBarState().total).toBe(0)
+      // A form value under the box: the same.
+      const field: Overlay = {
+        id: 'f1',
+        pageKey: 'src-a#0',
+        z: 0,
+        createdAt: 0,
+        geom,
+        type: 'formValue',
+        field: 'name',
+        value: 'SECRETNAME'
+      }
+      ctl.setOverlays([field])
+      await settle()
+      expect(ctl.getBarState().total).toBe(1)
+      ctl.setOverlays([field, box(1, 1)])
+      await settle()
+      expect(ctl.getBarState().total).toBe(0)
+      // The note drawn ABOVE the box paints over it in the export too: kept, found.
+      ctl.setOverlays([box(0, 0), note(1, 1)])
+      await settle()
+      expect(ctl.getBarState().total).toBe(1)
+      // A box elsewhere on the page covers nothing.
+      ctl.setOverlays([note(0, 0), { ...box(1, 1), geom: { ...geom, y: 100 } }])
+      await settle()
+      expect(ctl.getBarState().total).toBe(1)
+    })
+
     it('a redaction on one page never filters another page with the same text', async () => {
       setup([docOf('a', ['same words']), docOf('b', ['same words'])])
       ctl.open()

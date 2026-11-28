@@ -99,14 +99,24 @@ describe('ocrPageTextItems', () => {
           // Cleaning changes the text ("ﬁ" → "fi"): the edges no longer map, so none.
           { t: 'ﬁt', x: 50, y: 700, w: 12, conf: 90, confCal: 0.9, chars: new Float32Array([0, 8, 12]) }, // prettier-ignore
           // Too few edges for the text: none.
-          { t: 'abc', x: 70, y: 700, w: 15, conf: 90, confCal: 0.9, chars: new Float32Array([0, 15]) } // prettier-ignore
+          { t: 'abc', x: 70, y: 700, w: 15, conf: 90, confCal: 0.9, chars: new Float32Array([0, 15]) }, // prettier-ignore
+          // Edges that go backwards: none.
+          { t: 'dog', x: 90, y: 700, w: 15, conf: 90, confCal: 0.9, chars: new Float32Array([0, 9, 4, 15]) }, // prettier-ignore
+          // A last edge far from the word's advance (15 pt): none.
+          { t: 'cat', x: 110, y: 700, w: 15, conf: 90, confCal: 0.9, chars: new Float32Array([0, 5, 10, 30]) }, // prettier-ignore
+          // Within 5 % + 0.5 pt of it: kept.
+          { t: 'owl', x: 130, y: 700, w: 15, conf: 90, confCal: 0.9, chars: new Float32Array([0, 5, 10, 16]) } // prettier-ignore
         ]
       }
     ])
     const items = ocrPageTextItems(pack(p), UPRIGHT, 792).filter((i) => i.str.trim())
+    expect(items.map((i) => i.str)).toEqual(['Wilma', 'fit', 'abc', 'dog', 'cat', 'owl'])
     expect(Array.from(items[0].charEdges!)).toEqual([0, 14, 17, 21, 33, 40])
     expect(items[1].charEdges).toBeUndefined()
     expect(items[2].charEdges).toBeUndefined()
+    expect(items[3].charEdges).toBeUndefined()
+    expect(items[4].charEdges).toBeUndefined()
+    expect(Array.from(items[5].charEdges!)).toEqual([0, 5, 10, 16])
   })
 
   it.each([0, 90, 180, 270])(

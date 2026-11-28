@@ -38,12 +38,23 @@ const HELVETICA = [
   667, 611, 278, 278, 278, 469, 556, 333, 556, 556, 500, 556, 556, 278, 556, 556, 222, 222, 500,
   222, 833, 556, 556, 556, 556, 333, 500, 278, 556, 500, 722, 500, 500, 500, 334, 260, 334, 584
 ]
+/**
+ * Times-Roman advance widths (1/1000 em) for U+0020–U+007E (standard-14 metrics): the serif
+ * counterpart, which a redaction's slice bounds use alongside Helvetica's (sliceSpanBounds).
+ */
+const TIMES = [
+  250, 333, 408, 500, 500, 833, 778, 180, 333, 333, 500, 564, 250, 333, 250, 278, 500, 500, 500,
+  500, 500, 500, 500, 500, 500, 500, 278, 278, 564, 564, 564, 444, 921, 722, 667, 667, 722, 611,
+  556, 722, 722, 333, 389, 722, 611, 889, 722, 722, 556, 722, 667, 556, 611, 722, 722, 944, 722,
+  722, 611, 333, 278, 333, 469, 500, 333, 444, 500, 444, 500, 444, 333, 500, 500, 278, 278, 500,
+  278, 778, 500, 500, 500, 500, 333, 389, 278, 500, 500, 722, 500, 500, 444, 480, 200, 480, 541
+]
 const WIDE = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}\uff01-\uff60]/u
 
 /** The estimated advance of one UTF-16 unit of an item's str (combining marks and low surrogates: 0). */
-export function charWeight(str: string, i: number): number {
+export function charWeight(str: string, i: number, table: readonly number[] = HELVETICA): number {
   const c = str.charCodeAt(i)
-  if (c >= 0x20 && c <= 0x7e) return HELVETICA[c - 0x20]
+  if (c >= 0x20 && c <= 0x7e) return table[c - 0x20]
   if (c < 0x20) return 0
   if (c >= 0xdc00 && c <= 0xdfff) return 0
   const cp = str.codePointAt(i)!
@@ -52,8 +63,8 @@ export function charWeight(str: string, i: number): number {
   if (WIDE.test(ch)) return 1000
   // An accented Latin letter is as wide as its base letter ("é" as "e").
   const base = ch.normalize('NFD').charCodeAt(0)
-  if (base >= 0x20 && base <= 0x7e) return HELVETICA[base - 0x20]
-  return 556
+  if (base >= 0x20 && base <= 0x7e) return table[base - 0x20]
+  return table[0x6e - 0x20] // as wide as an "n"
 }
 
 /**
@@ -90,13 +101,24 @@ function sliceFractions(it: TextItemGeom, lo: number, hi: number): [number, numb
   const exact = !it.vertical && edgeFractions(it, lo, hi)
   if (exact) return exact
   if (it.mono) return [lo / len, hi / len]
+  return weightedFractions(it, lo, hi)
+}
+
+/** The fractions of [lo, hi) weighted by `table` (an even split when nothing has a weight). */
+function weightedFractions(
+  it: TextItemGeom,
+  lo: number,
+  hi: number,
+  table: readonly number[] = HELVETICA
+): [number, number] {
+  const len = Math.max(1, it.str.length)
   let total = 0
   let a = 0
   let b = 0
   for (let i = 0; i < it.str.length; i++) {
     if (i === lo) a = total
     if (i === hi) b = total
-    total += charWeight(it.str, i)
+    total += charWeight(it.str, i, table)
   }
   if (lo >= it.str.length) a = total
   if (hi >= it.str.length) b = total
@@ -119,6 +141,40 @@ function sliceSpan(it: TextItemGeom, lo: number, hi: number): [number, number] {
   return it.rtl ? [it.width * (1 - fb), it.width * (1 - fa)] : [it.width * fa, it.width * fb]
 }
 
+/**
+ * Where a raw [lo, hi) slice of an item MAY lie along its run (user units from its origin): the
+ * union of every estimate — the item's exact charEdges alone when it has them (`exact`), else the
+ * Helvetica-weighted, the Times-weighted and the even split together (a sans, a serif and a
+ * monospaced font; the weights are fractions of the run, so a condensed or expanded cut of one
+ * is covered too). `mono` is not trusted here: pdf.js flags a font monospaced from its widths
+ * alone, and PDFx's own glyphless OCR font (every width 500, each word stretched by its own Tz) is
+ * flagged so although its words are anything but evenly spaced across a merged line. Vertical
+ * runs are split evenly. A redaction uses this, never the single best estimate.
+ */
+export function sliceSpanBounds(
+  it: TextItemGeom,
+  lo: number,
+  hi: number
+): { s0: number; s1: number; exact: boolean } {
+  const len = Math.max(1, it.str.length)
+  const even: [number, number] = [lo / len, hi / len]
+  if (it.vertical) return { s0: (it.height * lo) / len, s1: (it.height * hi) / len, exact: false }
+  const exact = edgeFractions(it, lo, hi)
+  const candidates = exact
+    ? [exact]
+    : [weightedFractions(it, lo, hi), weightedFractions(it, lo, hi, TIMES), even]
+  let s0 = Infinity
+  let s1 = -Infinity
+  for (const [fa, fb] of candidates) {
+    const [p, q] = it.rtl
+      ? [it.width * (1 - fb), it.width * (1 - fa)]
+      : [it.width * fa, it.width * fb]
+    s0 = Math.min(s0, p)
+    s1 = Math.max(s1, q)
+  }
+  return { s0, s1, exact: !!exact }
+}
+
 /** Extra margin around a slice box, in user units: along the run and across it. */
 export interface SlicePad {
   along: number
@@ -136,9 +192,23 @@ export function itemSliceRect(
   vt: readonly number[],
   pad: SlicePad = { along: 0, across: 0 }
 ): PageRect {
+  const [s0, s1] = sliceSpan(it, lo, hi)
+  return itemSpanRect(it, s0, s1, vt, pad)
+}
+
+/**
+ * The stretch [s0, s1] of an item's run (user units from its origin along the run) → its
+ * axis-aligned box in page px, grown by `pad` as itemSliceRect.
+ */
+export function itemSpanRect(
+  it: TextItemGeom,
+  s0: number,
+  s1: number,
+  vt: readonly number[],
+  pad: SlicePad = { along: 0, across: 0 }
+): PageRect {
   const [a, b, , , e, f] = it.t
   const fh = itemFontSize(it)
-  const [s0, s1] = sliceSpan(it, lo, hi)
   const corners: Array<[number, number]> = []
   if (it.vertical) {
     // Vertical runs read top to bottom from the origin: split their length proportionally.

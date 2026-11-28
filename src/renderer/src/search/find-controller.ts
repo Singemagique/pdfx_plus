@@ -131,8 +131,12 @@ export function createFindController({
   let throttle: ReturnType<typeof setTimeout> | null = null
   const highlightCache = new Map<string, { version: number; value: readonly PageHighlight[] }>()
   let overlays: readonly Overlay[] = []
-  /** Page key → its page height (page px), for turning redaction geoms into page-px boxes. */
-  let heights = new Map<string, number>()
+  /**
+   * Page key → its page height (page px), for turning redaction geoms into page-px boxes. Never
+   * pruned: a key's height is fixed (sources are immutable), and keeping a removed page's height
+   * keeps its redactions in the engine, as the engine's contract intends (kept until cleared).
+   */
+  const heights = new Map<string, number>()
   /** Page keys the engine currently holds redactions for. */
   let redactedKeys = new Set<string>()
 
@@ -141,8 +145,8 @@ export function createFindController({
   /**
    * Feed the engine every live page's redaction boxes (DESIGN.md §3.6.1): Find never reports text
    * the user has boxed out, matching what an export will contain. The box is the redaction's
-   * rotation-aware footprint (mirror.ts, the same box export redacts). A page whose key is not
-   * live has no known height and is skipped until it is. Cheap when nothing changed: the engine
+   * rotation-aware footprint (mirror.ts, the same box export redacts). A page key never seen yet
+   * has no known height and is skipped until it is. Cheap when nothing changed: the engine
    * ignores an unchanged set.
    */
   function syncRedactions(): void {
@@ -506,19 +510,20 @@ export function createFindController({
       if (next === docs) return
       docs = next
       const map = new Map<string, PageInfo>()
-      const nextHeights = new Map<string, number>()
       let order = 0
       for (const d of next) {
         for (const p of d.pages) {
           const pageKey = makePageKey(p.source.id, p.pageIndex)
           map.set(p.id, { docId: d.id, page: p, pageKey, order: order++ })
-          nextHeights.set(pageKey, p.height)
+          heights.set(pageKey, p.height)
         }
       }
       pages = map
-      heights = nextHeights
-      engine.reconcile(next)
+      // Redactions BEFORE reconcile: a page that comes back (undo of a delete) may get its cached
+      // text back synchronously, and a search may rerun right there; its boxes must already be
+      // in place, or the redacted match is counted and navigated to for that moment.
       syncRedactions()
+      engine.reconcile(next)
       if (isOpen && query) scheduleRecompute()
     },
     setOverlays(next) {

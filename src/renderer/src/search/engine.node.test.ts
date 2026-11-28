@@ -447,14 +447,15 @@ describe('find engine', () => {
     })
 
     it('duplicates share the extraction, not the supplement or the redactions', async () => {
-      // Two spaces between words: a neighbour clear of the slice pad (see the next tests).
-      const { engine, x } = await indexed(['shared  native  text'], true)
+      // Three spaces between words: a neighbour clear of the slice pad and of the spread of the
+      // slice estimates (see the next tests).
+      const { engine, x } = await indexed(['shared   native   text'], true)
       expect(x.extract).toHaveBeenCalledTimes(1)
       engine.setSupplement('s2#0', { mode: 'append', items: ocrLine('only', 'here') })
       expect(has(engine, 'only here')).toEqual(['s2#0'])
       expect(has(engine, 'shared')).toEqual(['s1#0', 's2#0'])
       // A redaction of "native" on the original filters only the original.
-      engine.setRedactions('s1#0', [nativeBox(8, 14)])
+      engine.setRedactions('s1#0', [nativeBox(9, 15)])
       expect(has(engine, 'native')).toEqual(['s2#0'])
       expect(has(engine, 'shared')).toEqual(['s1#0', 's2#0'])
       expect(engine.getPageText('s2#0')?.norm).toBe('shared native text only here')
@@ -506,8 +507,9 @@ describe('find engine', () => {
       // The redaction is a word boundary: the words either side never join.
       expect(has(engine, 'bravodelta')).toEqual([])
       expect(has(engine, 'brav delta')).toEqual([])
-      // The pad (one average character width + max(1 pt, 0.15 × size)) reaches across a single
-      // space, so the neighbours' facing characters go too (fail-safe, DESIGN.md §3.6.1).
+      // The pad (the spread of the slice estimates, half an average character width and
+      // max(1 pt, 0.15 × size)) reaches across a single space, so the neighbours' facing
+      // characters go too (fail-safe, DESIGN.md §3.6.1).
       expect(has(engine, 'bravo')).toEqual([])
       expect(has(engine, 'brav')).toEqual(['s1#0'])
       expect(has(engine, 'elta')).toEqual(['s1#0'])
@@ -522,6 +524,28 @@ describe('find engine', () => {
       expect(engine.getPageText('s1#0')).toBe(raw)
       engine.setRedactions('s1#0', [])
       expect(onChange).toHaveBeenCalledTimes(2)
+    })
+
+    it('moving a box (same number of boxes) filters the new place and restores the old', async () => {
+      const { engine, onChange } = await indexed(['alpha   middle   secret'])
+      // "alpha" is chars 0..5, "secret" 17..23.
+      engine.setRedactions('s1#0', [nativeBox(0, 5)])
+      expect(has(engine, 'alpha')).toEqual([])
+      expect(has(engine, 'secret')).toEqual(['s1#0'])
+      onChange.mockClear()
+      // The user drags the box from "alpha" onto "secret".
+      engine.setRedactions('s1#0', [nativeBox(17, 23)])
+      expect(onChange).toHaveBeenCalledTimes(1)
+      expect(has(engine, 'secret')).toEqual([])
+      expect(has(engine, 'alpha')).toEqual(['s1#0'])
+      expect(has(engine, 'middle')).toEqual(['s1#0'])
+      // Resized in place (same origin, wider): applied too.
+      engine.setRedactions('s1#0', [{ ...nativeBox(17, 23), w: 5 * 15 }])
+      expect(onChange).toHaveBeenCalledTimes(2)
+      expect(has(engine, 'middle')).toEqual(['s1#0'])
+      engine.setRedactions('s1#0', [{ ...nativeBox(8, 14), w: 5 * 15 }])
+      expect(has(engine, 'middle')).toEqual([])
+      expect(has(engine, 'secret')).toEqual([])
     })
 
     it('filters supplement words too, and keeps filtering a re-supplied supplement', async () => {
