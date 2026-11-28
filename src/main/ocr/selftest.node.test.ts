@@ -12,7 +12,12 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import type { Heartbeat } from '../../shared/ocr/protocol'
 import { Coordinator, type CoordinatorDeps, type PortLike } from './process/coordinator'
 import { STUB_ENGINE_WASM } from './process/stub-engine'
-import { selftestSession, type SelftestPort } from './selftest'
+import {
+  REQUIRED_CHILD_CHECKS,
+  childTripwireFailures,
+  selftestSession,
+  type SelftestPort
+} from './selftest'
 import { bundleEntry, type Bundled } from './test-utils/bundle'
 import { FakeParent, INIT, harness, settle } from './test-utils/fake-threads'
 import { PDFIUM_WASM_PATH } from './test-utils/pdfium-node'
@@ -82,6 +87,7 @@ describe('selftestSession', () => {
       tripwire: () => 0,
       tripwireIntact: () => true,
       electronNet: () => [],
+      selfCheck: () => ({ checked: [], failed: [] }),
       rss: () => 1,
       exit: () => {}
     }
@@ -127,5 +133,29 @@ describe('selftestSession', () => {
     expect(report.ok).toBe(false)
     expect(report.failures.join('\n')).toMatch(/page status too-large/)
     expect(report.failures.join('\n')).toMatch(/network tripwire fired/)
+  })
+})
+
+describe('childTripwireFailures (what the packaged self-test asks of the child realm)', () => {
+  const net = ['fetch', 'request', 'resolveHost', 'isOnline']
+  const all = { checked: [...REQUIRED_CHILD_CHECKS], failed: [] }
+
+  it('passes a child whose self-check tripped everything it must', () => {
+    expect(childTripwireFailures(net, all)).toEqual([])
+  })
+
+  it('fails on a hatch that did not trip, a check that was skipped, or no check at all', () => {
+    const text = (f: string[]): string => f.join(' | ')
+    expect(
+      text(childTripwireFailures(net, { ...all, failed: ['process._linkedBinding'] }))
+    ).toMatch(/self-check failed .*process\._linkedBinding/)
+    const skipped = all.checked.filter((c) => c !== 'process._linkedBinding')
+    expect(text(childTripwireFailures(net, { checked: skipped, failed: [] }))).toMatch(
+      /skipped: process\._linkedBinding/
+    )
+    expect(childTripwireFailures(net, null)).toEqual([
+      'no tripwire self-check from the utility process'
+    ])
+    expect(text(childTripwireFailures(['fetch'], all))).toMatch(/electron\.net stubs/)
   })
 })

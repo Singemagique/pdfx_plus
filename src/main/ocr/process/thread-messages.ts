@@ -13,7 +13,10 @@ import type { PageReason, StubRecognition } from '../../../shared/ocr/protocol'
 export interface RasterLimits {
   /** The PDFium WASM memory cap (the module declares 32,768 pages = 2 GiB; PR0). */
   heapCap: number
-  /** Close and reopen a document whose heap growth since it was opened exceeds this (§3.3.3). */
+  /**
+   * Close and reopen a document once the file bytes PDFium has read since it was opened exceed this
+   * (§3.3.3; raster-core.ts says why it is not measured as heap growth).
+   */
   reopenWatermark: number
   /** Headroom the probe asks for on top of the bitmap, for image decode buffers. */
   decodeAllowance: number
@@ -37,8 +40,12 @@ export type ToRaster =
       frame: { width: number; height: number }
     }
 
+/**
+ * `ready` carries the thread's own tripwire self-check: the escape hatches that did NOT trip in its
+ * realm (no-network.ts `tripwireSelfCheck`; empty when all is well).
+ */
 export type FromRaster =
-  | { type: 'ready'; tripwire: number }
+  | { type: 'ready'; tripwire: number; selfCheckFailed: string[] }
   | { type: 'opened'; src: string; pageCount: number; tripwire: number }
   | { type: 'open-failed'; src: string; pdfiumError: number; tripwire: number }
   | {
@@ -80,6 +87,6 @@ export type ToRecognize =
     }
 
 export type FromRecognize =
-  | { type: 'ready'; tripwire: number }
+  | { type: 'ready'; tripwire: number; selfCheckFailed: string[] }
   | { type: 'result'; taskId: number; result: StubRecognition; tripwire: number }
   | { type: 'error'; taskId: number; name: string; message: string; tripwire: number }

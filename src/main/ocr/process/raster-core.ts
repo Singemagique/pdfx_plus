@@ -10,7 +10,11 @@
 // - The frame (intrinsic /Rotate applied, view box = CropBox ∩ MediaBox) must equal the pdf.js
 //   PageEntry frame the renderer sent; a mismatch fails the page instead of misplacing text.
 // - PDFium keeps the stored bytes of every stream it touched until the document closes, so a
-//   document whose heap growth passes the reopen watermark is closed and reopened before rendering.
+//   document is closed and reopened before a render once the bytes its getBlock callback has served
+//   since it was opened pass the reopen watermark. That sum is an upper bound on what the document
+//   can be holding. (DESIGN.md §3.3.3 words the watermark as heap growth; but after the first
+//   reopen PDFium reuses the memory it freed without growing HEAPU8, so heap growth lets every
+//   cycle retain more than the last, measured in review: gaps of 22, 33, 40, 49 pages.)
 // - Headroom probe: malloc(bitmap + decode allowance) and free it again. Past the cap malloc returns
 //   0 without aborting (PR0), so this is a cheap, safe test.
 // - Silent-blank guard: near the cap PDFium can print "Cannot enlarge memory" and still return an
@@ -87,7 +91,8 @@ interface OpenDoc {
   doc: number
   fileAccess: number
   getBlock: number
-  heapAtOpen: number
+  /** Bytes the getBlock callback has copied into the heap since this open. */
+  served: { bytes: number }
 }
 
 interface Source {
@@ -126,6 +131,22 @@ export function fitRaster(
     }
   }
   return { dpi: d, ...s }
+}
+
+/**
+ * The `printErr` the raster thread hands PDFium's Emscripten glue: every line goes to the engine's
+ * `noteStderr` once it exists (lines from before, during init, are kept in `early` for it). This is
+ * the silent-blank guard's only input, so it is a function here and tested, not inline wiring.
+ */
+export function makePrintErr(
+  engine: () => RasterEngine | null,
+  early: string[]
+): (line: string) => void {
+  return (line) => {
+    const e = engine()
+    if (e) e.noteStderr(String(line))
+    else early.push(String(line))
+  }
 }
 
 export class RasterEngine {
@@ -187,8 +208,7 @@ export class RasterEngine {
     if (req.userUnit !== 1) return { kind: 'failed', status: 'failed', reason: 'user-unit' }
 
     // Reopen watermark: drop the stream bytes PDFium retained for this document so far.
-    if (s.open && this.heapBytes() - s.open.heapAtOpen > this.limits.reopenWatermark)
-      this.closeDoc(s)
+    if (s.open && s.open.served.bytes > this.limits.reopenWatermark) this.closeDoc(s)
     const doc = this.ensureOpen(s)
     if (typeof doc !== 'number') return { kind: 'failed', status: 'failed', reason: 'render' }
     if (req.index >= this.mod.FPDF_GetPageCount(doc))
@@ -257,7 +277,7 @@ export class RasterEngine {
     const rt = this.mod.pdfium
     const bytes = s.bytes
     const len = bytes.length
-    const heapAtOpen = rt.HEAPU8.length
+    const served = { bytes: 0 }
     const getBlock = rt.addFunction(
       (_param: number, position: number, pBuf: number, size: number) => {
         position >>>= 0
@@ -266,6 +286,7 @@ export class RasterEngine {
         if (position + size > len) return 0
         // Re-read HEAPU8 on every call: heap growth replaces the view.
         rt.HEAPU8.set(bytes.subarray(position, position + size), pBuf)
+        served.bytes += size
         return 1
       },
       'iiiii'
@@ -286,7 +307,7 @@ export class RasterEngine {
       rt.removeFunction(getBlock)
       return { pdfiumError: err }
     }
-    s.open = { doc, fileAccess: fa, getBlock, heapAtOpen }
+    s.open = { doc, fileAccess: fa, getBlock, served }
     return doc
   }
 

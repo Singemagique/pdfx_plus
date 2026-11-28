@@ -20,6 +20,8 @@ abstract class FakeWorker<In, Out> extends EventEmitter implements WorkerLike {
   readonly received: In[] = []
   terminated = false
   tripwire = 0
+  /** What this thread's tripwire self-check reports as not tripping (empty: all good). */
+  selfCheckFailed: string[] = []
 
   postMessage(msg: unknown): void {
     if (this.terminated) return
@@ -66,15 +68,21 @@ export class FakeRaster extends FakeWorker<ToRaster, FromRaster> {
 
   constructor(
     private readonly script: RasterScript,
-    private readonly pageCount: (src: string) => number
+    private readonly pageCount: (src: string) => number,
+    /** What opening (and counting) `src` does instead of answering `opened`, if anything. */
+    private readonly onOpen?: (src: string, thread: FakeRaster) => FromRaster | 'crash' | undefined
   ) {
     super()
   }
 
   protected handle(msg: ToRaster): void {
-    if (msg.type === 'init') this.reply({ type: 'ready', tripwire: this.tripwire })
+    if (msg.type === 'init')
+      this.reply({ type: 'ready', tripwire: this.tripwire, selfCheckFailed: this.selfCheckFailed })
     else if (msg.type === 'open') {
-      if (msg.count)
+      const out = msg.count ? this.onOpen?.(msg.src, this) : undefined
+      if (out === 'crash') this.crash(new Error('raster thread died opening a source'))
+      else if (out) this.reply(out)
+      else if (msg.count)
         this.reply({
           type: 'opened',
           src: msg.src,
@@ -122,21 +130,38 @@ export type RecognizeScript = (
 export class FakeRecognizer extends FakeWorker<ToRecognize, FromRecognize> {
   readonly jobs: RecognizeMsg[] = []
   initModule: WebAssembly.Module | null = null
+  private readyHeld = false
 
-  constructor(private readonly script: RecognizeScript) {
+  constructor(
+    private readonly script: RecognizeScript,
+    /** Take a while to start (a real engine needs 0.1–0.25 s): ready only on `releaseReady()`. */
+    private readonly holdReady = false
+  ) {
     super()
   }
 
   protected handle(msg: ToRecognize): void {
     if (msg.type === 'init') {
       this.initModule = msg.engine
-      this.reply({ type: 'ready', tripwire: this.tripwire })
+      if (this.holdReady) this.readyHeld = true
+      else this.sayReady()
       return
     }
     this.jobs.push(msg)
     const out = this.script(msg, this)
     if (out === 'crash') this.crash(new Error('recognize thread died'))
     else if (out !== 'hang') this.reply(out)
+  }
+
+  /** A held thread finishes starting. */
+  releaseReady(): void {
+    if (!this.readyHeld) return
+    this.readyHeld = false
+    this.sayReady()
+  }
+
+  private sayReady(): void {
+    this.reply({ type: 'ready', tripwire: this.tripwire, selfCheckFailed: this.selfCheckFailed })
   }
 }
 
@@ -214,7 +239,14 @@ export interface HarnessOptions {
   threads?: number
   budgets?: Partial<Budgets>
   tripwire?: () => number
+  /** Recognize threads only say ready when the test calls `releaseReady()`. */
+  holdRecognizeReady?: boolean
+  /** See FakeRaster: what a counted open of a source does instead of `opened`. */
+  rasterOpen?: (src: string, thread: FakeRaster) => FromRaster | 'crash' | undefined
 }
+
+/** A passing self-check, as index.ts reports it. */
+export const SELF_CHECK = { checked: ['fetch', 'process._linkedBinding'], failed: [] as string[] }
 
 export const STUB_MODULE = new WebAssembly.Module(
   new Uint8Array([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00])
@@ -231,13 +263,17 @@ export function harness(opts: HarnessOptions = {}): Harness {
     spawnRaster: () => {
       const r = new FakeRaster(
         opts.raster ?? ((m, t) => rendered(m, t)),
-        opts.pageCount ?? (() => 10)
+        opts.pageCount ?? (() => 10),
+        opts.rasterOpen
       )
       rasters.push(r)
       return r
     },
     spawnRecognize: () => {
-      const r = new FakeRecognizer(opts.recognize ?? ((m, t) => recognized(m, t)))
+      const r = new FakeRecognizer(
+        opts.recognize ?? ((m, t) => recognized(m, t)),
+        opts.holdRecognizeReady
+      )
       recognizers.push(r)
       return r
     },
@@ -248,6 +284,7 @@ export function harness(opts: HarnessOptions = {}): Harness {
     tripwire: opts.tripwire ?? (() => 0),
     tripwireIntact: () => true,
     electronNet: () => ['fetch', 'request', 'resolveHost', 'isOnline'],
+    selfCheck: () => SELF_CHECK,
     rss: () => 100 * 2 ** 20,
     exit: (code) => exitCodes.push(code),
     budgets: { maxThreads: 4, ...opts.budgets }

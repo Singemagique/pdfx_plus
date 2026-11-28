@@ -4,7 +4,13 @@
 //
 // Nothing here imports `electron`: `process.parentPort` is a global in a utility process. The
 // tripwire import must stay first so it runs before any other module of this realm.
-import { electronNetStubbed, tripwireCount, tripwireIntact } from './no-network'
+import {
+  allowThreadEntries,
+  electronNetStubbed,
+  tripwireCount,
+  tripwireIntact,
+  tripwireSelfCheck
+} from './no-network'
 import { readFile } from 'node:fs/promises'
 import { availableParallelism, totalmem } from 'node:os'
 import { Worker } from 'node:worker_threads'
@@ -12,6 +18,11 @@ import rasterThreadPath from './raster-thread?modulePath'
 import recognizeThreadPath from './recognize-thread?modulePath'
 import { Coordinator, type ParentLike, type WorkerLike } from './coordinator'
 import { STUB_ENGINE_WASM } from './stub-engine'
+
+// The only files a worker_thread may be started from in this realm (no-network.ts guards Worker).
+allowThreadEntries([rasterThreadPath, recognizeThreadPath])
+// Proven here, in the realm itself, before anything else runs; reported to main in `ready`.
+const selfCheck = tripwireSelfCheck()
 
 const parent = (process as unknown as { parentPort?: ParentLike }).parentPort
 if (!parent) throw new Error('the OCR coordinator must run in an Electron utility process')
@@ -44,6 +55,7 @@ new Coordinator({
   tripwire: tripwireCount,
   tripwireIntact,
   electronNet: electronNetStubbed,
+  selfCheck: () => selfCheck,
   rss: () => process.memoryUsage.rss(),
   exit: (code) => process.exit(code)
 })

@@ -6,7 +6,7 @@
 // terminate-on-cancel and recycling plumbing already lives in the coordinator.
 //
 // The tripwire import must stay first: each thread is its own realm (§3.3.1).
-import { tripwireCount } from './no-network'
+import { tripwireCount, tripwireSelfCheck } from './no-network'
 import { parentPort } from 'node:worker_threads'
 import type { StubRecognition } from '../../../shared/ocr/protocol'
 import type { FromRecognize, ToRecognize } from './thread-messages'
@@ -36,7 +36,7 @@ function describeBitmap(width: number, height: number, data: Uint8Array): StubRe
 async function handle(msg: ToRecognize): Promise<void> {
   if (msg.type === 'init') {
     instance = await WebAssembly.instantiate(msg.engine, {})
-    post({ type: 'ready', tripwire: tripwireCount() })
+    post({ type: 'ready', tripwire: tripwireCount(), selfCheckFailed: tripwireSelfCheck().failed })
     return
   }
   try {

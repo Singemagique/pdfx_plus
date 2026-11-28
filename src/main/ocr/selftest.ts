@@ -12,7 +12,8 @@ import {
   type FromOcr,
   type Heartbeat,
   type PageResult,
-  type ToOcr
+  type ToOcr,
+  type TripwireSelfCheck
 } from '../../shared/ocr/protocol'
 import { SELFTEST_BAND_FRACTION, SELFTEST_PAGE, selftestPdf } from './selftest-fixture'
 
@@ -39,6 +40,45 @@ export interface SelftestReport {
 }
 
 export const SELFTEST_DPI = 150
+
+/**
+ * Escape hatches the utility process's own self-check must have called (and seen trip). Any one
+ * missing from `checked` means the check itself was cut down, which fails the self-test too.
+ */
+export const REQUIRED_CHILD_CHECKS = [
+  'process._linkedBinding',
+  'process.binding',
+  'process.dlopen',
+  'worker_threads.Worker',
+  'child_process.spawn',
+  'dgram.Socket',
+  'dns.Resolver',
+  'electron.net.isOnline'
+] as const
+
+/**
+ * What the child said about its own tripwire in `ready`: in a utility process require('electron').net
+ * exists (PR0), so all four members must be stubbed, and every required escape hatch must have
+ * tripped when the child called it on itself.
+ */
+export function childTripwireFailures(
+  electronNet: readonly string[] | null,
+  selfCheck: TripwireSelfCheck | null
+): string[] {
+  const failures: string[] = []
+  if ((electronNet ?? []).length !== 4)
+    failures.push(`electron.net stubs: ${JSON.stringify(electronNet)}, expected 4`)
+  if (!selfCheck) failures.push('no tripwire self-check from the utility process')
+  else {
+    if (selfCheck.failed.length > 0)
+      failures.push(
+        `tripwire self-check failed in the utility process: ${selfCheck.failed.join(', ')}`
+      )
+    const missing = REQUIRED_CHILD_CHECKS.filter((c) => !selfCheck.checked.includes(c))
+    if (missing.length > 0) failures.push(`tripwire self-check skipped: ${missing.join(', ')}`)
+  }
+  return failures
+}
 const STEP_TIMEOUT_MS = 30_000
 
 export async function selftestSession(

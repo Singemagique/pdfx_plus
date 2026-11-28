@@ -35,7 +35,8 @@ import {
   type OcrToMain,
   type PageRequest,
   type PageResult,
-  type RecognizeRequest
+  type RecognizeRequest,
+  type TripwireSelfCheck
 } from '../../../shared/ocr/protocol'
 import {
   DEFAULT_BUDGETS,
@@ -90,6 +91,8 @@ export interface CoordinatorDeps {
   tripwireIntact(): boolean
   /** The electron.net members this realm's tripwire stubbed. */
   electronNet(): string[]
+  /** This realm's tripwire self-check (no-network.ts `tripwireSelfCheck`), run once at start. */
+  selfCheck(): TripwireSelfCheck
   rss(): number
   exit(code: number): void
   budgets?: Partial<Budgets>
@@ -151,6 +154,12 @@ interface RasterSlot extends Slot<ToRaster> {
   watchdog: ReturnType<typeof setTimeout> | null
   heap: number
   lastSrc: string | null
+  /**
+   * The PDFium work sent to the thread and not answered yet, in send order: renders, and opens with
+   * `count: true` (the only opens that call into PDFium). The thread handles messages one at a time
+   * in order, so when it traps, dies or hangs, the head of this list is what it was doing.
+   */
+  inflight: Array<{ open: string } | { render: number }>
 }
 
 interface RecognizeSlot extends Slot<ToRecognize> {
@@ -164,6 +173,13 @@ interface RecognizeSlot extends Slot<ToRecognize> {
 const DEFAULT_RENDER_DPI = 300
 /** Consecutive threads of one kind that may die before ever reporting ready. */
 const MAX_START_FAILURES = 3
+/**
+ * Fatals of raster threads that had started, within RASTER_FATAL_WINDOW_MS, before the process
+ * gives up. Each page is retried once and a source that kills its open is dropped, so only a stream
+ * of distinct failures (many trapping pages, a module that traps on everything) gets here.
+ */
+const MAX_RASTER_FATALS = 10
+const RASTER_FATAL_WINDOW_MS = 60_000
 const DEFAULT_LIMITS: OcrHostLimits = {
   onBattery: false,
   thermal: 'unknown',
@@ -199,9 +215,17 @@ export class Coordinator {
   private readonly recognizers: RecognizeSlot[] = []
   /** Session halving from OOM-shaped recognize failures. */
   private localDivisor = 1
-  /** Threads that died before reporting ready, in a row; past the cap the process gives up. */
+  /**
+   * Threads that died, errored or hung before reporting ready, in a row; past the cap the process
+   * gives up. A thread the coordinator retired on purpose (cancel, close, a new port, shedding) is
+   * never counted, ready or not.
+   */
   private startFailures = { raster: 0, recognize: 0 }
+  /** When started raster threads hit a fatal (RASTER_FATAL_WINDOW_MS). */
+  private rasterFatals: number[] = []
   private gaveUp = false
+  /** Self-check failures reported by any thread so far (never document data: API names). */
+  private readonly threadSelfCheckFailed = new Set<string>()
 
   private retiredTripwire = { raster: 0, recognize: 0 }
   private expectedPageMs = 4000
@@ -224,7 +248,8 @@ export class Coordinator {
     this.toParent({
       ready: {
         tripwire: deps.tripwire(),
-        electronNet: deps.electronNet() as Array<(typeof ELECTRON_NET_MEMBERS)[number]>
+        electronNet: deps.electronNet() as Array<(typeof ELECTRON_NET_MEMBERS)[number]>,
+        selfCheck: deps.selfCheck()
       }
     })
   }
@@ -501,7 +526,8 @@ export class Coordinator {
       // is dropped because its task is gone.
       if (t.state === 'recognizing') {
         const slot = this.recognizers.find((s) => s.task === t)
-        if (slot) this.retireRecognizer(slot)
+        if (slot && !slot.ready) this.unassign(slot)
+        else if (slot) this.retireRecognizer(slot)
       }
       t.bitmap = null
     }
@@ -595,7 +621,8 @@ export class Coordinator {
     if (this.disposed) return
     if (
       this.startFailures.raster >= MAX_START_FAILURES ||
-      this.startFailures.recognize >= MAX_START_FAILURES
+      this.startFailures.recognize >= MAX_START_FAILURES ||
+      this.rasterFatals.length >= MAX_RASTER_FATALS
     ) {
       this.giveUp()
       return
@@ -663,7 +690,8 @@ export class Coordinator {
       task: null,
       watchdog: null,
       heap: 0,
-      lastSrc: null
+      lastSrc: null,
+      inflight: []
     }
     this.raster = slot
     worker.on('message', (m) => this.guard(() => this.onRaster(slot, m as FromRaster)))
@@ -684,6 +712,8 @@ export class Coordinator {
 
   private sendRaster(slot: RasterSlot, msg: ToRaster): void {
     if (slot.dead) return
+    if (msg.type === 'open' && msg.count) slot.inflight.push({ open: msg.src })
+    else if (msg.type === 'render') slot.inflight.push({ render: msg.taskId })
     if (!slot.ready) slot.outbox.push({ msg })
     else slot.worker.postMessage(msg)
   }
@@ -718,11 +748,13 @@ export class Coordinator {
   }
 
   private takeRasterTask(slot: RasterSlot, taskId: number | null): Task | null {
+    if (taskId !== null) this.answered(slot, { render: taskId })
+    const t = slot.task
+    // Not the render in flight: leave that one (and its watchdog) alone.
+    if (!t || (taskId !== null && t.id !== taskId)) return null
     if (slot.watchdog) clearTimeout(slot.watchdog)
     slot.watchdog = null
-    const t = slot.task
     slot.task = null
-    if (!t || (taskId !== null && t.id !== taskId)) return null
     // Cancelled or closed while rendering: its result is dropped.
     return this.tasks.has(t) ? t : null
   }
@@ -734,11 +766,13 @@ export class Coordinator {
       case 'ready': {
         slot.ready = true
         this.startFailures.raster = 0
+        for (const f of m.selfCheckFailed) this.threadSelfCheckFailed.add(`raster:${f}`)
         const out = slot.outbox.splice(0)
         for (const o of out) slot.worker.postMessage(o.msg)
         break
       }
       case 'opened': {
+        this.answered(slot, { open: m.src })
         const s = this.sources.get(m.src)
         if (s && s.countPending) {
           s.countPending = false
@@ -747,18 +781,11 @@ export class Coordinator {
         break
       }
       case 'open-failed': {
-        if (this.sources.has(m.src)) {
-          for (const job of [...this.jobs.values()])
-            if (job.src === m.src) this.cancelJob(job.jobId, true)
-          this.dropSource(m.src)
-          this.toRenderer({
-            error: {
-              code: 'open-failed',
-              message: m.pdfiumError === 4 ? 'password required' : 'PDFium could not open the file',
-              src: m.src
-            }
-          })
-        }
+        this.answered(slot, { open: m.src })
+        this.openFailed(
+          m.src,
+          m.pdfiumError === 4 ? 'password required' : 'PDFium could not open the file'
+        )
         break
       }
       case 'rendered': {
@@ -789,13 +816,60 @@ export class Coordinator {
         break
       }
       case 'fatal': {
-        const t = this.takeRasterTask(slot, m.taskId)
-        if (t) this.rasterFailure(t)
-        this.retireRaster()
+        if (!slot.ready) {
+          // init itself failed (a bad module, say): a start failure, nothing else to blame.
+          this.startFailures.raster++
+          this.retireRaster()
+          break
+        }
+        this.rasterCrashed(slot, m.taskId)
         break
       }
     }
     this.pump()
+  }
+
+  private answered(slot: RasterSlot, work: { open: string } | { render: number }): void {
+    const i = slot.inflight.findIndex((w) =>
+      'open' in work
+        ? 'open' in w && w.open === work.open
+        : 'render' in w && w.render === work.render
+    )
+    if (i >= 0) slot.inflight.splice(i, 1)
+  }
+
+  /**
+   * A started raster thread trapped (`fatal`), died or hung. Blame what it was doing: the render a
+   * fatal names, else the head of `inflight`. A source whose open killed the thread is dropped for
+   * good, or every respawned thread would open it again and die again; a render is charged one
+   * failure. Anything else in flight was never reached and is re-queued uncharged by retireRaster.
+   */
+  private rasterCrashed(slot: RasterSlot, taskId: number | null): void {
+    this.noteRasterFatal()
+    const head = taskId === null ? slot.inflight[0] : { render: taskId }
+    if (head && 'open' in head) {
+      this.retireRaster()
+      this.openFailed(head.open, 'PDFium crashed opening the file')
+      return
+    }
+    const t = head ? this.takeRasterTask(slot, head.render) : null
+    if (t) this.rasterFailure(t)
+    this.retireRaster()
+  }
+
+  /** A source PDFium cannot open: its jobs end, it is dropped and the renderer told. */
+  private openFailed(src: string, message: string): void {
+    if (!this.sources.has(src)) return
+    for (const job of [...this.jobs.values()]) if (job.src === src) this.cancelJob(job.jobId, true)
+    this.dropSource(src)
+    this.toRenderer({ error: { code: 'open-failed', message, src } })
+  }
+
+  /** Count a fatal of a started raster thread; too many in the window and the process gives up. */
+  private noteRasterFatal(): void {
+    const now = Date.now()
+    this.rasterFatals = this.rasterFatals.filter((t) => now - t < RASTER_FATAL_WINDOW_MS)
+    this.rasterFatals.push(now)
   }
 
   /**
@@ -805,10 +879,17 @@ export class Coordinator {
   private giveUp(): void {
     if (this.gaveUp) return
     this.gaveUp = true
-    const which = this.startFailures.raster >= MAX_START_FAILURES ? 'raster' : 'recognize'
+    const crashing = this.rasterFatals.length >= MAX_RASTER_FATALS
+    const which =
+      crashing || this.startFailures.raster >= MAX_START_FAILURES ? 'raster' : 'recognize'
     for (const t of [...this.tasks])
       this.fail(t, 'failed', which === 'raster' ? 'raster-crash' : 'recognize-crash')
-    this.toParent({ fatal: { code: 'init', message: `${which} thread failed to start` } })
+    this.toParent({
+      fatal: {
+        code: 'init',
+        message: crashing ? 'raster thread keeps crashing' : `${which} thread failed to start`
+      }
+    })
   }
 
   private rasterFailure(t: Task): void {
@@ -820,17 +901,18 @@ export class Coordinator {
   private onRasterHang(slot: RasterSlot): void {
     if (slot !== this.raster || slot.dead) return
     slot.watchdog = null
-    const t = this.takeRasterTask(slot, null)
-    if (t) this.rasterFailure(t)
-    this.retireRaster()
+    // The watchdog only runs for a render, so the thread had started; an open queued ahead of the
+    // render may be what hangs, which rasterCrashed works out.
+    this.rasterCrashed(slot, null)
     this.pump()
   }
 
   private onRasterDeath(slot: RasterSlot): void {
     if (slot !== this.raster || slot.dead) return
-    const t = this.takeRasterTask(slot, null)
-    if (t) this.rasterFailure(t)
-    this.retireRaster()
+    if (!slot.ready) {
+      this.startFailures.raster++
+      this.retireRaster()
+    } else this.rasterCrashed(slot, null)
     this.pump()
   }
 
@@ -843,7 +925,6 @@ export class Coordinator {
     if (slot.task && this.tasks.has(slot.task)) this.requeue(slot.task)
     slot.task = null
     this.retiredTripwire.raster += slot.tripwire
-    if (!slot.ready) this.startFailures.raster++
     this.raster = null
     void slot.worker.terminate()
   }
@@ -912,6 +993,7 @@ export class Coordinator {
     if (m.type === 'ready') {
       slot.ready = true
       this.startFailures.recognize = 0
+      for (const f of m.selfCheckFailed) this.threadSelfCheckFailed.add(`recognize:${f}`)
       for (const o of slot.outbox.splice(0)) slot.worker.postMessage(o.msg, o.transfer)
       return
     }
@@ -949,6 +1031,8 @@ export class Coordinator {
 
   private onRecognizeHang(slot: RecognizeSlot): void {
     if (slot.dead) return
+    // Never answered init, let alone the page: it hung before it started.
+    if (!slot.ready) this.startFailures.recognize++
     slot.watchdog = null
     const t = slot.task
     slot.task = null
@@ -959,6 +1043,7 @@ export class Coordinator {
 
   private onRecognizeDeath(slot: RecognizeSlot, name: string, message: string): void {
     if (slot.dead) return
+    if (!slot.ready) this.startFailures.recognize++
     const t = slot.task
     slot.task = null
     this.retireRecognizer(slot)
@@ -974,8 +1059,19 @@ export class Coordinator {
     const i = this.recognizers.indexOf(slot)
     if (i >= 0) this.recognizers.splice(i, 1)
     this.retiredTripwire.recognize += slot.tripwire
-    if (!slot.ready) this.startFailures.recognize++
     void slot.worker.terminate()
+  }
+
+  /**
+   * A slot still starting whose task was cancelled: its page never left the outbox, so take it
+   * back and keep the thread for the next page instead of paying for another start.
+   */
+  private unassign(slot: RecognizeSlot): void {
+    if (slot.watchdog) clearTimeout(slot.watchdog)
+    slot.watchdog = null
+    slot.outbox = slot.outbox.filter((o) => o.msg.type !== 'recognize')
+    slot.task = null
+    slot.big = false
   }
 
   // -------------------------------------------------------------------------------------------
@@ -1039,7 +1135,7 @@ export class Coordinator {
     if (this.disposed) return
     const hb: Heartbeat = {
       tripwire: this.tripwireCounts(),
-      tripwireIntact: this.deps.tripwireIntact(),
+      tripwireIntact: this.deps.tripwireIntact() && this.threadSelfCheckFailed.size === 0,
       rss: Math.max(0, Math.round(this.deps.rss())),
       threads: { raster: this.raster ? 1 : 0, recognize: this.recognizers.length },
       pending: this.tasks.size,

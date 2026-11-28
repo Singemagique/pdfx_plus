@@ -256,9 +256,16 @@ describe('main ⇄ coordinator', () => {
       pending: 4,
       concurrency: 2
     }
+    const selfCheck = { checked: ['process._linkedBinding', 'dns.promises.Resolver'], failed: [] }
     for (const m of [
-      { ready: { tripwire: 0, electronNet: ['fetch', 'request', 'resolveHost', 'isOnline'] } },
-      { ready: { tripwire: 0, electronNet: [] } },
+      {
+        ready: {
+          tripwire: 0,
+          electronNet: ['fetch', 'request', 'resolveHost', 'isOnline'],
+          selfCheck
+        }
+      },
+      { ready: { tripwire: 0, electronNet: [], selfCheck: { checked: [], failed: ['fetch'] } } },
       { activity: { busy: true, done: 1, total: 3 } },
       { heartbeat: hb },
       { fatal: { code: 'init', message: 'PDFium failed to start' } }
@@ -269,7 +276,68 @@ describe('main ⇄ coordinator', () => {
     )
     rejects(() => parseOcrToMain({ heartbeat: { ...hb, log: 'page text' } }))
     rejects(() => parseOcrToMain({ ready: {} }))
-    rejects(() => parseOcrToMain({ ready: { tripwire: 0, electronNet: ['download'] } }))
+    rejects(() => parseOcrToMain({ ready: { tripwire: 0, electronNet: ['download'], selfCheck } }))
+    rejects(() => parseOcrToMain({ ready: { tripwire: 0, electronNet: [] } }), /missing selfCheck/)
+    rejects(() =>
+      parseOcrToMain({
+        ready: { tripwire: 0, electronNet: [], selfCheck: { ...selfCheck, failed: ['page text!'] } }
+      })
+    )
+    // The heartbeat's tripwire flag is a boolean, nothing else.
+    for (const v of ['yes', 1, null])
+      rejects(() => parseOcrToMain({ heartbeat: { ...hb, tripwireIntact: v } }))
     rejects(() => parseOcrToMain({ stderr: 'x' }))
+  })
+})
+
+describe('unknown keys named after Object.prototype members', () => {
+  // `k in obj` finds inherited members, so these names were dropped instead of rejected. Each
+  // message goes through structuredClone first: that is what a port delivers, and JSON.parse is
+  // how a `__proto__` key becomes an own property.
+  const clone = <T>(json: string): T => structuredClone(JSON.parse(json)) as T
+  const PROTO_NAMES = ['__proto__', 'constructor', 'toString', 'hasOwnProperty', 'valueOf']
+  const hb = {
+    tripwire: { process: 0, raster: 0, recognize: 0 },
+    tripwireIntact: true,
+    rss: 1,
+    threads: { raster: 0, recognize: 0 },
+    pending: 0,
+    concurrency: 1
+  }
+  const limits = { onBattery: false, thermal: 'nominal', speedLimit: 100, divisor: 1 }
+
+  for (const name of PROTO_NAMES) {
+    const extra = `${JSON.stringify(name)}: {"polluted": 1}`
+    it(`rejects ${name} in every direction`, () => {
+      rejects(
+        () => parseToOcr(clone(`{"focus": {"src": "a", "index": 0, ${extra}}}`)),
+        /unknown key/
+      )
+      rejects(
+        () => parseToOcr({ open: { src: 's', bytes, ...clone<object>(`{${extra}}`) } }),
+        /unknown key/
+      )
+      rejects(() => parseFromOcr(clone(`{"evicted": {"src": "s", ${extra}}}`)), /unknown key/)
+      rejects(
+        () =>
+          parseMainToOcr(
+            clone(
+              `{"init": {"limits": ${JSON.stringify(limits)}, "paths": {"pdfiumWasm": "/app/pdfium.wasm", ${extra}}}}`
+            )
+          ),
+        /unknown key/
+      )
+      rejects(
+        () =>
+          parseOcrToMain(clone(`{"heartbeat": {${JSON.stringify(hb).slice(1, -1)}, ${extra}}}`)),
+        /unknown key/
+      )
+      // And as the message key itself.
+      rejects(() => parseToOcr(clone(`{${extra}}`)), /unknown message/)
+    })
+  }
+
+  it('still never hands back an object with a polluted prototype', () => {
+    expect(Object.prototype).not.toHaveProperty('polluted')
   })
 })

@@ -3,10 +3,10 @@
 // raster-core.ts.
 //
 // The tripwire import must stay first: each thread is its own realm (§3.3.1).
-import { tripwireCount } from './no-network'
+import { tripwireCount, tripwireSelfCheck } from './no-network'
 import { parentPort } from 'node:worker_threads'
 import { init } from '@embedpdf/pdfium'
-import { RasterEngine, type PdfiumRaster } from './raster-core'
+import { RasterEngine, makePrintErr, type PdfiumRaster } from './raster-core'
 import type { FromRaster, ToRaster } from './thread-messages'
 
 const port = parentPort
@@ -42,7 +42,7 @@ async function start(msg: Extract<ToRaster, { type: 'init' }>): Promise<void> {
     },
     print: () => {},
     // Captured, never silenced: "Cannot enlarge memory" during a render is the silent-blank signal.
-    printErr: (line: string) => (pending ? pending.noteStderr(line) : lines.push(line))
+    printErr: makePrintErr(() => pending, lines)
   } as unknown as Parameters<typeof init>[0])) as unknown as PdfiumRaster & {
     PDFiumExt_Init(): void
   }
@@ -50,7 +50,7 @@ async function start(msg: Extract<ToRaster, { type: 'init' }>): Promise<void> {
   pending = new RasterEngine(mod, msg.limits)
   for (const l of lines) pending.noteStderr(l)
   engine = pending
-  post({ type: 'ready', tripwire: tripwireCount() })
+  post({ type: 'ready', tripwire: tripwireCount(), selfCheckFailed: tripwireSelfCheck().failed })
 }
 
 function handle(msg: ToRaster): void {

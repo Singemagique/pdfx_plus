@@ -4,6 +4,12 @@
 // read a network global (`fetch` needs no import), and must not load a module by a computed name.
 // The tripwire, no-network.ts, is the one file allowed to name those APIs: it is what replaces
 // them. src/shared/ocr/** gets the same network rules from src/shared/dom-free.node.test.ts.
+//
+// On top of the module and global bans: the native escape hatches (process.binding,
+// process._linkedBinding, process.dlopen) and a Worker started from a string of code (`eval: true`)
+// reach the network, or a realm without the tripwire, with no import at all. And the third-party
+// code bundled into these threads (the PDFium glue; PR5 adds the Tesseract glue to THIRD_PARTY) is
+// scanned for the same, since our rules do not apply to it at build time.
 
 import { readdirSync, readFileSync } from 'node:fs'
 import { dirname, join, relative, resolve } from 'node:path'
@@ -40,6 +46,50 @@ const OCR_PROCESS_BANNED_MODULES = [
     `node:${m}/*`
   ])
 ]
+
+/** Bundled third-party code that runs inside the OCR process (repo-relative). */
+const THIRD_PARTY = ['node_modules/@embedpdf/pdfium/dist/index.cjs']
+
+const ESCAPE_MEMBERS = new Set(['binding', '_linkedBinding', 'dlopen'])
+
+/**
+ * `process.binding` / `process._linkedBinding` / `process.dlopen` (dotted or bracketed, called or
+ * not) and any `new …Worker(…)` given an `eval` option. Returns `line:column name` entries.
+ */
+function escapeHatches(source: string, file: string): string[] {
+  const sf = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true)
+  const out: string[] = []
+  const at = (n: ts.Node, name: string): void => {
+    const { line, character } = sf.getLineAndCharacterOfPosition(n.getStart(sf))
+    out.push(`${line + 1}:${character + 1} ${name}`)
+  }
+  const visit = (n: ts.Node): void => {
+    if (
+      (ts.isPropertyAccessExpression(n) || ts.isElementAccessExpression(n)) &&
+      ts.isIdentifier(n.expression) &&
+      n.expression.text === 'process'
+    ) {
+      const member = ts.isPropertyAccessExpression(n)
+        ? n.name.text
+        : ts.isStringLiteralLike(n.argumentExpression)
+          ? n.argumentExpression.text
+          : null
+      if (member !== null && ESCAPE_MEMBERS.has(member)) at(n, `process.${member}`)
+    }
+    if (ts.isNewExpression(n) && /Worker$/.test(n.expression.getText(sf))) {
+      const options = n.arguments?.[1]
+      if (
+        options &&
+        ts.isObjectLiteralExpression(options) &&
+        options.properties.some((p) => p.name && p.name.getText(sf) === 'eval')
+      )
+        at(n, 'Worker eval')
+    }
+    ts.forEachChild(n, visit)
+  }
+  visit(sf)
+  return out
+}
 
 const RULES: ScanOptions = {
   globals: NETWORK_GLOBALS,
@@ -137,6 +187,34 @@ describe('src/main/ocr/process/** source bans', () => {
     expect(problems).toEqual([])
   })
 
+  it('names no native escape hatch and starts no Worker from code (tripwire excepted)', () => {
+    const problems: string[] = []
+    for (const file of files) {
+      const r = rel(file)
+      if (r === TRIPWIRE) continue
+      for (const p of escapeHatches(readFileSync(file, 'utf8'), r)) problems.push(`${r}:${p}`)
+    }
+    expect(problems).toEqual([])
+  })
+
+  it('bundled third-party code reaches no escape hatch, child process or network module', () => {
+    const banned = [
+      /\bprocess\s*(\.\s*|\[\s*['"])(binding|_linkedBinding|dlopen)\b/g,
+      /['"](node:)?(child_process|cluster|inspector|worker_threads)['"]/g,
+      /\brequire\(\s*['"](node:)?(https?|http2|net|tls|dgram|dns|electron)['"]\s*\)/g,
+      /\beval\s*:\s*(true|!0)\b/g
+    ]
+    const problems: string[] = []
+    for (const r of THIRD_PARTY) {
+      const src = readFileSync(join(REPO_ROOT, r), 'utf8')
+      for (const re of banned) for (const m of src.matchAll(re)) problems.push(`${r}: ${m[0]}`)
+    }
+    expect(problems).toEqual([])
+    // The scan is not vacuous: it does find what it bans.
+    const sample = "x = process.binding('tcp_wrap'); require('node:http'); new W(c, { eval: !0 })"
+    expect(banned.flatMap((re) => [...sample.matchAll(re)].map((m) => m[0]))).toHaveLength(3)
+  })
+
   it('makes the tripwire the first import of every process and thread entry', () => {
     for (const entry of ENTRIES) {
       const src = readFileSync(join(REPO_ROOT, entry), 'utf8')
@@ -166,5 +244,17 @@ describe('src/main/ocr/process/** source bans', () => {
       '../../../preload/index?modulePath'
     ])
     expect(scan("import { a } from '../../../shared/ocr/protocol'")).toEqual([])
+
+    const hatches = (src: string): string[] =>
+      escapeHatches(src, 'x.ts').map((f) => f.split(' ').slice(1).join(' '))
+    expect(hatches("process.binding('tcp_wrap')")).toEqual(['process.binding'])
+    expect(hatches("process._linkedBinding('electron_common_net')")).toEqual([
+      'process._linkedBinding'
+    ])
+    expect(hatches("const d = process['dlopen']")).toEqual(['process.dlopen'])
+    expect(hatches("new Worker('fetch(u)', { eval: true })")).toEqual(['Worker eval'])
+    expect(hatches('new wt.Worker(code, { eval })')).toEqual(['Worker eval'])
+    expect(hatches('new Worker(rasterThreadPath)')).toEqual([])
+    expect(hatches('process.memoryUsage.rss()')).toEqual([])
   })
 })

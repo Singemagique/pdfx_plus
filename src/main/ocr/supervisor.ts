@@ -13,6 +13,11 @@
 // - env carries nothing from main except SystemRoot on win32 (without it Chromium's Winsock init in
 //   the child prints WSALookupServiceBegin 10108 at every spawn). No NODE_OPTIONS, no proxy vars.
 // - An alive flag guards every postMessage (the #53293 fix is not in Electron 38).
+// - kill() before 'spawn' is a no-op in Electron 38 (UtilityProcessWrapper::Kill returns false
+//   while it has no pid yet), so a generation torn down while starting is killed again on 'spawn'.
+// - One child at a time: a connect while the last child is dead but not yet classified classifies
+//   it first, a spawn kills any child still alive, and a child-process-gone that arrives late (no
+//   pid to match on) is charged to the earlier child it belongs to, never to the healthy one.
 // - Exits: `child-process-gone` is filtered on details.name === 'pdfx-ocr' (serviceName is
 //   'node.mojom.NodeService' for every utility process). On Windows exit 1 reads as 'killed', our
 //   own kill() gives exit 0 and NO child-process-gone, and 'abnormal-exit' was never seen. So
@@ -35,7 +40,8 @@ import {
   type MainToOcr,
   type OcrDisconnectReason,
   type OcrHostLimits,
-  type OcrInit
+  type OcrInit,
+  type TripwireSelfCheck
 } from '../../shared/ocr/protocol'
 
 export const SERVICE_NAME = 'pdfx-ocr'
@@ -46,6 +52,11 @@ export const MAX_RESPAWNS = 3
 export const BACKOFF_MS = [500, 2_000, 5_000] as const
 /** How long an 'exit' waits for its child-process-gone details before it is classified anyway. */
 export const GONE_GRACE_MS = 500
+/**
+ * How long a child classified without its child-process-gone (its exit was not a clean 0) may
+ * still have that event arrive. One that does is matched to it, not to the next child.
+ */
+export const LATE_GONE_MS = 5_000
 export const HEARTBEAT_TIMEOUT_MS = 5_000
 
 // ---------------------------------------------------------------------------------------------
@@ -217,9 +228,15 @@ export class OcrSupervisor {
   }> = []
   private tripwireLogged = false
   private disposed = false
+  /** Children classified without their child-process-gone, which may still arrive (LATE_GONE_MS). */
+  private lateGone: Array<{ gen: Gen; until: number }> = []
+  /** Children forked that have neither launched ('spawn') nor exited, oldest first. */
+  private unlaunched: Gen[] = []
   lastExit: ExitInfo | null = null
   /** The electron.net members the current child's tripwire stubbed (from its `ready`). */
   childElectronNet: string[] | null = null
+  /** The current child's in-realm tripwire self-check (from its `ready`). */
+  childSelfCheck: TripwireSelfCheck | null = null
   lastHeartbeat: Heartbeat | null = null
   spawnCount = 0
 
@@ -372,6 +389,21 @@ export class OcrSupervisor {
       if (this.gen.ready && this.wantHandover) this.handOver()
       return
     }
+    const dead = this.gen
+    if (dead && !dead.classified && !dead.killRequested) {
+      // It exited (or was reported gone) moments ago and is still waiting for its details. Settle
+      // it now, as the crash it is, so its classification cannot later respawn over (and orphan)
+      // the child this connect is about to start. Without the owner: this connect is starting
+      // afresh, so there is nobody to tell "crashed" and no backoff to wait for.
+      const owner = this.owner
+      this.owner = null
+      this.classify(dead)
+      this.owner = owner
+      if (this.stateValue === 'fatal') {
+        this.becomeFatal()
+        return
+      }
+    }
     if (this.backoffTimer) {
       // An explicit connect beats the backoff wait.
       clearTimeout(this.backoffTimer)
@@ -381,6 +413,8 @@ export class OcrSupervisor {
   }
 
   private spawn(): void {
+    // Never two children: one still alive here would be orphaned (never killed, its messages ignored).
+    if (this.gen?.alive) this.kill('replaced')
     const env: Record<string, string> = {}
     // Only SystemRoot, only on win32 (PR0): nothing else from main's environment reaches the child.
     if (this.deps.platform === 'win32' && this.deps.env.SystemRoot)
@@ -411,12 +445,19 @@ export class OcrSupervisor {
       grace: null
     }
     this.gen = gen
+    this.unlaunched.push(gen)
     // Drain BOTH pipes, always: a full pipe blocks the child (PR0, Windows, 10 MiB).
     for (const stream of [child.stdout, child.stderr]) {
       stream?.on('data', (chunk) => gen.ring.push(chunk))
       stream?.on('error', () => {})
     }
     child.on('spawn', () => {
+      this.launched(gen)
+      if (gen.killRequested && gen.exitCode === null) {
+        // Torn down while starting: the kill() then was a no-op (no pid yet). Kill it now.
+        this.killChild(gen)
+        return
+      }
       if (child.pid !== undefined) {
         try {
           this.deps.setPriority(child.pid)
@@ -459,6 +500,14 @@ export class OcrSupervisor {
     if ('ready' in msg) {
       gen.ready = true
       this.childElectronNet = [...msg.ready.electronNet]
+      this.childSelfCheck = {
+        checked: [...msg.ready.selfCheck.checked],
+        failed: [...msg.ready.selfCheck.failed]
+      }
+      if (msg.ready.selfCheck.failed.length > 0)
+        this.deps.log(
+          `ocr: tripwire self-check FAILED in the utility process (${msg.ready.selfCheck.failed.join(', ')})`
+        )
       this.stateValue = 'running'
       const init = this.deps.init()
       this.post({ init: { paths: init.paths, limits: this.hostLimits() } })
@@ -553,16 +602,27 @@ export class OcrSupervisor {
     gen.killRequested = true
     gen.alive = false
     if (this.stateValue !== 'fatal') this.stateValue = 'stopped'
+    // Before 'spawn' this does nothing in Electron 38 (no pid yet); the 'spawn' handler kills again.
+    this.killChild(gen)
+  }
+
+  private killChild(gen: Gen): boolean {
     try {
-      gen.child.kill()
+      return gen.child.kill()
     } catch {
       // Already gone.
+      return false
     }
+  }
+
+  private launched(gen: Gen): void {
+    this.unlaunched = this.unlaunched.filter((g) => g !== gen)
   }
 
   private onExit(gen: Gen, code: number): void {
     gen.alive = false
     gen.exitCode = code
+    this.launched(gen)
     if (gen === this.gen) {
       this.clearIdle()
       this.endBatch()
@@ -578,6 +638,31 @@ export class OcrSupervisor {
   private onGone(d: ProcessGoneDetails): void {
     // Every utility process reports serviceName 'node.mojom.NodeService'; ours is in `name`.
     if (d.name !== SERVICE_NAME) return
+    // The details carry no pid. A launch failure belongs to the oldest child that never launched
+    // (one torn down while starting may fail to launch after its successor did).
+    if (d.reason === 'launch-failed') {
+      const failed = this.unlaunched.shift()
+      if (!failed) return
+      failed.alive = false
+      if (failed !== this.gen || failed.killRequested || failed.classified) {
+        // Nobody is waiting for that one any more.
+        failed.classified = true
+        return
+      }
+      failed.gone = d
+      this.classify(failed)
+      return
+    }
+    // A child classified without its gone event may still be owed one; the oldest such child takes
+    // it, so it can never be pinned on the healthy child after it.
+    const now = Date.now()
+    this.lateGone = this.lateGone.filter((l) => l.until > now)
+    if (this.lateGone.length > 0) {
+      // That child was already classified as a crash; only its reason is late. Nothing to act on.
+      this.lateGone.shift()
+      this.deps.log(`ocr: late child-process-gone (${d.reason}) for an earlier utility process`)
+      return
+    }
     const gen = this.gen
     if (!gen || gen.classified || gen.killRequested) return
     gen.gone = d
@@ -591,6 +676,9 @@ export class OcrSupervisor {
     gen.classified = true
     if (gen.grace) clearTimeout(gen.grace)
     gen.grace = null
+    // Its gone event can still come (a non-zero exit always has one); expect it, for a while.
+    if (!gen.gone && gen.exitCode !== 0)
+      this.lateGone.push({ gen, until: Date.now() + LATE_GONE_MS })
     const reason = gen.gone?.reason ?? (gen.exitCode === 0 ? 'clean-exit' : 'abnormal-exit')
     // child-process-gone's code is exact for native crashes; 'exit' is lossy there (PR0).
     const exitCode = gen.gone?.exitCode ?? gen.exitCode ?? -1

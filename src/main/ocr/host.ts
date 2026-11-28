@@ -24,7 +24,12 @@ import {
   type ProcessGoneDetails,
   type WebContentsLike
 } from './supervisor'
-import { selftestSession, type SelftestPort, type SelftestReport } from './selftest'
+import {
+  childTripwireFailures,
+  selftestSession,
+  type SelftestPort,
+  type SelftestReport
+} from './selftest'
 
 let supervisor: OcrSupervisor | null = null
 let speedLimit = 100
@@ -125,13 +130,13 @@ export async function runOcrSelftest(outArg: string | undefined): Promise<number
   const lastExit = sup.lastExit
   const spawnCount = sup.spawnCount
   const electronNet = sup.childElectronNet
+  const selfCheck = sup.childSelfCheck
   sup.teardown('selftest-done')
   const failures = [...(report?.failures ?? []), ...(error ? [error] : [])]
   if (lastExit) failures.push(`the utility process exited unexpectedly (${lastExit.reason})`)
-  // In a utility process require('electron').net exists (PR0): the tripwire must have stubbed all
-  // four members, or a network path is open that needs no import.
-  if ((electronNet ?? []).length !== 4)
-    failures.push(`electron.net stubs: ${JSON.stringify(electronNet)}, expected 4`)
+  // electron.net fully stubbed, and the child's own self-check saw every escape hatch trip
+  // (process._linkedBinding('electron_common_net') among them), inside the child.
+  failures.push(...childTripwireFailures(electronNet, selfCheck))
   const ok = !!report?.ok && failures.length === 0
   const result = {
     ok,
@@ -147,7 +152,13 @@ export async function runOcrSelftest(outArg: string | undefined): Promise<number
       utilityEntryInAsar: /app\.asar[\\/]/.test(ocrProcessPath),
       pdfiumWasmInAsar: /app\.asar[\\/]/.test(pdfiumWasmPath())
     },
-    child: { spawnCount, unexpectedExit: lastExit, stdio: output, electronNetStubbed: electronNet },
+    child: {
+      spawnCount,
+      unexpectedExit: lastExit,
+      stdio: output,
+      electronNetStubbed: electronNet,
+      tripwireSelfCheck: selfCheck
+    },
     totalMs: Math.round(performance.now() - started)
   }
   writeFileSync(out, JSON.stringify(result, null, 2) + '\n')

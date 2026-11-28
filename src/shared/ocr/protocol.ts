@@ -258,7 +258,10 @@ export interface TripwireCounts {
 
 export interface Heartbeat {
   tripwire: TripwireCounts
-  /** Every API the coordinator's tripwire replaced still holds the stub. */
+  /**
+   * Every API the coordinator's tripwire replaced still holds the stub, and every thread's
+   * in-realm self-check passed.
+   */
   tripwireIntact: boolean
   rss: number
   /** Live threads. */
@@ -272,11 +275,21 @@ export interface Heartbeat {
 /** The `require('electron').net` members the coordinator's tripwire replaced (§3.0 #3). */
 export const ELECTRON_NET_MEMBERS = ['fetch', 'request', 'resolveHost', 'isOnline'] as const
 
+/**
+ * The coordinator realm's tripwire self-check (no-network.ts `tripwireSelfCheck`): the escape
+ * hatches it called, and the ones that did not trip. API names only.
+ */
+export interface TripwireSelfCheck {
+  checked: string[]
+  failed: string[]
+}
+
 export type OcrToMain =
   | {
       ready: {
         tripwire: number
         electronNet: Array<(typeof ELECTRON_NET_MEMBERS)[number]>
+        selfCheck: TripwireSelfCheck
       }
     }
   /** Batch state for the power blocker and the taskbar progress (≤ 10 Hz). */
@@ -315,8 +328,14 @@ function object<T>(
     const out: Record<string, unknown> = {}
     const req = required as Record<string, Check<unknown>>
     const opt = optional as Record<string, Check<unknown> | undefined>
+    // Own keys only: `in` would also find Object.prototype members (constructor, toString,
+    // __proto__, ...) and let a key with such a name through unchecked.
     for (const k of Object.keys(x)) {
-      if (!(k in req) && !(k in opt)) fail(path, `unknown key ${JSON.stringify(k.slice(0, 32))}`)
+      if (
+        !Object.prototype.hasOwnProperty.call(req, k) &&
+        !Object.prototype.hasOwnProperty.call(opt, k)
+      )
+        fail(path, `unknown key ${JSON.stringify(k.slice(0, 32))}`)
     }
     for (const [k, check] of Object.entries(req)) {
       if (!Object.prototype.hasOwnProperty.call(x, k)) fail(path, `missing ${k}`)
@@ -587,13 +606,24 @@ export function parseMainToOcr(x: unknown): MainToOcr {
   return mainToOcr(x, 'MainToOcr')
 }
 
+/** A tripwire API label such as `process._linkedBinding` or `dns.promises.Resolver`. */
+const apiName = pattern(/^[A-Za-z0-9_.()]{1,64}$/, 'an API name')
+
 const tripwireCounts = object<TripwireCounts>({ process: count, raster: count, recognize: count })
 
 const ocrToMain = message<OcrToMain>(
   {
-    ready: object<{ tripwire: number; electronNet: Array<(typeof ELECTRON_NET_MEMBERS)[number]> }>({
+    ready: object<{
+      tripwire: number
+      electronNet: Array<(typeof ELECTRON_NET_MEMBERS)[number]>
+      selfCheck: TripwireSelfCheck
+    }>({
       tripwire: count,
-      electronNet: array(oneOf(ELECTRON_NET_MEMBERS), ELECTRON_NET_MEMBERS.length)
+      electronNet: array(oneOf(ELECTRON_NET_MEMBERS), ELECTRON_NET_MEMBERS.length),
+      selfCheck: object<TripwireSelfCheck>({
+        checked: array(apiName, 64),
+        failed: array(apiName, 64)
+      })
     }),
     activity: object<{ busy: boolean; done: number; total: number }>({
       busy: bool,

@@ -14,6 +14,7 @@ import {
   ByteRing,
   GONE_GRACE_MS,
   IDLE_KILL_MS,
+  LATE_GONE_MS,
   OcrSupervisor,
   RING_BYTES,
   SERVICE_NAME,
@@ -25,12 +26,17 @@ import {
 } from './supervisor'
 
 class FakeChild extends EventEmitter implements ChildLike {
-  pid: number | undefined = 4242
+  pid: number | undefined
   readonly stdout = new PassThrough({ highWaterMark: 16 * 1024 })
   readonly stderr = new PassThrough({ highWaterMark: 16 * 1024 })
   readonly received: Array<{ msg: unknown; transfer?: unknown[] }> = []
   killed = false
   exited = false
+  spawned = false
+  /** kill() calls, effective or not. */
+  killCalls = 0
+  /** Posts that reached this child after it exited (the alive flag must keep this at 0). */
+  postsAfterExit = 0
 
   constructor(
     readonly modulePath: string,
@@ -39,16 +45,36 @@ class FakeChild extends EventEmitter implements ChildLike {
     super()
   }
 
+  /** The process launched: Electron fills in the pid and emits 'spawn'. */
+  launch(): void {
+    if (this.spawned) return
+    this.spawned = true
+    this.pid = 4242
+    this.emit('spawn')
+  }
+
   postMessage(msg: unknown, transfer?: unknown[]): void {
-    if (this.exited) throw new Error('posted to an exited child (the alive flag failed)')
+    if (this.exited) {
+      this.postsAfterExit++
+      throw new Error('posted to an exited child (the alive flag failed)')
+    }
     this.received.push({ msg, transfer })
   }
 
   kill(): boolean {
+    this.killCalls++
+    // Electron 38 UtilityProcessWrapper::Kill(): returns false and does nothing while pid_ is
+    // still null, i.e. before the process launched ('spawn').
+    if (!this.spawned || this.exited) return false
     this.killed = true
     // Windows (PR0): our own kill() → 'exit' with code 0, and NO child-process-gone.
     queueMicrotask(() => this.exit(0))
     return true
+  }
+
+  /** Still running and nobody killed it. */
+  get orphanable(): boolean {
+    return !this.exited && !this.killed
   }
 
   exit(code: number): void {
@@ -125,8 +151,13 @@ interface Ctx {
   deps: SupervisorDeps
 }
 
+const SELF_CHECK = { checked: ['process._linkedBinding', 'process.binding'], failed: [] }
 const READY = {
-  ready: { tripwire: 0, electronNet: ['fetch', 'request', 'resolveHost', 'isOnline'] }
+  ready: {
+    tripwire: 0,
+    electronNet: ['fetch', 'request', 'resolveHost', 'isOnline'],
+    selfCheck: SELF_CHECK
+  }
 }
 const HB = {
   heartbeat: {
@@ -139,7 +170,10 @@ const HB = {
   }
 }
 
-function setup(over: Partial<SupervisorDeps> = {}): Ctx {
+function setup(
+  over: Partial<SupervisorDeps> = {},
+  { manualLaunch = false }: { manualLaunch?: boolean } = {}
+): Ctx {
   const children: FakeChild[] = []
   let goneListener: (d: ProcessGoneDetails) => void = () => {}
   const blockers = { started: [] as number[], stopped: [] as number[] }
@@ -162,7 +196,7 @@ function setup(over: Partial<SupervisorDeps> = {}): Ctx {
     fork: (modulePath, _args, options) => {
       const c = new FakeChild(modulePath, options)
       children.push(c)
-      queueMicrotask(() => c.emit('spawn'))
+      if (!manualLaunch) queueMicrotask(() => c.launch())
       return c
     },
     modulePath: '/app.asar/out/main/chunks/index-ocr.js',
@@ -406,9 +440,138 @@ describe('the alive flag', () => {
     const ctx = setup()
     const { child } = await connected(ctx)
     child.exit(1)
-    // FakeChild.postMessage throws after exit; none of these may reach it.
+    // post() would swallow FakeChild's throw, so count what reached it instead.
     ctx.sup.setLimits({ onBattery: true, thermal: 'nominal', speedLimit: 100 })
     await expect(ctx.sup.requestHeartbeat()).rejects.toThrow(/not running/)
+    expect(child.postsAfterExit).toBe(0)
+    expect(ctx.logs.filter((l) => l.includes('postMessage failed'))).toEqual([])
+  })
+
+  it('a child that exits before ready gets nothing when the next connect arrives', async () => {
+    const ctx = setup()
+    const wc = new FakeWebContents()
+    ctx.sup.connect(wc)
+    await tick()
+    const first = ctx.children[0]
+    first.exit(1)
+    ctx.sup.connect(wc)
+    await tick()
+    expect(first.postsAfterExit).toBe(0)
+    expect(first.received).toEqual([])
+    // The connect starts a new child, which gets the init and the port once it is ready.
+    expect(ctx.children).toHaveLength(2)
+    ctx.children[1].say(READY)
+    await tick()
+    expect(wc.ports).toHaveLength(1)
+    expect(ctx.logs.filter((l) => l.includes('postMessage failed'))).toEqual([])
+  })
+})
+
+describe('one child at a time', () => {
+  const orphans = (ctx: Ctx): FakeChild[] => ctx.children.filter((c) => c.orphanable)
+
+  it('kills a child torn down before it launched, once it launches', async () => {
+    const ctx = setup({}, { manualLaunch: true })
+    const wc = new FakeWebContents()
+    ctx.sup.connect(wc)
+    await tick()
+    const first = ctx.children[0]
+    // A reload right after connect(), before 'spawn': Electron 38's kill() is a no-op here.
+    wc.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false })
+    await tick()
+    expect(first.killCalls).toBe(1)
+    expect(first.killed).toBe(false)
+    expect(ctx.sup.state).toBe('stopped')
+    first.launch()
+    await tick()
+    expect(first.killed).toBe(true)
+    expect(first.exited).toBe(true)
+    // The next connect starts exactly one more, and nothing is left running unkilled but it.
+    ctx.sup.connect(wc)
+    await tick()
+    ctx.children[1].launch()
+    await tick()
+    expect(orphans(ctx)).toEqual([ctx.children[1]])
+    // No priority was set on the process that was killed at launch.
+    expect(ctx.priorities).toEqual([4242])
+  })
+
+  it('a connect after an exit, before it is classified, does not end with two children', async () => {
+    const ctx = setup()
+    const { wc } = await connected(ctx)
+    ctx.children[0].exit(1)
+    // Inside GONE_GRACE_MS, still unclassified.
+    ctx.sup.connect(wc)
+    await tick()
+    ctx.children[1].say(READY)
+    await tick()
+    await vi.advanceTimersByTimeAsync(10_500)
+    expect(ctx.children).toHaveLength(2)
+    expect(orphans(ctx)).toEqual([ctx.children[1]])
+    expect(ctx.sup.state).toBe('running')
+    expect(ctx.sup.lastExit).toMatchObject({ reason: 'abnormal-exit', exitCode: 1 })
+    // The renderer holds one live port; nobody told it the healthy child crashed.
+    expect(wc.ports).toHaveLength(2)
+    expect(wc.disconnects()).toEqual([])
+  })
+
+  it('a late child-process-gone for the dead child is not pinned on the healthy one', async () => {
+    const ctx = setup()
+    const { wc } = await connected(ctx)
+    ctx.children[0].exit(1)
+    ctx.sup.connect(wc)
+    await tick()
+    ctx.children[1].say(READY)
+    await tick()
+    // Child 0's details arrive after child 1 came up (no pid to tell them apart).
+    ctx.gone({ reason: 'crashed', exitCode: 1 })
+    await vi.advanceTimersByTimeAsync(10_500)
+    expect(ctx.children).toHaveLength(2)
+    expect(orphans(ctx)).toEqual([ctx.children[1]])
+    expect(ctx.sup.state).toBe('running')
+    expect(wc.disconnects()).toEqual([])
+    // Child 1's own crash, later, is still a crash.
+    ctx.children[1].exit(2)
+    ctx.gone({ reason: 'crashed', exitCode: 2 })
+    await tick()
+    expect(ctx.sup.lastExit).toMatchObject({ reason: 'crashed', exitCode: 2 })
+    expect(wc.disconnects()).toEqual([{ reason: 'crashed' }])
+  })
+
+  it('a launch failure of a child torn down while starting does not take down its successor', async () => {
+    const ctx = setup({}, { manualLaunch: true })
+    const wc = new FakeWebContents()
+    ctx.sup.connect(wc)
+    await tick()
+    wc.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false })
+    ctx.sup.connect(wc)
+    await tick()
+    ctx.children[1].launch()
+    ctx.children[1].say(READY)
+    await tick()
+    // Now child 0, never launched, reports its launch failure.
+    ctx.gone({ reason: 'launch-failed', exitCode: 0 })
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(ctx.sup.state).toBe('running')
+    expect(wc.disconnects()).toEqual([])
+    expect(ctx.children[1].orphanable).toBe(true)
+  })
+
+  it('a gone event before its exit still belongs to the live child once the late window is over', async () => {
+    const ctx = setup()
+    const { wc } = await connected(ctx)
+    ctx.children[0].exit(1)
+    ctx.sup.connect(wc)
+    await tick()
+    ctx.children[1].say(READY)
+    await tick()
+    await vi.advanceTimersByTimeAsync(LATE_GONE_MS)
+    // Child 0's details never came; child 1 now dies the gone-first way.
+    ctx.gone({ reason: 'oom', exitCode: -536870904 })
+    ctx.children[1].exit(1)
+    await tick()
+    expect(ctx.sup.lastExit).toMatchObject({ reason: 'oom' })
+    expect(ctx.sup.concurrencyDivisor).toBe(2)
   })
 })
 
@@ -481,6 +644,22 @@ describe('exits (the PR0 Windows matrix)', () => {
     expect(ctx.sup.lastExit).toBeNull()
   })
 
+  it('backs off 500 ms, then 2 s, then 5 s', async () => {
+    const ctx = setup()
+    await connected(ctx)
+    for (let i = 0; i < BACKOFF_MS.length; i++) {
+      const before = ctx.children.length
+      ctx.children.at(-1)!.exit(2)
+      ctx.gone({ reason: 'crashed', exitCode: 2 })
+      await vi.advanceTimersByTimeAsync(BACKOFF_MS[i] - 1)
+      expect(ctx.children, `crash ${i + 1}: not before ${BACKOFF_MS[i]} ms`).toHaveLength(before)
+      await vi.advanceTimersByTimeAsync(1)
+      expect(ctx.children, `crash ${i + 1}: at ${BACKOFF_MS[i]} ms`).toHaveLength(before + 1)
+      ctx.children.at(-1)!.say(READY)
+      await tick()
+    }
+  })
+
   it('caps respawns at 3 in 60 s, then stops with crash-loop', async () => {
     const ctx = setup()
     const { wc } = await connected(ctx)
@@ -536,7 +715,8 @@ describe('exits (the PR0 Windows matrix)', () => {
   })
 
   it('launch-failed is fatal: no respawn loop, and later connects are refused', async () => {
-    const ctx = setup()
+    // A process that fails to launch never emits 'spawn'.
+    const ctx = setup({}, { manualLaunch: true })
     const wc = new FakeWebContents()
     ctx.sup.connect(wc)
     await tick()
@@ -727,6 +907,27 @@ describe('window and renderer lifecycle', () => {
     const { child } = await connected(ctx)
     ctx.sup.dispose()
     expect(child.killed).toBe(true)
+  })
+})
+
+describe('the tripwire self-check', () => {
+  it("keeps the child realm's self-check from ready, and logs a failed one", async () => {
+    const ctx = setup()
+    const wc = new FakeWebContents()
+    ctx.sup.connect(wc)
+    await tick()
+    ctx.children[0].say({
+      ready: {
+        ...READY.ready,
+        selfCheck: { checked: SELF_CHECK.checked, failed: ['process.binding'] }
+      }
+    })
+    await tick()
+    expect(ctx.sup.childSelfCheck).toEqual({
+      checked: SELF_CHECK.checked,
+      failed: ['process.binding']
+    })
+    expect(ctx.logs.filter((l) => l.includes('self-check FAILED'))).toHaveLength(1)
   })
 })
 

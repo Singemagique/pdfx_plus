@@ -12,8 +12,10 @@ import { concurrency, recognizeWatchdogMs, rasterWatchdogMs } from './budget'
 import { Coordinator, isOomShaped } from './coordinator'
 import {
   FakePort,
+  FakeRaster,
   INIT,
   LIMITS,
+  SELF_CHECK,
   harness,
   recognized,
   rendered,
@@ -142,7 +144,11 @@ describe('the happy path', () => {
   it('opens a source, recognizes its pages and reports in protocol shape', async () => {
     const { h, port } = await start()
     expect(h.parent.of('ready')).toEqual([
-      { tripwire: 0, electronNet: ['fetch', 'request', 'resolveHost', 'isOnline'] }
+      {
+        tripwire: 0,
+        electronNet: ['fetch', 'request', 'resolveHost', 'isOnline'],
+        selfCheck: SELF_CHECK
+      }
     ])
     await open(port, 's1')
     expect(port.of('opened')).toEqual([{ src: 's1', pageCount: 10 }])
@@ -611,6 +617,169 @@ describe('recognize failure policy (§3.3.4)', () => {
   })
 })
 
+describe('raster: blame what the thread was doing (§3.3.4)', () => {
+  for (const [name, how] of [
+    ['traps', 'fatal'],
+    ['dies', 'crash']
+  ] as const) {
+    it(`a source whose open ${name} is dropped for good; the other source's pages carry on`, async () => {
+      const { h, c, port } = await start({
+        threads: 1,
+        rasterOpen: (src) =>
+          src !== 'bad'
+            ? undefined
+            : how === 'crash'
+              ? 'crash'
+              : { type: 'fatal', taskId: null, error: 'RuntimeError: unreachable', tripwire: 0 }
+      })
+      await open(port, 'good')
+      recognize(port, 'jg', 'good', [0, 1, 2, 3])
+      // Opened while good's pages are rendering: the thread opens it between two renders.
+      port.send({ open: { src: 'bad', bytes: bytes() } })
+      await settle(150)
+      expect(errors(port)).toEqual([
+        { code: 'open-failed', message: 'PDFium crashed opening the file', src: 'bad' }
+      ])
+      expect(c.snapshot().sources).toEqual(['good'])
+      // Nothing of good's was charged: every page ok, one respawn, and the new thread never saw bad.
+      expect(results(port).map((r) => r.page.status)).toEqual(['ok', 'ok', 'ok', 'ok'])
+      expect(h.rasters).toHaveLength(2)
+      expect(h.rasters[1].received.flatMap((m) => (m.type === 'open' ? [m.src] : []))).toEqual([
+        'good'
+      ])
+      // A later job does not start the cycle again.
+      recognize(port, 'jg2', 'good', [4])
+      await settle(60)
+      expect(h.rasters).toHaveLength(2)
+      expect(h.parent.of('fatal')).toEqual([])
+    })
+  }
+
+  it('a fatal names its render: another render in flight is re-queued, not charged', async () => {
+    // Thread 1 answers render 1 with a fatal that names task 99 (not the one in flight).
+    let first = true
+    const { h, port } = await start({
+      threads: 1,
+      raster: (m, t) => {
+        if (first) {
+          first = false
+          return { type: 'fatal', taskId: 99, error: 'RuntimeError: unreachable', tripwire: 0 }
+        }
+        return rendered(m, t)
+      }
+    })
+    await open(port, 's')
+    recognize(port, 'j', 's', [0])
+    await settle(60)
+    expect(results(port).map((r) => r.page.status)).toEqual(['ok'])
+    expect(h.rasters).toHaveLength(2)
+  })
+
+  it('gives up after 10 raster fatals in a minute, however many pages they spread over', async () => {
+    const { h, port } = await start({
+      threads: 1,
+      raster: (m) => ({ type: 'fatal', taskId: m.taskId, error: 'RuntimeError: x', tripwire: 0 })
+    })
+    await open(port, 's')
+    recognize(port, 'j', 's', [0, 1, 2, 3, 4, 5, 6, 7])
+    await settle(400)
+    expect(h.parent.of('fatal')).toEqual([
+      { code: 'init', message: 'raster thread keeps crashing' }
+    ])
+    // 10 threads died; no 11th was started.
+    expect(h.rasters).toHaveLength(10)
+    expect(results(port)).toHaveLength(8)
+    expect(results(port).every((r) => r.page.status === 'failed')).toBe(true)
+  })
+})
+
+describe('start failures: only threads that failed to start count', () => {
+  it('cancelling while recognize threads are still starting keeps them and is not fatal', async () => {
+    const { h, port } = await start({ threads: 4, holdRecognizeReady: true })
+    await open(port, 's')
+    recognize(port, 'j', 's', [0, 1, 2, 3])
+    await settle(60)
+    expect(h.recognizers).toHaveLength(4)
+    port.send({ cancel: 'j' })
+    await settle()
+    expect(h.parent.of('fatal')).toEqual([])
+    // Kept for the next pages, not terminated (their pages never left the outbox).
+    expect(h.recognizers.some((r) => r.terminated)).toBe(false)
+    for (const r of h.recognizers) r.releaseReady()
+    recognize(port, 'j2', 's', [0, 1])
+    await settle(60)
+    expect(jobDone(port)).toContainEqual({ jobId: 'j2', done: 2, failed: 0, cancelled: false })
+    expect(h.recognizers).toHaveLength(4)
+    expect(h.recognizers.flatMap((r) => r.jobs)).toHaveLength(2)
+  })
+
+  it('cancel, a new port and a close during startup, back to back, are not fatal', async () => {
+    const h0 = await start({ threads: 1, holdRecognizeReady: true })
+    const { h } = h0
+    let port = h0.port
+    await open(port, 's')
+    recognize(port, 'j0', 's', [0])
+    await settle()
+    port.send({ cancel: 'j0' })
+    await settle()
+    recognize(port, 'j1', 's', [0])
+    await settle()
+    port = new FakePort()
+    h.parent.send({ port: {} }, [port])
+    await settle()
+    await open(port, 's')
+    recognize(port, 'j2', 's', [0])
+    await settle()
+    port.send({ close: 's' })
+    await settle()
+    expect(h.parent.of('fatal')).toEqual([])
+    expect(h.recognizers).toHaveLength(1)
+    h.recognizers[0].releaseReady()
+    await open(port, 's2')
+    recognize(port, 'j3', 's2', [0])
+    await settle(60)
+    expect(jobDone(port)).toContainEqual({ jobId: 'j3', done: 1, failed: 0, cancelled: false })
+  })
+
+  it('still gives up on recognize threads that die before ever saying ready', async () => {
+    const h0 = harness({ threads: 1 })
+    let spawned = 0
+    const c = new Coordinator({
+      ...h0.deps,
+      spawnRecognize: () => {
+        spawned++
+        const w = new EventEmitter() as EventEmitter & {
+          postMessage(m: unknown): void
+          terminate(): void
+        }
+        w.postMessage = (m: unknown) => {
+          if ((m as { type: string }).type === 'init')
+            queueMicrotask(() => {
+              w.emit('error', new Error('Cannot find module'))
+              w.emit('exit', 1)
+            })
+        }
+        w.terminate = () => {}
+        return w as never
+      }
+    })
+    live.push(c)
+    h0.parent.send(INIT)
+    const port = new FakePort()
+    h0.parent.send({ port: {} }, [port])
+    await settle()
+    await open(port, 's')
+    // Each page is charged a recognize failure per death (it is re-queued once), so it takes two
+    // pages to reach the third start.
+    recognize(port, 'j', 's', [0, 1, 2])
+    await settle(120)
+    expect(spawned).toBe(3)
+    expect(h0.parent.of('fatal')).toEqual([
+      { code: 'init', message: 'recognize thread failed to start' }
+    ])
+  })
+})
+
 describe('memory: the byte-budgeted LRU', () => {
   it('evicts the least-recently used idle source past the budget, never a busy one', async () => {
     const { c, port } = await start({ budgets: { sourceBudget: 250 }, recognize: () => 'hang' })
@@ -678,6 +847,28 @@ describe('progress, activity and heartbeat', () => {
     expect(hb.tripwire).toEqual({ process: 1, raster: 3, recognize: 4 })
     expect(hb.threads).toEqual({ raster: 1, recognize: 0 })
     expect(c.snapshot().jobs).toEqual([])
+  })
+
+  it("reports the tripwire broken when a thread's self-check failed", async () => {
+    const h0 = harness()
+    const c = new Coordinator({
+      ...h0.deps,
+      spawnRaster: () => {
+        const r = h0.deps.spawnRaster() as FakeRaster
+        r.selfCheckFailed = ['process.binding']
+        return r
+      }
+    })
+    live.push(c)
+    h0.parent.send(INIT)
+    const port = new FakePort()
+    h0.parent.send({ port: {} }, [port])
+    h0.parent.send({ heartbeat: {} })
+    expect((h0.parent.of('heartbeat') as Heartbeat[]).at(-1)!.tripwireIntact).toBe(true)
+    await settle()
+    await open(port, 's')
+    h0.parent.send({ heartbeat: {} })
+    expect((h0.parent.of('heartbeat') as Heartbeat[]).at(-1)!.tripwireIntact).toBe(false)
   })
 
   it('shuts down on request', async () => {

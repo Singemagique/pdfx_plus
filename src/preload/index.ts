@@ -213,8 +213,18 @@ const api = {
     ipcRenderer.invoke('pdfx:settings-set', patch),
   /** Text recognition: a port to the "pdfx-ocr" utility process, kept inside this preload. */
   ocr: {
-    /** Ask main for a fresh port (spawns the OCR process if needed). Posts queue until it arrives. */
+    /**
+     * Ask main for a fresh port (spawns the OCR process if needed). Posts queue until it arrives.
+     * A port already held is closed first: the coordinator voids the old port's session when the
+     * new one arrives, so a post sent on it in between would be lost. The `connected` event that
+     * follows means a fresh session (sources must be opened again).
+     */
     connect: (): void => {
+      if (ocrPort) {
+        const old = ocrPort
+        ocrPort = null
+        old.close()
+      }
       ocrConnecting = true
       ipcRenderer.send(OCR_CONNECT_CHANNEL)
     },

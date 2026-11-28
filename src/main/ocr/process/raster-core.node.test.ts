@@ -7,13 +7,21 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { getDocument } from 'pdfjs-dist/legacy/build/pdf.mjs'
 import 'pdfjs-dist/legacy/build/pdf.worker.mjs'
 import type { PDFDocumentProxy } from 'pdfjs-dist'
-import { PDFDocument, rgb } from 'pdf-lib'
+import {
+  PDFDocument,
+  concatTransformationMatrix,
+  drawObject,
+  popGraphicsState,
+  pushGraphicsState,
+  rgb
+} from 'pdf-lib'
 
 import {
   DEFAULT_RASTER_LIMITS,
   FPDFBitmap_Gray,
   RasterEngine,
   fitRaster,
+  makePrintErr,
   type RenderOutcome
 } from './raster-core'
 import {
@@ -317,6 +325,36 @@ describe('memory guards', () => {
     expect(engine.stderrTail).toContain(ENLARGE_LINE)
   })
 
+  it('routes PDFium printErr lines into the engine, also those printed during a render', async () => {
+    // What raster-thread.ts hands the Emscripten glue as `printErr`.
+    let engine: RasterEngine | null = null
+    const early: string[] = []
+    const printErr = makePrintErr(() => engine, early)
+    printErr('init line')
+    expect(early).toEqual(['init line'])
+    const faulty = {
+      ...mod,
+      FPDF_RenderPageBitmap: (...args: Parameters<TestPdfium['FPDF_RenderPageBitmap']>) => {
+        // PDFium itself prints, through the glue, in the middle of the render call.
+        printErr(ENLARGE_LINE)
+        mod.FPDF_RenderPageBitmap(...args)
+      }
+    } as TestPdfium
+    engine = new RasterEngine(faulty)
+    engine.attach('s', shared(await onePage()))
+    expect(
+      engine.render({
+        src: 's',
+        index: 0,
+        dpi: 72,
+        userUnit: 1,
+        frame: { width: 612, height: 792 }
+      })
+    ).toEqual({ kind: 'heap-exhausted' })
+    expect(early).toEqual(['init line'])
+    expect(engine.stderrTail).toEqual([ENLARGE_LINE])
+  })
+
   it('answers heap-exhausted when the headroom probe cannot allocate', async () => {
     const big = DEFAULT_RASTER_LIMITS.decodeAllowance
     const starved = {
@@ -365,7 +403,7 @@ describe('memory guards', () => {
     expect(opens).toBe(1)
 
     opens = 0
-    // Watermark −1: any heap size counts as "grown past it", so every render reopens.
+    // Watermark −1: any amount served counts as "past it", so every render reopens.
     const reopen = new RasterEngine(counting, { ...DEFAULT_RASTER_LIMITS, reopenWatermark: -1 })
     reopen.attach('s', shared(bytes))
     for (let i = 0; i < 3; i++)
@@ -373,6 +411,66 @@ describe('memory guards', () => {
     expect(opens).toBe(3)
     keep.closeAll()
     reopen.closeAll()
+  })
+
+  it('reopens after a constant number of pages: the watermark bounds the bytes a document holds', async () => {
+    // Every page draws its own uncompressed 512 × 512 DeviceGray image (256 KiB of stream data),
+    // the case PDFium retains until the document closes. With the watermark measured as heap
+    // growth, the gaps between reopens grew every cycle (freed memory is reused without growing
+    // HEAPU8); measured as bytes served they stay constant.
+    const SIDE = 512
+    const PAGES = 40
+    const doc = await PDFDocument.create()
+    for (let i = 0; i < PAGES; i++) {
+      const img = doc.context.stream(new Uint8Array(SIDE * SIDE).fill((i * 37) % 256), {
+        Type: 'XObject',
+        Subtype: 'Image',
+        Width: SIDE,
+        Height: SIDE,
+        ColorSpace: 'DeviceGray',
+        BitsPerComponent: 8
+      })
+      const page = doc.addPage([72, 72])
+      const name = page.node.newXObject('Im', doc.context.register(img))
+      page.pushOperators(
+        pushGraphicsState(),
+        concatTransformationMatrix(72, 0, 0, 72, 0, 0),
+        drawObject(name),
+        popGraphicsState()
+      )
+    }
+    const bytes = await doc.save({ useObjectStreams: false })
+    let current = -1
+    const opensAt: number[] = []
+    const counting = {
+      ...mod,
+      FPDF_LoadCustomDocument: (fa: number, pw: string) => {
+        opensAt.push(current)
+        return mod.FPDF_LoadCustomDocument(fa, pw)
+      }
+    } as TestPdfium
+    const watermark = 2 * 2 ** 20
+    const engine = new RasterEngine(counting, {
+      ...DEFAULT_RASTER_LIMITS,
+      reopenWatermark: watermark
+    })
+    engine.attach('s', shared(bytes))
+    for (current = 0; current < PAGES; current++)
+      ok(
+        engine.render({
+          src: 's',
+          index: current,
+          dpi: 18,
+          userUnit: 1,
+          frame: { width: 72, height: 72 }
+        })
+      )
+    engine.closeAll()
+    const gaps = opensAt.slice(1).map((p, i) => p - opensAt[i])
+    // 2 MiB / 256 KiB = 8 pages per cycle (plus the page that crosses the mark).
+    expect(gaps.length).toBeGreaterThanOrEqual(3)
+    expect(Math.max(...gaps) - Math.min(...gaps)).toBeLessThanOrEqual(1)
+    expect(Math.max(...gaps)).toBeLessThanOrEqual(Math.ceil(watermark / (SIDE * SIDE)) + 1)
   })
 
   it('lets a WebAssembly.RuntimeError out (the thread then poisons itself)', async () => {
