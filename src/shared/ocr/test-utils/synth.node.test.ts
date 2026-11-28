@@ -240,6 +240,36 @@ describe.each(PR1_PRESETS)('GT sanity: %s', (preset) => {
   })
 })
 
+describe('vertical GT lines (margin-label, PR5)', () => {
+  it('each turned word box sits on its ink, and the two labels read up and down', async () => {
+    const { gt } = await synth('margin-label', 1)
+    const vertical = gt.lines.filter((l) => l.rotate !== undefined)
+    expect(vertical.map((l) => l.rotate)).toEqual([90, -90])
+    // GT order: left label, body, right label.
+    expect(gt.lines[0].rotate).toBe(90)
+    expect(gt.lines[gt.lines.length - 1].rotate).toBe(-90)
+    for (const l of vertical) {
+      const ws = l.words.map((i) => gt.words[i])
+      expect(ws.length).toBeGreaterThan(3)
+      for (const w of ws) {
+        // Turned: tall boxes; the ink covers most of the advance (now the height) and lies within.
+        expect(w.srcBox.h).toBeGreaterThan(w.srcBox.w * 0.9)
+        expect(w.srcInk, `no ink under "${w.t}"`).not.toBeNull()
+        expect(w.srcInk!.h).toBeGreaterThan(0.75 * w.srcBox.h)
+        expect(w.srcInk!.w).toBeGreaterThan(0.3 * w.srcBox.w)
+      }
+      for (let k = 1; k < ws.length; k++)
+        if (l.rotate === 90) expect(ws[k].srcBox.y).toBeGreaterThan(ws[k - 1].srcBox.y)
+        else expect(ws[k].srcBox.y).toBeLessThan(ws[k - 1].srcBox.y)
+      expect(l.text).toBe(ws.map((w) => w.t).join(' '))
+    }
+    // Left label up the left margin, right one down the right margin, clear of the body.
+    for (const i of vertical[0].words)
+      expect(gt.words[i].box.x + gt.words[i].box.w).toBeLessThan(30)
+    for (const i of vertical[1].words) expect(gt.words[i].box.x).toBeGreaterThan(gt.page.width - 30)
+  })
+})
+
 describe('GT frames', () => {
   it('rot90page: (X, Y) → (H − Y, X), and the raster is the clean raster turned once', async () => {
     const up = await synth('clean300', 1)

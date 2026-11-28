@@ -14,9 +14,15 @@ import {
 } from 'electron'
 import { writeFileSync } from 'node:fs'
 import { constants, setPriority } from 'node:os'
-import { resolve } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import ocrProcessPath from './process/index?modulePath'
-import { OCR_CONNECT_CHANNEL, type ThermalState } from '../../shared/ocr/protocol'
+import { OCR_CONNECT_CHANNEL, type OcrPaths, type ThermalState } from '../../shared/ocr/protocol'
+import {
+  ENGINE_CORE,
+  ENGINE_DATA,
+  RESOURCES_OCR_DIR,
+  RESOURCES_TESSDATA_DIR
+} from './process/engine-manifest'
 import { getMainWindow } from '../window'
 import {
   OcrSupervisor,
@@ -37,6 +43,32 @@ let speedLimit = 100
 /** pdfium.wasm inside the asar (packaged) or node_modules (dev). Main resolves; the child reads. */
 function pdfiumWasmPath(): string {
   return require.resolve('@embedpdf/pdfium/pdfium.wasm')
+}
+
+/**
+ * The Tesseract core and the bundled languages. Packaged: `resources/ocr/` and
+ * `resources/ocr/tessdata/`, copied there by electron-builder `extraResources` (never in the
+ * asar). Dev and tests: the same files straight from node_modules. The utility process checks every
+ * one against the compiled manifest before it uses it.
+ */
+export function ocrEnginePaths(): Omit<OcrPaths, 'pdfiumWasm'> {
+  if (app.isPackaged) {
+    const dir = join(process.resourcesPath, RESOURCES_OCR_DIR)
+    const data = join(process.resourcesPath, RESOURCES_TESSDATA_DIR)
+    return {
+      ocrCore: dir,
+      tessdata: Object.fromEntries(
+        Object.entries(ENGINE_DATA).map(([lang, f]) => [lang, join(data, f.file)])
+      )
+    }
+  }
+  const root = app.getAppPath()
+  return {
+    ocrCore: dirname(join(root, ENGINE_CORE.wasm.source)),
+    tessdata: Object.fromEntries(
+      Object.entries(ENGINE_DATA).map(([lang, f]) => [lang, join(root, f.source)])
+    )
+  }
 }
 
 function hostLimits(): { onBattery: boolean; thermal: ThermalState; speedLimit: number } {
@@ -74,7 +106,7 @@ export function getOcrSupervisor(): OcrSupervisor {
     },
     init: () => ({
       limits: { ...hostLimits(), divisor: 1 },
-      paths: { pdfiumWasm: pdfiumWasmPath() }
+      paths: { pdfiumWasm: pdfiumWasmPath(), ...ocrEnginePaths() }
     }),
     platform: process.platform,
     env: process.env,
@@ -115,24 +147,61 @@ export async function runOcrSelftest(outArg: string | undefined): Promise<number
   const sup = getOcrSupervisor()
   let report: SelftestReport | null = null
   let error: string | null = null
+  // OCR going fatal (e.g. an engine file failing its manifest check: the child reports which one)
+  // ends the session at once with that reason, instead of a step timing out a minute later.
+  let stopFatalWatch = (): void => {}
+  const fatal = new Promise<never>((_, reject) => {
+    stopFatalWatch = sup.onFatal((f) =>
+      reject(
+        new Error(
+          f
+            ? `OCR became unavailable: fatal ${f.code} error: ${f.message}`
+            : 'OCR became unavailable (fatal)'
+        )
+      )
+    )
+  })
+  fatal.catch(() => {})
+  let readyTimer: ReturnType<typeof setTimeout> | undefined
   try {
     const port = (await Promise.race([
       sup.connectLocal(),
-      new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error('the utility process did not become ready')), 30_000)
-      )
+      fatal,
+      new Promise<never>((_, reject) => {
+        readyTimer = setTimeout(
+          () => reject(new Error('the utility process did not become ready')),
+          30_000
+        )
+      })
     ])) as unknown as SelftestPort
-    report = await selftestSession(port, () => sup.requestHeartbeat())
+    clearTimeout(readyTimer)
+    report = await selftestSession(
+      port,
+      () => sup.requestHeartbeat(),
+      () => performance.now(),
+      fatal
+    )
   } catch (e) {
     error = e instanceof Error ? e.message : String(e)
+  } finally {
+    clearTimeout(readyTimer)
+    stopFatalWatch()
   }
   const output = sup.output
   const lastExit = sup.lastExit
   const spawnCount = sup.spawnCount
   const electronNet = sup.childElectronNet
   const selfCheck = sup.childSelfCheck
+  const supervisorState = sup.state
+  const lastFatal = sup.lastFatal
   sup.teardown('selftest-done')
   const failures = [...(report?.failures ?? []), ...(error ? [error] : [])]
+  if (supervisorState === 'fatal' && !failures.some((f) => f.startsWith('OCR became unavailable')))
+    failures.push(
+      lastFatal
+        ? `OCR became unavailable: fatal ${lastFatal.code} error: ${lastFatal.message}`
+        : 'OCR became unavailable (fatal)'
+    )
   if (lastExit) failures.push(`the utility process exited unexpectedly (${lastExit.reason})`)
   // electron.net fully stubbed, and the child's own self-check saw every escape hatch trip
   // (process._linkedBinding('electron_common_net') among them), inside the child.
@@ -150,10 +219,15 @@ export async function runOcrSelftest(outArg: string | undefined): Promise<number
       platform: process.platform,
       arch: process.arch,
       utilityEntryInAsar: /app\.asar[\\/]/.test(ocrProcessPath),
-      pdfiumWasmInAsar: /app\.asar[\\/]/.test(pdfiumWasmPath())
+      pdfiumWasmInAsar: /app\.asar[\\/]/.test(pdfiumWasmPath()),
+      // The engine must come from resources/ocr (extraResources), never from inside the asar.
+      ocrEngineInAsar: /app\.asar[\\/]/.test(ocrEnginePaths().ocrCore),
+      ocrLanguages: Object.keys(ocrEnginePaths().tessdata)
     },
     child: {
       spawnCount,
+      supervisorState,
+      fatal: lastFatal,
       unexpectedExit: lastExit,
       stdio: output,
       electronNetStubbed: electronNet,

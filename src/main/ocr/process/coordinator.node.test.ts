@@ -9,6 +9,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
   OCR_HEARTBEAT_INTERVAL_MS,
+  OcrError,
   type FromOcr,
   type Heartbeat,
   type PageResult
@@ -23,6 +24,7 @@ import {
   recognizeWatchdogMs,
   threadOptions
 } from './budget'
+import { ENGINE_ID } from '../../../shared/ocr/engine/tess-core'
 import { Coordinator, isOomShaped, isThreadOom } from './coordinator'
 import {
   FakePort,
@@ -210,6 +212,9 @@ describe('budgets', () => {
     expect(isOomShaped('RuntimeError', 'Aborted(Cannot enlarge memory arrays)')).toBe(true)
     expect(isOomShaped('Error', 'Array buffer allocation failed')).toBe(true)
     expect(isOomShaped('RuntimeError', 'unreachable')).toBe(false)
+    // The recognize thread's WASM OOM (Recognize rc −1 / empty hOCR + Leptonica malloc failure).
+    expect(isOomShaped('OcrOutOfMemory', 'out of memory: Recognize returned -1')).toBe(true)
+    expect(isOomShaped('TessError', 'empty hOCR')).toBe(false)
     // A stack overflow is a RangeError too, and no memory shortage: the stack is fixed per thread.
     expect(isOomShaped('RangeError', 'Maximum call stack size exceeded')).toBe(false)
   })
@@ -237,17 +242,71 @@ describe('the happy path', () => {
     for (const r of results(port)) {
       expect(r.page.status).toBe('ok')
       expect(r.page.raster).toEqual({ width: 612, height: 792 })
-      expect(r.page.recognition?.stub).toBe(true)
+      // The thread's RawOcr, mapped into the overlay frame and packed (map.ts).
+      const p = r.page.recognition!
+      expect(p).toMatchObject({
+        v: 1,
+        engineId: ENGINE_ID,
+        langs: ['eng'],
+        dataHashes: { eng: 'e'.repeat(64) },
+        pageClass: 'scanned',
+        renderDpi: 72,
+        status: 'ok'
+      })
+      expect(p.text).toBe('scanned')
+      // Raster 612 × 792 px for a 612 × 792 pt page: px = pt; the word's left edge is x0 = 153.
+      expect(p.wordGeom[0]).toBeCloseTo(153, 4)
+      expect(p.wordGeom[3]).toBe(92)
     }
     expect(jobDone(port)).toEqual([{ jobId: 'j1', done: 3, failed: 0, cancelled: false }])
-    // The recognize threads got the coordinator's compiled module, once each.
-    for (const r of h.recognizers) expect(r.initModule).toBeInstanceOf(WebAssembly.Module)
+    // The recognize threads got the coordinator's compiled module and data, once each.
+    for (const r of h.recognizers) {
+      expect(r.initModule?.module).toBeInstanceOf(WebAssembly.Module)
+      expect(r.initModule?.coreDir).toBe(INIT.init.paths.ocrCore)
+    }
     // Source bytes reach the raster thread as a SharedArrayBuffer (survives a respawn).
     const openMsg = h.rasters[0].received.find((m) => m.type === 'open')
     expect(openMsg && 'data' in openMsg && openMsg.data).toBeInstanceOf(SharedArrayBuffer)
     // Every message the renderer got is valid protocol.
     const { parseFromOcr } = await import('../../../shared/ocr/protocol')
     for (const m of port.sent) expect(() => parseFromOcr(m as FromOcr)).not.toThrow()
+  })
+
+  it('a job in a language with no data ends needs-language without rendering', async () => {
+    const { h, port } = await start()
+    await open(port, 's1')
+    port.send({
+      recognize: { jobId: 'jr', src: 's1', pages: pages(0, 1), opts: { langs: ['eng', 'rus'] } }
+    })
+    await settle()
+    expect(results(port).map((r) => r.page.status)).toEqual(['needs-language', 'needs-language'])
+    expect(jobDone(port)).toEqual([{ jobId: 'jr', done: 2, failed: 0, cancelled: false }])
+    expect(h.rasters[0].received.filter((m) => m.type === 'render')).toHaveLength(0)
+  })
+
+  it('a page with no text is no-text; a result the mapping rejects fails the page', async () => {
+    const { port } = await start({
+      recognize: (m, t) =>
+        m.taskId % 2
+          ? {
+              ...recognized(m, t),
+              result: {
+                raw: { lines: [], meanConf: null, confSource: 'none' },
+                chosen: 'pass1',
+                passes: []
+              }
+            }
+          : { ...recognized(m, t), result: { raw: null, chosen: 'pass1', passes: [] } as never }
+    })
+    await open(port, 's1')
+    recognize(port, 'j1', 's1', [0, 1])
+    await settle()
+    const byIndex = results(port).sort((a, b) => a.index - b.index)
+    expect(byIndex.map((r) => [r.page.status, r.page.reason])).toEqual([
+      ['no-text', undefined],
+      ['failed', 'recognize-crash']
+    ])
+    expect(byIndex[0].page.recognition).toMatchObject({ status: 'no-text', text: '' })
   })
 
   it('answers bad and not-yet-supported messages without acting on them', async () => {
@@ -596,6 +655,36 @@ describe('raster failure policy (§3.3.4)', () => {
     expect(results(port).map((r) => r.page.status)).toEqual(['failed', 'failed'])
   })
 
+  it('an engine file that fails its manifest check is fatal to main, naming the file and check', async () => {
+    // loadEngine's OcrError messages are built path-free; they are what main logs and the packaged
+    // self-test reports (PR5 review: only "OcrError" arrived, and the self-test waited 60 s).
+    const h0 = harness()
+    const c = new Coordinator({
+      ...h0.deps,
+      loadEngine: async () => {
+        throw new OcrError('init', 'traineddata fra: SHA-256 mismatch')
+      }
+    })
+    live.push(c)
+    h0.parent.send(INIT)
+    await settle()
+    expect(h0.parent.of('fatal')).toEqual([
+      { code: 'init', message: 'traineddata fra: SHA-256 mismatch' }
+    ])
+    // Any other error (a failed read of the PDFium .wasm, say) may carry a path: its name only.
+    const h1 = harness()
+    const c1 = new Coordinator({
+      ...h1.deps,
+      loadPdfium: async () => {
+        throw new Error("ENOENT: no such file or directory, open 'C:\\Users\\someone\\pdfium.wasm'")
+      }
+    })
+    live.push(c1)
+    h1.parent.send(INIT)
+    await settle()
+    expect(h1.parent.of('fatal')).toEqual([{ code: 'init', message: 'Error' }])
+  })
+
   it('reports a source PDFium cannot open and forgets it', async () => {
     const h0 = harness()
     const c = new Coordinator({
@@ -677,6 +766,35 @@ describe('recognize failure policy (§3.3.4)', () => {
     await settle(80)
     expect(c.snapshot().concurrency).toBe(2)
     expect(results(port).every((r) => r.page.status === 'ok')).toBe(true)
+  })
+
+  it('a WASM OOM (Recognize rc −1): respawn, re-queue once, halve n, then the page succeeds', async () => {
+    let first = true
+    const { c, h, port } = await start({
+      threads: 2,
+      recognize: (m, t) => {
+        if (first) {
+          first = false
+          // What recognize-thread.ts posts for a TessError of kind 'oom' (PR0b §f).
+          return {
+            type: 'error',
+            taskId: m.taskId,
+            name: 'OcrOutOfMemory',
+            message: 'out of memory: Recognize returned -1',
+            tripwire: 0
+          }
+        }
+        return recognized(m, t)
+      }
+    })
+    await open(port, 's')
+    recognize(port, 'j', 's', [0])
+    await settle(80)
+    expect(c.snapshot().concurrency).toBe(1)
+    expect(results(port).map((r) => r.page.status)).toEqual(['ok'])
+    // The thread that failed was retired; the page went to a fresh one.
+    expect(h.recognizers[0].terminated).toBe(true)
+    expect(h.recognizers.length).toBeGreaterThanOrEqual(2)
   })
 
   /** What a thread under `threadOptions()` emits when its V8 heap cap is reached (Node 24, PR0b). */
@@ -982,7 +1100,7 @@ describe('progress, activity and heartbeat', () => {
     expect(jobDone(port)).toEqual([{ jobId: 'j', done: 40, failed: 0, cancelled: false }])
     const act = h.parent.of('activity') as Array<{ busy: boolean; done: number; total: number }>
     expect(act[0]).toMatchObject({ busy: true, total: 40 })
-    expect(act.at(-1)).toEqual({ busy: false, done: 0, total: 0 })
+    expect(act.at(-1)).toEqual({ busy: false, done: 0, total: 0, triage: false })
   })
 
   it('sums the tripwire counters of the process and of every thread, retired ones included', async () => {

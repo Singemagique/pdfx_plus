@@ -1,6 +1,6 @@
 {
   "extends": "@electron-toolkit/tsconfig/tsconfig.json",
-  "include": ["src/shared/**/*"],
+  "include": ["src/shared/**/*", "types/shared-webassembly.d.ts"],
   "compilerOptions": {
     "composite": true,
     "lib": ["ESNext"],

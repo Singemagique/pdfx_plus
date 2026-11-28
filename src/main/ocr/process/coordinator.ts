@@ -21,14 +21,19 @@
 //         error, watchdog) → respawn and re-queue once, then `failed`; "Cannot enlarge memory"
 //         during a render or no headroom → recycle and retry once, then `too-large`. A page queued
 //         behind a failure carries on.
-// §3.3.5  Progress ≤ 10 Hz per job; activity (busy, done, total) to main for the power blocker.
+// §3.3.5  Progress ≤ 10 Hz per job; activity (busy, done, total) to main for the power blocker,
+//         and whether triage requests are open (which holds off main's idle kill).
 // §3.3.6  Work order: the focused page, then the rest of its source, then the other jobs in order.
 // §3.4.1  Triage requests go to the raster thread in chunks of TRIAGE_CHUNK pages, one PDFium task
 //         at a time with the renders, which go first (triage is background work). A chunk that
 //         kills the thread is retried one page at a time, uncharged; a page that kills it twice is
 //         reported with `failure: 'raster-crash'`, and once TRIAGE_SOURCE_CRASH_PAGES pages of one
 //         source have, the rest of that source's triage is answered the same way without PDFium.
-//         Every page a thread returns is validated before it is forwarded.
+//         Every page a thread returns is validated before it is forwarded. The coordinator keeps
+//         each page's class and refusal: a recognized page is stamped with its triage class, and a
+//         recognize request for a page triage refused (`protected`, a refused JPX image, over the
+//         pixel caps) is answered `skipped-protected` / `failed` `image-format` / `too-large`
+//         without a render or the engine, whether triage answered before or after the request.
 
 import {
   ELECTRON_NET_MEMBERS,
@@ -40,6 +45,7 @@ import {
   type FromOcr,
   type Heartbeat,
   type OcrHostLimits,
+  type OcrPaths,
   type OcrToMain,
   type PageRequest,
   type PageResult,
@@ -54,8 +60,19 @@ import {
   type Budgets,
   type SystemInfo
 } from './budget'
+import { TESS_CORE7_PLACEHOLDER } from '../../../shared/ocr/calibration'
+import { ENGINE_ID, PIPELINE_VERSION } from '../../../shared/ocr/engine/tess-core'
+import { mapRawOcr } from '../../../shared/ocr/map'
+import type { PackedOcrPage } from '../../../shared/ocr/types'
 import { fitRaster } from './raster-core'
-import type { FromRaster, FromRecognize, ToRaster, ToRecognize } from './thread-messages'
+import type { RecognizeOutcome } from './recognize-core'
+import type {
+  EngineAssets,
+  FromRaster,
+  FromRecognize,
+  ToRaster,
+  ToRecognize
+} from './thread-messages'
 import type { TriagePage } from '../../../shared/ocr/triage'
 
 // ---------------------------------------------------------------------------------------------
@@ -91,8 +108,11 @@ export interface CoordinatorDeps {
   spawnRecognize(): WorkerLike
   /** Compile pdfium.wasm (main resolves the path; the renderer never names one). */
   loadPdfium(path: string): Promise<WebAssembly.Module>
-  /** The recognize engine's module. PR4a: a stub module; PR5: the SHA-checked simd-lstm core. */
-  loadEngine(): Promise<WebAssembly.Module>
+  /**
+   * The recognize engine: the SHA-checked simd-lstm core compiled once, and each bundled
+   * language's verified .traineddata.gz (engine-node.ts). Main resolves the paths.
+   */
+  loadEngine(paths: OcrPaths): Promise<LoadedEngine>
   system(): SystemInfo
   /** This realm's tripwire count. */
   tripwire(): number
@@ -107,6 +127,13 @@ export interface CoordinatorDeps {
   /** `process.platform` (PER_WORKER depends on it); tests pass another. */
   platform?: string
   budgets?: Partial<Budgets>
+}
+
+export interface LoadedEngine {
+  /** Posted to every recognize thread's init. */
+  assets: EngineAssets
+  /** SHA-256 of each language's shipped .traineddata.gz (into every OcrPage, §3.5.1). */
+  dataHashes: Record<string, string>
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -154,7 +181,15 @@ interface Source {
   pageCount: number | null
   /** Pages of this source whose triage killed the raster thread twice on their own. */
   triageCrashedPages: number
+  /**
+   * What triage said about each page it answered for (the class, any refusal): a recognized page
+   * carries its class, and a page triage refused is answered without the engine. Only these
+   * fields are kept, never the native words.
+   */
+  triaged: Map<number, TriageVerdict>
 }
+
+type TriageVerdict = Pick<TriagePage, 'pageClass' | 'refused' | 'failure'>
 
 /** A renderer `triage` request (§3.4.1). */
 interface TriageTask {
@@ -242,6 +277,9 @@ const DEFAULT_LIMITS: OcrHostLimits = {
  */
 export function isOomShaped(name: string, message: string): boolean {
   return (
+    // The recognize thread's name for a WASM OOM (Recognize rc ≠ 0, or empty hOCR with a
+    // Leptonica allocation failure on printErr; PR0b §f).
+    name === 'OcrOutOfMemory' ||
     (name === 'RangeError' && !/Maximum call stack size exceeded/i.test(message)) ||
     /out of memory|Cannot enlarge memory|memory access out of bounds|Array buffer allocation failed/i.test(
       message
@@ -267,7 +305,11 @@ export class Coordinator {
   private readonly b: Budgets
   private limits: OcrHostLimits = DEFAULT_LIMITS
   private pdfiumModule: Promise<WebAssembly.Module> | null = null
-  private engineModule: Promise<WebAssembly.Module> | null = null
+  private engineModule: Promise<LoadedEngine> | null = null
+  /** The engine once loaded (the hashes go into every page). */
+  private engine: LoadedEngine | null = null
+  /** Languages main gave paths for (known at init, before the engine has loaded). */
+  private availableLangs = new Set<string>()
   private port: PortLike | null = null
 
   private readonly sources = new Map<string, Source>()
@@ -299,7 +341,9 @@ export class Coordinator {
   private lastFlush = -Infinity
   private flushTimer: ReturnType<typeof setTimeout> | null = null
   /** The last activity sent to main; starts idle so an idle process says nothing. */
-  private lastActivity = 'false:0:0'
+  private lastActivity = 'false:false:0:0'
+  /** Its `activityState()` part. */
+  private lastActivityState = 'false:false'
   private readonly heartbeatTimer: ReturnType<typeof setInterval>
   private disposed = false
 
@@ -398,10 +442,28 @@ export class Coordinator {
     if ('init' in msg) {
       this.limits = msg.init.limits
       this.pdfiumModule = this.deps.loadPdfium(msg.init.paths.pdfiumWasm)
-      this.engineModule = this.deps.loadEngine()
+      this.availableLangs = new Set(Object.keys(msg.init.paths.tessdata))
+      this.engineModule = this.deps.loadEngine(msg.init.paths)
+      this.engineModule.then(
+        (e) => {
+          this.engine = e
+        },
+        () => {}
+      )
+      // An OcrError's message is built path-free ("traineddata fra: SHA-256 mismatch") and says
+      // which file and which check failed, so main can log it and the self-test report it. Any
+      // other error (e.g. a read of the PDFium .wasm) may carry a path: only its name.
       const fatal = (e: unknown): void =>
         this.toParent({
-          fatal: { code: 'init', message: e instanceof Error ? e.name : 'init failed' }
+          fatal: {
+            code: 'init',
+            message:
+              e instanceof OcrError
+                ? e.message.slice(0, 500)
+                : e instanceof Error
+                  ? e.name
+                  : 'init failed'
+          }
         })
       this.pdfiumModule.catch(fatal)
       this.engineModule.catch(fatal)
@@ -487,7 +549,8 @@ export class Coordinator {
       lastUse: Date.now(),
       countPending: true,
       pageCount: null,
-      triageCrashedPages: 0
+      triageCrashedPages: 0,
+      triaged: new Map()
     }
     this.sources.set(src, source)
     this.evictOverBudget(src)
@@ -519,10 +582,12 @@ export class Coordinator {
   private dropSource(src: string): void {
     this.sources.delete(src)
     // Its triage requests end with it (a chunk in flight is dropped when it answers).
+    const triages = this.triages.length
     for (let i = this.triages.length - 1; i >= 0; i--)
       if (this.triages[i].src === src) this.triages.splice(i, 1)
     if (this.raster) this.sendRaster(this.raster, { type: 'close', src })
     if (this.focus?.src === src) this.focus = null
+    if (this.triages.length !== triages) this.scheduleFlush()
   }
 
   private closeSource(src: string): void {
@@ -648,6 +713,49 @@ export class Coordinator {
     const finished = task.pending.length === 0
     if (finished) this.triages.splice(this.triages.indexOf(task), 1)
     this.toRenderer({ triaged: { src: task.src, pages, done: finished } })
+    this.noteTriaged(task.src, pages)
+  }
+
+  /**
+   * Keep what triage said about `pages` of `src`, and answer any page of it already waiting to be
+   * rendered or recognised that triage refuses (a recognize request can arrive before triage has
+   * answered, and renders go ahead of triage). A page already at a recognize thread is checked
+   * when its result comes back.
+   */
+  private noteTriaged(src: string, pages: TriagePage[]): void {
+    const source = this.sources.get(src)
+    if (!source) return
+    for (const p of pages) {
+      const v: TriageVerdict = { pageClass: p.pageClass }
+      if (p.refused) v.refused = p.refused
+      if (p.failure) v.failure = p.failure
+      source.triaged.set(p.index, v)
+    }
+    for (const t of [...this.tasks])
+      if (t.job.src === src && (t.state === 'queued' || t.state === 'rendered'))
+        this.refuseIfTriaged(t)
+  }
+
+  /**
+   * The result triage decides for a recognize request without the engine, or null (§3.4.1):
+   * a protected page is never recognised, a page whose image the JPX pre-check refused is never
+   * rendered by PDFium, and a page the pixel caps leave under 1 DPI is too large.
+   */
+  private triageRefusal(t: Task): PageResult | null {
+    const v = this.sources.get(t.job.src)?.triaged.get(t.req.index)
+    if (!v) return null
+    const none = { renderDpi: null, raster: null, recognition: null }
+    if (v.pageClass === 'protected') return { status: 'skipped-protected', ...none }
+    if (v.refused) return { status: 'failed', reason: 'image-format', ...none }
+    if (v.failure === 'too-large') return { status: 'too-large', reason: 'page-too-large', ...none }
+    return null
+  }
+
+  /** Answer `t` with triage's refusal if triage refused its page; true if it did. */
+  private refuseIfTriaged(t: Task): boolean {
+    const refusal = this.triageRefusal(t)
+    if (refusal) this.finalize(t, refusal)
+    return refusal !== null
   }
 
   /**
@@ -729,6 +837,8 @@ export class Coordinator {
       progressDirty: true
     }
     this.jobs.set(job.jobId, job)
+    // A language that is neither bundled nor installed: nothing to recognise with (§3.5.1).
+    const missing = req.opts.langs.some((l) => !this.availableLangs.has(l))
     req.pages.forEach((p, order) => {
       const t: Task = {
         id: ++this.taskSeq,
@@ -746,6 +856,17 @@ export class Coordinator {
       job.tasks.add(t)
       this.tasks.add(t)
     })
+    for (const t of [...job.tasks]) {
+      // A page triage already refused is answered without a render or the engine.
+      if (this.refuseIfTriaged(t)) continue
+      if (missing)
+        this.finalize(t, {
+          status: 'needs-language',
+          renderDpi: null,
+          raster: null,
+          recognition: null
+        })
+    }
     this.scheduleFlush()
     this.pump()
   }
@@ -875,7 +996,9 @@ export class Coordinator {
     if (queued > 0 && waiting < n + 1 && this.pdfiumModule) {
       const r = this.ensureRaster()
       if (r.ready && !r.task && !r.triage) {
-        const t = this.pick('queued')
+        // The gate before PDFium: a page triage refused is never rendered, whatever re-queued it.
+        let t = this.pick('queued')
+        while (t && this.refuseIfTriaged(t)) t = this.pick('queued')
         if (t) {
           if (r.lastSrc !== null && r.lastSrc !== t.job.src && r.heap > this.b.rasterRecycleHeap) {
             // Between documents and the heap only grows: hand the memory back (§3.3.3).
@@ -1187,6 +1310,7 @@ export class Coordinator {
       t.pending ??= []
       this.failTriage(t)
     }
+    this.scheduleFlush()
     this.toParent({
       fatal: {
         code: 'init',
@@ -1259,7 +1383,8 @@ export class Coordinator {
     worker.on('exit', () => this.guard(() => this.onRecognizeDeath(slot, false)))
     void this.engineModule.then(
       (engine) => {
-        if (!slot.dead) worker.postMessage({ type: 'init', engine } satisfies ToRecognize)
+        if (!slot.dead)
+          worker.postMessage({ type: 'init', engine: engine.assets } satisfies ToRecognize)
       },
       () => {}
     )
@@ -1310,12 +1435,24 @@ export class Coordinator {
     if (m.type === 'result') {
       slot.pages++
       const raster = t.raster!
-      this.finalize(t, {
-        status: 'ok',
-        renderDpi: raster.dpi,
-        raster: { width: raster.width, height: raster.height },
-        recognition: m.result
-      })
+      // Triage answered while the page was at the engine, and refuses it: its words are dropped.
+      const refusal = this.triageRefusal(t)
+      let page: PackedOcrPage | null = null
+      try {
+        if (!refusal) page = this.toPage(t, m.result)
+      } catch {
+        // A mapping bug or an impossible engine result: this page fails, the thread is fine.
+        page = null
+      }
+      if (refusal) this.finalize(t, refusal)
+      else if (page)
+        this.finalize(t, {
+          status: page.status,
+          renderDpi: raster.dpi,
+          raster: { width: raster.width, height: raster.height },
+          recognition: page
+        })
+      else this.fail(t, 'failed', 'recognize-crash')
       // The WASM heap never shrinks: recycle after 50 pages, or after any page over 12 MP.
       if (slot.pages >= this.b.recyclePages || slot.big) this.retireRecognizer(slot)
       slot.big = false
@@ -1326,9 +1463,38 @@ export class Coordinator {
     this.pump()
   }
 
+  /**
+   * A thread's RawOcr → the packed OcrPage in the overlay frame (map.ts). The raster covers the
+   * request's page frame exactly (the raster thread checked it against PDFium's), so the frame
+   * and the raster size give the mapping.
+   */
+  private toPage(t: Task, outcome: RecognizeOutcome): PackedOcrPage {
+    const raster = t.raster!
+    const langs = t.job.langs
+    const hashes = this.engine?.dataHashes ?? {}
+    const dataHashes: Record<string, string> = {}
+    for (const l of langs) if (Object.hasOwn(hashes, l)) dataHashes[l] = hashes[l]
+    return mapRawOcr(outcome.raw, {
+      page: { width: t.req.width, height: t.req.height },
+      raster: { width: raster.width, height: raster.height },
+      renderDpi: raster.dpi,
+      engineId: ENGINE_ID,
+      dataHashes,
+      langs,
+      pipelineVersion: PIPELINE_VERSION,
+      // The class triage gave the page (§3.4.1). A page recognised without triage, or one triage
+      // could not classify, is treated as a scan.
+      pageClass: this.sources.get(t.job.src)?.triaged.get(t.req.index)?.pageClass ?? 'scanned',
+      calibration: TESS_CORE7_PLACEHOLDER
+    })
+  }
+
   private recognizeFailure(t: Task, oom: boolean): void {
     if (oom) this.localDivisor *= 2
     if (!this.tasks.has(t)) return
+    // Triage refused the page while it was at the thread: that is its answer, not a re-render
+    // (PDFium must never render a page whose image the JPX pre-check refused).
+    if (this.refuseIfTriaged(t)) return
     t.recognizeFailures++
     if (t.recognizeFailures >= 2) this.fail(t, 'failed', 'recognize-crash')
     else this.requeue(t) // the bitmap went with the thread: render again
@@ -1342,7 +1508,7 @@ export class Coordinator {
     const t = slot.task
     slot.task = null
     this.retireRecognizer(slot)
-    if (t) this.fail(t, 'timeout', 'watchdog')
+    if (t && !this.refuseIfTriaged(t)) this.fail(t, 'timeout', 'watchdog')
     this.pump()
   }
 
@@ -1386,10 +1552,9 @@ export class Coordinator {
 
   private scheduleFlush(): void {
     if (this.disposed) return
-    // Busy ↔ idle transitions go to main at once (the power blocker and the taskbar follow them);
-    // counts within a batch ride the throttled flush.
-    const busy = this.jobs.size > 0
-    if (busy !== this.lastActivity.startsWith('true')) this.reportActivity()
+    // Busy ↔ idle transitions go to main at once (the power blocker and the taskbar follow them,
+    // and open triage holds off the idle kill); counts within a batch ride the throttled flush.
+    if (this.activityState() !== this.lastActivityState) this.reportActivity()
     if (this.flushTimer) return
     const wait = this.lastFlush + this.b.progressIntervalMs - Date.now()
     if (wait <= 0) {
@@ -1424,6 +1589,11 @@ export class Coordinator {
     this.reportActivity()
   }
 
+  /** Jobs open, and triage requests open: a change in either goes to main at once. */
+  private activityState(): string {
+    return `${this.jobs.size > 0}:${this.triages.length > 0}`
+  }
+
   private reportActivity(): void {
     let done = 0
     let total = 0
@@ -1432,10 +1602,12 @@ export class Coordinator {
       total += job.total
     }
     const busy = this.jobs.size > 0
-    const key = `${busy}:${done}:${total}`
+    const triage = this.triages.length > 0
+    const key = `${busy}:${triage}:${done}:${total}`
     if (key === this.lastActivity) return
     this.lastActivity = key
-    this.toParent({ activity: { busy, done, total } })
+    this.lastActivityState = this.activityState()
+    this.toParent({ activity: { busy, done, total, triage } })
   }
 
   private postHeartbeat(): void {

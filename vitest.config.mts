@@ -36,6 +36,20 @@ export default defineConfig({
           environment: 'jsdom',
           include: ['src/**/*.dom.test.ts']
         }
+      },
+      {
+        resolve: { alias },
+        test: {
+          // Tier 1 (DESIGN.md §3.9.3): the REAL Tesseract core and data from node_modules (the
+          // bytes resources/ocr ships, SHA-checked) on the synth presets, gated against
+          // bench/ocr-baseline.json. One file at a time: each runs real recognize threads.
+          name: 'ocr',
+          environment: 'node',
+          include: ['src/**/*.ocr.test.ts'],
+          testTimeout: 120_000,
+          hookTimeout: 120_000,
+          fileParallelism: false
+        }
       }
     ]
   }

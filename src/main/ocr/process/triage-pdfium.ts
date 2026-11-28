@@ -635,8 +635,8 @@ function triageOne(
     imageOrigin,
     caps: ctx.caps
   })
-  // A page so large that the pixel caps leave under 1 DPI cannot be recognised.
-  if (!(dpi.renderDpi >= MIN_RENDER_DPI)) return { ...failedPage(index), failure: 'render' }
+  // A page so large that the pixel caps leave under 1 DPI cannot be recognised (`too-large`).
+  if (!(dpi.renderDpi >= MIN_RENDER_DPI)) return { ...failedPage(index), failure: 'too-large' }
   const out: TriagePage = {
     index,
     pageClass,
