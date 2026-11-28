@@ -83,6 +83,12 @@ describe('alignStats (lexicographic: min distance, then max matches)', () => {
       rateNormalised: 2 / 3
     })
   })
+
+  it('breaks ties toward matches on the deletion branch too', () => {
+    // "aab" vs "baa": +b, a, a, −b keeps two matches (S=0 D=1 I=1 C=2), not b/a a/a a/b (S=2 C=1).
+    expect(alignStats([...'aab'], [...'baa'])).toMatchObject({ s: 0, d: 1, i: 1, c: 2 })
+    expect(alignStats([...'bba'], [...'abb'])).toMatchObject({ s: 0, d: 1, i: 1, c: 2 })
+  })
 })
 
 describe('cer', () => {
@@ -213,6 +219,7 @@ describe('boxes', () => {
   it('needs IoU strictly above the threshold', () => {
     // b(0,0,10,10) vs b(0,0,10,20): ∩ 100, ∪ 200 → exactly 0.5, which does not count.
     expect(boxScores([b(0, 0, 10, 10)], [b(0, 0, 10, 20)]).matched).toBe(0)
+    expect(boxScores([b(0, 0, 10, 10)], [b(0, 0, 10, 20)], { order: 'index' }).matched).toBe(0)
   })
 
   it('greedy by IoU vs PaddleOCR index order', () => {
@@ -227,6 +234,13 @@ describe('boxes', () => {
     const s = boxScores([b(0, 0, 10, 10), b(0, 0, 10, 10)], [b(0, 0, 10, 10)])
     expect(s.matched).toBe(1)
     expect(s.recall).toBe(0.5)
+  })
+
+  it('one-to-one: a gt box is used once (duplicate hyp boxes)', () => {
+    for (const order of ['iou', 'index'] as const)
+      expect(
+        boxScores([b(0, 0, 10, 10)], [b(0, 0, 10, 10), b(0, 0, 10, 10)], { order })
+      ).toMatchObject({ matched: 1, precision: 0.5, recall: 1 })
   })
 
   it('empty cases', () => {
@@ -336,7 +350,7 @@ describe('findScores', () => {
   const C = { x: 80, y: 0, w: 10, h: 10 }
   const D = { x: 0, y: 50, w: 30, h: 10 }
 
-  it('recall, hit-on-target and one-to-one occurrence recall', async () => {
+  it('recall is per occurrence; hit-on-target is per hit', async () => {
     const gtWords = [
       { t: 'Hello,', box: A },
       { t: 'world', box: B },
@@ -355,14 +369,88 @@ describe('findScores', () => {
     })
     expect(queries).toEqual(['Hello', 'world', 'missing']) // punctuation stripped, deduplicated
     expect(r.eligible).toBe(4)
-    // found: Hello, world(B), world(D: the query hit elsewhere on its page) → 3 of 4.
-    expect(r.recall).toBe(3 / 4)
-    // on target among found: Hello, world(B) → 2 of 3.
-    expect(r.hitOnTarget).toBe(2 / 3)
-    // one-to-one: Hello, world(B) → 2 of 4.
-    expect(r.occurrenceRecall).toBe(2 / 4)
-    expect(r.words.map((w) => w.index)).toEqual([0, 1, 3, 4])
+    // found: Hello, world(B); world(D) is NOT found by the hit on B → 2 of 4.
+    expect(r).toMatchObject({ found: 2, recall: 2 / 4, anyHitOnPage: 3 / 4 })
+    // Both hits are on target.
+    expect(r).toMatchObject({ hits: 2, onTargetHits: 2, offTargetHits: 0, hitOnTarget: 1 })
+    expect(r.words.map((w) => [w.index, w.found, w.anyHitOnPage])).toEqual([
+      [0, true, true],
+      [1, true, true],
+      [3, false, true],
+      [4, false, false]
+    ])
     expect(r.words[0].bestIou).toBeCloseTo(29 / 31, 12)
+  })
+
+  it('a missed word is not found by a hit inside another word, which is a substring hit', async () => {
+    const weather = { x: 40, y: 0, w: 42, h: 10 }
+    const theInWeather = { x: 46, y: 0, w: 18, h: 10 } // the "the" of "weather"
+    const r = await findScores(
+      [
+        { t: 'the', box: A },
+        { t: 'weather', box: weather }
+      ],
+      (q) => (q === 'the' ? [{ page: 0, box: theInWeather }] : [{ page: 0, box: weather }])
+    )
+    expect(r.words[0]).toMatchObject({ found: false, anyHitOnPage: true })
+    expect(r).toMatchObject({ found: 1, recall: 1 / 2 })
+    // The hit is a correct substring match: not on target, not a false positive either.
+    expect(r).toMatchObject({ hits: 2, onTargetHits: 1, substringHits: 1, offTargetHits: 0 })
+    expect(r.hitOnTarget).toBe(1)
+  })
+
+  it('a second occurrence needs its own hit', async () => {
+    const r = await findScores(
+      [
+        { t: 'harbour', box: A },
+        { t: 'harbour', box: B }
+      ],
+      () => [{ page: 0, box: A }]
+    )
+    expect(r).toMatchObject({ eligible: 2, found: 1, recall: 1 / 2, hitOnTarget: 1 })
+  })
+
+  it('false positives and duplicate hits count against hit-on-target', async () => {
+    const far = { x: 200, y: 0, w: 30, h: 10 }
+    const r = await findScores([{ t: 'harbour', box: A }], () => [
+      { page: 0, box: A },
+      { page: 0, box: far }, // nowhere near a GT word
+      { page: 0, box: A }, // a doubled hit on the one occurrence
+      { page: 3, box: A } // a page with no occurrence at all
+    ])
+    expect(r).toMatchObject({ recall: 1, hits: 4, onTargetHits: 1, offTargetHits: 3 })
+    expect(r.hitOnTarget).toBe(1 / 4)
+    expect(r.strayHits).toEqual([
+      { query: 'harbour', page: 0, box: far },
+      { query: 'harbour', page: 0, box: A },
+      { query: 'harbour', page: 3, box: A }
+    ])
+  })
+
+  it('case and diacritic variants are one search, and each copy is an occurrence', async () => {
+    const queries: string[] = []
+    const r = await findScores(
+      [
+        { t: 'The', box: A },
+        { t: 'the', box: B },
+        { t: 'thé', box: D }
+      ],
+      (q) => {
+        queries.push(q)
+        return [A, B, D].map((box) => ({ page: 0, box }))
+      }
+    )
+    expect(queries).toEqual(['The'])
+    expect(r).toMatchObject({ found: 3, recall: 1, onTargetHits: 3, hitOnTarget: 1 })
+  })
+
+  it('on target needs IoU strictly above the threshold', async () => {
+    // A vs a hit twice as tall: ∩ 300, ∪ 600 → exactly 0.5.
+    const r = await findScores([{ t: 'alpha', box: A }], () => [
+      { page: 0, box: { x: 0, y: 0, w: 30, h: 20 } }
+    ])
+    expect(r).toMatchObject({ found: 0, onTargetHits: 0, offTargetHits: 1, hitOnTarget: 0 })
+    expect(r.words[0].bestIou).toBe(0.5)
   })
 
   it('counts hits only on the word’s own page, and accepts async search', async () => {
@@ -373,9 +461,9 @@ describe('findScores', () => {
       ],
       async () => [{ page: 1, box: A }]
     )
-    expect(r.words.map((w) => [w.found, w.onTarget, w.matchedOneToOne])).toEqual([
-      [true, true, true],
-      [false, false, false]
+    expect(r.words.map((w) => [w.found, w.anyHitOnPage])).toEqual([
+      [true, true],
+      [false, false]
     ])
     expect(r.recall).toBe(1 / 2)
     expect(r.hitOnTarget).toBe(1)
@@ -403,8 +491,9 @@ describe('findScores', () => {
     expect(await findScores([], () => [])).toMatchObject({
       eligible: 0,
       recall: 1,
-      hitOnTarget: 1,
-      occurrenceRecall: 1
+      anyHitOnPage: 1,
+      hits: 0,
+      hitOnTarget: 1
     })
   })
 })

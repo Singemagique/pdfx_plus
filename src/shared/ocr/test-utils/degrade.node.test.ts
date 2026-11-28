@@ -91,6 +91,25 @@ describe('determinism rules', () => {
       'Math.random'
     ])
   })
+
+  it('scanMath sees through wrappers, globalThis and aliases', () => {
+    const found = (src: string): string[] => scanMath(src).map((f) => f.name)
+    expect(found('(Math as any).exp(1)')).toEqual(['Math.exp'])
+    expect(found('(Math).sin(1)')).toEqual(['Math.sin'])
+    expect(found('globalThis.Math.cos(1)')).toEqual(['Math.cos'])
+    expect(found("global['Math'].tan(1)")).toEqual(['Math.tan'])
+    expect(found('const { log: ln } = globalThis.Math')).toEqual(['Math.log'])
+    expect(found("const { 'atan2': a } = Math")).toEqual(['Math.atan2'])
+    expect(found('const { ...all } = Math')).toEqual(['Math{…}'])
+    expect(found('Math[k](1)')).toEqual(['Math[?]'])
+    expect(found('const M = Math; M.sin(1)')).toEqual(['Math (aliased)'])
+    expect(found('f(globalThis.Math)')).toEqual(['Math (aliased)'])
+    expect(found('const s = scanMath; const o = { Math: 1 }; o.Math')).toEqual([])
+    expect(found('if (typeof Math === "object") Math.floor(Math.sqrt(2))')).toEqual([])
+    expect(scanMath('var M = Math; M.sin(1)', 'x.js').map((f) => f.name)).toEqual([
+      'Math (aliased)'
+    ])
+  })
 })
 
 describe('sfc32 / createRng', () => {
@@ -152,6 +171,18 @@ describe('gaussianBlur', () => {
       expect(k.reduce((a, b) => a + b, 0)).toBe(16384)
       expect(Array.from(k)).toEqual(Array.from(k).reverse())
     }
+  })
+
+  it('rounds the Q28 result half up, not down', () => {
+    // One row, so the vertical pass multiplies by 2^14 exactly. Centre: 2·6536/16384 = 0.798 → 1
+    // (truncation gives 0). Next: 2·3966/16384 = 0.484 → 0; then 2·885 and 2·(73+73) → 0.
+    expect(Array.from(gaussianBlur(img(7, 1, [0, 0, 0, 2, 0, 0, 0]), 1).data)).toEqual([
+      0, 0, 0, 1, 0, 0, 0
+    ])
+    // 3·3966/16384 = 0.726 → 1 next to the centre; 3·6536/16384 = 1.197 → 1.
+    expect(Array.from(gaussianBlur(img(7, 1, [0, 0, 0, 3, 0, 0, 0]), 1).data)).toEqual([
+      0, 0, 1, 1, 1, 0, 0
+    ])
   })
 
   it('leaves a flat image unchanged', () => {
@@ -258,6 +289,14 @@ describe('resample (box filter)', () => {
     // (10+20+30+41)/4 = 25.25 → 25; (0+255+1+0)/4 = 64
     expect(r.image).toEqual(img(2, 1, [25, 64]))
     expect(r.transform).toEqual([0.5, 0, 0, 0.5, 0, 0])
+  })
+
+  it('rounds half up, not down (one final rounding)', () => {
+    // (0 + 1)/2 = 0.5 → 1; truncation would give 0. (1 + 2 + 2 + 2)/4 = 1.75 → 2, not 1.
+    expect(resample(img(2, 1, [0, 1]), 1, 1).image.data).toEqual(Uint8Array.from([1]))
+    expect(resample(img(2, 2, [1, 2, 2, 2]), 1, 1).image.data).toEqual(Uint8Array.from([2]))
+    // Below a half stays down: (0 + 0 + 0 + 1)/4 = 0.25 → 0.
+    expect(resample(img(2, 2, [0, 0, 0, 1]), 1, 1).image.data).toEqual(Uint8Array.from([0]))
   })
 
   it('3:2 weights partial pixels', () => {

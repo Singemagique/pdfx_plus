@@ -92,7 +92,8 @@ const ALL_FONTS: FontId[] = [
   'dejavu-serif',
   'dejavu-mono'
 ]
-const DEJAVU_ONLY: FontId[] = ['dejavu-sans', 'dejavu-serif', 'dejavu-mono']
+/** DejaVu Sans Mono has no precomposed Vietnamese "ở", "ố", "ỗ", so it cannot draw the vi line. */
+const DIACRITIC_FONTS: FontId[] = ['dejavu-sans', 'dejavu-serif']
 
 export interface SynthDeps {
   rasterize: Rasterizer
@@ -119,10 +120,55 @@ async function embed(doc: PDFDocument, id: FontId, deps: SynthDeps): Promise<PDF
   })
 }
 
-/** Ascent and descent (both positive, pt) of `font` at `size`. */
-function vMetrics(font: PDFFont, size: number): { ascent: number; descent: number } {
-  const ascent = font.heightAtSize(size, { descender: false })
-  return { ascent, descent: font.heightAtSize(size) - ascent }
+/** How a font is measured for the GT: vertical em metrics and the advance width it is drawn with. */
+interface FontMeasure {
+  /** Ascent and descent (both positive, pt) at `size`. */
+  vMetrics(size: number): { ascent: number; descent: number }
+  /** Advance width (pt) of `text` at `size`, exactly as `page.drawText` lays it out. */
+  advance(text: string, size: number): number
+  /** Throws if the font has no glyph for a character of `text` (it would draw .notdef). */
+  assertCovers(text: string): void
+}
+
+function measureFont(font: PDFFont, id: FontId, deps: SynthDeps): FontMeasure {
+  if (id in STANDARD_FONTS) {
+    return {
+      // pdf-lib's WinAnsi encoder already throws on a character the font cannot encode.
+      assertCovers: () => {},
+      // pdf-lib reads the AFM Ascender / Descender correctly for the Standard-14 fonts.
+      vMetrics: (size) => {
+        const ascent = font.heightAtSize(size, { descender: false })
+        return { ascent, descent: font.heightAtSize(size) - ascent }
+      },
+      // `widthOfTextAtSize` adds the AFM kerning pairs, but `drawText` emits a plain `Tj` that is
+      // never kerned, so the drawn advance is the sum of the single-glyph widths.
+      advance: (text, size) => {
+        let w = 0
+        for (const ch of text) w += font.widthOfTextAtSize(ch, size)
+        return w
+      }
+    }
+  }
+  // pdf-lib's CustomFontEmbedder.heightOfFontAtSize({ descender: false }) subtracts the descent in
+  // raw font units from a value already scaled to 1000/em (for DejaVu, 2048 upm, the ascent comes
+  // out 0.25 em short), so read the hhea ascent / descent from the font itself. pdf-lib writes the
+  // same two numbers into the FontDescriptor.
+  const f = fontkit.create(deps.fontBytes(id as DejaVuFontId))
+  const asc = f.ascent / f.unitsPerEm
+  const desc = Math.abs(f.descent) / f.unitsPerEm
+  return {
+    // fontkit would silently lay out .notdef (e.g. DejaVu Sans Mono has no "ở"), and the GT
+    // would then claim text the page does not show.
+    assertCovers: (text) => {
+      for (const ch of text)
+        if (!f.hasGlyphForCodePoint(ch.codePointAt(0)!))
+          throw new Error(`font ${id} has no glyph for "${ch}"`)
+    },
+    vMetrics: (size) => ({ ascent: asc * size, descent: desc * size }),
+    // Sums the laid-out glyphs' advance widths without GPOS kerning: the same glyphs `drawText`
+    // encodes, each advancing by its own width.
+    advance: (text, size) => font.widthOfTextAtSize(text, size)
+  }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -596,9 +642,9 @@ BUILTIN.push(
   },
   {
     id: 'latin-diacritics',
-    description: 'de/fr/es/pl/cs/vi sentences in DejaVu',
+    description: 'de/fr/es/pl/cs/vi sentences in DejaVu Sans or Serif',
     font: 'dejavu-sans',
-    fonts: DEJAVU_ONLY,
+    fonts: DIACRITIC_FONTS,
     page: PAGE,
     renderDpi: 300,
     layout: diacriticsLayout,
@@ -694,6 +740,7 @@ export async function synthesize(spec: SynthSpec, deps: SynthDeps): Promise<Synt
   const { width: W, height: H } = def.page
   const page = doc.addPage([W, H])
   const font = await embed(doc, fontId, deps)
+  const { vMetrics, advance, assertCovers } = measureFont(font, fontId, deps)
   const rng = createRng(spec.seed, 'layout')
   const srcWords: { t: string; line: number; srcBox: Box }[] = []
   const lines: GtLine[] = []
@@ -706,27 +753,35 @@ export async function synthesize(spec: SynthSpec, deps: SynthDeps): Promise<Synt
     rng,
     bankWords: () => shuffled(SAMPLE_SENTENCES, rng).join(' ').split(' '),
     wrap: (ws, maxWidth, size) => {
+      // The same measure `line` advances by: each word's own width plus one space between words.
+      const space = advance(' ', size)
       const out: string[][] = []
       let cur: string[] = []
+      let curW = 0
       for (const w of ws) {
-        const next = [...cur, w]
-        if (cur.length > 0 && font.widthOfTextAtSize(next.join(' '), size) > maxWidth) {
+        const ww = advance(w.normalize('NFC'), size)
+        if (cur.length > 0 && curW + space + ww > maxWidth) {
           out.push(cur)
           cur = [w]
-        } else cur = next
+          curW = ww
+        } else {
+          curW = cur.length > 0 ? curW + space + ww : ww
+          cur = [...cur, w]
+        }
       }
       if (cur.length > 0) out.push(cur)
       return out
     },
     line: (ws, x, baseline, size) => {
-      const { ascent, descent } = vMetrics(font, size)
-      const space = font.widthOfTextAtSize(' ', size)
+      const { ascent, descent } = vMetrics(size)
+      const space = advance(' ', size)
       const li = lines.length
       const idx: number[] = []
       let cx = x
       for (const raw of ws) {
         const t = raw.normalize('NFC')
-        const w = font.widthOfTextAtSize(t, size)
+        assertCovers(t)
+        const w = advance(t, size)
         page.drawText(t, { x: cx, y: baseline, size, font, color: rgb(0, 0, 0) })
         idx.push(srcWords.length)
         srcWords.push({
@@ -751,8 +806,8 @@ export async function synthesize(spec: SynthSpec, deps: SynthDeps): Promise<Synt
         thickness,
         color: rgb(0, 0, 0)
       }),
-    ascent: (size) => vMetrics(font, size).ascent,
-    descent: (size) => vMetrics(font, size).descent
+    ascent: (size) => vMetrics(size).ascent,
+    descent: (size) => vMetrics(size).descent
   }
   def.layout(ctx)
   const vectorPdf = await doc.save()

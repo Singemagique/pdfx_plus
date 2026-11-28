@@ -23,10 +23,13 @@ function sourceFiles(dir: string): string[] {
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
     const p = join(dir, entry.name)
     if (entry.isDirectory()) out.push(...sourceFiles(p))
-    else if (/\.(ts|tsx|mts|cts)$/.test(entry.name)) out.push(p)
+    // JS too: a .js/.mjs/.cjs file is neither typechecked (allowJs is off) nor exempt.
+    else if (SOURCE_FILE.test(entry.name)) out.push(p)
   }
   return out
 }
+
+const SOURCE_FILE = /\.[cm]?[jt]sx?$/
 
 const names = (src: string, filePath?: string): string[] =>
   scanSource(src, { filePath }).map((f: ScanFinding) => `${f.kind}:${f.name}`)
@@ -63,15 +66,58 @@ describe('src/shared is DOM-free and Electron-free', () => {
 })
 
 describe('scanSource', () => {
+  const net = (src: string): string[] =>
+    scanSource(src, { globals: NETWORK_GLOBALS, modules: NETWORK_MODULES }).map((f) => f.name)
+
+  it('scans every JS/TS extension, JS parsed as JS', () => {
+    for (const f of ['a.ts', 'a.tsx', 'a.mts', 'a.cts', 'a.js', 'a.jsx', 'a.mjs', 'a.cjs'])
+      expect(SOURCE_FILE.test(f), f).toBe(true)
+    expect(SOURCE_FILE.test('a.json')).toBe(false)
+    expect(SOURCE_FILE.test('a.d.ts')).toBe(true)
+    expect(names("const e = require('electron')", 'src/shared/ocr/foo.mjs')).toEqual([
+      'import:electron'
+    ])
+    expect(names('const t = <div>{document.title}</div>', 'src/shared/x.jsx')).toEqual([
+      'global:document'
+    ])
+  })
+
   it('applies the network rule set when asked', () => {
-    const net = (src: string): string[] =>
-      scanSource(src, { globals: NETWORK_GLOBALS, modules: NETWORK_MODULES }).map((f) => f.name)
     expect(net("import https from 'node:https'")).toEqual(['node:https'])
     expect(net("import { lookup } from 'dns/promises'")).toEqual(['dns/promises'])
     expect(net("const { request } = require('undici')")).toEqual(['undici'])
     expect(net('await fetch(url)')).toEqual(['fetch'])
     expect(net('new WebSocket(u)')).toEqual(['WebSocket'])
     expect(net("import { readFileSync } from 'node:fs'; const s = 'fetch'")).toEqual([])
+    expect(net("eval('1')")).toEqual(['eval'])
+    expect(net("new Function('return 1')")).toEqual(['Function'])
+    expect(net('type F = Function')).toEqual([])
+  })
+
+  it('sees network globals behind globalThis wrappers, global and destructuring', () => {
+    expect(net('(globalThis as any).fetch(u)')).toEqual(['globalThis.fetch'])
+    expect(net('(<any>globalThis).fetch(u)')).toEqual(['globalThis.fetch'])
+    expect(net('globalThis!.fetch(u)')).toEqual(['globalThis.fetch'])
+    expect(net('(globalThis satisfies object as any).fetch(u)')).toEqual(['globalThis.fetch'])
+    expect(net('global.fetch(u)')).toEqual(['globalThis.fetch'])
+    expect(net("global['fetch'](u)")).toEqual(['globalThis.fetch'])
+    expect(net('globalThis.globalThis.fetch(u)')).toEqual(['globalThis.fetch'])
+    expect(net('global.globalThis.fetch(u)')).toEqual(['globalThis.fetch'])
+    expect(net('const { fetch: f } = globalThis; f(u)')).toEqual(['globalThis.fetch'])
+    expect(net("const { 'fetch': f } = global")).toEqual(['globalThis.fetch'])
+    expect(net('let f; ({ fetch: f } = globalThis)')).toEqual(['globalThis.fetch'])
+    expect(net('const { fetch } = globalThis')).toEqual(['fetch'])
+    expect(net('globalThis.process.env.X')).toEqual([])
+  })
+
+  it('reports the global object behind a computed key or an alias', () => {
+    expect(net("globalThis['fe' + 'tch'](u)")).toEqual(['globalThis[?]'])
+    expect(net('const g = globalThis; g.fetch(u)')).toEqual(['globalThis (aliased)'])
+    expect(net("Reflect.get(global, 'fetch')")).toEqual(['global (aliased)'])
+    expect(net('const { ...all } = globalThis')).toEqual(['globalThis{…}'])
+    expect(net('if (typeof globalThis === "object") {}')).toEqual([])
+    expect(net('declare global { interface X { a: 1 } }')).toEqual([])
+    expect(net('const o = { global: 1 }; o.global')).toEqual([])
   })
 
   it('reports value references to banned globals', () => {
@@ -86,10 +132,43 @@ describe('scanSource', () => {
     expect(names('let d: typeof document')).toEqual(['global:document'])
   })
 
+  it('reports more browser-only globals than the four DOM roots', () => {
+    const src = [
+      'localStorage.getItem("a")',
+      'requestAnimationFrame(f)',
+      'new OffscreenCanvas(1, 1)',
+      'new Image()',
+      'const h = location.href',
+      'addEventListener("message", f)',
+      'postMessage(1)',
+      'new DOMParser()'
+    ].join('\n')
+    expect(names(src).map((n) => n.replace('global:', ''))).toEqual([
+      'localStorage',
+      'requestAnimationFrame',
+      'OffscreenCanvas',
+      'Image',
+      'location',
+      'addEventListener',
+      'postMessage',
+      'DOMParser'
+    ])
+    // Node-safe relatives stay allowed.
+    expect(names('new TextDecoder(); structuredClone(x); queueMicrotask(f); new URL(u)')).toEqual(
+      []
+    )
+  })
+
   it('reports globalThis property access by name', () => {
     expect(names('globalThis.window.close()')).toEqual(['global:globalThis.window'])
     expect(names("globalThis['navigator']")).toEqual(['global:globalThis.navigator'])
     expect(names('globalThis.process')).toEqual([])
+    expect(names('(globalThis as any).window.foo')).toEqual(['global:globalThis.window'])
+    expect(names('(globalThis).document.title')).toEqual(['global:globalThis.document'])
+    expect(names('globalThis!.document')).toEqual(['global:globalThis.document'])
+    expect(names('const { window: w } = globalThis')).toEqual(['global:globalThis.window'])
+    expect(names('global.window')).toEqual(['global:globalThis.window'])
+    expect(names("globalThis['win' + 'dow']")).toEqual(['global:globalThis[?]'])
   })
 
   it('reports shadowing locals (stricter than no-restricted-globals; rename them)', () => {
@@ -149,6 +228,38 @@ describe('scanSource', () => {
   it('reports require/import() with a non-literal argument', () => {
     expect(names('const m = require(name)')).toEqual(['dynamic-import:require()'])
     expect(names('await import(`./${x}`)')).toEqual(['dynamic-import:import()'])
+  })
+
+  it('treats every require-like call as an import', () => {
+    expect(names("module.require('electron')")).toEqual(['import:electron'])
+    expect(names("process.mainModule?.require('electron')")).toEqual(['import:electron'])
+    expect(names("process.getBuiltinModule('electron')")).toEqual(['import:electron'])
+    expect(names("(0, require)('electron')")).toEqual(['import:electron'])
+    expect(names("require?.('electron')")).toEqual(['import:electron'])
+    expect(names("(require as any)('electron')")).toEqual(['import:electron'])
+    expect(names("module['require']('electron')")).toEqual(['import:electron'])
+    expect(names("createRequire(import.meta.url)('electron')")).toEqual(['import:electron'])
+    expect(names("import { createRequire } from 'node:module'")).toEqual(['import:node:module'])
+    expect(names("import m from 'module'")).toEqual(['import:module'])
+    expect(net("process.getBuiltinModule('node:https')")).toEqual(['node:https'])
+    expect(net("module.require('http')")).toEqual(['http'])
+  })
+
+  it('reports a loader that is handed on instead of called', () => {
+    expect(names("const r = require; r('electron')")).toEqual(['dynamic-import:require (aliased)'])
+    expect(names("require.call(null, 'electron')")).toEqual(['dynamic-import:require (aliased)'])
+    expect(names('const r = module.require')).toEqual(['dynamic-import:.require (aliased)'])
+    expect(names("const req = createRequire(import.meta.url); req('electron')")).toEqual([
+      'dynamic-import:createRequire (aliased)'
+    ])
+    expect(names('const cr = createRequire')).toEqual(['dynamic-import:createRequire (aliased)'])
+    expect(names('f(process.getBuiltinModule)')).toEqual([
+      'dynamic-import:.getBuiltinModule (aliased)'
+    ])
+    // Not loading anything: allowed.
+    expect(names("if (typeof require === 'function') {}")).toEqual([])
+    expect(names("const p = require.resolve('pdf-lib')")).toEqual([])
+    expect(names('declare const require: unknown')).toEqual([])
   })
 
   it('allows environment-agnostic packages and node built-ins', () => {

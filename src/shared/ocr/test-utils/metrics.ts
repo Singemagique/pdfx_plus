@@ -467,26 +467,48 @@ export type SearchFn = (query: string) => readonly FindHit[] | Promise<readonly 
 
 export interface FindWordResult {
   index: number
+  /** The query searched for this word (its text, edge punctuation stripped). */
   query: string
-  /** The query returned at least one hit on this word's page. */
+  /**
+   * The word was found: one of its query's hits matches THIS word's box, one-to-one (IoU >
+   * threshold; two occurrences need two hits). A hit elsewhere does not count.
+   */
   found: boolean
-  /** Some hit on this page has IoU > threshold with the word's box. */
-  onTarget: boolean
-  /** Matched one-to-one among the hits for this query (duplicates each need their own hit). */
-  matchedOneToOne: boolean
+  /** Diagnostic: the query returned at least one hit somewhere on this word's page. */
+  anyHitOnPage: boolean
+  /** Best IoU of any of the query's hits on this page with the word's box. */
   bestIou: number
 }
 
+/** A hit that matched no GT occurrence of its query and lies inside no longer GT word. */
+export interface StrayHit extends FindHit {
+  query: string
+}
+
 export interface FindScores {
-  /** GT words with ≥ minGraphemes graphemes in their query (the denominator). */
+  /** GT words with ≥ minGraphemes graphemes in their query (the denominator of `recall`). */
   eligible: number
-  /** found / eligible (1 when nothing is eligible). */
+  /** Eligible words found (see `FindWordResult.found`). */
+  found: number
+  /** Find recall: found / eligible (1 when nothing is eligible). The headline number. */
   recall: number
-  /** onTarget / found among found words (1 when nothing was found). */
+  /** Diagnostic: share of eligible words whose query hit anything on their page. */
+  anyHitOnPage: number
+  /** Every hit the searches returned, split three ways (onTarget + substring + offTarget). */
+  hits: number
+  /** Hits matched one-to-one to a GT occurrence of their query at IoU > threshold. */
+  onTargetHits: number
+  /**
+   * Unmatched hits lying inside a longer GT word that contains the query ("the" in "weather"):
+   * correct substring matches of the app's Find, so they are excluded from `hitOnTarget`.
+   */
+  substringHits: number
+  /** All other hits: false positives, duplicates on one occurrence, misplaced rects. */
+  offTargetHits: number
+  /** Hit-on-target among hits: onTarget / (onTarget + offTarget) (1 when there are none). */
   hitOnTarget: number
-  /** matchedOneToOne / eligible: recall that also needs one on-target hit per occurrence. */
-  occurrenceRecall: number
   words: FindWordResult[]
+  strayHits: StrayHit[]
 }
 
 export interface FindOptions {
@@ -494,14 +516,48 @@ export interface FindOptions {
   minGraphemes?: number
   /** IoU threshold for "on target" (strict >). Default 0.5. */
   threshold?: number
+  /**
+   * The search's text folding, used to decide which GT words are occurrences of a query and
+   * which contain it. Default `foldForFind`; the real harness passes the app's `normalizeQuery`.
+   */
+  fold?: (s: string) => string
 }
 
 /**
- * Find recall and hit-on-target (DESIGN.md §3.9.2) over the GT words, given a search callback.
- * The query for a word is its NFC text with leading/trailing punctuation stripped ("dog," → "dog");
- * words whose query has fewer than `minGraphemes` graphemes are skipped. Each distinct query is
- * searched once. The callback owns query normalisation (the real harness passes the app's Find
- * engine), and must report hits in the GT words' frame.
+ * An approximation of the app's Find folding (search/normalize.ts) that needs no renderer code:
+ * NFKD, non-spacing marks dropped, lower case, NFC.
+ */
+export function foldForFind(s: string): string {
+  return s
+    .normalize('NFKD')
+    .replace(/\p{Mn}/gu, '')
+    .toLowerCase()
+    .normalize('NFC')
+}
+
+/** Share of `inner`'s area that lies inside `outer` (0 if `inner` has no area). */
+function areaInside(inner: Box, outer: Box): number {
+  const ix = Math.min(inner.x + inner.w, outer.x + outer.w) - Math.max(inner.x, outer.x)
+  const iy = Math.min(inner.y + inner.h, outer.y + outer.h) - Math.max(inner.y, outer.y)
+  const a = inner.w * inner.h
+  return ix <= 0 || iy <= 0 || a <= 0 ? 0 : (ix * iy) / a
+}
+
+/**
+ * Find recall and hit-on-target (DESIGN.md §3.9.2, §3.9.4) over the GT words, given a search
+ * callback that reports hits in the GT words' frame.
+ *
+ * - A word's query is its NFC text with leading/trailing punctuation stripped ("dog," → "dog");
+ *   words whose query has fewer than `minGraphemes` graphemes are skipped. Queries that fold to
+ *   the same text (`fold`: "The" and "the") are searched once, and every GT word that folds to it
+ *   is an occurrence of that search.
+ * - Recall is per occurrence: a word is found only if one of the hits matches its own box
+ *   one-to-one (greedy by IoU, per page, IoU > threshold). A hit on another copy of the word, or
+ *   inside another word, does not find it.
+ * - Hit-on-target is per hit, so false positives count: of all returned hits, those matched to an
+ *   occurrence are on target; an unmatched hit with ≥ 50% of its area inside a GT word whose
+ *   folded text contains the folded query but is not an occurrence (the app's Find is a substring
+ *   search) is a substring hit and is left out; every other hit is off target.
  */
 export async function findScores(
   gtWords: readonly FindGtWord[],
@@ -510,29 +566,53 @@ export async function findScores(
 ): Promise<FindScores> {
   const minG = opts.minGraphemes ?? 3
   const threshold = opts.threshold ?? 0.5
-  const byQuery = new Map<string, number[]>()
+  const fold = opts.fold ?? foldForFind
+  const folded = gtWords.map((w) => fold(w.t.normalize('NFC')))
+  const groups = new Map<string, { query: string; indices: number[] }>()
   gtWords.forEach((w, index) => {
     const q = w.t.normalize('NFC').replace(EDGE_PUNCT, '')
     if (graphemes(q).length < minG) return
-    const list = byQuery.get(q)
-    if (list) list.push(index)
-    else byQuery.set(q, [index])
+    const key = fold(q)
+    const g = groups.get(key)
+    if (g) g.indices.push(index)
+    else groups.set(key, { query: q, indices: [index] })
   })
   const results: FindWordResult[] = []
-  for (const [query, indices] of byQuery) {
+  const strayHits: StrayHit[] = []
+  let hitCount = 0
+  let onTargetHits = 0
+  let substringHits = 0
+  for (const [key, { query, indices }] of groups) {
     const hits = await search(query)
-    // One-to-one matching per page between this query's hits and its GT occurrences.
-    const pages = new Set(indices.map((i) => gtWords[i].page ?? 0))
-    const oneToOne = new Set<number>()
+    hitCount += hits.length
+    const occurrence = new Set(indices)
+    const found = new Set<number>()
+    const pages = new Set([...indices.map((i) => gtWords[i].page ?? 0), ...hits.map((h) => h.page)])
     for (const page of pages) {
       const occ = indices.filter((i) => (gtWords[i].page ?? 0) === page)
       const pageHits = hits.filter((h) => h.page === page)
+      const matched = new Set<number>()
       for (const m of matchBoxes(
         occ.map((i) => gtWords[i].box),
         pageHits.map((h) => h.box),
         { threshold }
-      ))
-        oneToOne.add(occ[m.gt])
+      )) {
+        found.add(occ[m.gt])
+        matched.add(m.hyp)
+      }
+      onTargetHits += matched.size
+      pageHits.forEach((h, hi) => {
+        if (matched.has(hi)) return
+        const inLongerWord = gtWords.some(
+          (w, wi) =>
+            (w.page ?? 0) === page &&
+            !occurrence.has(wi) &&
+            folded[wi].includes(key) &&
+            areaInside(h.box, w.box) >= 0.5
+        )
+        if (inLongerWord) substringHits++
+        else strayHits.push({ query, page: h.page, box: h.box })
+      })
     }
     for (const index of indices) {
       const w = gtWords[index]
@@ -542,24 +622,29 @@ export async function findScores(
       results.push({
         index,
         query,
-        found: pageHits.length > 0,
-        onTarget: best > threshold,
-        matchedOneToOne: oneToOne.has(index),
+        found: found.has(index),
+        anyHitOnPage: pageHits.length > 0,
         bestIou: best
       })
     }
   }
   results.sort((a, b) => a.index - b.index)
   const eligible = results.length
-  const found = results.filter((r) => r.found).length
-  const onTarget = results.filter((r) => r.found && r.onTarget).length
-  const oneToOne = results.filter((r) => r.matchedOneToOne).length
+  const nFound = results.filter((r) => r.found).length
+  const offTargetHits = strayHits.length
+  const judged = onTargetHits + offTargetHits
   return {
     eligible,
-    recall: eligible === 0 ? 1 : found / eligible,
-    hitOnTarget: found === 0 ? 1 : onTarget / found,
-    occurrenceRecall: eligible === 0 ? 1 : oneToOne / eligible,
-    words: results
+    found: nFound,
+    recall: eligible === 0 ? 1 : nFound / eligible,
+    anyHitOnPage: eligible === 0 ? 1 : results.filter((r) => r.anyHitOnPage).length / eligible,
+    hits: hitCount,
+    onTargetHits,
+    substringHits,
+    offTargetHits,
+    hitOnTarget: judged === 0 ? 1 : onTargetHits / judged,
+    words: results,
+    strayHits
   }
 }
 
