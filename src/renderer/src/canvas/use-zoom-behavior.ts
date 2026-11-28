@@ -8,7 +8,6 @@ import { WHEEL_ZOOM_SPEED } from './zoom-constants'
 export {
   MIN_SCALE,
   MAX_SCALE,
-  PAN_MARGIN,
   FIT_MARGIN,
   TARGET_FIT_SCALE,
   WHEEL_ZOOM_SPEED,

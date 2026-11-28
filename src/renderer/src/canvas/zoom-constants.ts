@@ -1,6 +1,5 @@
 export const MIN_SCALE = 0.02
 export const MAX_SCALE = 90
-export const PAN_MARGIN = 3
 export const FIT_MARGIN = 0.86
 /**
  * The zoom a fitted, fully-wrapped row of pages comes up at. Documents wrap to the viewport width
@@ -26,5 +25,14 @@ export const REVEAL_TOP_MARGIN = FIT_TOP_MARGIN + 52
 export const REVEAL_BOTTOM_MARGIN = FIT_BOTTOM_MARGIN
 export const REVEAL_SIDE_MARGIN = 24
 export const REVEAL_ANIMATION_MS = FIT_ANIMATION_MS
+/**
+ * How far the view can be panned, in screen px at any zoom (see boundTransform). Content taller
+ * than the window between these pans until its top reaches PAN_TOP_MARGIN below the top edge (it
+ * clears the toolbar) or its end PAN_BOTTOM_MARGIN above the bottom edge, and no further; shorter
+ * content stays entirely inside that window. Across, the same with PAN_SIDE_MARGIN on both sides.
+ */
+export const PAN_TOP_MARGIN = FIT_TOP_MARGIN
+export const PAN_BOTTOM_MARGIN = FIT_BOTTOM_MARGIN
+export const PAN_SIDE_MARGIN = REVEAL_SIDE_MARGIN
 export const WHEEL_ZOOM_SPEED = 0.03
 export const BUTTON_ZOOM_FACTOR = 1.35

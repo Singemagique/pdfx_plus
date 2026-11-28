@@ -12,7 +12,12 @@ vi.mock('./PageView', () => ({ PageView: () => null }))
 import { CollectionCanvas } from './CollectionCanvas'
 import type { CanvasHandle } from './Canvas'
 import { computeLayout, type CanvasLayout } from '../canvas/layout'
-import { FIT_ANIMATION_MS, REVEAL_ANIMATION_MS } from '../canvas/zoom-constants'
+import {
+  FIT_ANIMATION_MS,
+  PAN_BOTTOM_MARGIN,
+  PAN_TOP_MARGIN,
+  REVEAL_ANIMATION_MS
+} from '../canvas/zoom-constants'
 import { EditProvider, useEditStore } from '../edit/EditProvider'
 import { FindProvider } from '../search/FindContext'
 import { createFindController, type FindController } from '../search/find-controller'
@@ -245,6 +250,41 @@ describe('Find in the collection canvas', () => {
     expect(box.bottom).toBeLessThanOrEqual(VP_H)
     expect(box.left).toBeGreaterThanOrEqual(0)
     expect(box.right).toBeLessThanOrEqual(VP_W)
+  })
+
+  it('reveals a match on the last page without scrolling past the end of the content', async () => {
+    await render()
+    await findFor('another')
+    expect(reveal).toHaveBeenCalledWith('c-p11')
+    await wait(REVEAL_ANIMATION_MS + 100)
+    const t = zoomTransform(container.querySelector('.canvas-viewport') as HTMLElement)
+    const end = t.applyY(layoutRef.current!.contentHeight)
+    expect(end).toBeGreaterThanOrEqual(VP_H - PAN_BOTTOM_MARGIN - 1e-6)
+    const box = onScreen('c-p11')
+    expect(box.top).toBeGreaterThanOrEqual(0)
+    expect(box.bottom).toBeLessThanOrEqual(VP_H)
+  })
+
+  it('never brings the top of the content below the top bound to reveal the first page', async () => {
+    await render()
+    const vp = container.querySelector('.canvas-viewport') as HTMLElement
+    // Zoomed out, then scrolled to the end: the first page is off screen above.
+    await act(async () => {
+      vp.dispatchEvent(
+        new WheelEvent('wheel', { deltaY: 10, ctrlKey: true, bubbles: true, cancelable: true })
+      )
+    })
+    for (let i = 0; i < 20; i++) {
+      await act(async () => {
+        vp.dispatchEvent(new WheelEvent('wheel', { deltaY: 400, bubbles: true, cancelable: true }))
+      })
+    }
+    expect(onScreen('a-p0').bottom).toBeLessThan(0)
+    await findFor('apple')
+    await wait(REVEAL_ANIMATION_MS + 100)
+    const t = zoomTransform(vp)
+    expect(t.y).toBeLessThanOrEqual(PAN_TOP_MARGIN + 1e-6)
+    expect(onScreen('a-p0').top).toBeGreaterThanOrEqual(PAN_TOP_MARGIN)
   })
 
   it('leaves an already-visible match where it is', async () => {

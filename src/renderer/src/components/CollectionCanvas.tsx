@@ -3,6 +3,7 @@ import {
   MIN_DOC_WIDTH,
   BASE_PAGE_HEIGHT,
   betweenSlotY,
+  panReachWidth,
   wrapWidthForViewport
 } from '../canvas/layout'
 import { useImportFocus } from '../canvas/imported-doc'
@@ -115,6 +116,7 @@ export function CollectionCanvas(props: CollectionCanvasProps): React.JSX.Elemen
       ref={props.canvasRef}
       contentWidth={layout.contentWidth}
       contentHeight={layout.contentHeight}
+      reachWidth={panReachWidth(layout)}
       focus={focus}
       dragging={dragKind !== null}
       onScaleChange={props.onScaleChange}

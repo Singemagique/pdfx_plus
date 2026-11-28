@@ -1,5 +1,5 @@
 import { zoom as d3zoom, type ZoomBehavior } from 'd3-zoom'
-import { reversibleConstrain } from './constrain'
+import { panConstrain } from './constrain'
 import { MIN_SCALE, MAX_SCALE } from './zoom-constants'
 
 interface ZoomHandlerRefs {
@@ -18,7 +18,7 @@ export function createZoomBehavior(refs: ZoomHandlerRefs): ZoomBehavior<HTMLDivE
     refs
   return d3zoom<HTMLDivElement, unknown>()
     .scaleExtent([MIN_SCALE, MAX_SCALE])
-    .constrain(reversibleConstrain)
+    .constrain(panConstrain)
     .filter((event) => {
       if (event.type === 'wheel') return false
       if ((event as MouseEvent).button) return false

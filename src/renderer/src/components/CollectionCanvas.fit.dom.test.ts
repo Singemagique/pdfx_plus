@@ -12,7 +12,12 @@ vi.mock('./collection/HeaderLayer', () => ({ HeaderLayer: () => null }))
 
 import { CollectionCanvas } from './CollectionCanvas'
 import { computeLayout, wrapWidthForViewport } from '../canvas/layout'
-import { FIT_ANIMATION_MS, FIT_MARGIN, FIT_TOP_MARGIN } from '../canvas/zoom-constants'
+import {
+  FIT_ANIMATION_MS,
+  FIT_BOTTOM_MARGIN,
+  FIT_MARGIN,
+  FIT_TOP_MARGIN
+} from '../canvas/zoom-constants'
 import { movePageToNewDoc } from '../app/doc-ops/move'
 import { doc } from '../canvas/test-utils/layout-fixtures'
 import type { DocEntry } from '../types'
@@ -194,15 +199,21 @@ describe('fit on import', () => {
     await settle()
     expect(transform()).toEqual(before)
 
+    // Deleting a shortens the content under a view scrolled near its end: the view stays where it
+    // is unless that is now past the end, and then it only moves back as far as the end.
     await act(async () => setDocs([b]))
     await settle()
-    expect(transform()).toEqual(before)
+    const afterDelete = transform()
+    expect(afterDelete.k).toBe(before.k)
+    expect(afterDelete.x).toBe(before.x)
+    const end = VP_H - FIT_BOTTOM_MARGIN - layoutOf([b]).contentHeight * before.k
+    expect(afterDelete.y).toBeCloseTo(Math.max(before.y, end))
 
     await act(async () =>
       setDocs(movePageToNewDoc([b], { docId: 'b', pageId: 'b-p3' }, 1, 'split'))
     )
     await settle()
-    expect(transform()).toEqual(before)
+    expect(transform()).toEqual(afterDelete)
   })
 })
 
@@ -315,9 +326,17 @@ describe('fit on viewport resize', () => {
   it('keeps the middle of a zoomed-in view in the middle of the pane on resize', async () => {
     await act(async () => setDocs([a, b]))
     await settle()
+    // Zoom in about the middle of the pane, so neither side is held at its pan bound.
     await act(async () => {
       viewport().dispatchEvent(
-        new WheelEvent('wheel', { deltaY: -30, ctrlKey: true, bubbles: true, cancelable: true })
+        new WheelEvent('wheel', {
+          deltaY: -30,
+          ctrlKey: true,
+          clientX: VP_W / 2,
+          clientY: VP_H / 2,
+          bubbles: true,
+          cancelable: true
+        })
       )
     })
     const before = transform()
@@ -337,14 +356,33 @@ describe('fit on viewport resize', () => {
     await settle()
     await wheel(250)
     const before = transform()
-    await act(async () => setDocs([a, b, doc('c', 5)]))
-    // An import re-fits by design; deleting it again is a height-only change.
+    const c = doc('c', 5)
+    await act(async () => setDocs([a, b, c]))
+    // An import re-fits by design; splitting a page out into a new document is a height-only change.
     await settle()
-    await wheel(100)
+    await wheel(-100)
     const scrolled = transform()
-    await act(async () => setDocs([a, b]))
+    await act(async () =>
+      setDocs(movePageToNewDoc([a, b, c], { docId: 'a', pageId: 'a-p3' }, 0, 'split'))
+    )
     await settle()
     expect(transform()).toEqual(scrolled)
     expect(before.k).toBeCloseTo(scrolled.k)
+  })
+
+  it('pulls a view scrolled to the end back to the new end when the content gets shorter', async () => {
+    await act(async () => setDocs([a, b, doc('c', 5)]))
+    await settle()
+    await wheel(5000)
+    const atEnd = transform()
+    const long = layoutOf([a, b, doc('c', 5)]).contentHeight
+    expect(atEnd.y).toBeCloseTo(VP_H - FIT_BOTTOM_MARGIN - long * atEnd.k)
+
+    await act(async () => setDocs([a, b]))
+    await settle()
+    const t = transform()
+    expect(t.k).toBe(atEnd.k)
+    expect(t.x).toBe(atEnd.x)
+    expect(t.y).toBeCloseTo(VP_H - FIT_BOTTOM_MARGIN - layoutOf([a, b]).contentHeight * t.k)
   })
 })

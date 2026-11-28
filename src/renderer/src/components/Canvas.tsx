@@ -16,6 +16,11 @@ export interface CanvasHandle {
 interface CanvasProps {
   contentWidth: number
   contentHeight: number
+  /**
+   * The world width the view can be panned across, when wider than `contentWidth` (a round "Add
+   * page" button straddling a card's edge); the fit still frames `contentWidth`.
+   */
+  reachWidth?: number
   /** Set (a fresh object) when documents were just imported: fit and scroll to world y `focus.y`. */
   focus?: FitFocus | null
   dragging?: boolean
@@ -35,6 +40,7 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
   {
     contentWidth,
     contentHeight,
+    reachWidth = contentWidth,
     focus = null,
     dragging,
     onScaleChange,
@@ -80,6 +86,7 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
     fitTransform,
     contentWidth,
     contentHeight,
+    reachWidth,
     focus,
     viewportWidth: viewportSize.width,
     viewportHeight: viewportSize.height

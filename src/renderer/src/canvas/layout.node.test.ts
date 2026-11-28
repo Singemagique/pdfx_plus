@@ -17,6 +17,7 @@ import {
   flowCells,
   pageCellSize,
   pageDisplayWidth,
+  panReachWidth,
   reflowDoc,
   wrapWidthForViewport
 } from './layout'
@@ -125,6 +126,17 @@ describe('computeLayout wrapping', () => {
     const land = computeLayout([doc('l', 3, LANDSCAPE)], undefined, WRAP_5)
     expect(land.contentWidth).toBe(3 * LANDSCAPE_W + 2 * PAGE_GAP + 2 * CARD_PAD_X)
     expect(land.items[0].addPage.edge).toBe(true)
+  })
+
+  it('panReachWidth adds the outer half of an edge add-page button, and nothing otherwise', () => {
+    // 5 letter pages fill the row: the round button straddles the card's right edge.
+    const full = computeLayout([doc('a', 5), doc('b', 2)], undefined, WRAP_5)
+    expect(full.items[0].addPage.edge).toBe(true)
+    expect(panReachWidth(full)).toBe(full.contentWidth + ADD_PAGE_EDGE_SIZE / 2)
+    // Room for an add-page cell inside every card: the reach is the collection's width.
+    const roomy = computeLayout([doc('a', 2), doc('b', 3)], undefined, WRAP_5)
+    expect(roomy.items.some((i) => i.addPage.edge)).toBe(false)
+    expect(panReachWidth(roomy)).toBe(roomy.contentWidth)
   })
 
   it('narrows the add-page cell beside centred pages rather than wrapping it', () => {
