@@ -42,6 +42,9 @@ export interface PdfiumModule {
   FPDFPageObj_CreateNewRect(x: number, y: number, w: number, h: number): number
   FPDFPageObj_SetFillColor(obj: number, r: number, g: number, b: number, a: number): boolean
   FPDFPath_SetDrawMode(obj: number, fillMode: number, stroke: boolean): boolean
+  FPDFPageObj_GetType(obj: number): number
+  FPDFTextObj_GetFont(obj: number): number
+  FPDFFont_GetBaseFontName(font: number, buffer: number, length: number): number
   pdfium: {
     HEAPU8: Uint8Array
     wasmExports: { malloc(size: number): number; free(ptr: number): void }
@@ -65,12 +68,52 @@ export interface PageRedaction {
   rects: RedactRect[]
 }
 
+export interface RedactOptions {
+  /**
+   * Also remove EVERY text object in a PDFx OCR font (BaseFont /PDFxOCR-GlyphLess) on each redacted
+   * page, wherever it lies: the whole-page OCR fail-safe of a reopened OCR'd file (DESIGN.md §3.7.3
+   * rule 2 fail-safe, rule 5). Removing only the overlapping words would leave their characters in
+   * the layer font's ToUnicode, which no PDFium pass can trim; with no text object left in it,
+   * GenerateContent drops the font from the page's resources. Off by default, so the glyph-bounds
+   * suite still measures what per-word removal does.
+   */
+  dropOcrText?: boolean
+}
+
+/** BaseFont of the PDFx OCR layer font (ocr-font.ts `OCR_FONT_NAME`, kept free of pdf-lib here). */
+const OCR_FONT_BASE_NAME = 'PDFxOCR-GlyphLess'
+const FPDF_PAGEOBJ_TEXT = 1
+
 /** True if a box (l,b,r,t) positively overlaps the rectangle. */
 function overlaps(l: number, b: number, r: number, t: number, rc: RedactRect): boolean {
   return !(r <= rc.x || l >= rc.x + rc.w || t <= rc.y || b >= rc.y + rc.h)
 }
 
-function redactPage(pdfium: PdfiumModule, page: number, rects: RedactRect[]): void {
+/** Is `obj` a text object shown in a PDFx OCR font (a subset tag `ABCDEF+` tolerated)? */
+function isOcrText(pdfium: PdfiumModule, obj: number): boolean {
+  if (pdfium.FPDFPageObj_GetType(obj) !== FPDF_PAGEOBJ_TEXT) return false
+  const font = pdfium.FPDFTextObj_GetFont(obj)
+  if (!font) return false
+  const rt = pdfium.pdfium
+  const n = pdfium.FPDFFont_GetBaseFontName(font, 0, 0)
+  if (n <= 1 || n > 256) return false
+  const buf = rt.wasmExports.malloc(n)
+  try {
+    pdfium.FPDFFont_GetBaseFontName(font, buf, n)
+    let name = ''
+    for (let i = 0; i < n - 1; i++) name += String.fromCharCode(rt.HEAPU8[buf + i])
+    return name === OCR_FONT_BASE_NAME || name.endsWith(`+${OCR_FONT_BASE_NAME}`)
+  } finally {
+    rt.wasmExports.free(buf)
+  }
+}
+
+function redactPage(
+  pdfium: PdfiumModule,
+  page: number,
+  rects: RedactRect[],
+  opts: RedactOptions
+): void {
   const rt = pdfium.pdfium
   const { malloc, free } = rt.wasmExports
   const fb = malloc(16) // four floats; reused for object bounds and annotation rects
@@ -80,7 +123,12 @@ function redactPage(pdfium: PdfiumModule, page: number, rects: RedactRect[]): vo
     const count = pdfium.FPDFPage_CountObjects(page)
     for (let i = 0; i < count; i++) {
       const obj = pdfium.FPDFPage_GetObject(page, i)
-      if (!obj || !pdfium.FPDFPageObj_GetBounds(obj, fb, fb + 4, fb + 8, fb + 12)) continue
+      if (!obj) continue
+      if (opts.dropOcrText && isOcrText(pdfium, obj)) {
+        doomed.push(obj)
+        continue
+      }
+      if (!pdfium.FPDFPageObj_GetBounds(obj, fb, fb + 4, fb + 8, fb + 12)) continue
       const l = rt.getValue(fb, 'float')
       const b = rt.getValue(fb + 4, 'float')
       const r = rt.getValue(fb + 8, 'float')
@@ -168,7 +216,8 @@ function saveDocument(pdfium: PdfiumModule, doc: number): Uint8Array {
 export function redactPdf(
   pdfium: PdfiumModule,
   bytes: Uint8Array,
-  pages: PageRedaction[]
+  pages: PageRedaction[],
+  opts: RedactOptions = {}
 ): Uint8Array {
   const rt = pdfium.pdfium
   const { malloc, free } = rt.wasmExports
@@ -189,7 +238,7 @@ export function redactPdf(
       const page = pdfium.FPDF_LoadPage(doc, pageIndex)
       if (!page) throw new Error(`redact: FPDF_LoadPage failed for page ${pageIndex}`)
       try {
-        redactPage(pdfium, page, rects)
+        redactPage(pdfium, page, rects, opts)
       } finally {
         pdfium.FPDF_ClosePage(page)
       }

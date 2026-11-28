@@ -27,6 +27,11 @@ interface SignAppearanceOpts {
   includeImage?: boolean
   /** The signing certificate's identity, for the "digitally signed by …" block (Windows path). */
   signer?: { subject: string; issuer: string }
+  /**
+   * "Include recognized text (machine-generated, not reviewed)" (DESIGN.md §3.7.7, D7): bake the
+   * OCR text layer into the signed copy. Off unless set; the checkbox itself arrives with PR8.
+   */
+  includeRecognizedText?: boolean
 }
 
 interface SignDialogProps {
