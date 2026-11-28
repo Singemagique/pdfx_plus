@@ -144,9 +144,11 @@ async function exportAs(
   kind: Kind,
   docs: DocEntry[],
   editLayer: EditLayer,
-  ocr: ReadonlyMap<string, PackedOcrPage> | undefined
+  ocr: ReadonlyMap<string, PackedOcrPage> | undefined,
+  /** false: whole-image removal, as before pixel redaction (PR12) and as its fallback. */
+  pixelRedaction = true
 ): Promise<Exported> {
-  const redacted = await buildRedactedSources(editLayer, docs, { pdfium, report: true })
+  const redacted = await buildRedactedSources(editLayer, docs, { pdfium, report: true, pixelRedaction }) // prettier-ignore
   const layer = withOcrLayer(editLayer, ocr, { include: true, removed: redacted.removed })
   const flat = docs.flatMap((d) => exportPagesOf(d, redacted))
   let files: Uint8Array[]
@@ -301,13 +303,17 @@ async function framedPdf(rotate: number, strips: boolean): Promise<Uint8Array> {
 describe.each([0, 90, 180, 270])('/Rotate %i, offset MediaBox and CropBox', (rotate) => {
   const key = makePageKey(`f${rotate}`, 0)
 
-  async function run(kind: Kind, strips: boolean): Promise<Exported & { doc: DocEntry }> {
+  async function run(
+    kind: Kind,
+    strips: boolean,
+    pixelRedaction = true
+  ): Promise<Exported & { doc: DocEntry }> {
     const doc = await openDoc(`f${rotate}`, await framedPdf(rotate, strips))
     const page = framedOcr(rotate)
     // The frame pdf.js gives the editor is the one the words and boxes were made in.
     expect([doc.pages[0].width, doc.pages[0].height]).toEqual(Object.values(visualSize(rotate)))
     const layer = edits({ overlays: new Map([[key, [redaction(key, secretBox(page))]]]) })
-    return { doc, ...(await exportAs(kind, [doc], layer, new Map([[key, pack(page)]]))) }
+    return { doc, ...(await exportAs(kind, [doc], layer, new Map([[key, pack(page)]]), pixelRedaction)) } // prettier-ignore
   }
 
   const kinds = rotate === 0 || rotate === 90 ? ALL_KINDS : (['pdf', 'pdfx'] as Kind[])
@@ -324,9 +330,9 @@ describe.each([0, 90, 180, 270])('/Rotate %i, offset MediaBox and CropBox', (rot
   })
 
   it.each(kinds)(
-    'scan in strips, %s: rule 2 drops every word over the removed strip',
+    'scan in strips, %s, whole-image removal: rule 2 drops every word over the removed strip',
     async (kind) => {
-      const { files, redacted } = await run(kind, true)
+      const { files, redacted } = await run(kind, true, false)
       // The pass removed exactly the strip under the box, reported in the VISUAL frame.
       const gone = redacted.removed?.get(key) ?? []
       expect(gone).toHaveLength(1)
@@ -335,6 +341,25 @@ describe.each([0, 90, 180, 270])('/Rotate %i, offset MediaBox and CropBox', (rot
       const kept = LINES.filter((_, k) => k !== 1).flat()
       for (const f of files) expect(await wordsOn(f)).toEqual(kept)
       await expectNoLeak(files, { words: [SECRET_WORD, 'Morning', 'beside'], uniqueCps: SECRET.uniqueCps }) // prettier-ignore
+    }
+  )
+
+  it.each(kinds)(
+    'scan in strips, %s, pixel redaction: the strip is modified, not removed, so rule 1 alone applies',
+    async (kind) => {
+      const { files, redacted } = await run(kind, true)
+      // Nothing was removed; the strip under the box was redacted pixel by pixel (reported in the
+      // VISUAL frame), so only the boxed word goes.
+      expect(redacted.removed?.get(key)).toEqual([])
+      const mod = redacted.modified?.get(key) ?? []
+      expect(mod).toHaveLength(1)
+      const b = band(rotate, 1)
+      for (const k of ['x', 'y', 'w', 'h'] as const) expect(mod[0][k]).toBeCloseTo(b[k], 3)
+      for (const f of files) {
+        expect(await wordsOn(f)).toEqual(KEPT_WORDS)
+        expect(await layerCount(f)).toBe(1)
+      }
+      await expectNoLeak(files, SECRET)
     }
   )
 })
@@ -434,7 +459,42 @@ describe('a scan split into strips (its real pixels)', () => {
   }
 
   it.each(['pdf', 'pdfx', 'zip'] as Kind[])(
-    '%s: exactly the words over the removed strip go, the rest stay',
+    '%s, pixel redaction: only the words under the box go, every strip stays',
+    async (kind) => {
+      const { bytes, rects } = await stripScan()
+      const box = scan.gt.words[uniqueGtWord(scan)].box
+      const doc = await openDoc(`pxstrips-${kind}`, bytes)
+      const key = makePageKey(`pxstrips-${kind}`, 0)
+      const ocr = ocrPageFromGt(scan.gt)
+      const layer = edits({ overlays: new Map([[key, [redaction(key, box)]]]) })
+      const { files, redacted } = await exportAs(kind, [doc], layer, new Map([[key, pack(ocr)]]))
+      const meets = (a: FrameBox, b: FrameBox): boolean =>
+        a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h
+      // The strips the box overlaps are modified, not removed (rule 2 has nothing to say).
+      expect(redacted.removed!.get(key)).toEqual([])
+      expect(redacted.modified!.get(key)).toHaveLength(rects.filter((r) => meets(r, box)).length)
+      const kept: string[] = []
+      for (const line of ocr.lines)
+        for (const w of line.words) {
+          const f = wordFootprint(w, line)
+          if (!meets({ x: f.x0, y: f.y0, w: f.x1 - f.x0, h: f.y1 - f.y0 }, box)) kept.push(w.t)
+        }
+      expect(kept.length).toBeGreaterThan(scan.gt.words.length - 5)
+      for (const f of files) {
+        expect(await wordsOn(f)).toEqual(kept)
+        // All six strips still draw: nothing of the scan went but the pixels under the box.
+        const out = await PDFDocument.load(f, { updateMetadata: false })
+        const images = out.context
+          .enumerateIndirectObjects()
+          .filter(([, o]) => o instanceof PDFRawStream && o.dict.get(PDFName.of('Subtype')) === PDFName.of('Image')) // prettier-ignore
+        expect(images).toHaveLength(STRIPS)
+      }
+      await expectNoLeak(files, { words: [scan.gt.words[uniqueGtWord(scan)].t], uniqueCps: [] })
+    }
+  )
+
+  it.each(['pdf', 'pdfx', 'zip'] as Kind[])(
+    '%s, whole-image removal: exactly the words over the removed strip go, the rest stay',
     async (kind) => {
       const { bytes, rects } = await stripScan()
       // The strips render the page like the one-image scan (resampling at the seams aside).
@@ -448,7 +508,7 @@ describe('a scan split into strips (its real pixels)', () => {
       const key = makePageKey(`strips-${kind}`, 0)
       const ocr = ocrPageFromGt(scan.gt)
       const layer = edits({ overlays: new Map([[key, [redaction(key, box)]]]) })
-      const { files, redacted } = await exportAs(kind, [doc], layer, new Map([[key, pack(ocr)]]))
+      const { files, redacted } = await exportAs(kind, [doc], layer, new Map([[key, pack(ocr)]]), false) // prettier-ignore
       // Independent expectation: the strips the box overlaps, then every word whose footprint
       // meets the box or one of them.
       const meets = (a: FrameBox, b: FrameBox): boolean =>

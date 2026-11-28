@@ -9,11 +9,27 @@
 //
 // Rects are in the page's UNROTATED PDF user space (origin bottom-left) — the caller converts from
 // the editor's visual space. Removal is whole-object, so redacting over a large object (e.g. a
-// full-page scan image) removes that whole object: safe (no leak) but coarse on image-only pages.
+// full-page scan image) removes that whole object: safe (no leak) but coarse on image-only pages,
+// unless the image can be redacted pixel by pixel (next paragraph). A scan inside a Form XObject is
+// one form object here, so it is still removed whole.
+//
+// PIXEL REDACTION (DESIGN.md §2 D3, PR12; `RedactOptions.pixels`). With the pdf-lib pre-pass's
+// image candidates (pixel-redact-doc.ts), an image the box overlaps that is in scope (pixel-redact.ts:
+// unmasked DeviceGray, DeviceRGB or Indexed, no /Decode or ICC, an XObject, axis-aligned, no clip,
+// no transparency, no marked content, and PDFium reads it with the same colour space and depth) is
+// not removed: the samples the box touches are blanked on a
+// NEW image object put in its place in the page's object list (`pixelRedact`), so the shared
+// XObject, and every other page drawing it, keeps its pixels (FPDFImageObj_SetBitmap on the
+// original would rewrite the shared stream). PDFium can only write that object at 8 bits per
+// component, so it is an INTERIM, already blanked; the export's pdf-lib pass swaps the final
+// stream in (the source's own depth, 1-bit for fax scans, at most twice the source's size). The
+// modified image is NOT in the removed-object report: it still shows its pixels, so only the words
+// under the box go (§3.7.3 rule 1). Everything else, and any step that fails, falls back to removing
+// the whole image, so a mapping or decoding problem can never leave covered pixels behind.
 //
 // Caveat: removing an AcroForm widget annotation drops the widget and its appearance; a residual
 // value may remain in the document-level /AcroForm /Fields tree. For fully untrusted forms, flatten
-// the form before redacting. Sub-image (rasterize-region) redaction is a future refinement.
+// the form before redacting.
 //
 // OCR (DESIGN.md §3.7.3). Two additions serve the invisible OCR text layer:
 // - The REMOVED-OBJECT REPORT (rule 2). `redactPdfReport` returns, per page, the bounds of every
@@ -37,6 +53,25 @@
 // every annotation whose /Parent or /IRT names a removed one (a popup's /Parent, a reply). They
 // would otherwise stay on the page holding a reference to the removed dict, and copyPages carries
 // that dict, with its /Contents, into the export (pdf.js even shows it as the popup's text).
+
+import {
+  MAX_GROWTH,
+  blankSamples,
+  blankValue,
+  componentsOf,
+  encodeSamples,
+  expandSamples,
+  isAxisAligned,
+  matchCandidate,
+  pixelRect,
+  rowBytesOf,
+  type ImageCandidate,
+  type ImagePlan,
+  type Matrix,
+  type PageCandidates,
+  type PixelRect,
+  type PixelReplacement
+} from './pixel-redact'
 
 /** FPDF_SaveAsCopy flag: complete rewrite rather than incremental append (no retained revision). */
 const FPDF_NO_INCREMENTAL = 2
@@ -87,6 +122,29 @@ export interface PdfiumModule {
   FPDFFormObj_GetObject(form: number, index: number): number
   /** Ownership passes to the caller (FPDFPageObj_Destroy); GenerateContent rewrites the form. */
   FPDFFormObj_RemoveObject(form: number, obj: number): boolean
+  // Pixel redaction (pixelRedact).
+  FPDFPageObj_HasTransparency(obj: number): boolean
+  FPDFPageObj_GetClipPath(obj: number): number
+  /** -1 when the object has no clip path. */
+  FPDFClipPath_CountPaths(clip: number): number
+  FPDFPageObj_SetMatrix(obj: number, matrixPtr: number): boolean
+  FPDFPageObj_NewImageObj(doc: number): number
+  FPDFPage_InsertObjectAtIndex(page: number, obj: number, index: number): boolean
+  FPDFImageObj_GetImagePixelSize(obj: number, wPtr: number, hPtr: number): boolean
+  /** FPDF_IMAGEOBJ_METADATA (28 bytes): u32 width, height; f32 dpi x, y; u32 bpp; i32 cs, mcid. */
+  FPDFImageObj_GetImageMetadata(obj: number, page: number, metadataPtr: number): boolean
+  /** Bytes written (the full length when `buffer` is 0 or too small). */
+  FPDFImageObj_GetImageDataRaw(obj: number, buffer: number, length: number): number
+  FPDFImageObj_GetImageDataDecoded(obj: number, buffer: number, length: number): number
+  FPDFImageObj_GetBitmap(obj: number): number
+  FPDFImageObj_SetBitmap(pages: number, count: number, obj: number, bitmap: number): boolean
+  FPDFBitmap_CreateEx(w: number, h: number, format: number, first: number, stride: number): number
+  FPDFBitmap_GetFormat(bitmap: number): number
+  FPDFBitmap_GetWidth(bitmap: number): number
+  FPDFBitmap_GetHeight(bitmap: number): number
+  FPDFBitmap_GetStride(bitmap: number): number
+  FPDFBitmap_GetBuffer(bitmap: number): number
+  FPDFBitmap_Destroy(bitmap: number): void
   pdfium: {
     HEAPU8: Uint8Array
     wasmExports: { malloc(size: number): number; free(ptr: number): void }
@@ -120,6 +178,12 @@ export interface RedactOptions {
    * suite still measures what per-word removal does.
    */
   dropOcrText?: boolean
+  /**
+   * Pixel redaction (see the header): pageIndex → the image XObjects the pdf-lib pre-pass found on
+   * that page (pixel-redact-doc.ts `imageCandidates`). An image matched to none of them is removed
+   * whole. Off when absent; the export passes it.
+   */
+  pixels?: PageCandidates
 }
 
 /** BaseFont of the PDFx OCR layer font (ocr-font.ts `OCR_FONT_NAME`, kept free of pdf-lib here). */
@@ -289,24 +353,251 @@ function linkedAnnots(
 const finiteBox = (b: PdfBox): boolean =>
   Number.isFinite(b.l) && Number.isFinite(b.b) && Number.isFinite(b.r) && Number.isFinite(b.t)
 
+const FPDF_PAGEOBJ_IMAGE = 3
+/** FPDFBitmap_* formats. */
+const BITMAP_GRAY = 1
+const BITMAP_BGR = 2
+const BITMAP_BGRX = 3
+/** FPDF_COLORSPACE_* of each plan colour space. */
+const PDFIUM_COLORSPACE = { DeviceGray: 1, DeviceRGB: 2, Indexed: 10 } as const
+/**
+ * The bits per pixel FPDFImageObj_GetImageMetadata reports for a plan's layout: 1 for 1-bit Gray
+ * and Indexed, 8 for the other Gray and Indexed depths and for 1- and 2-bit RGB, 24 for 4- and
+ * 8-bit RGB [measured, @embedpdf/pdfium 2.14.4, every depth of the three colour spaces, Flate,
+ * CCITT and DCT]. Anything else falls back to whole-image removal.
+ */
+const pdfiumBpp = (plan: ImagePlan): number =>
+  plan.colorSpace.kind === 'DeviceRGB' ? (plan.bpc >= 4 ? 24 : 8) : plan.bpc === 1 ? 1 : 8
+
+/** `n` bytes PDFium writes through `fill(ptr, n)`, copied out of the heap; null if it wrote fewer. */
+function readOut(
+  pdfium: PdfiumModule,
+  n: number,
+  fill: (ptr: number, n: number) => number
+): Uint8Array | null {
+  const rt = pdfium.pdfium
+  const ptr = rt.wasmExports.malloc(n)
+  try {
+    if (fill(ptr, n) < n) return null
+    return new Uint8Array(rt.HEAPU8.subarray(ptr, ptr + n)) // a copy: the heap may grow later
+  } finally {
+    rt.wasmExports.free(ptr)
+  }
+}
+
+/**
+ * The image's samples in the plan's layout (packed rows, its depth and colour space), or null when
+ * PDFium cannot give exactly that. 'samples' is the stream after its non-image filters; 'bitmap'
+ * is PDFium's decode of a CCITT, JBIG2 or DCT image, converted back to samples (1-bit sources must
+ * decode to pure black and white, or the image is not what the plan says).
+ */
+function sourceSamples(
+  pdfium: PdfiumModule,
+  obj: number,
+  W: number,
+  H: number,
+  plan: ImagePlan
+): Uint8Array | null {
+  const nc = componentsOf(plan.colorSpace)
+  const stride = rowBytesOf(W, nc, plan.bpc)
+  if (plan.decode === 'samples') {
+    const n = pdfium.FPDFImageObj_GetImageDataDecoded(obj, 0, 0)
+    // Short data would leave samples PDFium pads on its own; extra bytes after the last row are
+    // ignored by every reader, so they are dropped.
+    if (!(n >= stride * H)) return null
+    const all = readOut(pdfium, n, (p, len) => pdfium.FPDFImageObj_GetImageDataDecoded(obj, p, len))
+    return all ? all.slice(0, stride * H) : null
+  }
+  const bmp = pdfium.FPDFImageObj_GetBitmap(obj)
+  if (!bmp) return null
+  try {
+    const fmt = pdfium.FPDFBitmap_GetFormat(bmp)
+    if (pdfium.FPDFBitmap_GetWidth(bmp) !== W || pdfium.FPDFBitmap_GetHeight(bmp) !== H) return null
+    const bs = pdfium.FPDFBitmap_GetStride(bmp)
+    const buf = pdfium.FPDFBitmap_GetBuffer(bmp)
+    const heap = pdfium.pdfium.HEAPU8
+    const out = new Uint8Array(stride * H)
+    if (plan.colorSpace.kind === 'DeviceGray') {
+      if (fmt !== BITMAP_GRAY) return null
+      for (let r = 0; r < H; r++) {
+        const row = buf + r * bs
+        if (plan.bpc === 8) {
+          out.set(heap.subarray(row, row + W), r * stride)
+          continue
+        }
+        if (plan.bpc !== 1) return null
+        for (let x = 0; x < W; x++) {
+          const v = heap[row + x]
+          if (v === 255) out[r * stride + (x >> 3)] |= 0x80 >> (x & 7)
+          else if (v !== 0) return null
+        }
+      }
+      return out
+    }
+    if (plan.colorSpace.kind !== 'DeviceRGB' || plan.bpc !== 8) return null
+    const px = fmt === BITMAP_BGR ? 3 : fmt === BITMAP_BGRX ? 4 : 0
+    if (!px) return null
+    for (let r = 0; r < H; r++)
+      for (let x = 0; x < W; x++) {
+        const s = buf + r * bs + x * px
+        const d = r * stride + x * 3
+        out[d] = heap[s + 2]
+        out[d + 1] = heap[s + 1]
+        out[d + 2] = heap[s]
+      }
+    return out
+  } finally {
+    pdfium.FPDFBitmap_Destroy(bmp)
+  }
+}
+
+/** A new image object showing the 8-bit `interim` raster, placed by the matrix at `matrixPtr`. */
+function interimImage(
+  pdfium: PdfiumModule,
+  doc: number,
+  interim: PixelReplacement['interim'],
+  W: number,
+  H: number,
+  matrixPtr: number
+): number {
+  const bmp = pdfium.FPDFBitmap_CreateEx(W, H, interim.channels === 1 ? BITMAP_GRAY : BITMAP_BGR, 0, 0) // prettier-ignore
+  if (!bmp) return 0
+  let obj = 0
+  try {
+    const bs = pdfium.FPDFBitmap_GetStride(bmp)
+    const buf = pdfium.FPDFBitmap_GetBuffer(bmp)
+    const heap = pdfium.pdfium.HEAPU8
+    const { data } = interim
+    if (interim.channels === 1)
+      for (let r = 0; r < H; r++) heap.set(data.subarray(r * W, r * W + W), buf + r * bs)
+    else
+      for (let r = 0; r < H; r++)
+        for (let x = 0; x < W; x++) {
+          const s = (r * W + x) * 3
+          const d = buf + r * bs + x * 3
+          heap[d] = data[s + 2]
+          heap[d + 1] = data[s + 1]
+          heap[d + 2] = data[s]
+        }
+    obj = pdfium.FPDFPageObj_NewImageObj(doc)
+    if (!obj) return 0
+    if (
+      !pdfium.FPDFImageObj_SetBitmap(0, 0, obj, bmp) ||
+      !pdfium.FPDFPageObj_SetMatrix(obj, matrixPtr)
+    ) {
+      pdfium.FPDFPageObj_Destroy(obj)
+      return 0
+    }
+    return obj
+  } finally {
+    pdfium.FPDFBitmap_Destroy(bmp)
+  }
+}
+
+/**
+ * Pixel redaction of one image object (see the header): a new image object, not yet on the page,
+ * with every sample `rects` touch blanked, and the replacement record for the pdf-lib pass. Null
+ * when the image is out of scope or any step fails: the caller then removes the whole image.
+ */
+function pixelRedact(
+  pdfium: PdfiumModule,
+  doc: number,
+  page: number,
+  obj: number,
+  box: PdfBox,
+  rects: readonly RedactRect[],
+  candidates: readonly ImageCandidate[]
+): { obj: number; replacement: PixelReplacement } | null {
+  if (pdfium.FPDFPageObj_GetType(obj) !== FPDF_PAGEOBJ_IMAGE) return null
+  // The new object carries neither the original's graphics state (soft mask, alpha, blend mode),
+  // nor its clip, nor its marked content (optional content, tags): any of them is out of scope.
+  if (pdfium.FPDFPageObj_HasTransparency(obj)) return null
+  const clip = pdfium.FPDFPageObj_GetClipPath(obj)
+  if (clip && pdfium.FPDFClipPath_CountPaths(clip) > 0) return null
+  if (pdfium.FPDFPageObj_CountMarks(obj) > 0) return null
+  const rt = pdfium.pdfium
+  const mp = rt.wasmExports.malloc(64) // FS_MATRIX at 0..23, pixel size at 24..31, metadata at 32..59
+  try {
+    if (!pdfium.FPDFPageObj_GetMatrix(obj, mp)) return null
+    const m = [0, 4, 8, 12, 16, 20].map((o) => rt.getValue(mp + o, 'float')) as unknown as Matrix
+    if (!isAxisAligned(m)) return null
+    if (!pdfium.FPDFImageObj_GetImagePixelSize(obj, mp + 24, mp + 28)) return null
+    const W = rt.getValue(mp + 24, 'i32')
+    const H = rt.getValue(mp + 28, 'i32')
+    if (!(W > 0 && H > 0)) return null
+    const rawLength = pdfium.FPDFImageObj_GetImageDataRaw(obj, 0, 0)
+    if (!(rawLength > 0)) return null
+    const raw = readOut(pdfium, rawLength, (p, n) => pdfium.FPDFImageObj_GetImageDataRaw(obj, p, n))
+    if (!raw) return null
+    const cand = matchCandidate(candidates, W, H, raw)
+    if (!cand || 'skip' in cand.plan) return null
+    const plan = cand.plan
+    // PDFium's own reading of the object must agree with the plan's sample layout (an inline image
+    // whose data happened to equal an XObject's would otherwise be read with the wrong layout).
+    if (!pdfium.FPDFImageObj_GetImageMetadata(obj, page, mp + 32)) return null
+    const bpp = rt.getValue(mp + 48, 'i32')
+    const csId = rt.getValue(mp + 52, 'i32')
+    if (csId !== PDFIUM_COLORSPACE[plan.colorSpace.kind]) return null
+    if (bpp !== pdfiumBpp(plan)) return null
+    const px = rects.map((rc) => pixelRect(m, W, H, rc)).filter((p): p is PixelRect => !!p)
+    if (!px.length) return null
+    const samples = sourceSamples(pdfium, obj, W, H, plan)
+    if (!samples) return null
+    const cs = plan.colorSpace
+    blankSamples(samples, W, componentsOf(cs), plan.bpc, px, blankValue(cs))
+    const data = encodeSamples(samples)
+    if (data.length > MAX_GROWTH * rawLength) return null
+    const interim = expandSamples(samples, W, H, plan)
+    const created = interimImage(pdfium, doc, interim, W, H, mp)
+    if (!created) return null
+    return {
+      obj: created,
+      replacement: {
+        width: W,
+        height: H,
+        interim,
+        final: { bpc: plan.bpc, colorSpace: cs, data },
+        sourceLength: rawLength,
+        rects: px,
+        box: { ...box }
+      }
+    }
+  } finally {
+    rt.wasmExports.free(mp)
+  }
+}
+
+/** The page's object index of `obj`, or -1. */
+function objectIndex(pdfium: PdfiumModule, page: number, obj: number): number {
+  const n = pdfium.FPDFPage_CountObjects(page)
+  for (let i = 0; i < n; i++) if (pdfium.FPDFPage_GetObject(page, i) === obj) return i
+  return -1
+}
+
 /**
  * Redact one loaded page; returns what it removed (see `RemovedObject`). Content objects in the
  * `dropOcrText` sweep that do not themselves overlap a box are removed but NOT reported: they are
- * invisible text, so no pixel goes with them and no OCR word over them needs to go either.
+ * invisible text, so no pixel goes with them and no OCR word over them needs to go either. An image
+ * redacted pixel by pixel (`pixels`) is not reported: it is replaced, not removed.
  */
 function redactPage(
   pdfium: PdfiumModule,
+  doc: number,
   page: number,
   rects: RedactRect[],
-  opts: RedactOptions
-): RemovedObject[] {
+  opts: RedactOptions,
+  candidates: readonly ImageCandidate[] | undefined
+): { removed: RemovedObject[]; pixels: PixelReplacement[] } {
   const rt = pdfium.pdfium
   const { malloc, free } = rt.wasmExports
   const removed: RemovedObject[] = []
+  const pixels: PixelReplacement[] = []
   const fb = malloc(48) // object bounds / annotation rects at 0..15, the pad's scratch at 16..47
   try {
     // 1) Remove page CONTENT objects overlapping any rect (collect handles, then remove by handle).
+    //    An in-scope image is swapped for a pixel-redacted copy instead (`swaps`).
     const doomed: number[] = []
+    const swaps: { orig: number; obj: number; replacement: PixelReplacement }[] = []
     const count = pdfium.FPDFPage_CountObjects(page)
     for (let i = 0; i < count; i++) {
       const obj = pdfium.FPDFPage_GetObject(page, i)
@@ -330,12 +621,32 @@ function redactPage(
       // the report existed, and for invisible text the removal changes no pixel.
       const hit = !known || rects.some((rc) => overlaps(box.l, box.b, box.r, box.t, rc))
       if (hit) {
+        if (known && candidates) {
+          const over = rects.filter((rc) => overlaps(raw.l, raw.b, raw.r, raw.t, rc))
+          const swap = pixelRedact(pdfium, doc, page, obj, raw, over, candidates)
+          if (swap) {
+            swaps.push({ orig: obj, ...swap })
+            continue
+          }
+        }
         doomed.push(obj)
         // The object's OWN bounds, not the pad: the pad only decides removal. A padded object is
         // invisible text, which paints no pixel an OCR word could describe, and the em box would
         // reach the footprints of the words on the lines above and below (rule 2 would drop them).
         removed.push({ type: pdfium.FPDFPageObj_GetType(obj), box: known ? raw : null })
       } else if (sweep) doomed.push(obj)
+    }
+    // The copy takes the original's place in the object list (its z-order), then the original goes
+    // like any removed object. Should PDFium refuse the insertion, the image is removed whole.
+    for (const s of swaps) {
+      const at = objectIndex(pdfium, page, s.orig)
+      if (at >= 0 && pdfium.FPDFPage_InsertObjectAtIndex(page, s.obj, at)) {
+        pixels.push(s.replacement)
+      } else {
+        pdfium.FPDFPageObj_Destroy(s.obj)
+        removed.push({ type: FPDF_PAGEOBJ_IMAGE, box: s.replacement.box })
+      }
+      doomed.push(s.orig)
     }
     for (const obj of doomed) {
       if (!pdfium.FPDFPage_RemoveObject(page, obj)) {
@@ -388,7 +699,7 @@ function redactPage(
   if (!pdfium.FPDFPage_GenerateContent(page)) {
     throw new Error('redact: FPDFPage_GenerateContent failed')
   }
-  return removed
+  return { removed, pixels }
 }
 
 /** Serialize the modified document to bytes via FPDF_SaveAsCopy + an FPDF_FILEWRITE callback. */
@@ -552,6 +863,11 @@ export interface RedactResult {
   bytes: Uint8Array
   /** One entry for every page that had rects (empty when nothing overlapped). */
   removed: Map<number, RemovedObject[]>
+  /**
+   * pageIndex → its pixel-redacted images (only pages that have one). Their objects in `bytes` are
+   * the 8-bit interims: pixel-redact-doc.ts `swapPixelImages` puts the final streams in.
+   */
+  pixels: Map<number, PixelReplacement[]>
 }
 
 /** `redactPdf`, also returning the removed-object report of every redacted page. */
@@ -562,6 +878,7 @@ export function redactPdfReport(
   opts: RedactOptions = {}
 ): RedactResult {
   const removed = new Map<number, RemovedObject[]>()
+  const pixels = new Map<number, PixelReplacement[]>()
   const rt = pdfium.pdfium
   const { malloc, free } = rt.wasmExports
   const filePtr = malloc(bytes.length)
@@ -581,13 +898,15 @@ export function redactPdfReport(
       const page = pdfium.FPDF_LoadPage(doc, pageIndex)
       if (!page) throw new Error(`redact: FPDF_LoadPage failed for page ${pageIndex}`)
       try {
-        const objs = redactPage(pdfium, page, rects, opts)
-        removed.set(pageIndex, [...(removed.get(pageIndex) ?? []), ...objs])
+        const got = redactPage(pdfium, doc, page, rects, opts, opts.pixels?.get(pageIndex))
+        removed.set(pageIndex, [...(removed.get(pageIndex) ?? []), ...got.removed])
+        if (got.pixels.length)
+          pixels.set(pageIndex, [...(pixels.get(pageIndex) ?? []), ...got.pixels])
       } finally {
         pdfium.FPDF_ClosePage(page)
       }
     }
-    return { bytes: saveDocument(pdfium, doc), removed }
+    return { bytes: saveDocument(pdfium, doc), removed, pixels }
   } finally {
     pdfium.FPDF_CloseDocument(doc)
     free(filePtr)
