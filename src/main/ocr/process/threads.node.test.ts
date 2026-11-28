@@ -12,7 +12,12 @@ import { Worker } from 'node:worker_threads'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { PDFDocument, degrees, rgb } from 'pdf-lib'
 
-import type { FromOcr, Heartbeat, PageResult } from '../../../shared/ocr/protocol'
+import {
+  parseFromOcr,
+  type FromOcr,
+  type Heartbeat,
+  type PageResult
+} from '../../../shared/ocr/protocol'
 import { THREAD_RESOURCE_LIMITS, threadOptions } from './budget'
 import { Coordinator, isThreadOom } from './coordinator'
 import { DEFAULT_RASTER_LIMITS } from './raster-core'
@@ -144,6 +149,26 @@ describe('real raster and recognize threads', () => {
       .slice(before)
       .find((m): m is Extract<FromOcr, { result: unknown }> => 'result' in m)
     expect(r?.result.page).toMatchObject({ status: 'failed', reason: 'frame-mismatch' })
+  }, 30_000)
+
+  it('triages in the real thread and answers in protocol shape (PR4b)', async () => {
+    const before = sent().length
+    port.send({ triage: { src: 'doc' } })
+    const done = await waitFor(() =>
+      sent()
+        .slice(before)
+        .find((m): m is Extract<FromOcr, { triaged: unknown }> => 'triaged' in m && m.triaged.done)
+    )
+    // Two vector-only pages, no text: blank, at the fallback DPI in their own frames.
+    expect(done.triaged.pages).toEqual([
+      expect.objectContaining({ index: 0, pageClass: 'blank', renderDpi: 300 }),
+      expect.objectContaining({
+        index: 1,
+        pageClass: 'blank',
+        raster: { width: 3300, height: 2550 }
+      })
+    ])
+    for (const m of sent().slice(before)) expect(() => parseFromOcr(m)).not.toThrow()
   }, 30_000)
 
   it('reports every thread tripwire counter at 0', async () => {

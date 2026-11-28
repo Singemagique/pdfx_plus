@@ -9,6 +9,7 @@
 // sending the file again.
 
 import type { PageReason, StubRecognition } from '../../../shared/ocr/protocol'
+import type { TriagePage } from '../../../shared/ocr/triage'
 
 export interface RasterLimits {
   /** The PDFium WASM memory cap (the module declares 32,768 pages = 2 GiB; PR0). */
@@ -39,6 +40,8 @@ export type ToRaster =
       userUnit: number
       frame: { width: number; height: number }
     }
+  /** Triage these pages of `src` (§3.4.1); answered by one `triaged` (or `triage-failed`). */
+  | { type: 'triage'; taskId: number; src: string; pages: number[] }
 
 /**
  * `ready` carries the thread's own tripwire self-check: the escape hatches that did NOT trip in its
@@ -71,6 +74,9 @@ export type FromRaster =
    * the headroom probe found no room. The bitmap, if any, was discarded inside the thread.
    */
   | { type: 'heap-exhausted'; taskId: number; heap: number; tripwire: number }
+  | { type: 'triaged'; taskId: number; pages: TriagePage[]; heap: number; tripwire: number }
+  /** PDFium could not open the source for triage (its FPDF_GetLastError code). */
+  | { type: 'triage-failed'; taskId: number; pdfiumError: number; tripwire: number }
   /** A RuntimeError (trap or abort) or any other throw: the module is never trusted again. */
   | { type: 'fatal'; taskId: number | null; error: string; tripwire: number }
 
