@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { createFindEngine } from './engine'
-import { buildPageText, type PageText } from './extract'
+import { buildPageText, type PageText, type PageTextItem } from './extract'
+import type { PageRect } from './geometry'
 import { compileQuery, findAll, normalizeQuery } from './normalize'
 import type { DocEntry, PageEntry, PdfSource } from '../types'
 import type { Overlay } from '../edit/model'
@@ -23,6 +24,7 @@ const pageText = (s: string): PageText =>
         descent: -0.2,
         vertical: false,
         rtl: false,
+        mono: true,
         hasEOL: false
       }
     ],
@@ -344,6 +346,209 @@ describe('find engine', () => {
     await resolveAll(x.calls)
     expect(x.extract).toHaveBeenCalledTimes(2)
     expect(engine.getPageText('s2#0')?.norm).toBe('once')
+  })
+
+  describe('supplements and redactions (per page key)', () => {
+    /** One OCR-style word item at (x, 700), 10 pt, 5 pt per character. */
+    const word = (str: string, x: number, extra: Partial<PageTextItem> = {}): PageTextItem => ({
+      str,
+      t: [10, 0, 0, 10, x, 700],
+      width: str.length * 5,
+      height: 10,
+      ascent: 0.8,
+      descent: -0.2,
+      vertical: false,
+      rtl: false,
+      hasEOL: false,
+      ocr: true,
+      ...extra
+    })
+    const ocrLine = (...words: string[]): PageTextItem[] => {
+      const out: PageTextItem[] = []
+      let x = 300
+      words.forEach((w, i) => {
+        out.push(word(w, x, { hasEOL: i === words.length - 1 }))
+        x += w.length * 5
+        if (i < words.length - 1) {
+          out.push(word(' ', x, { width: 3 }))
+          x += 3
+        }
+      })
+      return out
+    }
+    /** The page-px box of the first native item's characters [lo, hi) (5 pt each, at x = 50). */
+    const nativeBox = (lo: number, hi: number): PageRect => ({
+      x: 50 + 5 * lo,
+      y: 792 - 708,
+      w: 5 * (hi - lo),
+      h: 10
+    })
+    const has = (engine: ReturnType<typeof createFindEngine>, q: string): string[] =>
+      hitKeys(engine.search(...query(q)))
+
+    async function indexed(texts: string[], dup = false) {
+      const x = deferredExtract()
+      const onChange = vi.fn()
+      const engine = createFindEngine({ onChange, extract: x.extract as never })
+      const pdf = fakePdf(...texts)
+      const docs = [
+        docOf(
+          'a',
+          source('s1', pdf),
+          texts.map((_, i) => i)
+        )
+      ]
+      if (dup) docs.push(docOf('b', source('s2', pdf), [0]))
+      engine.reconcile(docs)
+      engine.activate()
+      await resolveAll(x.calls)
+      onChange.mockClear()
+      return { engine, onChange, x, docs, pdf }
+    }
+
+    it('appends recognised text to the native text, and clearing it restores the page', async () => {
+      const { engine, onChange } = await indexed(['native words'])
+      engine.setSupplement('s1#0', { mode: 'append', items: ocrLine('scanned', 'words') })
+      expect(onChange).toHaveBeenCalledTimes(1)
+      expect(engine.getPageText('s1#0')?.norm).toBe('native words scanned words')
+      expect(has(engine, 'scanned words')).toEqual(['s1#0'])
+      // Native text whose last item has no EOL still does not run into the OCR text.
+      expect(has(engine, 'wordsscanned')).toEqual([])
+      engine.setSupplement('s1#0', null)
+      expect(onChange).toHaveBeenCalledTimes(2)
+      expect(engine.getPageText('s1#0')?.norm).toBe('native words')
+      expect(has(engine, 'scanned')).toEqual([])
+      engine.setSupplement('s1#0', null) // nothing to clear: no change
+      expect(onChange).toHaveBeenCalledTimes(2)
+    })
+
+    it('replaces the native text (an ocr-ours page after Replace / Remove)', async () => {
+      const { engine } = await indexed(['old layer text'])
+      engine.setSupplement('s1#0', { mode: 'replace', items: ocrLine('new', 'layer') })
+      expect(engine.getPageText('s1#0')?.norm).toBe('new layer')
+      expect(has(engine, 'old')).toEqual([])
+      engine.setSupplement('s1#0', { mode: 'replace', items: [] }) // Remove: nothing left
+      expect(engine.getPageText('s1#0')?.norm).toBe('')
+      expect(has(engine, 'layer')).toEqual([])
+    })
+
+    it('a supplement waits for the native text (its vt) and never re-extracts', async () => {
+      const x = deferredExtract()
+      const engine = createFindEngine({ onChange: () => {}, extract: x.extract as never })
+      engine.reconcile([docOf('a', source('s1', fakePdf('native')), [0])])
+      engine.setSupplement('s1#0', { mode: 'append', items: ocrLine('early') })
+      expect(engine.getPageText('s1#0')).toBeUndefined()
+      expect(has(engine, 'early')).toEqual([])
+      engine.activate()
+      await resolveAll(x.calls)
+      expect(has(engine, 'early')).toEqual(['s1#0'])
+      expect(x.extract).toHaveBeenCalledTimes(1)
+      expect(engine.progress()).toEqual({ indexed: 1, total: 1 })
+    })
+
+    it('duplicates share the extraction, not the supplement or the redactions', async () => {
+      // Two spaces between words: a neighbour clear of the slice pad (see the next tests).
+      const { engine, x } = await indexed(['shared  native  text'], true)
+      expect(x.extract).toHaveBeenCalledTimes(1)
+      engine.setSupplement('s2#0', { mode: 'append', items: ocrLine('only', 'here') })
+      expect(has(engine, 'only here')).toEqual(['s2#0'])
+      expect(has(engine, 'shared')).toEqual(['s1#0', 's2#0'])
+      // A redaction of "native" on the original filters only the original.
+      engine.setRedactions('s1#0', [nativeBox(8, 14)])
+      expect(has(engine, 'native')).toEqual(['s2#0'])
+      expect(has(engine, 'shared')).toEqual(['s1#0', 's2#0'])
+      expect(engine.getPageText('s2#0')?.norm).toBe('shared native text only here')
+      expect(x.extract).toHaveBeenCalledTimes(1)
+    })
+
+    it('ignores a late supplement for a removed page, and reconcile drops supplements', async () => {
+      const { engine, docs, onChange, x } = await indexed(['kept'])
+      const gone = 's9#0'
+      engine.setSupplement(gone, { mode: 'append', items: ocrLine('stale') }) // never live
+      expect(onChange).not.toHaveBeenCalled()
+      engine.setSupplement('s1#0', { mode: 'append', items: ocrLine('recognised') })
+      engine.reconcile([]) // the page goes...
+      engine.reconcile(docs) // ...and comes back (undo / re-add): its old supplement does not
+      await resolveAll(x.calls)
+      expect(has(engine, 'recognised')).toEqual([])
+      expect(engine.getPageText('s1#0')?.norm).toBe('kept')
+      // The supplier re-supplies a returning key; that works.
+      engine.setSupplement('s1#0', { mode: 'append', items: ocrLine('recognised') })
+      expect(has(engine, 'recognised')).toEqual(['s1#0'])
+    })
+
+    it('a stale extraction for a removed key resurrects neither its text nor its supplement', async () => {
+      const x = deferredExtract()
+      const engine = createFindEngine({ onChange: () => {}, extract: x.extract as never })
+      const a = source('s1', fakePdf('kept'))
+      const b = source('s2', fakePdf('gone native'))
+      engine.reconcile([docOf('a', a, [0]), docOf('b', b, [0])])
+      engine.activate()
+      engine.setSupplement('s2#0', { mode: 'append', items: ocrLine('gone', 'ocr') })
+      engine.reconcile([docOf('a', a, [0])]) // b removed while its extraction is in flight
+      await resolveAll(x.calls)
+      expect(engine.getPageText('s2#0')).toBeUndefined()
+      engine.reconcile([docOf('a', a, [0]), docOf('b', b, [0])]) // b back: indexed again
+      await resolveAll(x.calls)
+      expect(engine.getPageText('s2#0')?.norm).toBe('gone native')
+      expect(has(engine, 'ocr')).toEqual([])
+    })
+
+    it('filters redacted native characters at build time; undo brings them back', async () => {
+      const { engine, onChange } = await indexed(['alpha bravo secret delta echo'])
+      const raw = engine.getPageText('s1#0')!
+      // "secret" is chars 12..18.
+      engine.setRedactions('s1#0', [nativeBox(12, 18)])
+      expect(onChange).toHaveBeenCalledTimes(1)
+      expect(has(engine, 'secret')).toEqual([])
+      expect(has(engine, 'alpha')).toEqual(['s1#0'])
+      expect(has(engine, 'echo')).toEqual(['s1#0'])
+      // The redaction is a word boundary: the words either side never join.
+      expect(has(engine, 'bravodelta')).toEqual([])
+      expect(has(engine, 'brav delta')).toEqual([])
+      // The pad (one average character width + max(1 pt, 0.15 × size)) reaches across a single
+      // space, so the neighbours' facing characters go too (fail-safe, DESIGN.md §3.6.1).
+      expect(has(engine, 'bravo')).toEqual([])
+      expect(has(engine, 'brav')).toEqual(['s1#0'])
+      expect(has(engine, 'elta')).toEqual(['s1#0'])
+      expect(engine.getPageText('s1#0')?.norm).toBe('alpha brav elta echo')
+      // The same boxes again: no change, no rebuild.
+      engine.setRedactions('s1#0', [nativeBox(12, 18)])
+      expect(onChange).toHaveBeenCalledTimes(1)
+      // The stored extraction was never mutated.
+      expect(raw.norm).toBe('alpha bravo secret delta echo')
+      engine.setRedactions('s1#0', null)
+      expect(has(engine, 'secret')).toEqual(['s1#0'])
+      expect(engine.getPageText('s1#0')).toBe(raw)
+      engine.setRedactions('s1#0', [])
+      expect(onChange).toHaveBeenCalledTimes(2)
+    })
+
+    it('filters supplement words too, and keeps filtering a re-supplied supplement', async () => {
+      const { engine } = await indexed([''])
+      engine.setRedactions('s1#0', [{ x: 340, y: 792 - 706, w: 10, h: 4 }]) // inside "hidden"
+      engine.setSupplement('s1#0', {
+        mode: 'append',
+        items: ocrLine('visible', 'hidden', 'word')
+      })
+      expect(has(engine, 'hidden')).toEqual([])
+      expect(has(engine, 'visible')).toEqual(['s1#0'])
+      expect(engine.getPageText('s1#0')?.norm).toBe('visible word')
+      // A new result for the page (Replace): the box still applies.
+      engine.setSupplement('s1#0', { mode: 'append', items: ocrLine('visible', 'hidden', 'again') })
+      expect(has(engine, 'hidden')).toEqual([])
+      expect(has(engine, 'again')).toEqual(['s1#0'])
+    })
+
+    it('keeps a page key’s redactions across reconcile (fail-safe)', async () => {
+      const { engine, docs, x } = await indexed(['top  secret  plan'])
+      engine.setRedactions('s1#0', [nativeBox(5, 11)])
+      engine.reconcile([])
+      engine.reconcile(docs)
+      await resolveAll(x.calls)
+      expect(has(engine, 'secret')).toEqual([])
+      expect(has(engine, 'plan')).toEqual(['s1#0'])
+    })
   })
 
   it('only searches newly indexed pages for the same query', async () => {

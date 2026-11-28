@@ -23,6 +23,19 @@ export interface TextItemGeom {
   rtl: boolean
   /** The font is monospaced (style.fontFamily), so glyphs split the advance evenly. */
   mono?: boolean
+  /** A line break follows the item (kept so a page's items can be rebuilt and copied). */
+  hasEOL?: boolean
+  /**
+   * Cumulative advance edges, one per code point of `str` plus one: 0 … `width`, in user units
+   * along the baseline (from OCR char boxes). When present, a slice is placed exactly instead of
+   * by the Helvetica-weighted estimate (DESIGN.md §3.6.2).
+   */
+  charEdges?: ArrayLike<number>
+  /**
+   * The item is one recognised OCR word (or the space after one), not pdf.js text: a redaction
+   * drops it whole when its word footprint touches the box (DESIGN.md §3.6.1, §3.7.3).
+   */
+  ocr?: boolean
 }
 
 export interface PageText {
@@ -74,6 +87,10 @@ export interface RawTextStyle {
 /** An input item for buildPageText: pdf.js geometry plus whether a line break follows it. */
 export type PageTextItem = TextItemGeom & { hasEOL: boolean }
 
+/** A stored item as a buildPageText input again (items keep their hasEOL). */
+export const asPageTextItem = (it: TextItemGeom): PageTextItem =>
+  it.hasEOL === undefined ? { ...it, hasEOL: false } : (it as PageTextItem)
+
 /** A pdf.js text item + its font style → the geometry kept for drawing matches. */
 export function toItemGeom(item: RawTextItem, style: RawTextStyle | undefined): PageTextItem {
   const t = item.transform
@@ -97,7 +114,7 @@ const fontHeight = (it: TextItemGeom): number => Math.hypot(it.t[2], it.t[3]) ||
  * Whether `cur` starts a new line relative to `prev` even though pdf.js gave `prev` no hasEOL:
  * the baseline moved perpendicular to the text direction by more than half a line.
  */
-function baselineJumped(prev: TextItemGeom, cur: TextItemGeom): boolean {
+export function baselineJumped(prev: TextItemGeom, cur: TextItemGeom): boolean {
   const a = Math.atan2(prev.t[1], prev.t[0])
   const dx = cur.t[4] - prev.t[4]
   const dy = cur.t[5] - prev.t[5]
@@ -123,7 +140,9 @@ export function buildPageText(items: readonly PageTextItem[], vt: readonly numbe
   }
   const n = normalizeSegments(segments)
   return {
-    items: items.map(({ hasEOL: _hasEOL, ...geom }) => geom),
+    // The items themselves, hasEOL included: the engine rebuilds a page from them (supplements,
+    // redactions) and Copy Page Text reads its line breaks from them.
+    items: items.slice(),
     vt: [...vt],
     norm: n.text,
     srcStart: n.srcStart,

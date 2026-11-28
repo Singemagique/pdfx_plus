@@ -457,4 +457,68 @@ describe('find controller', () => {
       { rect: { x: 100, y: 792 - 630, w: 120, h: 30 }, current: true }
     ])
   })
+
+  describe('redactions (DESIGN.md §3.6.1)', () => {
+    const redaction = (
+      id: string,
+      pageKey: string,
+      r: { x: number; y: number; w: number; h: number }
+    ): Overlay => ({
+      // prettier-ignore
+      id,
+      type: 'redaction',
+      pageKey,
+      z: 0,
+      createdAt: 0,
+      fill: { r: 0, g: 0, b: 0 },
+      // Page px (top-left) → the overlay frame (bottom-left), on the 792 pt page.
+      geom: { x: r.x, y: 792 - r.y - r.h, w: r.w, h: r.h, rotation: 0, opacity: 1 }
+    })
+
+    /** The highlight box of `word` on page `pageId` (searching for it). */
+    async function boxOf(word: string, pageId: string) {
+      await search(word)
+      const [h] = ctl.getPageHighlights(pageId)
+      return h.rect
+    }
+
+    it('feeds redaction overlays to the engine: the boxed text is not found; undo finds it', async () => {
+      setup([docOf('a', ['alpha   secret   omega', 'secret elsewhere'])])
+      ctl.open()
+      await settle()
+      const box = await boxOf('secret', 'a-p0')
+      expect(ctl.getBarState().total).toBe(2)
+      ctl.setOverlays([redaction('r1', 'src-a#0', box)])
+      await settle()
+      expect(ctl.getBarState().total).toBe(1)
+      expect(ctl.getCurrentMatch()?.pageId).toBe('a-p1')
+      await search('alpha')
+      expect(ctl.getBarState().total).toBe(1)
+      await search('omega')
+      expect(ctl.getBarState().total).toBe(1)
+      // Undo (the overlay gone): found again.
+      ctl.setOverlays([])
+      await search('secret')
+      expect(ctl.getBarState().total).toBe(2)
+    })
+
+    it('applies a redaction whose page arrives after the overlay (heights come with the docs)', async () => {
+      setup([])
+      ctl.setOverlays([redaction('r1', 'src-a#0', { x: 0, y: 0, w: 612, h: 792 })])
+      ctl.setDocs([docOf('a', ['all of it hidden'])])
+      ctl.open()
+      await search('hidden')
+      expect(ctl.getBarState().total).toBe(0)
+    })
+
+    it('a redaction on one page never filters another page with the same text', async () => {
+      setup([docOf('a', ['same words']), docOf('b', ['same words'])])
+      ctl.open()
+      await settle()
+      ctl.setOverlays([redaction('r1', 'src-a#0', { x: 0, y: 0, w: 612, h: 792 })])
+      await search('same')
+      expect(ctl.getBarState().total).toBe(1)
+      expect(ctl.getCurrentMatch()?.pageId).toBe('b-p0')
+    })
+  })
 })

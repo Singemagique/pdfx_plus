@@ -4,11 +4,39 @@
 // (onChange fires as pages land) and bounded (a few pages at a time, because every document shares
 // one pdf.js worker with thumbnail rendering).
 
+//
+// On top of the extraction, per page KEY (so two duplicates of one page never share them):
+// - a SUPPLEMENT (recognised text, DESIGN.md §3.6.1): appended to the native items, or replacing
+//   them (an `ocr-ours` page after Replace / Remove);
+// - REDACTIONS: boxes whose text is filtered out of native and supplement items alike at build
+//   time (redact-filter.ts), so what Find reports matches what an export will contain.
+// The page's effective text is buildPageText(filter(native ∪ supplement)) with the page's own
+// viewport transform. The stored extraction stays write-once and is never mutated: dropping a
+// supplement or a redaction brings the original text back.
+
 import type { Geom, Overlay } from '../edit/model'
 import { makePageKey } from '../edit/model'
 import type { DocEntry, PdfSource } from '../types'
-import { EMPTY_PAGE_TEXT, extractPageText, type PageText } from './extract'
+import {
+  asPageTextItem,
+  buildPageText,
+  EMPTY_PAGE_TEXT,
+  extractPageText,
+  type PageText,
+  type PageTextItem
+} from './extract'
+import type { PageRect } from './geometry'
 import { findAll, normalizeQuery } from './normalize'
+import { filterRedacted, normalizeRect } from './redact-filter'
+
+/**
+ * Recognised text for one page key, as PageTextItems in the page's pdf.js user space
+ * (ocr/to-page-text.ts). `append`: after the native text; `replace`: instead of it.
+ */
+export interface PageSupplement {
+  mode: 'append' | 'replace'
+  items: readonly PageTextItem[]
+}
 
 /** Matches on one page key: text pairs into PageText.norm, and overlay hits. */
 export interface PageMatches {
@@ -43,7 +71,21 @@ export interface FindEngine {
   setOverlays(overlays: readonly Overlay[]): void
   /** Matches per live page key for a normalized query and its compiled regex. */
   search(norm: string, re: RegExp): ReadonlyMap<string, PageMatches | null>
+  /**
+   * Set (or clear, with null) a page key's recognised text. Ignored for a key that is not live
+   * (a late result for a removed page); dropped by reconcile when its key goes, so the supplier
+   * re-supplies a key that comes back. Searchable once the key's native text is indexed (its
+   * viewport transform comes from there).
+   */
+  setSupplement(pageKey: string, supplement: PageSupplement | null): void
+  /**
+   * Set (or clear, with null or []) the redaction boxes of a page key, in page px (the frame
+   * textMatchRects returns). Kept until cleared, whether or not the key is live: forgetting a box
+   * would make redacted text findable again, keeping a stale one only hides text.
+   */
+  setRedactions(pageKey: string, rects: readonly PageRect[] | null): void
   progress(): { indexed: number; total: number }
+  /** The page's effective text: native ∪ supplement, redaction-filtered. */
   getPageText(pageKey: string): PageText | undefined
   getOverlay(overlayId: string): OverlayText | undefined
 }
@@ -100,10 +142,16 @@ export function createFindEngine({
   let overlayTexts = new Map<string, OverlayText[]>()
   let overlayById = new Map<string, OverlayText>()
 
+  const supplements = new Map<string, PageSupplement>()
+  const redactions = new Map<string, PageRect[]>()
+  /** Effective texts of keys with a supplement or redactions, built on first use. */
+  const derived = new Map<string, PageText>()
+
   let cache: { query: string; perKey: Map<string, PageMatches | null> } | null = null
 
   const invalidate = (key: string): void => {
     cache?.perKey.delete(key)
+    derived.delete(key)
   }
 
   const store = (key: string, result: PageText): boolean => {
@@ -113,6 +161,59 @@ export function createFindEngine({
     texts.set(key, result)
     invalidate(key)
     return true
+  }
+
+  /** The effective text of a key (undefined until its native text is indexed). */
+  function pageText(key: string): PageText | undefined {
+    const native = texts.get(key)
+    if (!native) return undefined
+    const sup = supplements.get(key)
+    const red = redactions.get(key)
+    if (!sup && !red) return native
+    const built = derived.get(key)
+    if (built) return built
+    let items: readonly PageTextItem[] = native.items.map(asPageTextItem)
+    if (sup?.mode === 'replace') items = sup.items
+    else if (sup && sup.items.length > 0) {
+      // The native text's last line ends before the recognised text starts, even when pdf.js
+      // left the last item open (same baseline: the two must still not run together).
+      const base = items.slice()
+      const last = base[base.length - 1]
+      if (last && !last.hasEOL) base[base.length - 1] = { ...last, hasEOL: true }
+      items = [...base, ...sup.items]
+    }
+    const pt = buildPageText(filterRedacted(items, red, native.vt), native.vt)
+    derived.set(key, pt)
+    return pt
+  }
+
+  function setSupplement(key: string, s: PageSupplement | null): void {
+    if (s === null) {
+      if (!supplements.delete(key)) return
+    } else {
+      if (!live.has(key) || supplements.get(key) === s) return
+      supplements.set(key, s)
+    }
+    invalidate(key)
+    onChange()
+  }
+
+  const sameRects = (a: readonly PageRect[], b: readonly PageRect[]): boolean =>
+    a.length === b.length &&
+    a.every((r, i) => r.x === b[i].x && r.y === b[i].y && r.w === b[i].w && r.h === b[i].h)
+
+  function setRedactions(key: string, rects: readonly PageRect[] | null): void {
+    const next = rects && rects.length > 0 ? rects.map(normalizeRect) : null
+    const prev = redactions.get(key)
+    if (!next) {
+      if (!prev) return
+      redactions.delete(key)
+    } else {
+      if (prev && sameRects(prev, next)) return
+      redactions.set(key, next)
+    }
+    invalidate(key)
+    onChange()
   }
 
   const settle = (key: string, promise: Promise<PageText>, counted: boolean): void => {
@@ -216,6 +317,14 @@ export function createFindEngine({
         dropped = true
       }
     }
+    // A removed page's recognised text goes with it (the supplier re-supplies it if it returns).
+    // Its redactions stay until cleared (see setRedactions).
+    for (const key of [...supplements.keys()]) {
+      if (!live.has(key)) {
+        supplements.delete(key)
+        invalidate(key)
+      }
+    }
     if (cache) {
       for (const key of [...cache.perKey.keys()]) if (!live.has(key)) cache.perKey.delete(key)
     }
@@ -271,7 +380,7 @@ export function createFindEngine({
   }
 
   function computeKey(key: string, re: RegExp): PageMatches | null {
-    const pt = texts.get(key)
+    const pt = pageText(key)
     // One past the limit, so hitting it can be told apart from having exactly that many.
     let text = pt && pt.norm ? match(pt.norm, re, perPageLimit + 1) : EMPTY_PAIRS
     let capped = false
@@ -316,13 +425,15 @@ export function createFindEngine({
     prioritize,
     reconcile,
     setOverlays,
+    setSupplement,
+    setRedactions,
     search,
     progress() {
       let indexed = 0
       for (const key of live.keys()) if (texts.has(key)) indexed++
       return { indexed, total: live.size }
     },
-    getPageText: (key) => texts.get(key),
+    getPageText: pageText,
     getOverlay: (id) => overlayById.get(id)
   }
 }

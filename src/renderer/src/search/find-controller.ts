@@ -5,6 +5,7 @@
 
 import type { Overlay } from '../edit/model'
 import { makePageKey } from '../edit/model'
+import { footprint } from '../pdfx/mirror'
 import type { DocEntry, PageEntry } from '../types'
 import { createFindEngine, type FindEngine, type PageMatches } from './engine'
 import { overlayRect, textMatchRects, type PageRect } from './geometry'
@@ -129,8 +130,37 @@ export function createFindController({
   let debounce: ReturnType<typeof setTimeout> | null = null
   let throttle: ReturnType<typeof setTimeout> | null = null
   const highlightCache = new Map<string, { version: number; value: readonly PageHighlight[] }>()
+  let overlays: readonly Overlay[] = []
+  /** Page key → its page height (page px), for turning redaction geoms into page-px boxes. */
+  let heights = new Map<string, number>()
+  /** Page keys the engine currently holds redactions for. */
+  let redactedKeys = new Set<string>()
 
   const engine = createEngine(() => scheduleRecompute())
+
+  /**
+   * Feed the engine every live page's redaction boxes (DESIGN.md §3.6.1): Find never reports text
+   * the user has boxed out, matching what an export will contain. The box is the redaction's
+   * rotation-aware footprint (mirror.ts, the same box export redacts). A page whose key is not
+   * live has no known height and is skipped until it is. Cheap when nothing changed: the engine
+   * ignores an unchanged set.
+   */
+  function syncRedactions(): void {
+    const next = new Map<string, PageRect[]>()
+    for (const o of overlays) {
+      if (o.type !== 'redaction') continue
+      const h = heights.get(o.pageKey)
+      if (h === undefined) continue
+      const f = footprint(o.geom)
+      const rect = { x: f.x0, y: h - f.y1, w: f.x1 - f.x0, h: f.y1 - f.y0 }
+      const list = next.get(o.pageKey)
+      if (list) list.push(rect)
+      else next.set(o.pageKey, [rect])
+    }
+    for (const key of redactedKeys) if (!next.has(key)) engine.setRedactions(key, null)
+    for (const [key, rects] of next) engine.setRedactions(key, rects)
+    redactedKeys = new Set(next.keys())
+  }
 
   let barState: FindBarState = buildBar()
 
@@ -476,19 +506,25 @@ export function createFindController({
       if (next === docs) return
       docs = next
       const map = new Map<string, PageInfo>()
+      const nextHeights = new Map<string, number>()
       let order = 0
       for (const d of next) {
         for (const p of d.pages) {
           const pageKey = makePageKey(p.source.id, p.pageIndex)
           map.set(p.id, { docId: d.id, page: p, pageKey, order: order++ })
+          nextHeights.set(pageKey, p.height)
         }
       }
       pages = map
+      heights = nextHeights
       engine.reconcile(next)
+      syncRedactions()
       if (isOpen && query) scheduleRecompute()
     },
-    setOverlays(overlays) {
-      engine.setOverlays(overlays)
+    setOverlays(next) {
+      overlays = next
+      engine.setOverlays(next)
+      syncRedactions()
     },
     cancelTimers() {
       clearDebounce()

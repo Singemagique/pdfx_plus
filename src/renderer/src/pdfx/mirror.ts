@@ -70,7 +70,7 @@ const bounds = (g: Geom): Rect => ({
  * is never smaller than the old bbox (rotation can only ever drop MORE), and `rotation === 0`
  * reduces to exactly the old bbox, so the normal path is unchanged.
  */
-function footprint(g: Geom): Rect {
+export function footprint(g: Geom): Rect {
   const box = bounds(g)
   if (!g.rotation || !Number.isFinite(g.rotation)) return box
   const rad = (g.rotation * Math.PI) / 180
