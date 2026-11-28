@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+"""Generate the glyphless TrueType font behind PDFx's invisible OCR text layer.
+
+DESIGN.md section 3.7.4: unitsPerEm 1000, glyphs .notdef and g1 with advance 500, OS/2 and
+hhea ascent/descent 800/-200. The font is written from scratch with fontTools' FontBuilder;
+Tesseract's pdf_ttf.h bytes are NOT copied.
+
+PR2 adds g2, the wide counterpart of g1 (advance 1000), for CIDs whose /W is 1000 (East Asian
+Wide/Fullwidth). PDFium's FPDFText_GetCharBox is the glyph's own bbox, so with g1 alone a CJK
+character's box covered only the left half of its advance [measured, PR2 layer suite].
+
+Three variants are generated so PR2 can measure how each tool computes glyph and text bounds
+(DESIGN.md section 3.7.3 rule 4):
+
+  zero-area  g1 (g2) is a single zero-area contour of two on-curve points, (0, -200) and
+             (500 (1000), 800), so its glyf bbox, and the head bbox, span the full em box while
+             it fills nothing. The default.
+  none       g1 and g2 have no contour (empty glyphs); the head bbox is all zeros.
+  fontbbox   no contours, but the head bbox is forced to the em box (0, -200, 1000, 800).
+
+.notdef has no contour in every variant. Everything is deterministic: fixed timestamps, no
+glyph names (post format 3), a two-entry cmap (U+0020 -> g1, U+3000 -> g2; the PDF font maps
+CIDs to GIDs through CIDToGIDMap and never consults the cmap).
+
+Usage (needs fontTools; a throwaway venv is enough):
+    python -m venv .venv && .venv/bin/pip install fonttools
+    .venv/bin/python scripts/make-glyphless-ttf.py
+It rewrites src/renderer/src/pdfx/ocr-glyphless-ttf.ts; run `corepack yarn prettier --write`
+on it afterwards (the output is already Prettier-clean, the call is a safeguard).
+"""
+
+import base64
+import hashlib
+import io
+import os
+import sys
+
+from fontTools import version as fonttools_version
+from fontTools.fontBuilder import FontBuilder
+from fontTools.pens.ttGlyphPen import TTGlyphPen
+
+UPM = 1000
+ADVANCE = 500
+WIDE = 1000
+ASCENT = 800
+DESCENT = -200
+# 2026-01-01T00:00:00Z as seconds since 1904-01-01 (the head table's epoch): a fixed value keeps
+# the bytes reproducible.
+TIMESTAMP = 3850070400
+FAMILY = 'PDFxOCR GlyphLess'
+PS_NAME = 'PDFxOCR-GlyphLess'
+
+OUT = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    '..',
+    'src',
+    'renderer',
+    'src',
+    'pdfx',
+    'ocr-glyphless-ttf.ts',
+)
+
+
+def empty_glyph():
+    return TTGlyphPen(None).glyph()
+
+
+def spanning_glyph(advance):
+    pen = TTGlyphPen(None)
+    pen.moveTo((0, DESCENT))
+    pen.lineTo((advance, ASCENT))
+    pen.closePath()
+    return pen.glyph()
+
+
+def build(variant):
+    fb = FontBuilder(UPM, isTTF=True)
+    order = ['.notdef', 'g1', 'g2']
+    fb.setupGlyphOrder(order)
+    fb.setupCharacterMap({0x20: 'g1', 0x3000: 'g2'})
+    spans = variant == 'zero-area'
+    fb.setupGlyf(
+        {
+            '.notdef': empty_glyph(),
+            'g1': spanning_glyph(ADVANCE) if spans else empty_glyph(),
+            'g2': spanning_glyph(WIDE) if spans else empty_glyph(),
+        }
+    )
+    fb.setupHorizontalMetrics({'.notdef': (ADVANCE, 0), 'g1': (ADVANCE, 0), 'g2': (WIDE, 0)})
+    fb.setupHorizontalHeader(ascent=ASCENT, descent=DESCENT, lineGap=0)
+    fb.setupNameTable(
+        {
+            'familyName': FAMILY,
+            'styleName': 'Regular',
+            'uniqueFontIdentifier': PS_NAME,
+            'fullName': FAMILY,
+            'psName': PS_NAME,
+            'version': 'Version 1.000',
+        }
+    )
+    fb.setupOS2(
+        sTypoAscender=ASCENT,
+        sTypoDescender=DESCENT,
+        sTypoLineGap=0,
+        usWinAscent=ASCENT,
+        usWinDescent=-DESCENT,
+        sxHeight=500,
+        sCapHeight=700,
+        achVendID='PDFx',
+        fsType=0,
+        usWeightClass=400,
+        xAvgCharWidth=ADVANCE,
+    )
+    fb.setupPost(keepGlyphNames=False)
+    fb.setupMaxp()
+    fb.setupHead(unitsPerEm=UPM, created=TIMESTAMP, modified=TIMESTAMP)
+    font = fb.font
+    font.recalcTimestamp = False
+    if variant == 'fontbbox':
+        # Keep the explicit em box: without this, saving recomputes it from the (empty) glyphs.
+        font.recalcBBoxes = False
+        head = font['head']
+        head.xMin, head.yMin, head.xMax, head.yMax = 0, DESCENT, WIDE, ASCENT
+    buf = io.BytesIO()
+    font.save(buf)
+    return buf.getvalue()
+
+
+VARIANTS = [
+    ('GLYPHLESS_TTF_ZERO_AREA', 'zero-area', 'g1/g2 = one zero-area contour (0,-200)-(500|1000,800); the default'),
+    ('GLYPHLESS_TTF_NO_CONTOUR', 'none', 'g1/g2 have no contour; head bbox all zeros'),
+    ('GLYPHLESS_TTF_FONTBBOX', 'fontbbox', 'g1/g2 have no contour; head bbox forced to the em box'),
+]
+
+
+def wrap(b64, indent, width):
+    """Split a base64 string into Prettier-stable concatenated string literals."""
+    room = width - indent - 5  # quote, quote, space, plus, slack
+    parts = [b64[i : i + room] for i in range(0, len(b64), room)]
+    pad = ' ' * indent
+    return (' +\n').join(pad + "'" + p + "'" for p in parts)
+
+
+def main():
+    lines = [
+        '// GENERATED by scripts/make-glyphless-ttf.py (fontTools %s). Do not edit by hand.' % fonttools_version,
+        '// The glyphless TrueType programs for the invisible OCR text layer (DESIGN.md §3.7.4): unitsPerEm',
+        '// 1000, glyphs .notdef, g1 (advance 500) and g2 (advance 1000, for wide CIDs), OS/2 + hhea',
+        "// 800/-200. Written from scratch with fontTools' FontBuilder; Tesseract's pdf_ttf.h is not",
+        '// copied. Only the default is imported by ocr-font.ts, so the other two variants (kept for the',
+        '// PR2 glyph-bounds measurements and their pinned tests) are tree-shaken out of the app bundle.',
+        '',
+    ]
+    for const, variant, note in VARIANTS:
+        data = build(variant)
+        digest = hashlib.sha256(data).hexdigest()
+        b64 = base64.b64encode(data).decode('ascii')
+        lines.append('/** Variant `%s`: %s. %d bytes, SHA-256 %s. */' % (variant, note, len(data), digest))
+        lines.append('export const %s =' % const)
+        lines.append(wrap(b64, 2, 100))
+        lines.append('')
+    text = '\n'.join(lines)
+    with open(OUT, 'w', encoding='utf-8', newline='\n') as f:
+        f.write(text)
+    sys.stdout.write('wrote %s\n' % os.path.normpath(OUT))
+
+
+if __name__ == '__main__':
+    main()
