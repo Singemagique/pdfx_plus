@@ -22,6 +22,11 @@
 //   and /SeparationInfo;
 // - an annotation whose /IRT, or a popup whose /Parent, names an annotation the page no longer
 //   lists (a second guard behind redact.ts `linkedAnnots`);
+// - XObject residue (xobject-trim.ts `trimXObjects`): an image or form the pass took off the page
+//   that another page's resource dictionary still lists (one /Resources inherited from /Pages, or
+//   one indirect dictionary shared by several pages), unused there, so copyPages would carry the
+//   unredacted original out with that page: every XObject nothing paints leaves every /XObject
+//   dictionary;
 // - font residue (font-trim.ts `trimFonts`): every font's character tables and TrueType outlines
 //   are cut to the codes the document still shows;
 // - pixel-redacted images (DESIGN.md §2 D3; pixel-redact-doc.ts): the interim 8-bit copies PDFium
@@ -47,8 +52,9 @@ import { getPdfium } from './pdfium'
 import type { PixelReplacement } from './pixel-redact'
 import { imageCandidates, PixelSwapError, swapPixelImages } from './pixel-redact-doc'
 import { deleteUnreachable, forEachRef } from './reachable'
+import { trimXObjects } from './xobject-trim'
 import {
-  redactPdfReport,
+  redactPdfReportAsync,
   type PageRedaction,
   type PdfBox,
   type PdfiumModule,
@@ -190,8 +196,12 @@ export async function sanitizeRedacted(
     }
     if (keep.length !== annots.size()) node.set(PDFName.of('Annots'), ctx.obj(keep))
   }
-  // An encrypted source's streams cannot be read here, so their fonts cannot be scanned.
-  if (!doc.isEncrypted) unlinked.push(...trimFonts(doc).unlinked)
+  // An encrypted source's streams cannot be read here, so neither its XObjects nor its fonts can
+  // be scanned. XObjects first: a form taken out no longer counts as showing text in a font.
+  if (!doc.isEncrypted) {
+    unlinked.push(...trimXObjects(doc))
+    unlinked.push(...trimFonts(doc).unlinked)
+  }
   deleteUnreachable(ctx, unlinked)
   return doc.save({ useObjectStreams: false, updateFieldAppearances: false })
 }
@@ -277,7 +287,7 @@ export async function buildRedactedSources(
     const indices = [...frames.keys()]
     const pixels =
       opts.pixelRedaction === false ? undefined : await imageCandidates(sourceBytes, indices)
-    let result = redactPdfReport(pdfium, sourceBytes, pageRedactions, { dropOcrText: true, pixels }) // prettier-ignore
+    let result = await redactPdfReportAsync(pdfium, sourceBytes, pageRedactions, { dropOcrText: true, pixels }) // prettier-ignore
     let clean: Uint8Array
     try {
       clean = await sanitizeRedacted(result.bytes, indices, result.pixels)
@@ -285,7 +295,9 @@ export async function buildRedactedSources(
       if (!(e instanceof PixelSwapError)) throw e
       // A copy PDFium wrote could not be found again: redact the source again, removing every
       // covered image whole (the reports below then come from this pass).
-      result = redactPdfReport(pdfium, sourceBytes, pageRedactions, { dropOcrText: true })
+      result = await redactPdfReportAsync(pdfium, sourceBytes, pageRedactions, {
+        dropOcrText: true
+      })
       clean = await sanitizeRedacted(result.bytes, indices)
     }
     out.set(sourceKey, clean)

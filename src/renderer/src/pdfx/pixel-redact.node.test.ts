@@ -13,13 +13,14 @@
 
 import type { PDFDocumentProxy } from 'pdfjs-dist'
 import { getDocument } from 'pdfjs-dist/legacy/build/pdf.mjs'
-import { zlibSync } from 'fflate'
+import { unzlibSync, zlibSync } from 'fflate'
 import jpeg from 'jpeg-js'
 import {
   concatTransformationMatrix,
   decodePDFRawStream,
   degrees,
   drawObject,
+  grayscale,
   PDFArray,
   PDFDict,
   PDFDocument,
@@ -51,8 +52,10 @@ import {
   blankSamples,
   blankValue,
   isAxisAligned,
+  encodeWithin,
   matchCandidate,
   MAX_GROWTH,
+  MAX_RASTER_BYTES,
   pixelRect,
   type ImageCandidate,
   type Matrix
@@ -61,7 +64,7 @@ import { imageCandidates, imagePlan, PixelSwapError, swapPixelImages } from './p
 import { redactPdfReport, type RedactRect, type RedactResult } from './redact'
 import { applyRedactedBytes, buildRedactedSources, sanitizeRedacted } from './redact-export'
 import { encodeG4 } from './test-utils/ccitt-g4'
-import { extractorLeaks, rawLeaks } from './test-utils/leak-oracle'
+import { extractorLeaks, pixelLeaks, rawLeaks } from './test-utils/leak-oracle'
 import { ocrPageFromGt, pdfjsCopyText, pdfjsText, type ProbePdfium } from './test-utils/ocr-layer'
 
 let pdfium: ProbePdfium
@@ -179,28 +182,6 @@ async function pageImages(bytes: Uint8Array, i = 0): Promise<PageImage[]> {
 const num = (d: PDFDict, k: string): number | undefined =>
   (d.get(PDFName.of(k)) as PDFNumber | undefined)?.asNumber()
 
-/**
- * Every stream of `bytes` whose decoded data contains `needle` (the covered pixels of a fixture):
- * the pixel half of the leak oracle.
- */
-async function pixelLeaks(bytes: Uint8Array, needle: Uint8Array): Promise<string[]> {
-  const doc = await PDFDocument.load(bytes, { updateMetadata: false, ignoreEncryption: true })
-  const hits: string[] = []
-  const n = Buffer.from(needle)
-  for (const [ref, o] of doc.context.enumerateIndirectObjects()) {
-    if (!(o instanceof PDFRawStream)) continue
-    let data: Uint8Array
-    try {
-      data = decodePDFRawStream(o).decode()
-    } catch {
-      data = o.contents
-    }
-    if (Buffer.from(data.buffer, data.byteOffset, data.byteLength).indexOf(n) >= 0)
-      hits.push(ref.toString())
-  }
-  return hits
-}
-
 /** Row `r`, samples c0..c1 (inclusive), of packed rows of `stride` bytes at 8 bits × nc. */
 const rowBytes = (s: Uint8Array, stride: number, r: number, from: number, to: number): Uint8Array =>
   s.slice(r * stride + from, r * stride + to)
@@ -278,6 +259,7 @@ describe('pixelRect: the conservative mapping', () => {
     expect(isAxisAligned([-240, 0, 0, -160, 1, 2])).toBe(true)
     expect(isAxisAligned([0, 160, -240, 0, 1, 2])).toBe(false) // 90°
     expect(isAxisAligned([240, 0, 10, 160, 1, 2])).toBe(false) // skew
+    expect(isAxisAligned([240, 10, 0, 160, 0, 0])).toBe(false) // vertical shear (b alone)
     const t = (1 * Math.PI) / 180
     expect(isAxisAligned([240 * Math.cos(t), 240 * Math.sin(t), -160 * Math.sin(t), 160 * Math.cos(t), 0, 0])).toBe(false) // prettier-ignore
     expect(isAxisAligned([240, 1e-5, 0, 160, 0, 0])).toBe(true) // float32 noise
@@ -303,10 +285,42 @@ describe('blankSamples and blankValue', () => {
 
   it('an Indexed palette blanks with its darkest entry; Gray and RGB with 0', () => {
     const lookup = Uint8Array.from([255, 0, 0, 0, 0, 255, 3, 3, 3, 200, 200, 200])
-    expect(blankValue({ kind: 'Indexed', base: 'DeviceRGB', hival: 3, lookup })).toBe(2)
-    expect(blankValue({ kind: 'Indexed', base: 'DeviceGray', hival: 2, lookup: Uint8Array.from([9, 0, 4]) })).toBe(1) // prettier-ignore
-    expect(blankValue({ kind: 'DeviceGray' })).toBe(0)
-    expect(blankValue({ kind: 'DeviceRGB' })).toBe(0)
+    expect(blankValue({ kind: 'Indexed', base: 'DeviceRGB', hival: 3, lookup }, 8)).toBe(2)
+    expect(blankValue({ kind: 'Indexed', base: 'DeviceGray', hival: 2, lookup: Uint8Array.from([9, 0, 4]) }, 2)).toBe(1) // prettier-ignore
+    expect(blankValue({ kind: 'DeviceGray' }, 8)).toBe(0)
+    expect(blankValue({ kind: 'DeviceRGB' }, 1)).toBe(0)
+  })
+
+  it('...the darkest entry the depth can hold: a 1-bit sample cannot name index 2', () => {
+    // White, near-black, black, grey: at 1 bit only 0 (white) and 1 (near-black) exist.
+    const lookup = Uint8Array.from([255, 255, 255, 16, 16, 16, 0, 0, 0, 128, 128, 128])
+    const cs = { kind: 'Indexed', base: 'DeviceRGB', hival: 3, lookup } as const
+    expect(blankValue(cs, 1)).toBe(1)
+    expect(blankValue(cs, 2)).toBe(2)
+    // Blanked at 1 bit, the samples read back as index 1, not as 2 & 1 = 0 (white).
+    const got = new Uint8Array(2)
+    blankSamples(got, 16, 1, 1, [{ c0: 0, c1: 15, r0: 0, r1: 0 }], blankValue(cs, 1))
+    expect(Array.from(got)).toEqual([0xff, 0xff])
+  })
+
+  it('encodeWithin: the Flate stream when it fits, null as soon as it cannot', () => {
+    // Compressible rows (a ramp), large enough for the band estimate, and small.
+    const rowBytes = 2000
+    const ramp = Uint8Array.from({ length: rowBytes * 800 }, (_, i) => (i % rowBytes) & 0xf0)
+    for (const s of [ramp, ramp.subarray(0, rowBytes * 3)]) {
+      const all = encodeWithin(s, rowBytes, Infinity)!
+      expect(Buffer.compare(Buffer.from(unzlibSync(all)), Buffer.from(s))).toBe(0)
+      expect(encodeWithin(s, rowBytes, 1.5 * all.length)).not.toBeNull()
+      // One byte under its size, it does not fit (the streamed size is exact).
+      expect(encodeWithin(s, rowBytes, all.length - 1)).toBeNull()
+    }
+    // Small (no estimate): exactly at its own size it still fits.
+    const small = ramp.subarray(0, rowBytes * 3)
+    expect(encodeWithin(small, rowBytes, encodeWithin(small, rowBytes, Infinity)!.length)).not.toBeNull() // prettier-ignore
+    // Noise (incompressible): over a limit of half its size, by the estimate or the stream.
+    const n = noise(rowBytes * 800, 40)
+    expect(encodeWithin(n, rowBytes, n.length / 2)).toBeNull()
+    expect(encodeWithin(n.subarray(0, 50_000), rowBytes, 25_000)).toBeNull()
   })
 
   it('matchCandidate: by size and stored bytes; two disagreeing plans for one stream match none', () => {
@@ -420,6 +434,29 @@ describe('an 8-bit DeviceGray image', () => {
     expect(diff).toBe(0)
     expect(extractText(pdfium as TextPdfium, out)).toBe('PUBLIC')
   })
+
+  it('...and still paints over what was drawn before it (the copy goes at its index, not at 0)', async () => {
+    // A grey square under the image's lower-left corner, away from the box: the opaque image
+    // hides it, and must still hide it after the swap.
+    const doc = await PDFDocument.create()
+    const page = doc.addPage([400, 400])
+    page.drawRectangle({ x: 45, y: 65, width: 40, height: 40, color: grayscale(0.5) })
+    place(page, imageStream(page, new Uint8Array(W * H).fill(255), W, H, GRAY), M)
+    const bytes = await doc.save()
+    const { r, out } = await redactPixels(bytes, [BOX])
+    expect(r.pixels.get(0)).toHaveLength(1)
+    const a = raster(bytes, 72).data
+    const b = raster(out, 72).data
+    let diff = 0
+    for (let y = 0; y < 400; y++)
+      for (let x = 0; x < 400; x++) {
+        const ux = x + 0.5
+        const uy = 400 - y - 0.5
+        const inBox = ux > BOX.x - 3 && ux < BOX.x + BOX.w + 3 && uy > BOX.y - 3 && uy < BOX.y + BOX.h + 3 // prettier-ignore
+        if (!inBox && a[y * 400 + x] !== b[y * 400 + x]) diff++
+      }
+    expect(diff).toBe(0)
+  })
 })
 
 describe('depths and colour spaces', () => {
@@ -478,6 +515,22 @@ describe('depths and colour spaces', () => {
       expectBlanked(img.samples, src, BOX_PX, { bpc, blank: 2 })
     }
   )
+
+  it('1-bit Indexed whose darkest entry (2) is past the depth: blanked with the darkest it holds', async () => {
+    // White, near-black, black, grey: index 1 is the darkest a 1-bit sample can name.
+    const lookup = Uint8Array.from([255, 255, 255, 16, 16, 16, 0, 0, 0, 128, 128, 128])
+    const stride = Math.ceil(W / 8)
+    const src = noise(stride * H, 31)
+    const doc = await PDFDocument.create()
+    const page = doc.addPage([400, 400])
+    const cs = doc.context.obj([PDFName.of('Indexed'), PDFName.of('DeviceRGB'), 3, doc.context.register(doc.context.stream(lookup))]) // prettier-ignore
+    place(page, imageStream(page, src, W, H, { ColorSpace: cs, BitsPerComponent: 1 }), M)
+    const { r, out } = await redactPixels(await doc.save(), [BOX])
+    expect(r.pixels.get(0)).toHaveLength(1)
+    const [img] = await pageImages(out)
+    expect(num(img.dict, 'BitsPerComponent')).toBe(1)
+    expectBlanked(img.samples, src, BOX_PX, { bpc: 1, blank: 1 })
+  })
 
   it('DCT: a flat JPEG is redacted at 8 bits; a photo-like one fails the growth gate and goes whole', async () => {
     const jpegOf = (rgba: Buffer, q = 90): Uint8Array => new Uint8Array(jpeg.encode({ width: W, height: H, data: rgba }, q).data) // prettier-ignore
@@ -695,9 +748,13 @@ describe('out of scope: the whole image is removed, as before', () => {
     await expectWhole(await onePage(noise(400, 14), { ColorSpace: 'DeviceRGB', BitsPerComponent: 8, Filter: 'JPXDecode' }, { raw: true }), null) // prettier-ignore
   })
 
-  it('a quarter-turned, a skewed and a slightly rotated placement', async () => {
+  it('a quarter-turned, a skewed, a vertically sheared and a slightly rotated placement', async () => {
     await expectWhole(await onePage(src, GRAY, { m: [0, 160, -240, 0, 300, 60] }), needle, [{ x: 150, y: 100, w: 30, h: 30 }]) // prettier-ignore
     await expectWhole(await onePage(src, GRAY, { m: [240, 0, 40, 160, 20, 60] }), needle)
+    // b alone (c = 0): column u rises by 120·u. Under the box (x 120–140, y 200–240) lie columns
+    // 40–50 and, at column 45, rows 13–32: the needle is row 22, columns 41–49.
+    const shear: Matrix = [240, 120, 0, 160, 40, 60]
+    await expectWhole(await onePage(src, GRAY, { m: shear }), rowBytes(src, W, 22, 41, 50), [{ x: 120, y: 200, w: 20, h: 40 }]) // prettier-ignore
     const t = (0.5 * Math.PI) / 180
     await expectWhole(await onePage(src, GRAY, { m: [240 * Math.cos(t), 240 * Math.sin(t), -160 * Math.sin(t), 160 * Math.cos(t), 40, 60] }), needle) // prettier-ignore
   })
@@ -786,6 +843,99 @@ describe('out of scope: the whole image is removed, as before', () => {
     // Control: its own plan is used.
     const ok = redactPdfReport(pdfium, bytes, [{ pageIndex: 0, rects: [BOX] }], { pixels: new Map([[0, [cand]]]) }) // prettier-ignore
     expect(ok.pixels.get(0)).toHaveLength(1)
+  })
+
+  it('...the colour space alone: an Indexed plan for a DeviceGray image of the same depth', async () => {
+    // Both read 8 bits per pixel, and an identity palette even decodes to the same picture: only
+    // PDFium's colour-space id tells them apart.
+    const bytes = await onePage(src, GRAY)
+    const [cand] = (await imageCandidates(bytes, [0])).get(0)!
+    const lookup = Uint8Array.from({ length: 256 }, (_, i) => i)
+    const asIndexed: ImageCandidate = { ...cand, plan: { decode: 'samples', bpc: 8, colorSpace: { kind: 'Indexed', base: 'DeviceGray', hival: 255, lookup } } } // prettier-ignore
+    const r = redactPdfReport(pdfium, bytes, [{ pageIndex: 0, rects: [BOX] }], { pixels: new Map([[0, [asIndexed]]]) }) // prettier-ignore
+    expect(r.pixels.size).toBe(0)
+    expect(r.removed.get(0)!.map((o) => o.type)).toEqual([3])
+  })
+
+  /**
+   * `bytes` with a second definition of the (only) image object added just before the xref, its
+   * /BitsPerComponent `from` changed to `to`. PDFium follows the xref (the first definition);
+   * pdf-lib parses the file in order and keeps the last one, so the two read different depths.
+   */
+  async function redefineDepth(source: Uint8Array, from: number, to: number): Promise<Uint8Array> {
+    // A classic xref table (no object streams), so the offsets below are the whole story.
+    const bytes = await (await PDFDocument.load(source)).save({ useObjectStreams: false })
+    const text = Buffer.from(bytes).toString('latin1')
+    const m = /\n(\d+ 0 obj\s*<<(?:(?!endobj)[\s\S])*?\/Subtype \/Image(?:(?!endobj)[\s\S])*?endobj)/.exec(text) // prettier-ignore
+    if (!m) throw new Error('no image object')
+    const twin = '\n' + m[1].replace(`/BitsPerComponent ${from}`, `/BitsPerComponent ${to}`)
+    expect(twin).not.toBe('\n' + m[1])
+    const at = text.lastIndexOf('\nxref')
+    expect(at).toBeGreaterThan(m.index)
+    const start = /startxref\s+(\d+)/.exec(text)!
+    const out = text.slice(0, at) + twin + text.slice(at, start.index) + `startxref\n${Number(start[1]) + twin.length}\n%%EOF\n` // prettier-ignore
+    return Uint8Array.from(Buffer.from(out, 'latin1'))
+  }
+
+  const sameRender = (a: Uint8Array, b: Uint8Array): boolean =>
+    Buffer.compare(Buffer.from(raster(a, 72).data), Buffer.from(raster(b, 72).data)) === 0
+
+  it('an object defined twice: PDFium reads 8 bits, pdf-lib 4 (the samples are longer than the plan)', async () => {
+    const as8 = await onePage(src, GRAY)
+    const bytes = await redefineDepth(as8, 8, 4)
+    const [cand] = (await imageCandidates(bytes, [0])).get(0)!
+    expect(cand.plan).toMatchObject({ bpc: 4 })
+    // PDFium follows the xref: it shows the 8-bit image, so the covered samples are the 8-bit
+    // needle.
+    expect(sameRender(bytes, as8)).toBe(true)
+    await expectWhole(bytes, needle)
+  })
+
+  it('...and the other way round: PDFium reads 4 bits, pdf-lib 8 (the lengths agree)', async () => {
+    // Declared 4-bit, with 8-bit data: PDFium reads the first half of the bytes as 4-bit rows of
+    // 60 bytes, so the box (samples 30–59, rows 20–39) shows bytes 15–29 of those rows.
+    const as4 = await onePage(src, { ColorSpace: 'DeviceGray', BitsPerComponent: 4 })
+    const bytes = await redefineDepth(as4, 4, 8)
+    const [cand] = (await imageCandidates(bytes, [0])).get(0)!
+    expect(cand.plan).toMatchObject({ bpc: 8 })
+    expect(sameRender(bytes, as4)).toBe(true)
+    await expectWhole(bytes, rowBytes(src, 60, 25, 16, 29))
+  })
+
+  it('a heap that cannot hold the samples (malloc gives 0): whole removal, no heap bytes copied', async () => {
+    const bytes = await onePage(src, GRAY)
+    const rt = Object.create(pdfium.pdfium) as ProbePdfium['pdfium']
+    const real = pdfium.pdfium.wasmExports
+    // Only the decoded samples' buffer (W × H bytes) fails.
+    rt.wasmExports = { malloc: (n: number) => (n === W * H ? 0 : real.malloc(n)), free: (p: number) => real.free(p) } // prettier-ignore
+    const spy = Object.create(pdfium) as ProbePdfium
+    spy.pdfium = rt
+    // A fill into buffer 0 would be taken by PDFium as a length query and "succeed".
+    let fromZero = 0
+    spy.FPDFImageObj_GetImageDataDecoded = (obj, buf, len) => {
+      if (!buf && len > 0) fromZero++
+      return pdfium.FPDFImageObj_GetImageDataDecoded(obj, buf, len)
+    }
+    const pixels = await imageCandidates(bytes, [0])
+    const r = redactPdfReport(spy, bytes, [{ pageIndex: 0, rects: [BOX] }], { pixels })
+    expect(r.pixels.size).toBe(0)
+    expect(r.removed.get(0)!.map((o) => o.type)).toEqual([3])
+    expect(fromZero).toBe(0)
+  })
+
+  it('an image over the raster budget is removed whole, before anything is decoded', async () => {
+    // 7300 × 7300 at 1 bit: 53 MB as the 8-bit raster the pass would build.
+    const w = 7300
+    expect(w * w).toBeGreaterThan(MAX_RASTER_BYTES)
+    const bytes = await onePage(new Uint8Array(Math.ceil(w / 8) * w), { ColorSpace: 'DeviceGray', BitsPerComponent: 1 }, { w, h: w, m: [400, 0, 0, 400, 0, 0] }) // prettier-ignore
+    const spy = Object.create(pdfium) as ProbePdfium
+    let decoded = 0
+    spy.FPDFImageObj_GetImageDataDecoded = (...a) => (decoded++, pdfium.FPDFImageObj_GetImageDataDecoded(...a)) // prettier-ignore
+    spy.FPDFImageObj_GetBitmap = (...a) => (decoded++, pdfium.FPDFImageObj_GetBitmap(...a))
+    const r = redactPdfReport(spy, bytes, [{ pageIndex: 0, rects: [BOX] }], { pixels: await imageCandidates(bytes, [0]) }) // prettier-ignore
+    expect(r.pixels.size).toBe(0)
+    expect(r.removed.get(0)!.map((o) => o.type)).toEqual([3])
+    expect(decoded).toBe(0)
   })
 
   it('no candidates (the pre-pass not run): whole removal, as before PR12', async () => {

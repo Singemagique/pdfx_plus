@@ -16,8 +16,9 @@
 // PIXEL REDACTION (DESIGN.md §2 D3, PR12; `RedactOptions.pixels`). With the pdf-lib pre-pass's
 // image candidates (pixel-redact-doc.ts), an image the box overlaps that is in scope (pixel-redact.ts:
 // unmasked DeviceGray, DeviceRGB or Indexed, no /Decode or ICC, an XObject, axis-aligned, no clip,
-// no transparency, no marked content, and PDFium reads it with the same colour space and depth) is
-// not removed: the samples the box touches are blanked on a
+// no transparency, no marked content, PDFium reads it with the same colour space and depth and its
+// own decode of it is exactly the plan's reading of the samples, and its 8-bit raster is at most
+// MAX_RASTER_BYTES) is not removed: the samples the box touches are blanked on a
 // NEW image object put in its place in the page's object list (`pixelRedact`), so the shared
 // XObject, and every other page drawing it, keeps its pixels (FPDFImageObj_SetBitmap on the
 // original would rewrite the shared stream). PDFium can only write that object at 8 bits per
@@ -56,10 +57,12 @@
 
 import {
   MAX_GROWTH,
+  MAX_RASTER_BYTES,
   blankSamples,
   blankValue,
+  channelsOf,
   componentsOf,
-  encodeSamples,
+  encodeWithin,
   expandSamples,
   isAxisAligned,
   matchCandidate,
@@ -369,7 +372,11 @@ const PDFIUM_COLORSPACE = { DeviceGray: 1, DeviceRGB: 2, Indexed: 10 } as const
 const pdfiumBpp = (plan: ImagePlan): number =>
   plan.colorSpace.kind === 'DeviceRGB' ? (plan.bpc >= 4 ? 24 : 8) : plan.bpc === 1 ? 1 : 8
 
-/** `n` bytes PDFium writes through `fill(ptr, n)`, copied out of the heap; null if it wrote fewer. */
+/**
+ * `n` bytes PDFium writes through `fill(ptr, n)`, copied out of the heap; null if it wrote fewer,
+ * or if the heap cannot hold them (malloc gives 0, and PDFium would take a 0 buffer for a length
+ * query and report n written, so the "samples" would be whatever the heap holds at address 0).
+ */
 function readOut(
   pdfium: PdfiumModule,
   n: number,
@@ -377,6 +384,7 @@ function readOut(
 ): Uint8Array | null {
   const rt = pdfium.pdfium
   const ptr = rt.wasmExports.malloc(n)
+  if (!ptr) return null
   try {
     if (fill(ptr, n) < n) return null
     return new Uint8Array(rt.HEAPU8.subarray(ptr, ptr + n)) // a copy: the heap may grow later
@@ -385,11 +393,90 @@ function readOut(
   }
 }
 
+/** PDFium's decode of an image object (FPDFImageObj_GetBitmap), as the heap holds it. */
+interface PdfiumBitmap {
+  heap: Uint8Array
+  buf: number
+  /** Bytes per row. */
+  stride: number
+  /** Bytes per pixel: 1 (grey) or 3 / 4 (BGR / BGRx). */
+  px: 1 | 3 | 4
+}
+
+/** Bytes per pixel of the FPDFBitmap formats the pass reads. */
+const BITMAP_PIXEL_BYTES: Partial<Record<number, 1 | 3 | 4>> = {
+  [BITMAP_GRAY]: 1,
+  [BITMAP_BGR]: 3,
+  [BITMAP_BGRX]: 4
+}
+
+/** `fn` on PDFium's W × H decode of `obj`; null when there is none, or not in a grey/BGR format. */
+function withBitmap<T>(
+  pdfium: PdfiumModule,
+  obj: number,
+  W: number,
+  H: number,
+  fn: (b: PdfiumBitmap) => T
+): T | null {
+  const bmp = pdfium.FPDFImageObj_GetBitmap(obj)
+  if (!bmp) return null
+  try {
+    if (pdfium.FPDFBitmap_GetWidth(bmp) !== W || pdfium.FPDFBitmap_GetHeight(bmp) !== H) return null
+    const fmt = pdfium.FPDFBitmap_GetFormat(bmp)
+    const px = BITMAP_PIXEL_BYTES[fmt]
+    if (!px) return null
+    const buf = pdfium.FPDFBitmap_GetBuffer(bmp)
+    if (!buf) return null
+    return fn({ heap: pdfium.pdfium.HEAPU8, buf, stride: pdfium.FPDFBitmap_GetStride(bmp), px })
+  } finally {
+    pdfium.FPDFBitmap_Destroy(bmp)
+  }
+}
+
+/**
+ * Does the 8-bit raster `r` (W × H, RGB order) show exactly what PDFium's decode `b` does? A grey
+ * raster matches a BGR decode whose three channels all equal it.
+ */
+function sameAsBitmap(
+  r: PixelReplacement['interim'],
+  W: number,
+  H: number,
+  b: PdfiumBitmap
+): boolean {
+  const { heap, buf, stride, px } = b
+  if (r.channels === 3 && px === 1) return false
+  const d = r.data
+  for (let y = 0; y < H; y++) {
+    const row = buf + y * stride
+    if (px === 1) {
+      for (let x = 0, i = y * W; x < W; x++, i++) if (heap[row + x] !== d[i]) return false
+    } else if (r.channels === 1) {
+      for (let x = 0, s = row, i = y * W; x < W; x++, s += px, i++) {
+        const v = d[i]
+        if (heap[s] !== v || heap[s + 1] !== v || heap[s + 2] !== v) return false
+      }
+    } else {
+      for (let x = 0, s = row, i = y * W * 3; x < W; x++, s += px, i += 3)
+        if (heap[s + 2] !== d[i] || heap[s + 1] !== d[i + 1] || heap[s] !== d[i + 2]) return false
+    }
+  }
+  return true
+}
+
 /**
  * The image's samples in the plan's layout (packed rows, its depth and colour space), or null when
  * PDFium cannot give exactly that. 'samples' is the stream after its non-image filters; 'bitmap'
  * is PDFium's decode of a CCITT, JBIG2 or DCT image, converted back to samples (1-bit sources must
  * decode to pure black and white, or the image is not what the plan says).
+ *
+ * The plan is read off pdf-lib's view of the dictionary, PDFium's off its own, and the two can
+ * differ (a file defining the object twice: pdf-lib keeps the last definition, PDFium follows the
+ * xref), and PDFium's metadata cannot tell 2, 4 and 8 bits apart. So 'samples' must be EXACTLY
+ * stride × H bytes (trailing bytes, which readers ignore, are not told apart from a deeper reading)
+ * and, expanded under the plan, must reproduce PDFium's own decode of the object sample for sample
+ * [measured: it does, exactly, for every in-scope depth and colour space, Indexed included].
+ * Otherwise the box would be mapped onto other bytes than the ones shown under it, and the image
+ * is removed whole instead.
  */
 function sourceSamples(
   pdfium: PdfiumModule,
@@ -402,23 +489,16 @@ function sourceSamples(
   const stride = rowBytesOf(W, nc, plan.bpc)
   if (plan.decode === 'samples') {
     const n = pdfium.FPDFImageObj_GetImageDataDecoded(obj, 0, 0)
-    // Short data would leave samples PDFium pads on its own; extra bytes after the last row are
-    // ignored by every reader, so they are dropped.
-    if (!(n >= stride * H)) return null
-    const all = readOut(pdfium, n, (p, len) => pdfium.FPDFImageObj_GetImageDataDecoded(obj, p, len))
-    return all ? all.slice(0, stride * H) : null
+    if (n !== stride * H) return null
+    const samples = readOut(pdfium, n, (p, len) => pdfium.FPDFImageObj_GetImageDataDecoded(obj, p, len)) // prettier-ignore
+    if (!samples) return null
+    const shown = expandSamples(samples, W, H, plan)
+    return withBitmap(pdfium, obj, W, H, (b) => sameAsBitmap(shown, W, H, b)) ? samples : null
   }
-  const bmp = pdfium.FPDFImageObj_GetBitmap(obj)
-  if (!bmp) return null
-  try {
-    const fmt = pdfium.FPDFBitmap_GetFormat(bmp)
-    if (pdfium.FPDFBitmap_GetWidth(bmp) !== W || pdfium.FPDFBitmap_GetHeight(bmp) !== H) return null
-    const bs = pdfium.FPDFBitmap_GetStride(bmp)
-    const buf = pdfium.FPDFBitmap_GetBuffer(bmp)
-    const heap = pdfium.pdfium.HEAPU8
+  return withBitmap(pdfium, obj, W, H, ({ heap, buf, stride: bs, px }) => {
     const out = new Uint8Array(stride * H)
     if (plan.colorSpace.kind === 'DeviceGray') {
-      if (fmt !== BITMAP_GRAY) return null
+      if (px !== 1) return null
       for (let r = 0; r < H; r++) {
         const row = buf + r * bs
         if (plan.bpc === 8) {
@@ -434,9 +514,7 @@ function sourceSamples(
       }
       return out
     }
-    if (plan.colorSpace.kind !== 'DeviceRGB' || plan.bpc !== 8) return null
-    const px = fmt === BITMAP_BGR ? 3 : fmt === BITMAP_BGRX ? 4 : 0
-    if (!px) return null
+    if (plan.colorSpace.kind !== 'DeviceRGB' || plan.bpc !== 8 || px === 1) return null
     for (let r = 0; r < H; r++)
       for (let x = 0; x < W; x++) {
         const s = buf + r * bs + x * px
@@ -446,9 +524,7 @@ function sourceSamples(
         out[d + 2] = heap[s]
       }
     return out
-  } finally {
-    pdfium.FPDFBitmap_Destroy(bmp)
-  }
+  })
 }
 
 /** A new image object showing the 8-bit `interim` raster, placed by the matrix at `matrixPtr`. */
@@ -517,6 +593,7 @@ function pixelRedact(
   if (pdfium.FPDFPageObj_CountMarks(obj) > 0) return null
   const rt = pdfium.pdfium
   const mp = rt.wasmExports.malloc(64) // FS_MATRIX at 0..23, pixel size at 24..31, metadata at 32..59
+  if (!mp) return null
   try {
     if (!pdfium.FPDFPageObj_GetMatrix(obj, mp)) return null
     const m = [0, 4, 8, 12, 16, 20].map((o) => rt.getValue(mp + o, 'float')) as unknown as Matrix
@@ -541,12 +618,16 @@ function pixelRedact(
     if (bpp !== pdfiumBpp(plan)) return null
     const px = rects.map((rc) => pixelRect(m, W, H, rc)).filter((p): p is PixelRect => !!p)
     if (!px.length) return null
+    const cs = plan.colorSpace
+    // The budget, before anything is decoded (see MAX_RASTER_BYTES).
+    if (W * H * channelsOf(cs) > MAX_RASTER_BYTES) return null
     const samples = sourceSamples(pdfium, obj, W, H, plan)
     if (!samples) return null
-    const cs = plan.colorSpace
-    blankSamples(samples, W, componentsOf(cs), plan.bpc, px, blankValue(cs))
-    const data = encodeSamples(samples)
-    if (data.length > MAX_GROWTH * rawLength) return null
+    const nc = componentsOf(cs)
+    blankSamples(samples, W, nc, plan.bpc, px, blankValue(cs, plan.bpc))
+    // The growth gate, given up on as soon as it is sure to fail (a JPEG scan).
+    const data = encodeWithin(samples, rowBytesOf(W, nc, plan.bpc), MAX_GROWTH * rawLength)
+    if (!data) return null
     const interim = expandSamples(samples, W, H, plan)
     const created = interimImage(pdfium, doc, interim, W, H, mp)
     if (!created) return null
@@ -877,11 +958,45 @@ export function redactPdfReport(
   pages: PageRedaction[],
   opts: RedactOptions = {}
 ): RedactResult {
+  const steps = redactSteps(pdfium, bytes, pages, opts)
+  for (;;) {
+    const s = steps.next()
+    if (s.done) return s.value
+  }
+}
+
+/**
+ * `redactPdfReport`, giving the event loop a turn after each redacted page: the pass runs on the
+ * renderer thread, and a pixel-redacted page can take a few hundred ms (MAX_RASTER_BYTES bounds it).
+ * The document stays open in between; nothing else touches it.
+ */
+export async function redactPdfReportAsync(
+  pdfium: PdfiumModule,
+  bytes: Uint8Array,
+  pages: PageRedaction[],
+  opts: RedactOptions = {}
+): Promise<RedactResult> {
+  const steps = redactSteps(pdfium, bytes, pages, opts)
+  for (;;) {
+    const s = steps.next()
+    if (s.done) return s.value
+    await new Promise<void>((resolve) => setTimeout(resolve, 0))
+  }
+}
+
+/** The pass, one step per redacted page (see redactPdfReport / redactPdfReportAsync). */
+function* redactSteps(
+  pdfium: PdfiumModule,
+  bytes: Uint8Array,
+  pages: PageRedaction[],
+  opts: RedactOptions
+): Generator<void, RedactResult> {
   const removed = new Map<number, RemovedObject[]>()
   const pixels = new Map<number, PixelReplacement[]>()
   const rt = pdfium.pdfium
   const { malloc, free } = rt.wasmExports
   const filePtr = malloc(bytes.length)
+  if (!filePtr) throw new Error('redact: out of memory loading the PDF')
   rt.HEAPU8.set(bytes, filePtr)
   // PDFium references the input buffer for the document's lifetime, so filePtr is freed only after
   // FPDF_CloseDocument below.
@@ -905,6 +1020,7 @@ export function redactPdfReport(
       } finally {
         pdfium.FPDF_ClosePage(page)
       }
+      yield
     }
     return { bytes: saveDocument(pdfium, doc), removed, pixels }
   } finally {

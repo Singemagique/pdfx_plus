@@ -75,6 +75,7 @@ import {
   extractorLeaks,
   hasManifest,
   parseToUnicode,
+  pixelLeaks,
   rawLeaks,
   uniqueCodePoints,
   type Secret
@@ -1221,6 +1222,93 @@ describe('a page reached only by a reference is not copied (orphan pages)', () =
     const dest = link.lookup(PDFName.of('Dest'), PDFArray)
     expect(dest.get(0)).toBe(out.getPage(0).ref)
     await expectNoOrphanPages(files[0])
+  })
+})
+
+describe('pages sharing one resource dictionary: the redacted image does not ride out with the other page', () => {
+  const IW = 120
+  const IH = 80
+  /** A deterministic byte stream (LCG): image noise no row of which repeats. */
+  function noise(n: number, seed: number): Uint8Array {
+    let s = seed >>> 0
+    const out = new Uint8Array(n)
+    for (let i = 0; i < n; i++) {
+      s = (Math.imul(s, 1664525) + 1013904223) >>> 0
+      out[i] = s >>> 24
+    }
+    return out
+  }
+  const imA = noise(IW * IH, 101)
+  const imB = noise(IW * IH, 102)
+  /** Row `r`, columns c0..c1 (exclusive) of an 8-bit image `IW` wide. */
+  const needle = (im: Uint8Array, r: number, c0: number, c1: number): Uint8Array =>
+    im.slice(r * IW + c0, r * IW + c1)
+  /** 1 sample = 2 pt from (40, 60); the box covers samples 30–59, rows 20–39 of ImA. */
+  const BOX = { x: 100.5, y: 140.5, w: 59, h: 39 }
+
+  /**
+   * Page 0 draws /ImA, page 1 /ImB, both listed in ONE /XObject dictionary: inherited from /Pages,
+   * or one indirect /Resources set on both pages.
+   */
+  async function sharedPdf(how: 'inherited' | 'indirect'): Promise<Uint8Array> {
+    const doc = await PDFDocument.create()
+    const pages = [doc.addPage([400, 400]), doc.addPage([400, 400])]
+    const ctx = doc.context
+    const image = (data: Uint8Array): PDFRef =>
+      ctx.register(ctx.flateStream(data, { Type: 'XObject', Subtype: 'Image', Width: IW, Height: IH, ColorSpace: 'DeviceGray', BitsPerComponent: 8 })) // prettier-ignore
+    const res = ctx.obj({ XObject: { ImA: image(imA), ImB: image(imB) } })
+    pages.forEach((p, i) => {
+      p.pushOperators(pushGraphicsState(), concatTransformationMatrix(240, 0, 0, 160, 40, 60), drawObject(i ? 'ImB' : 'ImA'), popGraphicsState()) // prettier-ignore
+      // After pushOperators, which gives the page a /Resources of its own.
+      p.node.delete(PDFName.of('Resources'))
+    })
+    if (how === 'inherited') doc.catalog.Pages().set(PDFName.of('Resources'), res)
+    else {
+      const ref = ctx.register(res)
+      for (const p of pages) p.node.set(PDFName.of('Resources'), ref)
+    }
+    return doc.save({ useObjectStreams: false })
+  }
+
+  it.each(['inherited', 'indirect'] as const)(
+    'control (%s): copying page 1 alone carries ImA along',
+    async (how) => {
+      const bytes = await sharedPdf(how)
+      // Both pages really draw their image.
+      for (const i of [0, 1]) expect(raster(bytes, 72, i).data.filter((v) => v < 250).length).toBeGreaterThan(30_000) // prettier-ignore
+      const src = await PDFDocument.load(bytes)
+      const out = await PDFDocument.create()
+      out.addPage((await out.copyPages(src, [1]))[0])
+      expect(await pixelLeaks(await out.save(), needle(imA, 25, 32, 56))).toHaveLength(1)
+    }
+  )
+
+  describe.each(['inherited', 'indirect'] as const)('%s', (how) => {
+    it.each(ALL_KINDS.flatMap((k) => [true, false].map((px) => [k, px] as const)))(
+      '%s, pixel redaction %s: both pages exported, ImA nowhere under the box',
+      async (kind, pixelRedaction) => {
+        const bytes = await sharedPdf(how)
+        const id = `shared-${how}-${kind}-${pixelRedaction}`
+        const doc = await openDoc(id, bytes)
+        const key = makePageKey(id, 0)
+        const layer = edits({ overlays: new Map([[key, [redaction(key, BOX)]]]) })
+        const { files, redacted } = await exportAs(kind, [doc], layer, undefined, pixelRedaction)
+        expect(redacted.modified!.has(key)).toBe(pixelRedaction)
+        for (const f of files) {
+          // The covered samples of ImA are in no stream of the file.
+          expect(await pixelLeaks(f, needle(imA, 25, 32, 56))).toEqual([])
+          // Its other rows only where the pixel-redacted copy is, and ImB intact for page 1.
+          expect(await pixelLeaks(f, needle(imA, 60, 32, 56))).toHaveLength(pixelRedaction ? 1 : 0)
+          expect(await pixelLeaks(f, needle(imB, 25, 32, 56))).toHaveLength(1)
+        }
+        // Page 1 paints exactly as before.
+        if (kind === 'pdf') {
+          const a = raster(bytes, 72, 1).data
+          const b = raster(files[0], 72, 1).data
+          expect(Buffer.compare(Buffer.from(a), Buffer.from(b))).toBe(0)
+        }
+      }
+    )
   })
 })
 

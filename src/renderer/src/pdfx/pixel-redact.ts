@@ -14,12 +14,23 @@
 // Encoding: the new stream keeps the source's depth and colour space (1-bit sources, CCITT and
 // JBIG2 included, stay 1-bit: as 8-bit Flate a fax page grows from tens of KB to MB) and is
 // Flate-compressed. It must be at most `MAX_GROWTH` times the source's encoded stream, or the caller
-// falls back to removing the whole image, which is also what happens to anything out of scope.
+// falls back to removing the whole image, which is also what happens to anything out of scope and
+// to an image whose 8-bit raster is over `MAX_RASTER_BYTES`. `encodeWithin` gives up on the encode
+// as soon as the gate is sure to fail (a JPEG scan), rather than after it.
 
-import { zlibSync } from 'fflate'
+import { Zlib, zlibSync } from 'fflate'
 
 /** The new stream may be at most this many times the source's encoded stream. */
 export const MAX_GROWTH = 2
+
+/**
+ * The largest image redacted pixel by pixel, in bytes of its 8-bit raster (W × H × the interim's
+ * channels): an A4 page at 400 dpi in RGB, an A3 page at 300 dpi in grey. A bigger one is removed
+ * whole. The pass runs on the renderer thread and its rasters live in the shared PDFium heap, which
+ * never shrinks [measured in review on a copy of a0cfe9c: an A0 300 dpi RGB scan took 16 s and
+ * left 1.26 GB of WASM heap].
+ */
+export const MAX_RASTER_BYTES = 48 * 2 ** 20
 
 /** Outward slack of the pixel mapping, in samples (PDFium matrices are float32). */
 const PIXEL_EPSILON = 1e-3
@@ -129,16 +140,21 @@ export const componentsOf = (cs: PlanColorSpace): number => (cs.kind === 'Device
 export const rowBytesOf = (W: number, nc: number, bpc: number): number =>
   Math.ceil((W * nc * bpc) / 8)
 
+/** Channels of the 8-bit raster a plan's samples expand to (an Indexed palette's base). */
+export const channelsOf = (cs: PlanColorSpace): 1 | 3 =>
+  cs.kind === 'DeviceRGB' || (cs.kind === 'Indexed' && cs.base === 'DeviceRGB') ? 3 : 1
+
 /**
  * The sample value that paints black (or the darkest colour an Indexed palette has): 0 for
- * DeviceGray and DeviceRGB at every depth, the darkest palette entry for Indexed.
+ * DeviceGray and DeviceRGB at every depth, for Indexed the darkest palette entry a `bpc`-bit
+ * sample can hold (an entry past 2^bpc − 1 cannot be written at that depth).
  */
-export function blankValue(cs: PlanColorSpace): number {
+export function blankValue(cs: PlanColorSpace, bpc: number): number {
   if (cs.kind !== 'Indexed') return 0
   const n = cs.base === 'DeviceRGB' ? 3 : 1
   let best = 0
   let bestLuma = Infinity
-  for (let i = 0; i <= cs.hival; i++) {
+  for (let i = 0; i <= Math.min(cs.hival, (1 << bpc) - 1); i++) {
     const p = cs.lookup.subarray(i * n, i * n + n)
     const luma = n === 3 ? 0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2] : p[0]
     if (luma < bestLuma) {
@@ -201,6 +217,9 @@ export function expandSamples(
   const nc = componentsOf(cs)
   const stride = rowBytesOf(W, nc, plan.bpc)
   const max = (1 << plan.bpc) - 1
+  // 8-bit Gray or RGB already is that raster (rows of W × nc bytes, no padding): a view, no copy.
+  if (cs.kind !== 'Indexed' && plan.bpc === 8)
+    return { channels: nc as 1 | 3, data: samples.subarray(0, W * H * nc) }
   if (cs.kind !== 'Indexed') {
     const out = new Uint8Array(W * H * nc)
     for (let r = 0; r < H; r++)
@@ -219,8 +238,62 @@ export function expandSamples(
   return { channels: n as 1 | 3, data: out }
 }
 
-/** The new image stream's bytes: the samples, Flate-compressed (no predictor). */
-export const encodeSamples = (samples: Uint8Array): Uint8Array => zlibSync(samples, { level: 6 })
+/** Above this many sample bytes, `encodeWithin` estimates the size from bands first. */
+const ESTIMATE_MIN_BYTES = 2 ** 20
+/** Bands of rows the estimate compresses, each 1/64 of the rows (1/8 of the image in all). */
+const ESTIMATE_BANDS = 8
+/** The estimate gives up only this far over the limit (it may be off; the full encode is exact). */
+const ESTIMATE_MARGIN = 1.25
+/** Input fed to the streaming encoder between two checks of its output size. */
+const ENCODE_CHUNK = 2 ** 20
+
+/**
+ * The new image stream's bytes (the samples, Flate-compressed at level 6, no predictor), or null as
+ * soon as it is clear they would exceed `limit` bytes, so an image that fails the growth gate (most
+ * JPEG scans: their 8-bit Flate copy is over 2× [measured in review on a copy of a0cfe9c, A4
+ * 300 dpi, q60–q75]) does not pay for a full encode. A large
+ * raster is first estimated from ESTIMATE_BANDS bands of rows spread over it (Flate's 32 KB window
+ * spans only a few rows of a scan, so bands compress about as the whole does); then it is encoded
+ * in chunks, stopping once the output passes `limit`. Rows are `rowBytes` long.
+ */
+export function encodeWithin(
+  samples: Uint8Array,
+  rowBytes: number,
+  limit: number
+): Uint8Array | null {
+  const rows = rowBytes > 0 ? Math.floor(samples.length / rowBytes) : 0
+  if (samples.length > ESTIMATE_MIN_BYTES && rows >= 64) {
+    const bandRows = Math.ceil(rows / 64)
+    let read = 0
+    let wrote = 0
+    for (let k = 0; k < ESTIMATE_BANDS; k++) {
+      const r0 = Math.min(rows - bandRows, Math.floor(((k + 0.5) * rows) / ESTIMATE_BANDS))
+      const band = samples.subarray(r0 * rowBytes, (r0 + bandRows) * rowBytes)
+      read += band.length
+      wrote += zlibSync(band, { level: 6 }).length
+    }
+    if ((wrote / read) * samples.length > ESTIMATE_MARGIN * limit) return null
+  }
+  const chunks: Uint8Array[] = []
+  let size = 0
+  const z = new Zlib({ level: 6 }, (chunk) => {
+    chunks.push(chunk)
+    size += chunk.length
+  })
+  for (let off = 0; ; off += ENCODE_CHUNK) {
+    const end = Math.min(samples.length, off + ENCODE_CHUNK)
+    z.push(samples.subarray(off, end), end === samples.length)
+    if (size > limit) return null
+    if (end === samples.length) break
+  }
+  const out = new Uint8Array(size)
+  let at = 0
+  for (const c of chunks) {
+    out.set(c, at)
+    at += c.length
+  }
+  return out
+}
 
 /** A pixel-redacted image of one page: what pixel-redact-doc.ts swaps into the saved file. */
 export interface PixelReplacement {
