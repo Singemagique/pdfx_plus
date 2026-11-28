@@ -1,6 +1,13 @@
 import { describe, expect, it } from 'vitest'
 import { buildPageText, type PageTextItem } from './extract'
-import { charWeight, mergeLineRects, overlayRect, textMatchRects, type PageRect } from './geometry'
+import {
+  charWeight,
+  mergeLineRects,
+  overlayRect,
+  sliceItem,
+  textMatchRects,
+  type PageRect
+} from './geometry'
 
 /** pdf.js's viewport transform for an unrotated US Letter page at scale 1. */
 const UPRIGHT = [1, 0, 0, -1, 0, 792]
@@ -227,5 +234,65 @@ describe('overlayRect', () => {
       w: 100,
       h: 20
     })
+  })
+})
+
+describe('charEdges (OCR words): exact partial-word highlights', () => {
+  // "Wilma" as an OCR word: 40 pt wide, with a wide W and a narrow i (edges per code point).
+  const edges = [0, 20, 22, 25, 34, 40]
+  const wilma = item('Wilma', [10, 0, 0, 10, 100, 700], 40, { mono: false, charEdges: edges })
+
+  it('places a slice exactly on its edges instead of the Helvetica estimate', () => {
+    const pt = buildPageText([wilma], UPRIGHT)
+    const [ilm] = textMatchRects(pt, 1, 4)
+    close(ilm, { x: 120, y: 792 - 708, w: 14, h: 10 })
+    const [a] = textMatchRects(pt, 4, 5)
+    close(a, { x: 134, y: 792 - 708, w: 6, h: 10 })
+    // Without edges, the same slice falls elsewhere (the weighted estimate).
+    const est = buildPageText([{ ...wilma, charEdges: undefined }], UPRIGHT)
+    expect(Math.abs(textMatchRects(est, 1, 4)[0].x - 120)).toBeGreaterThan(1)
+  })
+
+  it('follows a rotated baseline', () => {
+    const pt = buildPageText([{ ...wilma, t: [0, 10, -10, 0, 100, 400] }], UPRIGHT)
+    // Running up the page from (100, 400): "ilm" covers user y 420..434.
+    const [r] = textMatchRects(pt, 1, 4)
+    close(r, { x: 100 - 8, y: 792 - 434, w: 10, h: 14 })
+  })
+
+  it('counts edges per code point (a surrogate pair is one character)', () => {
+    const w = item('𝐀bc', [10, 0, 0, 10, 0, 700], 30, { mono: false, charEdges: [0, 20, 25, 30] })
+    const pt = buildPageText([w], UPRIGHT)
+    const at = pt.norm.indexOf('b')
+    close(textMatchRects(pt, at, at + 1)[0], { x: 20, y: 792 - 708, w: 5, h: 10 })
+  })
+
+  it('ignores edges that do not fit the text', () => {
+    const bad = item('Wilma', [10, 0, 0, 10, 100, 700], 40, { mono: true, charEdges: [0, 10, 40] })
+    const pt = buildPageText([bad], UPRIGHT)
+    close(textMatchRects(pt, 1, 4)[0], { x: 108, y: 792 - 708, w: 24, h: 10 })
+    // Too MANY edges (7 for 5 characters): ignored as well, not read up to the 5th.
+    const extra = { ...bad, charEdges: [0, 10, 20, 25, 30, 35, 40] }
+    close(textMatchRects(buildPageText([extra], UPRIGHT), 1, 4)[0], { x: 108, y: 792 - 708, w: 24, h: 10 }) // prettier-ignore
+  })
+})
+
+describe('sliceItem', () => {
+  it('moves the origin along a rotated baseline and keeps the advance proportional', () => {
+    const a = Math.PI / 4
+    const it0 = item('abcdef', [10 * Math.cos(a), 10 * Math.sin(a), -10 * Math.sin(a), 10 * Math.cos(a), 0, 0], 30) // prettier-ignore
+    const s = sliceItem(it0, 2, 4)
+    expect(s.str).toBe('cd')
+    expect(s.width).toBeCloseTo(10, 9)
+    expect(s.t[4]).toBeCloseTo(10 * Math.cos(a), 9)
+    expect(s.t[5]).toBeCloseTo(10 * Math.sin(a), 9)
+  })
+
+  it('slices charEdges along, rebased to 0', () => {
+    const it0 = item('Wilma', [10, 0, 0, 10, 100, 700], 40, { mono: false, charEdges: [0, 20, 22, 25, 34, 40] }) // prettier-ignore
+    const s = sliceItem(it0, 1, 4)
+    expect(s.t[4]).toBe(120)
+    expect(s.width).toBe(14)
+    expect(Array.from(s.charEdges!)).toEqual([0, 2, 5, 14])
   })
 })

@@ -5,6 +5,7 @@
 
 import type { Overlay } from '../edit/model'
 import { makePageKey } from '../edit/model'
+import { footprint } from '../pdfx/mirror'
 import type { DocEntry, PageEntry } from '../types'
 import { createFindEngine, type FindEngine, type PageMatches } from './engine'
 import { overlayRect, textMatchRects, type PageRect } from './geometry'
@@ -129,8 +130,41 @@ export function createFindController({
   let debounce: ReturnType<typeof setTimeout> | null = null
   let throttle: ReturnType<typeof setTimeout> | null = null
   const highlightCache = new Map<string, { version: number; value: readonly PageHighlight[] }>()
+  let overlays: readonly Overlay[] = []
+  /**
+   * Page key → its page height (page px), for turning redaction geoms into page-px boxes. Never
+   * pruned: a key's height is fixed (sources are immutable), and keeping a removed page's height
+   * keeps its redactions in the engine, as the engine's contract intends (kept until cleared).
+   */
+  const heights = new Map<string, number>()
+  /** Page keys the engine currently holds redactions for. */
+  let redactedKeys = new Set<string>()
 
   const engine = createEngine(() => scheduleRecompute())
+
+  /**
+   * Feed the engine every live page's redaction boxes (DESIGN.md §3.6.1): Find never reports text
+   * the user has boxed out, matching what an export will contain. The box is the redaction's
+   * rotation-aware footprint (mirror.ts, the same box export redacts). A page key never seen yet
+   * has no known height and is skipped until it is. Cheap when nothing changed: the engine
+   * ignores an unchanged set.
+   */
+  function syncRedactions(): void {
+    const next = new Map<string, PageRect[]>()
+    for (const o of overlays) {
+      if (o.type !== 'redaction') continue
+      const h = heights.get(o.pageKey)
+      if (h === undefined) continue
+      const f = footprint(o.geom)
+      const rect = { x: f.x0, y: h - f.y1, w: f.x1 - f.x0, h: f.y1 - f.y0 }
+      const list = next.get(o.pageKey)
+      if (list) list.push(rect)
+      else next.set(o.pageKey, [rect])
+    }
+    for (const key of redactedKeys) if (!next.has(key)) engine.setRedactions(key, null)
+    for (const [key, rects] of next) engine.setRedactions(key, rects)
+    redactedKeys = new Set(next.keys())
+  }
 
   let barState: FindBarState = buildBar()
 
@@ -481,14 +515,21 @@ export function createFindController({
         for (const p of d.pages) {
           const pageKey = makePageKey(p.source.id, p.pageIndex)
           map.set(p.id, { docId: d.id, page: p, pageKey, order: order++ })
+          heights.set(pageKey, p.height)
         }
       }
       pages = map
+      // Redactions BEFORE reconcile: a page that comes back (undo of a delete) may get its cached
+      // text back synchronously, and a search may rerun right there; its boxes must already be
+      // in place, or the redacted match is counted and navigated to for that moment.
+      syncRedactions()
       engine.reconcile(next)
       if (isOpen && query) scheduleRecompute()
     },
-    setOverlays(overlays) {
-      engine.setOverlays(overlays)
+    setOverlays(next) {
+      overlays = next
+      engine.setOverlays(next)
+      syncRedactions()
     },
     cancelTimers() {
       clearDebounce()
