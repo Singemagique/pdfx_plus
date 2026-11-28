@@ -21,6 +21,8 @@ const REPLAYED = [
   'rot90page',
   'noise',
   'photoLike',
+  // PR11 review: a photo on a white Letter page is normalised in its own box (photoRegion).
+  'photoLike-fit-letter',
   'border-scan',
   'smallprint6pt',
   'smallprint6pt-fax',

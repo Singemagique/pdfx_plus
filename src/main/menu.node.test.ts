@@ -39,6 +39,7 @@ vi.mock('./window', () => ({
 }))
 
 import { buildMenu, registerMenuStateIpc, setMenuChecked } from './menu'
+import { hasRecognizeMenuItem, type MenuItemLike } from './ocr/selftest'
 
 const realPlatform = process.platform
 const setPlatform = (p: NodeJS.Platform): void => {
@@ -142,6 +143,20 @@ describe('Document menu (DESIGN.md §3.8)', () => {
     expect(item.registerAccelerator).toBe(false)
     // No other Document item has an accelerator that could double-fire.
     expect(documentMenu().filter((i) => i.accelerator)).toHaveLength(1)
+  })
+
+  it("is the item the packaged self-test's shortcut check looks for", () => {
+    buildMenu()
+    // The template's submenus are arrays; a built Menu's are { items } (what the check reads).
+    const asBuilt = (items: Electron.MenuItemConstructorOptions[]): MenuItemLike[] =>
+      items.map((i) => ({
+        id: i.id,
+        label: i.label,
+        accelerator: i.accelerator,
+        registerAccelerator: i.registerAccelerator,
+        submenu: Array.isArray(i.submenu) ? { items: asBuilt(i.submenu) } : null
+      }))
+    expect(hasRecognizeMenuItem(asBuilt(h.template!))).toBe(true)
   })
 
   it.each([

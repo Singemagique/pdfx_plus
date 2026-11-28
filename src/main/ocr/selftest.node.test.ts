@@ -6,7 +6,15 @@ import { describe, expect, it } from 'vitest'
 
 import type { Heartbeat } from '../../shared/ocr/protocol'
 import { Coordinator } from './process/coordinator'
-import { REQUIRED_CHILD_CHECKS, childTripwireFailures, selftestSession } from './selftest'
+import {
+  RECOGNIZE_ACCELERATOR,
+  REQUIRED_CHILD_CHECKS,
+  childTripwireFailures,
+  hasRecognizeMenuItem,
+  selftestSession,
+  shortcutVerdict,
+  type MenuItemLike
+} from './selftest'
 import type { FromRaster } from './process/thread-messages'
 import { FakeParent, INIT, harness, settle, triaged } from './test-utils/fake-threads'
 import { portPair } from './test-utils/port-pair'
@@ -119,5 +127,62 @@ describe('childTripwireFailures (what the packaged self-test asks of the child r
       'no tripwire self-check from the utility process'
     ])
     expect(text(childTripwireFailures(['fetch'], all))).toMatch(/electron\.net stubs/)
+  })
+})
+
+describe('shortcutVerdict (Ctrl/Cmd+Shift+R on a hidden window, §3.8)', () => {
+  const seen = { menuItem: true, sends: 1, wrongModifierSends: null, keyDowns: 1, loaded: true }
+
+  it('passes on exactly one recognize-text per press', () => {
+    expect(shortcutVerdict(seen).status).toBe('pass')
+    expect(shortcutVerdict({ ...seen, wrongModifierSends: 0, keyDowns: 2 }).status).toBe('pass')
+  })
+
+  it('is required: no handler and no menu item fails, it is never skipped', () => {
+    const v = shortcutVerdict({ ...seen, menuItem: false, sends: 0 })
+    expect(v.status).toBe('fail')
+    expect(v.message).toMatch(/no Recognize Text… item/)
+    expect(shortcutVerdict({ ...seen, menuItem: false }).status).toBe('fail')
+  })
+
+  it('fails when the press is lost, doubled or fires on the wrong chord', () => {
+    expect(shortcutVerdict({ ...seen, sends: 0 }).message).toMatch(/0 time\(s\) for one press/)
+    expect(shortcutVerdict({ ...seen, sends: 2 }).status).toBe('fail')
+    expect(shortcutVerdict({ ...seen, keyDowns: 0 }).message).toMatch(/never reached/)
+    expect(shortcutVerdict({ ...seen, loaded: false }).status).toBe('fail')
+    expect(shortcutVerdict({ ...seen, wrongModifierSends: 1 }).message).toMatch(/darwin/)
+    expect(shortcutVerdict({ ...seen, menuItem: false, sends: 2 }).status).toBe('fail')
+  })
+
+  it('says what it proved: main sent the action to the renderer once', () => {
+    expect(shortcutVerdict(seen).message).toMatch(
+      /made main send 'recognize-text' to the renderer once/
+    )
+  })
+})
+
+describe('hasRecognizeMenuItem (the menu half of the shortcut check)', () => {
+  const item = {
+    id: 'recognize-text',
+    label: 'Recognize Text…',
+    accelerator: RECOGNIZE_ACCELERATOR,
+    registerAccelerator: false
+  }
+  const menu = (i: object): MenuItemLike[] => [
+    { label: 'File', submenu: { items: [] } },
+    { label: 'Document', submenu: { items: [{ id: 'other', label: 'Other' }, i] } }
+  ]
+
+  it('finds the Document item showing Ctrl/Cmd+Shift+R, unregistered, in a submenu', () => {
+    expect(hasRecognizeMenuItem(menu(item))).toBe(true)
+  })
+
+  it('rejects a missing or different accelerator, a registered one, or another label', () => {
+    expect(hasRecognizeMenuItem(menu({ ...item, accelerator: undefined }))).toBe(false)
+    expect(hasRecognizeMenuItem(menu({ ...item, accelerator: 'CommandOrControl+R' }))).toBe(false)
+    expect(hasRecognizeMenuItem(menu({ ...item, registerAccelerator: true }))).toBe(false)
+    expect(hasRecognizeMenuItem(menu({ ...item, label: 'Recognize Text' }))).toBe(false)
+    expect(hasRecognizeMenuItem(menu({ ...item, id: 'recognize-all-scanned' }))).toBe(false)
+    expect(hasRecognizeMenuItem(undefined)).toBe(false)
   })
 })

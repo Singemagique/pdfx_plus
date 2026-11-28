@@ -14,10 +14,15 @@
 //   bit for bit either way [measured, raster-core.node.test.ts]) smoothing changes the raster.
 // - letter10pt: a full Letter page of 10 pt body text at 300 DPI (2550 × 3300 px): the §3.9.4 time
 //   row's page (the design names A4; Letter is the same 8.4–8.7 MP class) and a full-page check.
+// - smallprint6pt-letter (PR11 audit): a Letter page FILLED with smallprint6pt's 6 pt body, for
+//   §3.9.4's `smallprint6pt` full-page time gate (smallprint6pt itself is a 432 × 180 pt strip,
+//   1.35 MP at 300 DPI). Timing only (bench.ocr.test.ts); no tier-1 suite runs it.
 // - smallprint6pt-blur / smallprint6pt-fax: 6 pt text degraded, where the adaptive pass has
 //   something to win (§3.4.3: "PR6 measures what the pass gains on smallprint6pt + degradations").
+// - photoLike-fit-letter (PR11 review): photoLike fitted onto a white Letter page, the way PDFx
+//   imports a photo next to a Letter page (D4).
 
-import { listPresets, registerPreset, type LayoutContext, type PresetDef } from './synth'
+import { getPreset, listPresets, registerPreset, type LayoutContext, type PresetDef } from './synth'
 
 const PAGE = { width: 432, height: 180 }
 
@@ -28,6 +33,28 @@ function paragraphs(margin: number, size: number, leading: number): (ctx: Layout
     for (const words of lines) {
       if (baseline - ctx.descent(size) < margin) break
       ctx.line(words, margin, baseline, size)
+      baseline -= leading
+    }
+  }
+}
+
+/**
+ * `paragraphs`, but the word bank is repeated (reshuffled each time) until the lines reach the
+ * bottom margin: one bank is about 400 words, a fifth of a Letter page at 6 pt.
+ */
+function fullPage(margin: number, size: number, leading: number): (ctx: LayoutContext) => void {
+  return (ctx) => {
+    const rows = Math.floor((ctx.height - 2 * margin) / leading) + 1
+    let lines: string[][] = []
+    const words: string[] = []
+    while (lines.length < rows) {
+      words.push(...ctx.bankWords())
+      lines = ctx.wrap(words, ctx.width - 2 * margin, size)
+    }
+    let baseline = ctx.height - margin - ctx.ascent(size)
+    for (const w of lines) {
+      if (baseline - ctx.descent(size) < margin) break
+      ctx.line(w, margin, baseline, size)
       baseline -= leading
     }
   }
@@ -125,6 +152,15 @@ export const QUALITY_PRESETS: PresetDef[] = [
     ops: []
   },
   {
+    id: 'smallprint6pt-letter',
+    description: 'a Letter page filled with 6 pt body text, margin to margin, at 300 DPI',
+    font: 'helvetica',
+    page: { width: 612, height: 792 },
+    renderDpi: 300,
+    layout: fullPage(54, 6, 7.5),
+    ops: []
+  },
+  {
     id: 'bilevel240',
     description: '240 DPI binarised at 50% (1-bit, rendered at 1.25× native)',
     font: 'helvetica',
@@ -197,6 +233,15 @@ export const QUALITY_PRESETS: PresetDef[] = [
       { op: 'quarterTurns', turns: 1 },
       { op: 'rotate', deg: 2 }
     ]
+  },
+  // PR11 review: photoLike as PDFx imports a photo next to a Letter page (imageToPdf fits it onto
+  // 612 × 792 pt, centred, D4): a tinted, unevenly lit photo inside a white margin. The whole-page
+  // photo test read the margin as paper and skipped normalisation: 4 words of 116.
+  {
+    ...getPreset('photoLike'),
+    id: 'photoLike-fit-letter',
+    description: 'photoLike fitted onto a white Letter page (an imported photo, D4)',
+    place: { width: 612, height: 792 }
   }
 ]
 

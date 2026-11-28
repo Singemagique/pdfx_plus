@@ -39,6 +39,7 @@ import {
   writeEntry,
   type CacheSpec
 } from '../test-utils/ocr-cache'
+import { pageParts, sha256, xosDump } from '../test-utils/xos-dump'
 import { ENGINE_CORE, ENGINE_DATA } from './engine-manifest'
 import { verifyBytes } from './engine-node'
 
@@ -140,7 +141,16 @@ describe('tier 1: the real engine on the synth presets', () => {
           expect(hocr === cached!.hocr, `${spec.id}: live hOCR differs from the replay`).toBe(true)
         } else if (!cached || cached.hocr !== hocr) replayMismatches.push(spec.id)
       }
-      if (!gt) return
+      if (!gt) {
+        xosDump('engine', spec.id, {
+          text: '',
+          boxes: [],
+          engine: [hocr!],
+          inputs: [sha256(img.data)],
+          meta: { dpi }
+        })
+        return
+      }
 
       const page = mapRawOcrPage(reply.outcome.raw, {
         page: gt.page,
@@ -152,6 +162,13 @@ describe('tier 1: the real engine on the synth presets', () => {
         pipelineVersion: PIPELINE_VERSION,
         pageClass: 'scanned',
         calibration: TESS_CORE7
+      })
+      const { conf, ...parts } = pageParts(page)
+      xosDump('engine', spec.id, {
+        ...parts,
+        engine: [hocr!],
+        inputs: [sha256(img.data)],
+        meta: { dpi, conf, meanConfCal: page.meanConfCal, status: page.status }
       })
       const s = await scorePage(page, gt)
       measured[spec.id] = { ...s, ms: Math.round(ms) }
