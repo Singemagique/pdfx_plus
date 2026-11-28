@@ -26,6 +26,7 @@ import { calibrate, TESS_CORE7, thresholdsFor } from '../../../shared/ocr/calibr
 import type { CalibrationTable, GrayImage, RawOcr } from '../../../shared/ocr/engine/types'
 import { TessError, fullPageParams, type TessParams } from '../../../shared/ocr/engine/tess-core'
 import { hocrToRaw, parseHocr } from '../../../shared/ocr/hocr'
+import { UNIT_TUNING, cropGray, offsetRaw, planUnits, type LayoutBlock } from './unit-plan'
 import { noXHeightScript } from '../../../shared/ocr/map'
 import { normalizeRegion, photoRegion } from '../../../shared/ocr/preprocess/background'
 import { BORDER_PAD, removeBorder } from '../../../shared/ocr/preprocess/border'
@@ -81,6 +82,9 @@ export function describeRecognizeError(e: unknown): { name: string; message: str
 
 export interface RecognizeEngine {
   recognize(img: GrayImage, params: TessParams): { hocr: string }
+  /** PROTOTYPE: AnalyseLayout, and Recognize reusing it. */
+  layout?(img: GrayImage, params: TessParams): LayoutBlock[]
+  recognizeLaidOut?(): { hocr: string }
 }
 
 /** A full-page recognition recipe: the parameters beyond DPI. */
@@ -386,27 +390,110 @@ export interface RecognizePageOptions {
   prior?: Orientation
 }
 
-/** Recognise one page raster (see the header). */
+/** PROTOTYPE: one unit of a split pass, recognised wherever the driver likes. */
+export interface UnitJob {
+  image: Gray
+  params: TessParams
+}
+type Steps<T> = Generator<{ units: UnitJob[] }, T, string[]>
+
+/** Recognise one page raster (see the header); units run in order on `engine`. */
 export function recognizePage(
   engine: RecognizeEngine,
   img: GrayImage,
   dpi: number,
   opts: RecognizePageOptions = {}
 ): RecognizeOutcome {
+  const g = pageSteps(engine, img, dpi, opts)
+  for (let r = g.next(); ; ) {
+    if (r.done) return r.value
+    r = g.next(r.value.units.map((u) => engine.recognize(u.image, u.params).hocr))
+  }
+}
+
+/** PROTOTYPE: the same, with the units handed to `units` (e.g. other threads). */
+export async function recognizePageAsync(
+  engine: RecognizeEngine,
+  img: GrayImage,
+  dpi: number,
+  opts: RecognizePageOptions & { units?: (jobs: UnitJob[]) => Promise<string[]> } = {}
+): Promise<RecognizeOutcome> {
+  const g = pageSteps(engine, img, dpi, opts)
+  for (let r = g.next(); ; ) {
+    if (r.done) return r.value
+    const jobs = r.value.units
+    r = g.next(
+      opts.units
+        ? await opts.units(jobs)
+        : jobs.map((u) => engine.recognize(u.image, u.params).hocr)
+    )
+  }
+}
+
+function* pageSteps(
+  engine: RecognizeEngine,
+  img: GrayImage,
+  dpi: number,
+  opts: RecognizePageOptions = {}
+): Steps<RecognizeOutcome> {
   const now = opts.now ?? (() => performance.now())
   const table = opts.calibration ?? TESS_CORE7
   const hocrs: string[] = []
   const records: RecognitionRecord[] = []
   const passes: PassSummary[] = []
 
-  const run = (id: string, image: Gray, params: TessParams): { raw: RawOcr; score: number } => {
-    const t0 = now()
-    const { hocr } = engine.recognize(image, params)
+  let pageInk = 0
+  const recordAs = (id: string, image: Gray, params: TessParams, hocr: string): void => {
     if (opts.returnHocr) {
       hocrs.push(hocr)
       records.push({ id, params, width: image.width, height: image.height, fnv: fnv1a(image.data) })
     }
-    const raw = hocrToRaw(parseHocr(hocr))
+  }
+  const recogOne = (id: string, image: Gray, params: TessParams): RawOcr => {
+    const { hocr } = engine.recognize(image, params)
+    recordAs(id, image, params, hocr)
+    return hocrToRaw(parseHocr(hocr))
+  }
+  // PROTOTYPE: a PSM 3 pass on a page with enough ink is laid out first; when the layout splits
+  // into units they are recognised apart (by the driver: in order here, on idle threads in the
+  // harness) and merged in the layout's reading order. Otherwise Recognize reuses that layout,
+  // which gives the same hOCR as a plain Recognize [measured].
+  function* recogPass(id: string, image: Gray, params: TessParams): Steps<RawOcr> {
+    if (
+      params.tessedit_pageseg_mode !== 3 ||
+      !engine.layout ||
+      !engine.recognizeLaidOut ||
+      pageInk < UNIT_TUNING.minInk
+    )
+      return recogOne(id, image, params)
+    const plan = planUnits(engine.layout(image, params), image)
+    if (!plan) {
+      const { hocr } = engine.recognizeLaidOut()
+      recordAs(id, image, params, hocr)
+      return hocrToRaw(parseHocr(hocr))
+    }
+    const lines: RawOcr['lines'] = []
+    const jobs: UnitJob[] = plan.map((u) => ({
+      image: cropGray(image, u.box),
+      params: { ...params, tessedit_pageseg_mode: 6 }
+    }))
+    const got = yield { units: jobs }
+    plan.forEach((u, i) => {
+      recordAs(`${id}#u${i}`, jobs[i].image, jobs[i].params, got[i])
+      lines.push(...offsetRaw(hocrToRaw(parseHocr(got[i])), u.box.x0, u.box.y0))
+    })
+    let cs = 0
+    let cn = 0
+    for (const l of lines) for (const w of l.words) if (w.conf !== null) ((cs += w.conf), cn++)
+    return { lines, meanConf: cn > 0 ? cs / cn : null, confSource: cn > 0 ? 'word' : 'none' }
+  }
+  function* run(
+    id: string,
+    image: Gray,
+    params: TessParams
+  ): Steps<{ raw: RawOcr; score: number }> {
+    const t0 = now()
+    const raw = yield* recogPass(id, image, params)
     const score = passScore(raw)
     passes.push({ id, ms: Math.round(now() - t0), words: wordCount(raw), score })
     return { raw, score }
@@ -421,6 +508,7 @@ export function recognizePage(
   base = border.image
   const ds = despeckle(base, dpi)
   base = ds.image
+  pageInk = ds.ink
 
   // 2. Geometry (§3.4.5).
   let plan: GeometryPlan
@@ -456,7 +544,7 @@ export function recognizePage(
   const recipe0: PassRecipe = opts.reuse?.recipe ?? { psm: 3, thresholding: 0 }
   let full = 0
   type Best = { raw: RawOcr; score: number; id: string; recipe: PassRecipe }
-  const first = run(opts.reuse ? 'adaptive' : 'pass1', copy.image, paramsFor(dpi, recipe0))
+  const first = yield* run(opts.reuse ? 'adaptive' : 'pass1', copy.image, paramsFor(dpi, recipe0))
   full++
   let best: Best = { ...first, id: opts.reuse ? 'adaptive' : 'pass1', recipe: recipe0 }
 
@@ -472,17 +560,21 @@ export function recognizePage(
   ) {
     orientationChecked = true
     const bandParams = { ...fullPageParams(dpi), tessedit_pageseg_mode: 6 }
-    const readBoth = (img: Gray, id: string): { asIs: BandReading; flipped: BandReading } => {
+    const readBoth = function* (
+      img: Gray,
+      id: string
+    ): Steps<{ asIs: BandReading; flipped: BandReading }> {
       const bandH = Math.max(1, Math.floor((img.height * BAND_NUM) / BAND_DEN))
       const y0 = textBand(img, bandH)
       const band = cropRows(img, y0, y0 + bandH)
-      return {
-        asIs: bandReading(run(id, band, bandParams).raw),
-        flipped: bandReading(run(`${id}-flipped`, rotateQuarterCW(band, 2).image, bandParams).raw)
-      }
+      const asIs = bandReading((yield* run(id, band, bandParams)).raw)
+      const flipped = bandReading(
+        (yield* run(`${id}-flipped`, rotateQuarterCW(band, 2).image, bandParams)).raw
+      )
+      return { asIs, flipped }
     }
     const turn = (by: number): QuarterTurns => ((plan.quarterTurns + by) % 4) as QuarterTurns
-    bandStats = readBoth(copy.image, 'band')
+    bandStats = yield* readBoth(copy.image, 'band')
     let target: { turns: QuarterTurns; id: string } | null = null
     if (shouldFlip(bandStats.asIs, bandStats.flipped))
       target = { turns: turn(2), id: 'pass1-flipped' }
@@ -491,7 +583,7 @@ export function recognizePage(
       // [measured, PR6 review: receipt90 (narrow, short lines) read as vertical=false in 3 fonts].
       // Turned a quarter clockwise, the band as is is turn(1) and flipped turn(3).
       const qPlan = { quarterTurns: turn(1), skewDeg: skewFor(turn(1)) }
-      quarterStats = readBoth(orientedCopy(base, qPlan).image, 'band-quarter')
+      quarterStats = yield* readBoth(orientedCopy(base, qPlan).image, 'band-quarter')
       const refConf = Math.max(bandStats.asIs.meanConf, bandStats.flipped.meanConf)
       const cw = quarterWins(refConf, quarterStats.asIs)
       const ccw = quarterWins(refConf, quarterStats.flipped)
@@ -504,7 +596,7 @@ export function recognizePage(
       // page (a fold-over mailer's upside-down address block in the middle of upright text).
       const tPlan = { quarterTurns: target.turns, skewDeg: skewFor(target.turns) }
       const tCopy = orientedCopy(base, tPlan)
-      const again = run(target.id, tCopy.image, paramsFor(dpi, recipe0))
+      const again = yield* run(target.id, tCopy.image, paramsFor(dpi, recipe0))
       full++
       if (again.score > best.score) {
         flipped = true
@@ -521,13 +613,13 @@ export function recognizePage(
     const cal = calibratedMean(best.raw, table)
     if (full < MAX_PASSES && cal !== null && cal < retryAt) {
       const recipe: PassRecipe = { psm: best.recipe.psm, thresholding: 2 }
-      const r = run('sauvola', copy.image, paramsFor(dpi, recipe))
+      const r = yield* run('sauvola', copy.image, paramsFor(dpi, recipe))
       full++
       if (r.score > best.score) best = { ...r, id: 'sauvola', recipe }
     }
     if (full < MAX_PASSES && charCount(best.raw) < SPARSE_RATIO * ds.ink) {
       const recipe: PassRecipe = { psm: 11, thresholding: best.recipe.thresholding }
-      const r = run('sparse', copy.image, paramsFor(dpi, recipe))
+      const r = yield* run('sparse', copy.image, paramsFor(dpi, recipe))
       full++
       if (r.score > best.score) best = { ...r, id: 'sparse', recipe }
     }

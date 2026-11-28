@@ -15,7 +15,12 @@ import { tripwireCount, tripwireSelfCheck } from './no-network'
 import { parentPort } from 'node:worker_threads'
 import { createTess, type Tess, type TessFactory } from '../../../shared/ocr/engine/tess-core'
 import { gunzipTraineddata, loadGlue } from './engine-node'
-import { describeRecognizeError, recognizePage, recognizeRawPass1 } from './recognize-core'
+import {
+  describeRecognizeError,
+  recognizePage,
+  recognizePageAsync,
+  recognizeRawPass1
+} from './recognize-core'
 import type { EngineAssets, FromRecognize, ToRecognize } from './thread-messages'
 
 const port = parentPort
@@ -28,9 +33,12 @@ let factory: TessFactory | null = null
 let tess: Tess | null = null
 let tessKey = ''
 
-function post(msg: FromRecognize): void {
-  port!.postMessage(msg)
+function post(msg: FromRecognize, transfer?: ArrayBuffer[]): void {
+  port!.postMessage(msg, transfer)
 }
+
+/** PROTOTYPE: page tasks waiting for their units. */
+const waitingUnits = new Map<number, (hocr: string[]) => void>()
 
 async function engineFor(langs: readonly string[]): Promise<Tess> {
   if (!assets || !factory) throw new Error('engine not initialised')
@@ -63,6 +71,27 @@ async function handle(msg: ToRecognize): Promise<void> {
     post({ type: 'ready', tripwire: tripwireCount(), selfCheckFailed: tripwireSelfCheck().failed })
     return
   }
+  if (msg.type === 'units-done') {
+    waitingUnits.get(msg.taskId)?.(msg.hocr)
+    waitingUnits.delete(msg.taskId)
+    return
+  }
+  if (msg.type === 'unit') {
+    try {
+      const engine = await engineFor(msg.langs)
+      const img = { width: msg.width, height: msg.height, data: new Uint8Array(msg.data) }
+      const { hocr } = engine.recognize(img, msg.params)
+      post({ type: 'unit-result', taskId: msg.taskId, hocr, tripwire: tripwireCount() })
+    } catch (e) {
+      post({
+        type: 'error',
+        taskId: msg.taskId,
+        ...describeRecognizeError(e),
+        tripwire: tripwireCount()
+      })
+    }
+    return
+  }
   try {
     const data = new Uint8Array(msg.data)
     if (data.length !== msg.width * msg.height) throw new RangeError('bitmap size mismatch')
@@ -76,18 +105,50 @@ async function handle(msg: ToRecognize): Promise<void> {
         const r = engine.recognize(img, params)
         stderrLines += r.stderrLines
         return r
+      },
+      layout: (img: Parameters<Tess['layout']>[0], params: Parameters<Tess['layout']>[1]) =>
+        engine.layout(img, params),
+      recognizeLaidOut: () => {
+        const r = engine.recognizeLaidOut()
+        stderrLines += r.stderrLines
+        return r
       }
     }
     const img = { width: msg.width, height: msg.height, data }
     const result = msg.rawPass1
       ? recognizeRawPass1(counted, img, msg.dpi, msg.returnHocr === true)
-      : recognizePage(counted, img, msg.dpi, {
-          returnHocr: msg.returnHocr === true,
-          reuse: msg.reuse,
-          adaptive: msg.adaptive,
-          prior: msg.editRotation,
-          calibration: msg.calibration
-        })
+      : msg.delegateUnits
+        ? await recognizePageAsync(counted, img, msg.dpi, {
+            returnHocr: msg.returnHocr === true,
+            reuse: msg.reuse,
+            adaptive: msg.adaptive,
+            prior: msg.editRotation,
+            calibration: msg.calibration,
+            units: (jobs) =>
+              new Promise<string[]>((resolve) => {
+                waitingUnits.set(msg.taskId, resolve)
+                const out = jobs.map((j) => {
+                  const d = j.image.data.slice()
+                  return {
+                    width: j.image.width,
+                    height: j.image.height,
+                    data: d.buffer,
+                    params: j.params
+                  }
+                })
+                post(
+                  { type: 'units', taskId: msg.taskId, jobs: out, tripwire: tripwireCount() },
+                  out.map((o) => o.data)
+                )
+              })
+          })
+        : recognizePage(counted, img, msg.dpi, {
+            returnHocr: msg.returnHocr === true,
+            reuse: msg.reuse,
+            adaptive: msg.adaptive,
+            prior: msg.editRotation,
+            calibration: msg.calibration
+          })
     post({
       type: 'result',
       taskId: msg.taskId,

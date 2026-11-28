@@ -109,6 +109,17 @@ export interface TessApi {
   Recognize(monitor: null): number
   GetHOCRText(page: number): string
   End(): void
+  /** PROTOTYPE: layout only (PSM from the variables); a later Recognize reuses it. */
+  AnalyseLayout?(mergeSimilarWords: boolean): PageIteratorApi | null
+}
+
+/** PROTOTYPE: the PageIterator surface the unit planner reads. */
+export interface PageIteratorApi {
+  Begin(): void
+  Next(level: number): boolean
+  IsAtBeginningOf(level: number): boolean
+  BoundingBox(level: number, l: number, t: number, r: number, b: number): boolean
+  BlockType(): number
 }
 
 export interface TessModule {
@@ -118,6 +129,11 @@ export interface TessModule {
     unlink(path: string): void
   }
   TessBaseAPI: new () => TessApi
+  _malloc?(n: number): number
+  _free?(p: number): void
+  getValue?(ptr: number, type: string): number
+  destroy?(o: unknown): void
+  NULL?: unknown
 }
 
 export type TessFactory = (opts: EmscriptenOpts) => Promise<TessModule>
@@ -204,6 +220,13 @@ export function encodePgm(img: GrayImage): Uint8Array {
   return out
 }
 
+interface Box4 {
+  x0: number
+  y0: number
+  x1: number
+  y1: number
+}
+
 export interface TessRecognition {
   hocr: string
   /** printErr lines seen during this call (bounded; for diagnostics counts only). */
@@ -214,6 +237,10 @@ export interface Tess {
   readonly langs: readonly string[]
   /** Run one recognition pass over `img` and return its hOCR. Throws TessError. */
   recognize(img: GrayImage, params: TessParams): TessRecognition
+  /** PROTOTYPE: AnalyseLayout on `img`: blocks (type, box) with their text lines, in order. */
+  layout(img: GrayImage, params: TessParams): { type: number; box: Box4; lines: Box4[] }[]
+  /** PROTOTYPE: Recognize the image `layout` analysed, reusing that layout. */
+  recognizeLaidOut(): TessRecognition
   /** Bytes of WASM linear memory (it only ever grows). */
   heapBytes(): number
   /** After an abort or a quit the module is never trusted again (§3.3.4). */
@@ -390,6 +417,63 @@ export async function createTess(deps: TessCoreDeps, langs: readonly string[]): 
           lines.some((l) => ALLOC_FAILURE_RE.test(l)) ? 'oom' : 'empty',
           'empty hOCR'
         )
+      }
+      return { hocr, stderrLines: lines.length }
+    },
+    layout(img, params) {
+      const pgm = encodePgm(img)
+      return call(() => {
+        for (const [k, v] of Object.entries(params))
+          if (!api.SetVariable(k, String(v))) throw new TessError('params', `${k} rejected`)
+        m.FS.writeFile('/input', pgm)
+        api.SetImageFile(1, 0)
+        const it = api.AnalyseLayout!(false)
+        const out: { type: number; box: Box4; lines: Box4[] }[] = []
+        if (!it || it === m.NULL) return out
+        const p = m._malloc!(16)
+        const box = (level: number): Box4 | null =>
+          it.BoundingBox(level, p, p + 4, p + 8, p + 12)
+            ? {
+                x0: m.getValue!(p, 'i32'),
+                y0: m.getValue!(p + 4, 'i32'),
+                x1: m.getValue!(p + 8, 'i32'),
+                y1: m.getValue!(p + 12, 'i32')
+              }
+            : null
+        it.Begin()
+        do {
+          if (it.IsAtBeginningOf(0)) {
+            const b = box(0)
+            if (b) out.push({ type: it.BlockType(), box: b, lines: [] })
+          }
+          const l = box(2)
+          if (l && out.length > 0) out[out.length - 1].lines.push(l)
+        } while (it.Next(2))
+        m.destroy!(it)
+        m._free!(p)
+        return out
+      })
+    },
+    recognizeLaidOut() {
+      const mark = ring.mark()
+      const hocr = call(() => {
+        const r = api.Recognize(null)
+        const out = r === 0 ? api.GetHOCRText(0) : ''
+        try {
+          m.FS.unlink('/input')
+        } catch {
+          // already gone
+        }
+        if (r !== 0) {
+          broken = true
+          throw new TessError('oom', `Recognize returned ${r}`)
+        }
+        return out
+      })
+      const lines = ring.since(mark)
+      if (hocr.length === 0) {
+        broken = true
+        throw new TessError('empty', 'empty hOCR')
       }
       return { hocr, stderrLines: lines.length }
     },

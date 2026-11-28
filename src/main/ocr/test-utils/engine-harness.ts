@@ -9,6 +9,7 @@ import { Worker } from 'node:worker_threads'
 
 import type { OcrPaths } from '../../../shared/ocr/protocol'
 import type { GrayImage } from '../../../shared/ocr/engine/types'
+import type { TessParams } from '../../../shared/ocr/engine/tess-core'
 import { threadOptions } from '../process/budget'
 import { ENGINE_CORE, ENGINE_DATA } from '../process/engine-manifest'
 import { loadEngine } from '../process/engine-node'
@@ -44,8 +45,16 @@ export type RecognizeExtra = Pick<
   'reuse' | 'adaptive' | 'rawPass1' | 'editRotation' | 'calibration'
 >
 
+/** PROTOTYPE: threads that may run each other's units when idle (shared by harnesses). */
+export interface UnitPool {
+  threads: EngineThread[]
+  busy: Set<EngineThread>
+}
+
 export interface EngineThread {
   engine: LoadedEngine
+  /** PROTOTYPE: recognise one unit as given. */
+  unit(img: GrayImage, langs: string[], params: TessParams): Promise<string>
   recognize(
     img: GrayImage,
     dpi: number,
@@ -81,7 +90,10 @@ export function disposeBundles(): void {
 }
 
 /** Start one real recognize thread with the node_modules engine. */
-export async function startEngineThread(engine?: LoadedEngine): Promise<EngineThread> {
+export async function startEngineThread(
+  engine?: LoadedEngine,
+  pool?: UnitPool
+): Promise<EngineThread> {
   const loaded = engine ?? (await loadEngine(nodeModulesEnginePaths()))
   const b = await recognizeBundle()
   // The production heap caps, plus the thread's own stdout/stderr captured (not inherited), so a test
@@ -93,21 +105,66 @@ export async function startEngineThread(engine?: LoadedEngine): Promise<EngineTh
   let tripwire = 0
   let seq = 0
   const waiting = new Map<number, { resolve(r: RecognizeReply): void; reject(e: Error): void }>()
+  const unitWaiting = new Map<number, { resolve(h: string): void; reject(e: Error): void }>()
+  const langsOf = new Map<number, string[]>()
+  // eslint-disable-next-line prefer-const
+  let self: EngineThread
   let ready!: () => void
   let failed: Error | null = null
   const readyP = new Promise<void>((r) => (ready = r))
+  const runUnits = async (
+    taskId: number,
+    jobs: Extract<FromRecognize, { type: 'units' }>['jobs']
+  ) => {
+    const langs = langsOf.get(taskId) ?? ['eng']
+    const helpers = [self, ...(pool?.threads ?? []).filter((t) => t !== self && !pool!.busy.has(t))]
+    for (const h of helpers) if (h !== self) pool!.busy.add(h)
+    const out: string[] = new Array(jobs.length)
+    let next = 0
+    await Promise.all(
+      helpers.map(async (h) => {
+        for (;;) {
+          const i = next++
+          if (i >= jobs.length) return
+          const j = jobs[i]
+          out[i] = await h.unit(
+            { width: j.width, height: j.height, data: new Uint8Array(j.data) },
+            langs,
+            j.params
+          )
+        }
+      })
+    )
+    for (const h of helpers) if (h !== self) pool!.busy.delete(h)
+    worker.postMessage({ type: 'units-done', taskId, hocr: out } satisfies ToRecognize)
+  }
   worker.on('message', (m: FromRecognize) => {
     tripwire = m.tripwire
     if (m.type === 'ready') ready()
-    else if (m.type === 'result')
+    else if (m.type === 'units') {
+      void runUnits(m.taskId, m.jobs)
+      return
+    } else if (m.type === 'unit-result') {
+      unitWaiting.get(m.taskId)?.resolve(m.hocr)
+      unitWaiting.delete(m.taskId)
+      return
+    } else if (m.type === 'error' && unitWaiting.has(m.taskId)) {
+      unitWaiting.get(m.taskId)?.reject(new Error(`${m.name}: ${m.message}`))
+      unitWaiting.delete(m.taskId)
+      return
+    } else if (m.type === 'result')
       waiting.get(m.taskId)?.resolve({
         outcome: m.result,
         heap: m.heap,
         stderrLines: m.stderrLines,
         tripwire: m.tripwire
       })
-    else waiting.get(m.taskId)?.reject(new Error(`${m.name}: ${m.message}`))
-    if (m.type !== 'ready') waiting.delete(m.taskId)
+    else if (m.type === 'error') waiting.get(m.taskId)?.reject(new Error(`${m.name}: ${m.message}`))
+    if (m.type !== 'ready') {
+      waiting.delete(m.taskId)
+      langsOf.delete(m.taskId)
+      pool?.busy.delete(self)
+    }
   })
   worker.on('error', (e) => {
     failed = e
@@ -116,8 +173,28 @@ export async function startEngineThread(engine?: LoadedEngine): Promise<EngineTh
   })
   worker.postMessage({ type: 'init', engine: loaded.assets } satisfies ToRecognize)
   await readyP
-  return {
+  self = {
     engine: loaded,
+    unit(img, langs, params) {
+      const taskId = ++seq
+      const copy = new Uint8Array(img.width * img.height)
+      copy.set(img.data.subarray(0, copy.length))
+      return new Promise<string>((resolve, reject) => {
+        unitWaiting.set(taskId, { resolve, reject })
+        worker.postMessage(
+          {
+            type: 'unit',
+            taskId,
+            width: img.width,
+            height: img.height,
+            data: copy.buffer,
+            langs,
+            params
+          } satisfies ToRecognize,
+          [copy.buffer]
+        )
+      })
+    },
     get stdioBytes() {
       return stdioBytes
     },
@@ -129,6 +206,8 @@ export async function startEngineThread(engine?: LoadedEngine): Promise<EngineTh
       const taskId = ++seq
       const copy = new Uint8Array(img.width * img.height)
       copy.set(img.data.subarray(0, copy.length))
+      pool?.busy.add(self)
+      langsOf.set(taskId, langs)
       return new Promise<RecognizeReply>((resolve, reject) => {
         waiting.set(taskId, { resolve, reject })
         const msg: ToRecognize = {
@@ -140,6 +219,7 @@ export async function startEngineThread(engine?: LoadedEngine): Promise<EngineTh
           data: copy.buffer,
           langs,
           returnHocr,
+          ...(pool ? { delegateUnits: true } : {}),
           ...extra
         }
         worker.postMessage(msg, [copy.buffer])
@@ -149,4 +229,6 @@ export async function startEngineThread(engine?: LoadedEngine): Promise<EngineTh
       await worker.terminate()
     }
   }
+  pool?.threads.push(self)
+  return self
 }

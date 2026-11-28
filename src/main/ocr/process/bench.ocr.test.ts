@@ -56,7 +56,8 @@ import {
   disposeBundles,
   nodeModulesEnginePaths,
   startEngineThread,
-  type EngineThread
+  type EngineThread,
+  type UnitPool
 } from '../test-utils/engine-harness'
 import { FakeParent, INIT } from '../test-utils/fake-threads'
 import { pageHarness, type PageHarness, type PageRun } from '../test-utils/page-harness'
@@ -203,10 +204,15 @@ describe.runIf(on('sweep') || on('timing'))('tier 2: sweep and timing', () => {
   const threads: EngineThread[] = []
   const harnesses: PageHarness[] = []
 
+  // PROTOTYPE: idle threads run the units of a split pass (the coordinator's helpers).
+  const pool: UnitPool = { threads: [], busy: new Set() }
   beforeAll(async () => {
     deps = await loadNodeSynthDeps()
     for (let i = 0; i < Math.max(2, THREADS); i++) {
-      const t = await startEngineThread(threads[0]?.engine)
+      const t = await startEngineThread(
+        threads[0]?.engine,
+        process.env.PDFX_UNIT_POOL === '0' ? undefined : pool
+      )
       threads.push(t)
       harnesses.push(await pageHarness(t))
     }
