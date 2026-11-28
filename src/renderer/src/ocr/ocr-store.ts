@@ -24,7 +24,12 @@
 // scanned and near-scanned pages; a Replace also re-recognises `ocr-ours` pages. Requests go out
 // per (source, config) with the page in view first (§3.3.6), and `focus` tells the coordinator the
 // same. Progress is published at most 10 times a second with an EWMA (α = 0.3) ETA once 3 pages
-// are done (§3.3.5). The App busy count is never touched.
+// are done (§3.3.5). The App busy count is never touched. A request for a page already out with
+// the same config follows that work (or takes it over from a crash), a source the coordinator
+// refused fails its pages at once, and a page triage could not classify counts as recognised
+// only when a request named it (or it is an imported image), in the export and in Find alike.
+// Work dropped because its page left the collection is not "done"; automatic recognition asks
+// again for the pages an undo brings back.
 //
 // Failures. A crash (the link drops with `crashed`, or `closed` while work is out) holds every
 // unfinished page of the affected batches for Resume; finished pages stay. The pages the last
@@ -147,6 +152,10 @@ export interface OcrPageSupply {
   nativeWords?: readonly NativeWord[]
   /** The page's own PDFx OCR layer is gone in an export (a choice, or a redaction on it). */
   dropsOwnLayer: boolean
+  /** Triage answered for this page (its `pageClass` is a verdict, even when null). */
+  triaged: boolean
+  /** PDFx made the page's source from an imported image (it carries no text layer of its own). */
+  imageOrigin: boolean
 }
 
 export interface OcrStoreOptions {
@@ -174,6 +183,11 @@ interface PageRec {
   results: Map<string, PackedOcrPage>
   /** The config this page's automatic recognition used (absent: none yet). */
   auto?: string
+  /**
+   * `auto` came from a request that named the page (the dialog, the banner): it counts even when
+   * triage could not classify the page, since the user asked for exactly this text.
+   */
+  autoExplicit?: boolean
   last?: { status: OcrStatus; reason?: PageReason; rotateBy?: 90 | 180 | 270 }
   skip?: OcrPageState['skip']
   /** Crashes this page was in flight for (§3.3.2: two → failed, never retried). */
@@ -188,8 +202,15 @@ interface SourceOcr {
    * (send for triage), 'refused' (the coordinator refused the source: too large, unreadable).
    */
   gate: 'unknown' | 'checking' | 'closed' | 'open' | 'refused'
+  /** Why the coordinator refused the source (`gate === 'refused'`): what its pages report. */
+  refusal?: { status: OcrStatus; reason: PageReason }
   /** D4 / autoRecognizeOpened already fired for this source. */
   autoDone: boolean
+  /**
+   * Pages whose automatic recognition was dropped unfinished because they left the collection
+   * (a delete, a closed document): asked for again when they come back (an undo).
+   */
+  autoDropped: Set<number>
   /** Process crashes while this source's triage was outstanding. */
   triageCrashes: number
 }
@@ -213,8 +234,15 @@ type WorkState = 'triage' | 'ready' | 'sent' | 'held'
 interface Work {
   id: string
   src: string
+  so: SourceOcr
   index: number
+  /** The batch that owns the work (its requests, its progress). */
   batch: Batch
+  /**
+   * Later batches that asked for the same page and config while this work was out: they follow
+   * it (count its outcome, wait for it) instead of reporting an empty request as done.
+   */
+  watchers: Set<Batch>
   state: WorkState
   /** User / replace requests name their pages: a page that is not recognised counts as skipped. */
   explicit: boolean
@@ -243,6 +271,8 @@ interface Batch {
   failed: number
   /** Pages a Stop dropped (a stopped batch's total still counts them: "7 of 12"). */
   cancelled: number
+  /** Pages that left the collection before they finished (not in the total: they are gone). */
+  dropped: number
   startedAt: number
   lastFinishAt: number
   ewma: number | null
@@ -407,7 +437,7 @@ export function createOcrStore(opts: OcrStoreOptions): OcrStore {
   let disposed = false
 
   // ---- Stage 0 queue (one source at a time, idle priority)
-  const stage0Queue: string[] = []
+  const stage0Queue: Array<{ src: string; so: SourceOcr }> = []
   let stage0Cancel: (() => void) | null = null
   let stage0Running = false
 
@@ -504,12 +534,20 @@ export function createOcrStore(opts: OcrStoreOptions): OcrStore {
     return autoAllowed(key, r) ? r.auto : undefined
   }
 
-  /** The auto result counts only on scanned / near-scanned pages (and imported images). */
+  /**
+   * The auto result counts on scanned / near-scanned pages, and on a page triage could not
+   * classify when it was asked for by name or comes from an imported image (`autoCounts`).
+   */
   function autoAllowed(key: string, r: PageRec): boolean {
+    const info = keyInfo.get(key)
+    return autoCounts(r, !!info && live.get(info.src)?.origin === 'image')
+  }
+
+  /** The one rule for which auto result exports and searches (snapshotFor and Find alike). */
+  function autoCounts(r: PageRec, imageOrigin: boolean): boolean {
     const cls = r.triage?.pageClass ?? null
     if (SCANS.has(cls)) return true
-    const info = keyInfo.get(key)
-    return cls === null && !!info && live.get(info.src)?.origin === 'image'
+    return cls === null && (imageOrigin || !!r.autoExplicit)
   }
 
   function recOf(key: string): { r: PageRec; src: string; index: number } | null {
@@ -585,7 +623,7 @@ export function createOcrStore(opts: OcrStoreOptions): OcrStore {
   function pageSupply(key: string): OcrPageSupply | null {
     const found = recOf(key)
     if (!found) return null
-    const { r } = found
+    const { r, src } = found
     const hash = chosenHash(key, r)
     const page = hash ? r.results.get(hash) : undefined
     const cls = r.triage?.pageClass ?? null
@@ -596,7 +634,9 @@ export function createOcrStore(opts: OcrStoreOptions): OcrStore {
       mode: ours ? 'replace' : 'append',
       pageClass: cls,
       nativeWords: r.triage?.nativeWords,
-      dropsOwnLayer
+      dropsOwnLayer,
+      triaged: !!r.triage,
+      imageOrigin: live.get(src)?.origin === 'image'
     }
   }
 
@@ -618,6 +658,7 @@ export function createOcrStore(opts: OcrStoreOptions): OcrStore {
             pages: new Map(),
             gate: 'unknown',
             autoDone: false,
+            autoDropped: new Set(),
             triageCrashes: 0
           }
           sources.set(bytes, so)
@@ -656,21 +697,41 @@ export function createOcrStore(opts: OcrStoreOptions): OcrStore {
     for (const w of [...works.values()]) {
       const ls = live.get(w.src)
       if (ls && !ls.pages.has(w.index) && w.state !== 'sent') {
-        finishWork(w, null)
+        dropWork(w)
         dropped = true
       }
     }
     for (const key of [...pageStates.keys()]) if (!keyInfo.has(key)) pageStates.delete(key)
     for (const [src, ls] of next) if (!prev.has(src)) onNewSource(src, ls)
+    // Automatic recognition a removal cut short: the pages that came back (an undo) ask again.
+    for (const [src, ls] of next) {
+      const so = ls.so
+      if (so.autoDropped.size === 0) continue
+      const back = [...so.autoDropped].filter((i) => ls.pages.has(i)).sort((a, b) => a - b)
+      if (back.length === 0) continue
+      for (const i of back) so.autoDropped.delete(i)
+      const keys = back.map((i) => ls.pages.get(i)![0].key)
+      void settingsReady.then(() => {
+        if (disposed || !live.has(src) || !autoSetting(src)) return
+        startBatch('auto', keys, currentSettings['ocr.languages'], false)
+      })
+    }
     changed()
     if (dropped) pump()
+  }
+
+  /** The automatic-recognition setting that applies to a live source (D4, or opened scans). */
+  function autoSetting(src: string): boolean {
+    return live.get(src)?.origin === 'image'
+      ? currentSettings['ocr.autoRecognizeImports']
+      : currentSettings['ocr.autoRecognizeOpened']
   }
 
   function onNewSource(src: string, ls: LiveSource): void {
     const so = ls.so
     if (ls.origin === 'image') {
-      // Imported image: no Stage 0 (§3.4.1); D4 recognises it once settings say so.
-      if (so.gate === 'unknown') so.gate = 'open'
+      // Imported image: no Stage 0 (§3.4.1); D4 recognises it once settings say so. With D4 off
+      // the gate stays shut: its bytes go to the process only on a request (startBatch, prepare).
       void settingsReady.then(() => {
         if (disposed || !live.has(src) || so.autoDone) return
         if (!currentSettings['ocr.autoRecognizeImports']) return
@@ -696,7 +757,20 @@ export function createOcrStore(opts: OcrStoreOptions): OcrStore {
       jobs.delete(j.id)
       if (j.session === postSession()) post({ cancel: j.id })
     }
-    for (const w of [...works.values()]) if (w.src === src) finishWork(w, null)
+    for (const w of [...works.values()]) if (w.src === src) dropWork(w)
+  }
+
+  /**
+   * `w`'s page left the collection before it finished: off the books uncounted (`dropped`, not in
+   * any total), and remembered when automatic recognition wanted it, so an undo that brings the
+   * page back asks again (reconcile).
+   */
+  function dropWork(w: Work): void {
+    if (works.get(w.id) !== w) return
+    const holders = [w.batch, ...w.watchers]
+    if (holders.some((b) => b.kind === 'auto')) w.so.autoDropped.add(w.index)
+    for (const b of holders) b.dropped++
+    finishWork(w, null)
   }
 
   // -------------------------------------------------------------------------------------------
@@ -706,7 +780,7 @@ export function createOcrStore(opts: OcrStoreOptions): OcrStore {
     const ls = live.get(src)
     if (!ls || ls.so.gate !== 'unknown') return
     ls.so.gate = 'checking'
-    stage0Queue.push(src)
+    stage0Queue.push({ src, so: ls.so })
     runStage0Soon()
   }
 
@@ -719,12 +793,24 @@ export function createOcrStore(opts: OcrStoreOptions): OcrStore {
   }
 
   async function runOneStage0(): Promise<void> {
-    const src = stage0Queue.shift()
-    if (src === undefined) return
+    const item = stage0Queue.shift()
+    if (item === undefined) return
+    const { src, so } = item
     stage0Running = true
+    /**
+     * The source (or one of the pages being read) left the collection mid-run: no decision on
+     * partial texts. The gate goes back to 'unknown', so the source is checked afresh, now if it is
+     * still live, or by onNewSource when it comes back (an undo).
+     */
+    const restart = (): void => {
+      if (so.gate !== 'checking') return
+      so.gate = 'unknown'
+      if (live.get(src)?.so === so) queueStage0(src)
+    }
     try {
+      if (so.gate !== 'checking') return
       const ls = live.get(src)
-      if (!ls || ls.so.gate !== 'checking') return
+      if (!ls) return restart()
       // The first min(8, n) live pages of the source in page order, and the page in view.
       const indices = [...ls.pages.keys()].sort((a, b) => a - b)
       const focus = focusKey ? keyInfo.get(focusKey) : undefined
@@ -734,17 +820,23 @@ export function createOcrStore(opts: OcrStoreOptions): OcrStore {
       if (inView >= STAGE0_PAGES) positions.set(inView, indices[inView])
       const texts = new Map<number, Pick<PageText, 'items'>>()
       for (const [pos, index] of positions) {
-        if (disposed || ls.so.gate !== 'checking') return
+        if (disposed || so.gate !== 'checking') return
         const key = live.get(src)?.pages.get(index)?.[0]?.key
-        if (!key) continue
+        if (!key) return restart()
         let t: Pick<PageText, 'items'> | undefined
+        let threw = false
         try {
           t = await text.readNative(key)
         } catch {
-          t = undefined
+          threw = true
         }
-        // Unreadable text is exactly what triage is for: a candidate.
-        texts.set(pos, t ?? { items: [] })
+        if (disposed || so.gate !== 'checking') return
+        // Undefined also means the key stopped being live while its text was read: that is no
+        // evidence about the page, so start over rather than call it a candidate.
+        if (!keyInfo.has(key) || keyInfo.get(key)!.src !== src) return restart()
+        // Text that cannot be read (the engine stores an empty text for a failed extraction) is
+        // exactly what triage is for: a candidate.
+        texts.set(pos, (!threw && t) || { items: [] })
         if (isCandidatePage(texts.get(pos)!)) break
         // One page per idle slice: the pdf.js worker is shared with thumbnails and Find.
         await new Promise<void>((r) => {
@@ -754,14 +846,16 @@ export function createOcrStore(opts: OcrStoreOptions): OcrStore {
           })
         })
       }
-      if (ls.so.gate !== 'checking') return
+      if (disposed || so.gate !== 'checking') return
+      if (!live.has(src)) return restart()
       const decision = stage0Decision({
         pageCount: indices.length,
         inView: inView >= 0 ? inView : null,
         texts
       })
       if (decision.kind === 'candidate') openGate(src)
-      else ls.so.gate = 'closed'
+      else if (decision.kind === 'not-candidate') so.gate = 'closed'
+      else restart()
     } finally {
       stage0Running = false
       runStage0Soon()
@@ -773,7 +867,8 @@ export function createOcrStore(opts: OcrStoreOptions): OcrStore {
     const info = keyInfo.get(key)
     if (!info) return
     const ls = live.get(info.src)
-    if (!ls) return
+    // An imported image has no Stage 0: D4 or a request sends it, never its (empty) native text.
+    if (!ls || ls.origin === 'image') return
     const gate = ls.so.gate
     if (gate === 'open' || gate === 'refused') return
     if (isCandidatePage(pt)) openGate(info.src)
@@ -782,13 +877,14 @@ export function createOcrStore(opts: OcrStoreOptions): OcrStore {
   function openGate(src: string): void {
     const ls = live.get(src)
     if (!ls || ls.so.gate === 'open' || ls.so.gate === 'refused') return
-    ls.so.gate = 'open'
+    const so = ls.so
+    so.gate = 'open'
     changed()
     pump()
     void settingsReady.then(() => {
-      if (disposed || !live.has(src) || ls.so.autoDone) return
-      if (!currentSettings['ocr.autoRecognizeOpened']) return
-      ls.so.autoDone = true
+      if (disposed || !live.has(src) || so.autoDone) return
+      if (!autoSetting(src)) return
+      so.autoDone = true
       startBatch('auto', livePageKeysOf(src), currentSettings['ocr.languages'], false)
     })
   }
@@ -814,6 +910,7 @@ export function createOcrStore(opts: OcrStoreOptions): OcrStore {
       skipped: 0,
       failed: 0,
       cancelled: 0,
+      dropped: 0,
       startedAt: now(),
       lastFinishAt: now(),
       ewma: null,
@@ -826,19 +923,44 @@ export function createOcrStore(opts: OcrStoreOptions): OcrStore {
       const ls = live.get(info.src)
       if (!ls) continue
       const id = workId(info.src, info.index, config.hash)
-      if (seen.has(id) || works.has(id)) continue
+      if (seen.has(id)) continue
       seen.add(id)
       const r = rec(ls.so, info.index)
       if (r.results.has(config.hash)) continue // already recognised with this config
+      if (ls.so.gate === 'refused') {
+        // The coordinator refused the whole source (too large, unreadable): nothing will be sent,
+        // so the page fails now, with the refusal's reason, instead of waiting forever.
+        r.last = { ...(ls.so.refusal ?? { status: 'failed', reason: 'render' }) }
+        b.failed++
+        continue
+      }
       if (r.crashes >= 2) {
         // §3.3.2: a page implicated in two crashes is failed and not retried.
         if (explicit) b.failed++
         continue
       }
-      const w: Work = { id, src: info.src, index: info.index, batch: b, state: 'triage', explicit }
+      const existing = works.get(id)
+      if (existing) {
+        // The same page and config is already out: follow it rather than report an empty request.
+        if (explicit) existing.explicit = true
+        b.works.add(existing)
+        if (existing.state === 'held') adopt(existing, b, r)
+        else existing.watchers.add(b)
+        continue
+      }
+      const w: Work = {
+        id,
+        src: info.src,
+        so: ls.so,
+        index: info.index,
+        batch: b,
+        watchers: new Set(),
+        state: 'triage',
+        explicit
+      }
       works.set(id, w)
       b.works.add(w)
-      if (ls.so.gate !== 'open' && ls.so.gate !== 'refused') ls.so.gate = 'open'
+      ls.so.gate = 'open'
       void unitFor(info.src, info.index)
       // Triage already answered for this page (this session or an earlier one): decide now.
       if (r.triage) decide(w, r)
@@ -850,12 +972,27 @@ export function createOcrStore(opts: OcrStoreOptions): OcrStore {
     return b.id
   }
 
+  /**
+   * A new request takes over a page a crash holds for Resume (asking again is resuming it): the
+   * crashed batch lets it go (counted as cancelled there), and it is decided again for `b`.
+   */
+  function adopt(w: Work, b: Batch, r: PageRec): void {
+    const old = w.batch
+    old.works.delete(w)
+    old.cancelled++
+    if (old.works.size === 0 && old.state === 'crashed') old.state = 'stopped'
+    w.watchers.delete(b)
+    w.batch = b
+    w.state = 'triage'
+    if (r.triage) decide(w, r)
+  }
+
   /** What triage's verdict means for `w` (§3.4.1 table): recognise, or skip with a reason. */
   function decide(w: Work, r: PageRec): void {
     const t = r.triage!
     const cls = t.pageClass
     if (cls === 'protected') return skipWork(w, r, 'protected', 'skipped-protected')
-    if (w.batch.kind === 'replace') {
+    if (holders(w).some((b) => b.kind === 'replace')) {
       w.state = 'ready'
       return
     }
@@ -888,24 +1025,33 @@ export function createOcrStore(opts: OcrStoreOptions): OcrStore {
     finishWork(w, w.explicit || skip === 'protected' ? 'skipped' : null)
   }
 
-  /** Take `w` off the books, counted as `outcome` (null: not counted at all). */
+  /** The batches a work counts for: its owner, then the requests following it. */
+  const holders = (w: Work): Batch[] => [w.batch, ...w.watchers]
+
+  /** Take `w` off the books, counted as `outcome` (null: not counted at all) in every holder. */
   function finishWork(w: Work, outcome: 'recognized' | 'skipped' | 'failed' | null): void {
     if (works.get(w.id) !== w) return
     works.delete(w.id)
-    const b = w.batch
-    b.works.delete(w)
     if (w.job) w.job.pages.delete(w.index)
-    if (outcome) {
-      b[outcome]++
-      if (outcome !== 'skipped') {
-        const t = now()
-        const interval = t - b.lastFinishAt
-        b.lastFinishAt = t
-        b.ewma = b.ewma === null ? interval : 0.3 * interval + 0.7 * b.ewma
-        b.samples++
+    for (const b of holders(w)) {
+      b.works.delete(w)
+      if (outcome) {
+        b[outcome]++
+        if (outcome !== 'skipped') {
+          const t = now()
+          const interval = t - b.lastFinishAt
+          b.lastFinishAt = t
+          b.ewma = b.ewma === null ? interval : 0.3 * interval + 0.7 * b.ewma
+          b.samples++
+        }
+      }
+      if (b.works.size === 0 && (b.state === 'running' || b.state === 'crashed')) {
+        // A request whose every page left the collection before it finished did not complete:
+        // 'stopped', not 'done' (a toast must not say "recognised" for it).
+        const finished = b.recognized + b.skipped + b.failed
+        b.state = finished === 0 && b.dropped > 0 ? 'stopped' : 'done'
       }
     }
-    if (b.works.size === 0 && (b.state === 'running' || b.state === 'crashed')) b.state = 'done'
     changed()
   }
 
@@ -1200,10 +1346,23 @@ export function createOcrStore(opts: OcrStoreOptions): OcrStore {
       if (ls) ls.so.triageCrashes++
     }
     triaging.clear()
-    for (const b of hit) {
-      for (const w of b.works) if (w.state !== 'held') w.state = 'held'
-      if (b.works.size > 0) b.state = 'crashed'
+    // Every unfinished page of an affected batch is held, and so is every request following one of
+    // those pages (otherwise it would stay 'running' on work nobody runs until a Resume it never
+    // gets offered).
+    const todo = [...hit]
+    while (todo.length > 0) {
+      const b = todo.pop()!
+      for (const w of b.works) {
+        if (w.state !== 'held') w.state = 'held'
+        for (const o of holders(w))
+          if (!hit.has(o)) {
+            hit.add(o)
+            todo.push(o)
+          }
+      }
     }
+    for (const b of hit)
+      if (b.works.size > 0 && (b.state === 'running' || b.state === 'crashed')) b.state = 'crashed'
     changed()
   }
 
@@ -1239,7 +1398,13 @@ export function createOcrStore(opts: OcrStoreOptions): OcrStore {
       if (page.status === 'skipped-protected') r.skip = 'protected'
       if (page.recognition && RECOGNISED.has(page.status)) {
         r.results.set(j.batch.config.hash, page.recognition)
-        if (j.batch.kind !== 'replace') r.auto = j.batch.config.hash
+        // A Replace's text is only ever its choice (undo brings the automatic text back), unless a
+        // plain request asked for the same page and config too.
+        const asked = w ? holders(w) : [j.batch]
+        if (asked.some((b) => b.kind !== 'replace')) {
+          r.auto = j.batch.config.hash
+          r.autoExplicit = !!w?.explicit && asked.some((b) => b.kind === 'user')
+        }
       }
     }
     if (w) {
@@ -1308,6 +1473,7 @@ export function createOcrStore(opts: OcrStoreOptions): OcrStore {
       ls.so.gate = 'refused'
       const reason: PageReason = e.code === 'too-large' ? 'source-too-large' : 'render'
       const status: OcrStatus = e.code === 'too-large' ? 'too-large' : 'failed'
+      ls.so.refusal = { status, reason }
       for (const j of [...jobs.values()]) if (j.src === src) jobs.delete(j.id)
       for (const w of [...works.values()]) {
         if (w.src !== src) continue
@@ -1328,15 +1494,39 @@ export function createOcrStore(opts: OcrStoreOptions): OcrStore {
 
   function cancelBatch(b: Batch): void {
     if (b.state !== 'running' && b.state !== 'crashed') return
+    let requeued = false
     for (const j of [...jobs.values()]) {
       if (j.batch !== b) continue
       jobs.delete(j.id)
       if (j.session === postSession()) post({ cancel: j.id })
+      // Pages another request still follows go out again under it (see below).
+      for (const w of j.pages.values()) {
+        w.job = undefined
+        if (w.state === 'sent') w.state = 'ready'
+      }
     }
-    b.cancelled += b.works.size
-    for (const w of [...b.works]) finishWork(w, null)
+    for (const w of [...b.works]) {
+      b.cancelled++
+      if (w.batch !== b) {
+        // b only followed this page: the request that owns it carries on.
+        w.watchers.delete(b)
+        b.works.delete(w)
+        continue
+      }
+      const heir = w.watchers.values().next().value
+      if (heir) {
+        // Another request asked for this page too: it is not stopped for that one.
+        w.watchers.delete(heir)
+        w.batch = heir
+        b.works.delete(w)
+        requeued = true
+        continue
+      }
+      finishWork(w, null)
+    }
     b.state = 'stopped'
     changed()
+    if (requeued) pump()
   }
 
   function resumeBatch(b: Batch): void {
@@ -1369,9 +1559,11 @@ export function createOcrStore(opts: OcrStoreOptions): OcrStore {
     let pending = 0
     const touched = new Set<Batch>()
     for (const w of works.values()) {
-      if (!srcs.has(w.src) || w.state === 'held' || w.batch.state !== 'running') continue
+      if (!srcs.has(w.src) || w.state === 'held') continue
+      const running = holders(w).filter((b) => b.state === 'running')
+      if (running.length === 0) continue
       pending++
-      touched.add(w.batch)
+      for (const b of running) touched.add(b)
     }
     let done = 0
     let total = 0
@@ -1418,7 +1610,8 @@ export function createOcrStore(opts: OcrStoreOptions): OcrStore {
     // The batches this wait is for: if one of them ends crashed or stopped, the export would lack
     // pages the user chose to wait for, so that is asked again rather than exported silently.
     const waitedOn = new Set<Batch>()
-    for (const w of works.values()) if (w.batch.state === 'running') waitedOn.add(w.batch)
+    for (const w of works.values())
+      for (const b of holders(w)) if (b.state === 'running') waitedOn.add(b)
     return new Promise((resolve) => {
       let finished = false
       const finish = (r: 'done' | 'now' | 'cancel' | 'stopped'): void => {
@@ -1434,8 +1627,12 @@ export function createOcrStore(opts: OcrStoreOptions): OcrStore {
         if (finished) return
         const p = pendingFor(liveDocs)
         if (p.pending === 0) {
-          // Stopped or crashed with pages left: say so instead of exporting without them.
-          const stopped = [...waitedOn].some((b) => b.state === 'crashed' || b.state === 'stopped')
+          // Stopped or crashed with pages left: say so instead of exporting without them. (A request
+          // whose pages all left the collection is 'stopped' with nothing cancelled: nothing the
+          // export could include is missing.)
+          const stopped = [...waitedOn].some(
+            (b) => b.state === 'crashed' || (b.state === 'stopped' && b.cancelled > 0)
+          )
           finish(stopped ? 'stopped' : 'done')
           return
         }
@@ -1501,11 +1698,10 @@ export function createOcrStore(opts: OcrStoreOptions): OcrStore {
         const r = so?.pages.get(p.pageIndex)
         if (!r || r.results.size === 0) continue
         const key = makePageKey(p.source.id, p.pageIndex)
-        const cls = r.triage?.pageClass ?? null
-        // auto only for scanned / near-scanned pages (and imported images triage could not read):
+        // auto only for scanned / near-scanned pages (and pages triage could not read that came
+        // from an imported image or were asked for by name: `autoCounts`, the rule Find uses):
         // an `ocr-ours` page keeps its own layer unless the user chose Replace or Remove.
-        const auto =
-          SCANS.has(cls) || (cls === null && p.source.origin === 'image') ? r.auto : undefined
+        const auto = autoCounts(r, p.source.origin === 'image') ? r.auto : undefined
         pages.set(key, { results: r.results, auto })
       }
     return applyOcrSelections(pages, editLayer.ocrSelect)

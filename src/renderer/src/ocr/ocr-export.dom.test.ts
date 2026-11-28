@@ -160,6 +160,28 @@ describe('export while recognition runs (real store)', () => {
     expect(container.querySelector('[role="status"]')).toBeNull()
   })
 
+  it('turning "Include recognized text" off while waiting: the export bakes none', async () => {
+    const api = await mount([])
+    let done: Promise<void> = Promise.resolve()
+    await act(async () => {
+      done = api.exportCollection('pdf')
+    })
+    await tick()
+    await act(async () => button('Wait and export')!.click())
+    await tick()
+    // The waiting card is non-modal: the menu stays usable and the user switches the setting off.
+    await act(async () => store.setSettings({ 'ocr.includeInExports': false }))
+    await act(async () => {
+      answer(0, 'first')
+      answer(1, 'second')
+      await done
+    })
+    expect(store.settings()['ocr.includeInExports']).toBe(false)
+    const built = vi.mocked(buildPdf).mock.calls[0][1]!
+    expect(built.ocr).toBeUndefined()
+    expect(built.ocrPassthrough).toBe('drop')
+  })
+
   it('Export now: the pages still running are left out', async () => {
     const api = await mount([])
     await act(async () => answer(0, 'ready'))

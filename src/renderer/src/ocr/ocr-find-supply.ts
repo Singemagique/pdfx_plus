@@ -11,6 +11,12 @@
 //   `replace` with triage's visible native words plus the new words, if any. The redaction pass
 //   removes such a page's WHOLE own layer (redact-export.ts `dropOcrText`), so Find must not keep
 //   finding it;
+// - a page with a redaction whose class triage has not given yet (a reopened PDFx export is never
+//   sent by Stage 0: its own layer reads as text): the store is asked to triage it (`prepare`),
+//   and until it answers its native text is held out of Find and Copy (`replace` with no native
+//   words), since the export may drop that text as a PDFx OCR layer. Triage then decides as above.
+//   The same hold stands when triage cannot answer at all (OCR unavailable, the source refused):
+//   fail-safe;
 // - otherwise nothing.
 // A key that leaves the collection loses its supplement in the engine's reconcile; it is supplied
 // again (with its viewport transform) when it comes back. `setSupplement` says whether the engine
@@ -22,9 +28,12 @@
 // does): so on every page with recognised words and a redaction, the export's own pass
 // (redact-export.ts `buildRedactedSources({ report: true })`) runs in the background, debounced,
 // and its removed-object report filters the words through ocr-export.ts `redactOcrPage`, the very
-// function the export uses. FAIL-SAFE: until the report for the page's current redactions is in,
-// or when the pass fails or reports nothing for the page, the page's recognised words are left out
-// of Find altogether.
+// function the export uses. The pass runs, as in the export, on EVERY redacted page of the source
+// (a pixel swap that fails on one page makes the export remove every covered image of the source
+// whole), and a report stands for the redactions of the whole source it was computed for: a
+// redaction added, moved or removed anywhere on the source sends its pages back to pending.
+// FAIL-SAFE: until the report for the source's current redactions is in, or when the pass fails or
+// reports nothing for the page, the page's recognised words are left out of Find altogether.
 
 import type { Overlay } from '../edit/model'
 import type { EditLayer } from '../pdfx/build'
@@ -75,6 +84,9 @@ const redactionsOf = (overlays: readonly Overlay[] | undefined): Overlay[] =>
 const redactionSig = (reds: readonly Overlay[]): string =>
   JSON.stringify(reds.map((o) => [o.id, o.geom.x, o.geom.y, o.geom.w, o.geom.h, o.geom.rotation]))
 
+/** The native words of a page held back (one identity, so an unchanged hold is not re-sent). */
+const NO_WORDS: readonly never[] = []
+
 interface Supplied {
   mode: 'append' | 'replace'
   page: PackedOcrPage | null
@@ -104,6 +116,28 @@ export function createOcrFindSupply(opts: OcrFindSupplyOptions): OcrFindSupply {
   let disposed = false
   let syncQueued = false
 
+  /**
+   * The redactions of every live page of one source (by source id: what one redaction pass sees),
+   * as a comparable string: the key a removal report is valid for.
+   */
+  function sourceSig(sourceId: string): string {
+    const parts: string[] = []
+    for (const [k, p] of pages) {
+      if (p.source.id !== sourceId) continue
+      const reds = redactionsOf(editLayer.overlays.get(k))
+      if (reds.length) parts.push(`${k}:${redactionSig(reds)}`)
+    }
+    return parts.sort().join('|')
+  }
+
+  const sigOf = (key: string): string => {
+    const p = pages.get(key)
+    return p ? sourceSig(p.source.id) : ''
+  }
+
+  /** Keys asked for triage because a redaction landed on them before their class was known. */
+  const prepared = new Set<string>()
+
   /** The page's words after the rules, and whether its own layer is replaced (see the header). */
   function effective(key: string): {
     page: PackedOcrPage | null
@@ -111,28 +145,39 @@ export function createOcrFindSupply(opts: OcrFindSupplyOptions): OcrFindSupply {
     native?: readonly { t: string; x0: number; y0: number; x1: number; y1: number }[]
   } | null {
     const sup = store.pageSupply(key)
-    if (!sup) return null
     const reds = redactionsOf(editLayer.overlays.get(key))
-    const replaceNative = sup.pageClass === 'ocr-ours' && (sup.dropsOwnLayer || reds.length > 0)
+    // A redacted page whose class is not known yet may carry a PDFx OCR layer that the export
+    // drops whole: hold its native text back until triage says (see the header).
+    const unknown = reds.length > 0 && (!sup || (!sup.triaged && !sup.imageOrigin))
+    if (unknown) {
+      if (sup && !prepared.has(key)) {
+        prepared.add(key)
+        store.prepare([key])
+      }
+      if (!sup) return { page: null, replaceNative: true, native: NO_WORDS }
+    }
+    if (!sup) return null
+    const replaceNative =
+      unknown || (sup.pageClass === 'ocr-ours' && (sup.dropsOwnLayer || reds.length > 0))
     let page: PackedOcrPage | null = sup.page ?? null
     if (page && reds.length > 0) {
       const pred = predictions.get(key)
       page =
-        pred && pred.sig === redactionSig(reds) && pred.gone
+        pred && pred.sig === sigOf(key) && pred.gone
           ? redactOcrPage(page, editLayer, key, new Map([[key, pred.gone]]))
           : null
     } else if (page) page = redactOcrPage(page, editLayer, key, undefined)
-    return { page, replaceNative, native: sup.nativeWords }
+    return { page, replaceNative, native: unknown ? NO_WORDS : sup.nativeWords }
   }
 
-  /** Pages whose recognised words wait for a removal report of their current redactions. */
+  /** Pages whose recognised words wait for a removal report of their source's redactions. */
   function needsPrediction(key: string): boolean {
     const sup = store.pageSupply(key)
     if (!sup?.page) return false
     const reds = redactionsOf(editLayer.overlays.get(key))
     if (reds.length === 0) return false
     const pred = predictions.get(key)
-    return !pred || pred.sig !== redactionSig(reds)
+    return !pred || pred.sig !== sigOf(key)
   }
 
   function syncKey(key: string): void {
@@ -222,16 +267,22 @@ export function createOcrFindSupply(opts: OcrFindSupplyOptions): OcrFindSupply {
       rerun = true
       return predicting
     }
-    const keys = [...pages.keys()].filter(needsPrediction)
-    if (keys.length === 0) return Promise.resolve()
-    const sigs = new Map(
-      keys.map((k) => [k, redactionSig(redactionsOf(editLayer.overlays.get(k)))])
+    const wanted = [...pages.keys()].filter(needsPrediction)
+    if (wanted.length === 0) return Promise.resolve()
+    // The pass over every redacted page of each source involved, as the export runs it: one
+    // page's failed pixel swap changes what is removed on the others.
+    const srcIds = new Set(wanted.map((k) => pages.get(k)!.source.id))
+    const keys = [...pages.keys()].filter(
+      (k) =>
+        srcIds.has(pages.get(k)!.source.id) && redactionsOf(editLayer.overlays.get(k)).length > 0
     )
+    const sigs = new Map([...srcIds].map((id) => [id, sourceSig(id)]))
     const layer: EditLayer = {
       ...editLayer,
       overlays: new Map(keys.map((k) => [k, editLayer.overlays.get(k) ?? []]))
     }
     const forDocs = [...docs]
+    const forPages = pages
     predicting = (async () => {
       let report: RemovedReport | null = null
       try {
@@ -240,7 +291,10 @@ export function createOcrFindSupply(opts: OcrFindSupplyOptions): OcrFindSupply {
         console.warn('ocr: could not predict what the redaction pass removes', err)
       }
       if (disposed) return
-      for (const [key, sig] of sigs) predictions.set(key, { sig, gone: report?.get(key) ?? null })
+      for (const key of keys) {
+        const sig = sigs.get(forPages.get(key)!.source.id)!
+        predictions.set(key, { sig, gone: report?.get(key) ?? null })
+      }
       for (const key of keys) syncKey(key)
     })().finally(() => {
       predicting = null

@@ -90,13 +90,17 @@ export function useExport(
         flash('Nothing to export')
         return
       }
-      // D7: the persistent "Include Recognized Text When Exporting" setting, read once per export.
-      const includeOcr = ocr.includeInExports()
-      // BEFORE the save dialog and before busy: a mid-job prompt is answered first, and waiting
-      // shows the OCR pill, never the App busy overlay. Cancel leaves everything untouched.
-      if (includeOcr && !(await ocr.flushOrConfirm(latest.current.docs))) return
+      // D7: the persistent "Include Recognized Text When Exporting" setting. With it on, the
+      // mid-job prompt comes BEFORE the save dialog and before busy: it is answered first, and
+      // waiting shows the OCR pill, never the App busy overlay. Cancel leaves everything untouched.
+      const askedOcr = ocr.includeInExports()
+      if (askedOcr && !(await ocr.flushOrConfirm(latest.current.docs))) return
       const path = await window.api.chooseSavePath(defaultName, filter)
       if (!path) return
+      // Read again after the waits: the setting can be switched off while "Wait and export"
+      // waits (the card is non-modal), and machine text the user just turned off must not be
+      // baked. Never switched ON here: a layer is only baked after its mid-job prompt was answered.
+      const includeOcr = askedOcr && ocr.includeInExports()
       setBusy(true)
       try {
         // What the collection is NOW, after every wait above (edits made meanwhile included).
