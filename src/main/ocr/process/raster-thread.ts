@@ -7,6 +7,7 @@ import { tripwireCount, tripwireSelfCheck } from './no-network'
 import { parentPort } from 'node:worker_threads'
 import { init } from '@embedpdf/pdfium'
 import { RasterEngine, makePrintErr, type PdfiumRaster } from './raster-core'
+import type { PdfiumTriage } from './triage-pdfium'
 import type { FromRaster, ToRaster } from './thread-messages'
 
 const port = parentPort
@@ -43,9 +44,10 @@ async function start(msg: Extract<ToRaster, { type: 'init' }>): Promise<void> {
     print: () => {},
     // Captured, never silenced: "Cannot enlarge memory" during a render is the silent-blank signal.
     printErr: makePrintErr(() => pending, lines)
-  } as unknown as Parameters<typeof init>[0])) as unknown as PdfiumRaster & {
-    PDFiumExt_Init(): void
-  }
+  } as unknown as Parameters<typeof init>[0])) as unknown as PdfiumRaster &
+    PdfiumTriage & {
+      PDFiumExt_Init(): void
+    }
   mod.PDFiumExt_Init()
   pending = new RasterEngine(mod, msg.limits)
   for (const l of lines) pending.noteStderr(l)
@@ -62,16 +64,16 @@ function handle(msg: ToRaster): void {
     return
   }
   if (poisoned || !engine) {
-    if (msg.type === 'render' || msg.type === 'open')
+    if (msg.type === 'render' || msg.type === 'open' || msg.type === 'triage')
       post({
         type: 'fatal',
-        taskId: msg.type === 'render' ? msg.taskId : null,
+        taskId: msg.type === 'open' ? null : msg.taskId,
         error: poisoned ? 'raster module poisoned' : 'raster not initialised',
         tripwire: tripwireCount()
       })
     return
   }
-  const taskId = msg.type === 'render' ? msg.taskId : null
+  const taskId = msg.type === 'render' || msg.type === 'triage' ? msg.taskId : null
   try {
     if (msg.type === 'open') {
       engine.attach(msg.src, new Uint8Array(msg.data))
@@ -88,6 +90,23 @@ function handle(msg: ToRaster): void {
         })
     } else if (msg.type === 'close') {
       engine.close(msg.src)
+    } else if (msg.type === 'triage') {
+      const out = engine.triage(msg.src, msg.pages)
+      if (Array.isArray(out))
+        post({
+          type: 'triaged',
+          taskId: msg.taskId,
+          pages: out,
+          heap: engine.heapBytes(),
+          tripwire: tripwireCount()
+        })
+      else
+        post({
+          type: 'triage-failed',
+          taskId: msg.taskId,
+          pdfiumError: out.pdfiumError,
+          tripwire: tripwireCount()
+        })
     } else if (msg.type === 'render') {
       const out = engine.render(msg)
       const heap = engine.heapBytes()

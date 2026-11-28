@@ -23,6 +23,9 @@
 //         behind a failure carries on.
 // §3.3.5  Progress ≤ 10 Hz per job; activity (busy, done, total) to main for the power blocker.
 // §3.3.6  Work order: the focused page, then the rest of its source, then the other jobs in order.
+// §3.4.1  Triage requests go to the raster thread in chunks of TRIAGE_CHUNK pages, one PDFium task
+//         at a time with the renders. A chunk that kills the thread is retried one page at a
+//         time; a page that kills it twice is reported with `failure: 'raster-crash'`.
 
 import {
   ELECTRON_NET_MEMBERS,
@@ -49,6 +52,7 @@ import {
 } from './budget'
 import { fitRaster } from './raster-core'
 import type { FromRaster, FromRecognize, ToRaster, ToRecognize } from './thread-messages'
+import type { TriagePage } from '../../../shared/ocr/triage'
 
 // ---------------------------------------------------------------------------------------------
 // Injected surfaces (structural, so Node's Worker and Electron's MessagePortMain both fit).
@@ -142,6 +146,22 @@ interface Source {
   lastUse: number
   /** The renderer is still waiting for `opened`. */
   countPending: boolean
+  /** From the raster thread's `opened` (a triage of every page needs it). */
+  pageCount: number | null
+}
+
+/** A renderer `triage` request (§3.4.1). */
+interface TriageTask {
+  id: number
+  src: string
+  /** Pages still to triage, in request order; null until the page count is known (all pages). */
+  pending: number[] | null
+  /** The chunk at the raster thread (a prefix of `pending`), or null. */
+  chunk: number[] | null
+  /** Pages that go one per message: they were in a chunk that killed the thread. */
+  solo: Set<number>
+  /** Thread deaths charged to a page sent alone. */
+  failures: Map<number, number>
 }
 
 interface Slot<M> {
@@ -162,7 +182,9 @@ interface RasterSlot extends Slot<ToRaster> {
    * `count: true` (the only opens that call into PDFium). The thread handles messages one at a time
    * in order, so when it traps, dies or hangs, the head of this list is what it was doing.
    */
-  inflight: Array<{ open: string } | { render: number }>
+  inflight: Array<{ open: string } | { render: number } | { triage: number }>
+  /** The triage task whose chunk the thread is working on (never together with `task`). */
+  triage: TriageTask | null
 }
 
 interface RecognizeSlot extends Slot<ToRecognize> {
@@ -174,6 +196,10 @@ interface RecognizeSlot extends Slot<ToRecognize> {
 }
 
 const DEFAULT_RENDER_DPI = 300
+/** Pages per triage message (PDFium triage takes milliseconds per page). */
+export const TRIAGE_CHUNK = 32
+/** A triage chunk that takes longer than this is treated like a hung render. */
+export const triageWatchdogMs = (pages: number): number => 15_000 + 1_000 * pages
 /** Consecutive threads of one kind that may die before ever reporting ready. */
 const MAX_START_FAILURES = 3
 /**
@@ -228,6 +254,7 @@ export class Coordinator {
   private readonly sources = new Map<string, Source>()
   private readonly jobs = new Map<string, Job>()
   private readonly tasks = new Set<Task>()
+  private readonly triages: TriageTask[] = []
   private focus: { src: string; index: number } | null = null
   private jobSeq = 0
   private taskSeq = 0
@@ -403,10 +430,7 @@ export class Coordinator {
       return
     }
     if ('open' in msg) this.open(msg.open.src, msg.open.bytes)
-    else if ('triage' in msg)
-      this.toRenderer({
-        error: { code: 'unsupported', message: 'triage lands in PR4b', src: msg.triage.src }
-      })
+    else if ('triage' in msg) this.triage(msg.triage.src, msg.triage.pages)
     else if ('recognize' in msg) this.recognize(msg.recognize)
     else if ('cancel' in msg) this.cancelJob(msg.cancel, true)
     else if ('close' in msg) this.closeSource(msg.close)
@@ -442,7 +466,8 @@ export class Coordinator {
       sab,
       bytes: bytes.byteLength,
       lastUse: Date.now(),
-      countPending: true
+      countPending: true,
+      pageCount: null
     }
     this.sources.set(src, source)
     this.evictOverBudget(src)
@@ -459,6 +484,7 @@ export class Coordinator {
     if (total <= this.b.sourceBudget) return
     const busy = new Set<string>()
     for (const j of this.jobs.values()) busy.add(j.src)
+    for (const t of this.triages) busy.add(t.src)
     const victims = [...this.sources.values()]
       .filter((s) => s.src !== keep && !busy.has(s.src))
       .sort((a, b) => a.lastUse - b.lastUse)
@@ -472,6 +498,9 @@ export class Coordinator {
 
   private dropSource(src: string): void {
     this.sources.delete(src)
+    // Its triage requests end with it (a chunk in flight is dropped when it answers).
+    for (let i = this.triages.length - 1; i >= 0; i--)
+      if (this.triages[i].src === src) this.triages.splice(i, 1)
     if (this.raster) this.sendRaster(this.raster, { type: 'close', src })
     if (this.focus?.src === src) this.focus = null
   }
@@ -486,6 +515,124 @@ export class Coordinator {
     for (const id of [...this.jobs.keys()]) this.cancelJob(id, false)
     for (const src of [...this.sources.keys()]) this.dropSource(src)
     this.focus = null
+  }
+
+  // -------------------------------------------------------------------------------------------
+  // Triage (§3.4.1).
+
+  private triage(src: string, pages: number[] | undefined): void {
+    const source = this.sources.get(src)
+    if (!source) {
+      this.toRenderer({ error: { code: 'not-open', message: 'source not open', src } })
+      return
+    }
+    source.lastUse = Date.now()
+    if (pages && pages.length === 0) {
+      this.toRenderer({ triaged: { src, pages: [], done: true } })
+      return
+    }
+    this.triages.push({
+      id: ++this.taskSeq,
+      src,
+      pending: pages
+        ? [...pages]
+        : source.pageCount === null
+          ? null
+          : Array.from({ length: source.pageCount }, (_, i) => i),
+      chunk: null,
+      solo: new Set(),
+      failures: new Map()
+    })
+    if (source.pageCount === 0 && !pages) this.finishEmptyTriages(src)
+    this.pump()
+  }
+
+  /** A whole-document triage of a source with no pages answers at once. */
+  private finishEmptyTriages(src: string): void {
+    for (let i = this.triages.length - 1; i >= 0; i--) {
+      const t = this.triages[i]
+      if (t.src !== src || !t.pending || t.pending.length > 0 || t.chunk) continue
+      this.triages.splice(i, 1)
+      this.toRenderer({ triaged: { src, pages: [], done: true } })
+    }
+  }
+
+  private startTriage(r: RasterSlot, task: TriageTask): void {
+    const pending = task.pending!
+    const chunk: number[] = []
+    if (task.solo.has(pending[0])) chunk.push(pending[0])
+    else
+      for (const p of pending) {
+        if (chunk.length >= TRIAGE_CHUNK || task.solo.has(p)) break
+        chunk.push(p)
+      }
+    const source = this.sources.get(task.src)
+    if (source) source.lastUse = Date.now()
+    task.chunk = chunk
+    r.triage = task
+    r.lastSrc = task.src
+    r.watchdog = setTimeout(
+      () => this.guard(() => this.onRasterHang(r)),
+      triageWatchdogMs(chunk.length)
+    )
+    this.sendRaster(r, { type: 'triage', taskId: task.id, src: task.src, pages: chunk })
+  }
+
+  /** The thread answered (or died on) `slot.triage`'s chunk: take it off the slot. */
+  private takeTriage(slot: RasterSlot, taskId: number): TriageTask | null {
+    const task = slot.triage
+    if (!task || task.id !== taskId) return null
+    if (slot.watchdog) clearTimeout(slot.watchdog)
+    slot.watchdog = null
+    slot.triage = null
+    // Closed while triaging: its answer is dropped.
+    return this.triages.includes(task) ? task : null
+  }
+
+  /** Forward a chunk's (or a page's) results; the request ends with its last page. */
+  private triageAnswered(task: TriageTask, answered: number[], pages: TriagePage[]): void {
+    const pending = task.pending!
+    const done = new Set(answered)
+    task.pending = pending.filter((p) => !done.has(p))
+    const finished = task.pending.length === 0
+    if (finished) this.triages.splice(this.triages.indexOf(task), 1)
+    this.toRenderer({ triaged: { src: task.src, pages, done: finished } })
+  }
+
+  /**
+   * The raster thread died, trapped or hung on a triage chunk. A chunk of several pages cannot say
+   * which page did it, so its pages go again one at a time, uncharged; a page that kills the thread
+   * twice on its own is reported as failed and skipped (§3.3.4's page rule).
+   */
+  private triageCrashed(slot: RasterSlot, taskId: number): void {
+    const task = this.takeTriage(slot, taskId)
+    const chunk = task?.chunk
+    if (!task || !chunk) return
+    task.chunk = null
+    if (chunk.length > 1) {
+      for (const p of chunk) task.solo.add(p)
+      return
+    }
+    const p = chunk[0]
+    const n = (task.failures.get(p) ?? 0) + 1
+    task.failures.set(p, n)
+    if (n < 2) return
+    this.triageAnswered(
+      task,
+      [p],
+      [
+        {
+          index: p,
+          pageClass: null,
+          failure: 'raster-crash',
+          renderDpi: null,
+          raster: null,
+          effectiveDpi: null,
+          bitsPerPixel: null,
+          imageOrigin: false
+        }
+      ]
+    )
   }
 
   // -------------------------------------------------------------------------------------------
@@ -658,9 +805,14 @@ export class Coordinator {
       if (t.state === 'rendered') waiting++
       else if (t.state === 'queued') queued++
     }
+    const triage = this.triages.find((t) => t.pending && t.pending.length > 0 && !t.chunk)
+    if (triage && this.pdfiumModule) {
+      const r = this.ensureRaster()
+      if (r.ready && !r.task && !r.triage) this.startTriage(r, triage)
+    }
     if (queued > 0 && waiting < n + 1 && this.pdfiumModule) {
       const r = this.ensureRaster()
-      if (r.ready && !r.task) {
+      if (r.ready && !r.task && !r.triage) {
         const t = this.pick('queued')
         if (t) {
           if (r.lastSrc !== null && r.lastSrc !== t.job.src && r.heap > this.b.rasterRecycleHeap) {
@@ -713,7 +865,8 @@ export class Coordinator {
       watchdog: null,
       heap: 0,
       lastSrc: null,
-      inflight: []
+      inflight: [],
+      triage: null
     }
     this.raster = slot
     worker.on('message', (m) => this.guard(() => this.onRaster(slot, m as FromRaster)))
@@ -739,6 +892,7 @@ export class Coordinator {
     if (slot.dead) return
     if (msg.type === 'open' && msg.count) slot.inflight.push({ open: msg.src })
     else if (msg.type === 'render') slot.inflight.push({ render: msg.taskId })
+    else if (msg.type === 'triage') slot.inflight.push({ triage: msg.taskId })
     if (!slot.ready) slot.outbox.push({ msg })
     else slot.worker.postMessage(msg)
   }
@@ -799,10 +953,39 @@ export class Coordinator {
       case 'opened': {
         this.answered(slot, { open: m.src })
         const s = this.sources.get(m.src)
+        if (s) {
+          s.pageCount = m.pageCount
+          // Whole-document triages were waiting for the count.
+          for (const t of this.triages)
+            if (t.src === m.src && t.pending === null)
+              t.pending = Array.from({ length: m.pageCount }, (_, i) => i)
+          this.finishEmptyTriages(m.src)
+        }
         if (s && s.countPending) {
           s.countPending = false
           this.toRenderer({ opened: { src: m.src, pageCount: m.pageCount } })
         }
+        break
+      }
+      case 'triaged': {
+        slot.heap = m.heap
+        this.answered(slot, { triage: m.taskId })
+        const task = this.takeTriage(slot, m.taskId)
+        const chunk = task?.chunk
+        if (task && chunk) {
+          task.chunk = null
+          this.triageAnswered(task, chunk, m.pages)
+        }
+        break
+      }
+      case 'triage-failed': {
+        this.answered(slot, { triage: m.taskId })
+        const task = this.takeTriage(slot, m.taskId)
+        if (task)
+          this.openFailed(
+            task.src,
+            m.pdfiumError === 4 ? 'password required' : 'PDFium could not open the file'
+          )
         break
       }
       case 'open-failed': {
@@ -854,11 +1037,16 @@ export class Coordinator {
     this.pump()
   }
 
-  private answered(slot: RasterSlot, work: { open: string } | { render: number }): void {
+  private answered(
+    slot: RasterSlot,
+    work: { open: string } | { render: number } | { triage: number }
+  ): void {
     const i = slot.inflight.findIndex((w) =>
       'open' in work
         ? 'open' in w && w.open === work.open
-        : 'render' in w && w.render === work.render
+        : 'render' in work
+          ? 'render' in w && w.render === work.render
+          : 'triage' in w && w.triage === work.triage
     )
     if (i >= 0) slot.inflight.splice(i, 1)
   }
@@ -871,10 +1059,18 @@ export class Coordinator {
    */
   private rasterCrashed(slot: RasterSlot, taskId: number | null): void {
     this.noteRasterFatal()
-    const head = taskId === null ? slot.inflight[0] : { render: taskId }
+    const head =
+      taskId === null
+        ? slot.inflight[0]
+        : (slot.inflight.find((w) => 'triage' in w && w.triage === taskId) ?? { render: taskId })
     if (head && 'open' in head) {
       this.retireRaster()
       this.openFailed(head.open, 'PDFium crashed opening the file')
+      return
+    }
+    if (head && 'triage' in head) {
+      this.triageCrashed(slot, head.triage)
+      this.retireRaster()
       return
     }
     const t = head ? this.takeRasterTask(slot, head.render) : null
@@ -949,6 +1145,9 @@ export class Coordinator {
     slot.watchdog = null
     if (slot.task && this.tasks.has(slot.task)) this.requeue(slot.task)
     slot.task = null
+    // A triage chunk the thread never answered goes again, uncharged.
+    if (slot.triage) slot.triage.chunk = null
+    slot.triage = null
     this.retiredTripwire.raster += slot.tripwire
     this.raster = null
     void slot.worker.terminate()
