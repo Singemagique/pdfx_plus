@@ -731,11 +731,9 @@ export class Coordinator {
       if (p.failure) v.failure = p.failure
       source.triaged.set(p.index, v)
     }
-    for (const t of [...this.tasks]) {
-      if (t.job.src !== src || (t.state !== 'queued' && t.state !== 'rendered')) continue
-      const refusal = this.triageRefusal(t)
-      if (refusal) this.finalize(t, refusal)
-    }
+    for (const t of [...this.tasks])
+      if (t.job.src === src && (t.state === 'queued' || t.state === 'rendered'))
+        this.refuseIfTriaged(t)
   }
 
   /**
@@ -751,6 +749,13 @@ export class Coordinator {
     if (v.refused) return { status: 'failed', reason: 'image-format', ...none }
     if (v.failure === 'too-large') return { status: 'too-large', reason: 'page-too-large', ...none }
     return null
+  }
+
+  /** Answer `t` with triage's refusal if triage refused its page; true if it did. */
+  private refuseIfTriaged(t: Task): boolean {
+    const refusal = this.triageRefusal(t)
+    if (refusal) this.finalize(t, refusal)
+    return refusal !== null
   }
 
   /**
@@ -853,9 +858,8 @@ export class Coordinator {
     })
     for (const t of [...job.tasks]) {
       // A page triage already refused is answered without a render or the engine.
-      const refusal = this.triageRefusal(t)
-      if (refusal) this.finalize(t, refusal)
-      else if (missing)
+      if (this.refuseIfTriaged(t)) continue
+      if (missing)
         this.finalize(t, {
           status: 'needs-language',
           renderDpi: null,
@@ -992,7 +996,9 @@ export class Coordinator {
     if (queued > 0 && waiting < n + 1 && this.pdfiumModule) {
       const r = this.ensureRaster()
       if (r.ready && !r.task && !r.triage) {
-        const t = this.pick('queued')
+        // The gate before PDFium: a page triage refused is never rendered, whatever re-queued it.
+        let t = this.pick('queued')
+        while (t && this.refuseIfTriaged(t)) t = this.pick('queued')
         if (t) {
           if (r.lastSrc !== null && r.lastSrc !== t.job.src && r.heap > this.b.rasterRecycleHeap) {
             // Between documents and the heap only grows: hand the memory back (§3.3.3).
@@ -1486,6 +1492,9 @@ export class Coordinator {
   private recognizeFailure(t: Task, oom: boolean): void {
     if (oom) this.localDivisor *= 2
     if (!this.tasks.has(t)) return
+    // Triage refused the page while it was at the thread: that is its answer, not a re-render
+    // (PDFium must never render a page whose image the JPX pre-check refused).
+    if (this.refuseIfTriaged(t)) return
     t.recognizeFailures++
     if (t.recognizeFailures >= 2) this.fail(t, 'failed', 'recognize-crash')
     else this.requeue(t) // the bitmap went with the thread: render again
@@ -1499,7 +1508,7 @@ export class Coordinator {
     const t = slot.task
     slot.task = null
     this.retireRecognizer(slot)
-    if (t) this.fail(t, 'timeout', 'watchdog')
+    if (t && !this.refuseIfTriaged(t)) this.fail(t, 'timeout', 'watchdog')
     this.pump()
   }
 

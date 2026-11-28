@@ -576,4 +576,65 @@ describe('triage results drive recognition', () => {
       recognition: null
     })
   })
+
+  it('never re-renders a page triage refused while its recognize thread died', async () => {
+    // The page is at the engine when triage refuses its JPX image; the thread then dies. A
+    // recognize failure re-queues the page for a fresh render, but PDFium must never render a
+    // page whose image the JPX pre-check refused: the refusal answers it instead.
+    let crash: (() => void) | null = null
+    let release: (() => void) | null = null
+    const { h, port } = await start({
+      recognize: (_msg, thread) => {
+        crash = () => thread.crash()
+        return 'hang'
+      },
+      rasterTriage: (msg, thread) => {
+        release = () => thread.reply(REFUSING!(msg, thread) as FromRaster)
+        return 'hang'
+      }
+    })
+    await open(port, 's1')
+    port.send(job('j1', [2]))
+    port.send({ triage: { src: 's1', pages: [2] } })
+    await settle(60)
+    expect(h.recognizers.flatMap((t) => t.jobs)).toHaveLength(1)
+    release!()
+    await settle(60)
+    crash!()
+    await settle(120)
+    expect(h.rasters.flatMap((t) => t.renders.map((m) => m.index))).toEqual([2])
+    expect(h.recognizers.flatMap((t) => t.jobs)).toHaveLength(1)
+    expect(resultsOf(port).get(2)).toMatchObject({
+      status: 'failed',
+      reason: 'image-format',
+      recognition: null
+    })
+    expect(port.of('jobDone')).toEqual([{ jobId: 'j1', done: 0, failed: 1, cancelled: false }])
+  })
+
+  it('answers the refusal, not a timeout, when the engine hangs on a page triage refused', async () => {
+    vi.useFakeTimers()
+    let release: (() => void) | null = null
+    const { h, port } = await start({
+      recognize: () => 'hang',
+      rasterTriage: (msg, thread) => {
+        release = () => thread.reply(REFUSING!(msg, thread) as FromRaster)
+        return 'hang'
+      }
+    })
+    await open(port, 's1')
+    port.send(job('j1', [1]))
+    port.send({ triage: { src: 's1', pages: [1] } })
+    await settle(60)
+    expect(h.recognizers.flatMap((t) => t.jobs)).toHaveLength(1)
+    release!()
+    await settle(60)
+    await vi.advanceTimersByTimeAsync(10 * 60_000)
+    await settle(60)
+    expect(resultsOf(port).get(1)).toMatchObject({
+      status: 'skipped-protected',
+      recognition: null
+    })
+    expect(h.rasters.flatMap((t) => t.renders.map((m) => m.index))).toEqual([1])
+  })
 })
