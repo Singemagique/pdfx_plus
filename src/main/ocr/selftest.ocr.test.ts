@@ -32,6 +32,7 @@ import { FakeParent, INIT } from './test-utils/fake-threads'
 import { RECORD } from './test-utils/ocr-cache'
 import { PDFIUM_WASM_PATH } from './test-utils/pdfium-node'
 import { portPair } from './test-utils/port-pair'
+import { xosDump } from './test-utils/xos-dump'
 
 const here = (p: string): string => fileURLToPath(new URL(p, import.meta.url))
 
@@ -145,6 +146,13 @@ describe('the packaged self-test session, real engine', () => {
     const [coordinatorEnd, mainEnd] = portPair()
     parent.send({ port: {} }, [coordinatorEnd])
     const report = await selftestSession(mainEnd, heartbeat)
+    xosDump('selftest', 'clean300', {
+      text: '',
+      boxes: [],
+      engine: [],
+      inputs: [],
+      meta: { triage: report.triage, page: report.page, jobDone: report.jobDone }
+    })
     expect(report.failures).toEqual([])
     expect(report.ok).toBe(true)
     // Triage ran first in the real raster thread and its class reached the packed page.

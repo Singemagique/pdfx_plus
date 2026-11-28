@@ -1,0 +1,196 @@
+name: OCR bench
+
+# Tier 2 of the OCR tests (DESIGN.md §3.9.3): too slow for every PR, so it runs nightly, on demand,
+# and on pull requests labelled `ocr`. It never gates a merge; a red run is a regression to look at.
+#
+# - sweep: seeds × presets × fonts through the whole pipeline, scored against the ground truth (and
+#   the committed real corpus once bench/ocr-real/ exists), compared with
+#   bench/ocr-real-baseline.json when that file exists (scores only, never data); the calibration
+#   determinism check (the committed table must refit byte for byte) and a refit report over the
+#   sweep's seeds.
+# - timing: the §3.9.4 time row's page (letter10pt) end to end at n = 1 and n = 2 on all three
+#   runners, blocking on Windows only (median ≤ 6 s), plus smallprint6pt (reported).
+# - scale: a 1,000-page synthetic scan through the real coordinator and threads (utility RSS
+#   ≤ 2.5 GB, renderer growth estimate ≤ 50 MB), and the 1.5 GiB sparse-file source (over the
+#   ceiling: `too-large`; at it: answered; no crash either way).
+#
+# Every job uploads its JSON results; they hold scores, timings and memory figures only.
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      seeds:
+        description: Sweep seeds (comma-separated)
+        default: '1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20'
+      presets:
+        description: Sweep presets (comma-separated; empty = every tier-1 pipeline preset)
+        default: ''
+      scale_pages:
+        description: Pages in the scale test
+        default: '1000'
+  pull_request:
+    types: [labeled, opened, reopened, synchronize]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ocr-bench-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SEEDS: ${{ inputs.seeds || '1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20' }}
+  PRESETS: ${{ inputs.presets || '' }}
+  SCALE_PAGES: ${{ inputs.scale_pages || '1000' }}
+
+jobs:
+  sweep:
+    name: Sweep and calibration
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ocr')
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: yarn
+
+      # Engine, data and synth need only the JS/WASM packages: no Electron download, no native build.
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile --ignore-scripts
+
+      - name: Sweep (seeds × presets × fonts)
+        shell: bash
+        env:
+          PDFX_OCR_BENCH: sweep
+          PDFX_OCR_BENCH_OUT: ${{ runner.temp }}/ocr-bench
+          PDFX_OCR_BENCH_SEEDS: ${{ env.SEEDS }}
+          PDFX_OCR_BENCH_PRESETS: ${{ env.PRESETS }}
+        run: |
+          [ -n "$PDFX_OCR_BENCH_PRESETS" ] || unset PDFX_OCR_BENCH_PRESETS
+          yarn vitest run --project ocr src/main/ocr/process/bench.ocr.test.ts
+
+      - name: Compare with bench/ocr-real-baseline.json (scores only)
+        run: node scripts/ocr-bench-compare.mjs "$RUNNER_TEMP/ocr-bench/sweep.json" "$RUNNER_TEMP/ocr-bench"
+
+      # The committed table must refit byte for byte from its committed seeds (the fit is
+      # deterministic; calibrate.ocr.test.ts), then a report-only refit over this run's seeds.
+      - name: Calibration determinism check (committed seeds)
+        if: ${{ !cancelled() }}
+        run: >-
+          node scripts/ocr-calibrate.mjs --seeds 1,2,3,4,5 --threads 4 --check
+          --report "$RUNNER_TEMP/ocr-bench/calibration-check.json"
+
+      - name: Calibration refit report (sweep seeds, not written to the table)
+        if: ${{ !cancelled() }}
+        env:
+          PDFX_OCR_CAL_DRY: '1'
+        run: >-
+          node scripts/ocr-calibrate.mjs --seeds "$SEEDS" --threads 4
+          --report "$RUNNER_TEMP/ocr-bench/calibration-refit.json"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ocr-bench-sweep
+          path: ${{ runner.temp }}/ocr-bench/*.json
+          if-no-files-found: error
+
+  timing:
+    name: Timing (${{ matrix.os }})
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ocr')
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: yarn
+
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile --ignore-scripts
+
+      - name: Time the §3.9.4 pages (n = 1 and n = 2)
+        shell: bash
+        env:
+          PDFX_OCR_BENCH: timing
+          PDFX_OCR_BENCH_OUT: ${{ runner.temp }}/ocr-bench
+        run: yarn vitest run --project ocr src/main/ocr/process/bench.ocr.test.ts
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ocr-bench-timing-${{ matrix.os }}
+          path: ${{ runner.temp }}/ocr-bench/*.json
+          if-no-files-found: error
+
+  scale:
+    name: Scale (1,000 pages, 1.5 GiB source)
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ocr')
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: yarn
+
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile --ignore-scripts
+
+      - name: Scale tests
+        shell: bash
+        env:
+          PDFX_OCR_BENCH: scale,too-large
+          PDFX_OCR_BENCH_OUT: ${{ runner.temp }}/ocr-bench
+          PDFX_OCR_SCALE_PAGES: ${{ env.SCALE_PAGES }}
+        run: |
+          free -m
+          yarn vitest run --project ocr src/main/ocr/process/bench.ocr.test.ts
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ocr-bench-scale
+          path: ${{ runner.temp }}/ocr-bench/*.json
+          if-no-files-found: error
+
+  summary:
+    name: Summary
+    needs: [sweep, timing, scale]
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ocr')) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ocr-bench-*
+          path: ${{ runner.temp }}/ocr-bench
+      - name: Results to the job summary
+        shell: bash
+        run: |
+          for f in $(find "$RUNNER_TEMP/ocr-bench" -name '*.json' | sort); do
+            {
+              echo "<details><summary>${f#$RUNNER_TEMP/ocr-bench/}</summary>"
+              echo
+              echo '```json'
+              head -c 60000 "$f"
+              echo
+              echo '```'
+              echo '</details>'
+            } >> "$GITHUB_STEP_SUMMARY"
+          done

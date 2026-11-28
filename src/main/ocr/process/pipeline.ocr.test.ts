@@ -48,6 +48,7 @@ import {
   writePipelineEntry,
   type PipelineSpec
 } from '../test-utils/pipeline-cache'
+import { pageParts, sha256, xosDump } from '../test-utils/xos-dump'
 import { ENGINE_DATA } from './engine-manifest'
 import { NO_SMOOTH_1BIT, overlayAffine } from './page-plan'
 
@@ -204,6 +205,27 @@ describe('tier 1: the PR6 pipeline on the synth presets (§3.9.4)', () => {
       expect(run.first.stderrLines).toBe(0)
       checkReplay(s, run)
       if (RECORD) return
+      const { conf, ...parts } = pageParts(run.page)
+      xosDump('pipeline', s.id, {
+        ...parts,
+        engine: run.recognitions.map((x) => x.hocr),
+        inputs: [sha256(run.firstRaster.data)],
+        meta: {
+          conf,
+          orientation: run.page.orientation,
+          skewDeg: run.page.skewDeg,
+          renderDpi: run.firstRaster.dpi,
+          keptDpi: run.raster.dpi,
+          kept: run.kept,
+          flags: run.flags,
+          triage: run.triage.pageClass,
+          meanConfCal: run.page.meanConfCal,
+          passes: [
+            ...run.first.outcome.passes.map((p) => p.id),
+            ...(run.second?.outcome.passes.map((p) => p.id) ?? [])
+          ]
+        }
+      })
 
       const sc: PageScores = await scorePage(run.page, r.gt)
       const fid = copyFidelity(
@@ -311,6 +333,12 @@ describe('tier 1: the PR6 pipeline on the synth presets (§3.9.4)', () => {
         smooth: pick(ab.smooth),
         noSmooth: pick(ab.noSmooth)
       }
+      xosDump('pipeline', `codec-${id}`, {
+        ...pageParts(srcPage),
+        engine: src.outcome.hocr ?? [],
+        inputs: [sha256(r.raster.data)],
+        meta: { scores: measured[`codec:${id}`] }
+      })
       const shipped = NO_SMOOTH_1BIT ? ab.noSmooth : ab.smooth
       if (CODEC_REPORTED.has(id)) return
       expect
