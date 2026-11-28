@@ -1,18 +1,32 @@
 // The DocHeader chip (DESIGN.md §3.8 "DocHeader chip"), per document:
 // "Scanned · Recognize text" (one click, remembered settings) → "Recognizing 4 / 12 ✕" with a thin
 // bar (✕ stops) → "3 pages need attention" (opens the summary). Gone when everything is fine.
+// Not a live region: the toolbar pill's throttled region is the one place progress is announced
+// (one region, not three repeating each other); the chip's own text is there to read on demand.
 
 import { useRef, useState } from 'react'
 import { useOcrStore, useOcrSummary } from '../../ocr/OcrContext'
 import { pagesWord } from '../../ocr/ocr-ui'
 import { CloseIcon } from '../icons'
+import { useFocusRescue } from './focus-rescue'
 import { OcrSummaryPopover } from './OcrSummaryPopover'
 
 export function OcrDocChip({ docId }: { docId: string }): React.JSX.Element | null {
   const { store, actions } = useOcrStore()
   const { summary, runs } = useOcrSummary()
   const ref = useRef<HTMLButtonElement | null>(null)
+  const slot = useRef<HTMLSpanElement | null>(null)
   const [open, setOpen] = useState(false)
+  // The chip swaps one control for another (start → ✕ → attention): focus follows the swap, to
+  // what replaced it, else to the header's own buttons.
+  useFocusRescue(
+    slot,
+    () =>
+      slot.current?.querySelector<HTMLElement>('button') ??
+      slot.current
+        ?.closest('.doc-header')
+        ?.querySelector<HTMLElement>('.doc-actions button:not(:disabled)')
+  )
   const doc = summary.byDoc.get(docId)
   if (!store || !doc) return null
   const run = runs.get(docId)
@@ -25,7 +39,7 @@ export function OcrDocChip({ docId }: { docId: string }): React.JSX.Element | nu
   if (run) {
     const pct = run.total > 0 ? Math.round((run.done / run.total) * 100) : 0
     chip = (
-      <span className="ocr-chip running" role="status">
+      <span className="ocr-chip running">
         <span aria-hidden="true">
           Recognizing {run.done} / {run.total}
         </span>
@@ -40,7 +54,7 @@ export function OcrDocChip({ docId }: { docId: string }): React.JSX.Element | nu
     )
   } else if (doc.held.length > 0) {
     chip = (
-      <span className="ocr-chip" role="status">
+      <span className="ocr-chip">
         Text recognition stopped
         <button
           className="ocr-chip-link"
@@ -83,11 +97,11 @@ export function OcrDocChip({ docId }: { docId: string }): React.JSX.Element | nu
     )
   }
   return (
-    <>
+    <span ref={slot} className="ocr-chip-slot">
       {chip}
       {open && doc.attention > 0 && (
         <OcrSummaryPopover anchor={ref.current} docId={docId} onClose={() => setOpen(false)} />
       )}
-    </>
+    </span>
   )
 }

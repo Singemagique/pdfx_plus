@@ -1,11 +1,20 @@
 // The Recognize Text… / Replace Recognized Text… dialog (DESIGN.md §3.8 "Dialog", "Language
 // picker"), in the Sign dialog's modal pattern (focus trap, Esc). Pages scope, language chips with
 // a searchable picker (Included and Installed groups; the Download group and "Install from file…"
-// are PR9's), the orientation and auto-recognise settings, the privacy line, the D8 wording and the
-// D7 export setting. Opening it asks the store to triage the collection (Stage 0 gate (b)), so the
-// counts fill in as triage answers. Settings are saved when the user recognises, never on Cancel.
+// are PR9's), the auto-recognise settings, the privacy line, the D8 wording and the D7 export
+// setting. Opening it asks the store to triage the collection (Stage 0 gate (b)), so the counts
+// fill in as triage answers. Settings are saved when the user recognises, never on Cancel.
+//
+// "[✓] Fix page orientation for reading" (§3.8) is not shown: the engine always reads a page the
+// way up it detects (PR6), and nothing yet carries the setting to it, so a box that could be
+// unticked would promise something the app does not do. It returns with the engine option.
+//
+// Modal for real: focus never rests outside the box. A control that unmounts while focused (the
+// picker on Esc or on choosing a language, a removed chip) hands focus to one that stays, and a
+// window listener catches any key or focus that still lands outside, so Esc keeps closing the
+// dialog and Delete never removes the page behind it.
 
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useOcrSettings, useOcrStore, useOcrSummary } from '../../ocr/OcrContext'
 import {
   INCLUDED_LANGS,
@@ -22,8 +31,6 @@ import { CloseIcon } from '../icons'
 
 export const DIALOG_COPY = {
   langHint: 'Pick every language on these pages. Fewer is faster.',
-  orientation: 'Fix page orientation for reading',
-  orientationNote: '(never changes how the page looks)',
   autoImports: 'Recognize imported photos automatically',
   autoOpened: 'Recognize scanned pages when I open PDFs',
   privacy: 'Runs on this computer. Nothing is uploaded.',
@@ -67,6 +74,28 @@ function LockIcon(): React.JSX.Element {
   )
 }
 
+/**
+ * The box's Tab stops in order, as the browser walks them: of a radio group only the checked radio
+ * (else the group's first) is a stop, so the trap's first and last are the real ends.
+ */
+export function tabStops(box: HTMLElement): HTMLElement[] {
+  const all = [
+    ...box.querySelectorAll<HTMLElement>(
+      'button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled)'
+    )
+  ]
+    .filter((el) => el.tabIndex >= 0)
+    // Document order, whatever order the selector engine returns a selector list in.
+    .sort((a, b) => (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1))
+  const radio = (el: HTMLElement): el is HTMLInputElement =>
+    el instanceof HTMLInputElement && el.type === 'radio' && !!el.name
+  return all.filter((el) => {
+    if (!radio(el)) return true
+    const group = all.filter((o): o is HTMLInputElement => radio(o) && o.name === el.name)
+    return el === (group.find((g) => g.checked) ?? group[0])
+  })
+}
+
 export function RecognizeDialog({
   mode,
   fixedKeys,
@@ -96,7 +125,16 @@ export function RecognizeDialog({
   const focusDoc = focusDocId ? summary.byDoc.get(focusDocId) : undefined
   const docKeys = focusDoc ? (replace ? focusDoc.replaceable : focusDoc.unrecognized) : []
   const allKeys = replace ? summary.replaceable : summary.unrecognized
-  const scopes: Array<{ id: Scope; label: string; keys: readonly string[] }> = fixedKeys
+  type ScopeRow = { id: Scope; label: string; keys: readonly string[] }
+  const allScope: ScopeRow = {
+    id: 'all',
+    label: `${replace ? 'Pages with recognized text' : 'Scanned pages'} in all documents (${allKeys.length})`,
+    keys: allKeys
+  }
+  // Only scopes with something to act on (a "(0)" choice would leave a disabled primary button),
+  // and the page scope only while its page is still in the collection. With nothing anywhere, the
+  // collection-wide row stays, with its 0, so the dialog still says why the button is off.
+  const offered: ScopeRow[] = fixedKeys
     ? [
         {
           id: 'page',
@@ -114,12 +152,8 @@ export function RecognizeDialog({
               }
             ]
           : []),
-        {
-          id: 'all' as const,
-          label: `${replace ? 'Pages with recognized text' : 'Scanned pages'} in all documents (${allKeys.length})`,
-          keys: allKeys
-        },
-        ...(focusPageKey
+        allScope,
+        ...(focusPageKey && summary.byKey.has(focusPageKey)
           ? [
               {
                 id: 'page' as const,
@@ -128,11 +162,12 @@ export function RecognizeDialog({
               }
             ]
           : [])
-      ]
+      ].filter((s) => s.keys.length > 0)
+  const scopes: ScopeRow[] = offered.length > 0 ? offered : [allScope]
   const initialScope = (): Scope => {
     if (fixedKeys) return 'page'
     if (focusDoc && docKeys.length > 0) return 'doc'
-    if (allKeys.length > 0 || !focusPageKey) return 'all'
+    if (allKeys.length > 0 || !scopes.some((s) => s.id === 'page')) return 'all'
     return 'page'
   }
   // Until the user picks one, the default follows the counts as triage fills them in.
@@ -142,7 +177,6 @@ export function RecognizeDialog({
   const keys = current?.keys ?? []
 
   const [langs, setLangs] = useState<string[]>(() => [...(settings?.['ocr.languages'] ?? ['eng'])])
-  const [orientation, setOrientation] = useState(settings?.['ocr.fixOrientation'] ?? true)
   const [autoImports, setAutoImports] = useState(settings?.['ocr.autoRecognizeImports'] ?? true)
   const [autoOpened, setAutoOpened] = useState(settings?.['ocr.autoRecognizeOpened'] ?? false)
   const [include, setInclude] = useState(settings?.['ocr.includeInExports'] ?? true)
@@ -156,6 +190,42 @@ export function RecognizeDialog({
   )
 
   const box = useRef<HTMLDivElement | null>(null)
+  /** What Esc does now (the picker first, then the dialog); read by the window guard. */
+  const escape = useRef<() => void>(() => {})
+  /** Where focus goes after the render that unmounts the focused control. */
+  const refocus = useRef<{ kind: 'add' } | { kind: 'chip'; index: number } | null>(null)
+
+  // The window guard (declared before the focus effect below, so its cleanup runs first and never
+  // pulls the restored focus back): a key or focus outside the box belongs to the dialog.
+  useEffect(() => {
+    const outside = (t: EventTarget | null): HTMLElement | null => {
+      const b = box.current
+      return b && !b.contains(t as Node | null) ? b : null
+    }
+    const onKey = (e: KeyboardEvent): void => {
+      const b = outside(e.target)
+      if (!b) return // inside: the box's own handler has it
+      e.stopPropagation()
+      if (e.key === 'Escape') {
+        e.preventDefault()
+        escape.current()
+      } else if (e.key === 'Tab') {
+        e.preventDefault()
+        const stops = tabStops(b)
+        ;(e.shiftKey ? stops[stops.length - 1] : stops[0])?.focus()
+      }
+    }
+    const onFocus = (e: FocusEvent): void => {
+      const b = outside(e.target)
+      if (b) tabStops(b)[0]?.focus()
+    }
+    window.addEventListener('keydown', onKey, true)
+    document.addEventListener('focusin', onFocus, true)
+    return () => {
+      window.removeEventListener('keydown', onKey, true)
+      document.removeEventListener('focusin', onFocus, true)
+    }
+  }, [])
   useEffect(() => {
     const previous = document.activeElement as HTMLElement | null
     const b = box.current
@@ -163,12 +233,41 @@ export function RecognizeDialog({
       b?.querySelector<HTMLElement>('button.primary:not(:disabled)') ??
       b?.querySelector<HTMLElement>('input:checked, input, button')
     )?.focus()
-    return () => previous?.focus?.()
+    return () => {
+      // The opener can be gone (the toolbar's Recognize Text button goes once nothing waits):
+      // then the activity pill, else the toolbar's first button.
+      const back =
+        previous && previous !== document.body && previous.isConnected
+          ? previous
+          : (document.querySelector<HTMLElement>('.ocr-pill') ??
+            document.querySelector<HTMLElement>('.toolbar .btn:not(:disabled)'))
+      back?.focus()
+    }
   }, [])
   const searchRef = useRef<HTMLInputElement | null>(null)
   useEffect(() => {
     if (picking) searchRef.current?.focus()
   }, [picking])
+  useLayoutEffect(() => {
+    const want = refocus.current
+    const b = box.current
+    if (!want || !b) return
+    refocus.current = null
+    const xs = [...b.querySelectorAll<HTMLElement>('.ocr-lang-x:not(:disabled)')]
+    const addBtn = b.querySelector<HTMLElement>('.ocr-add-lang')
+    const target =
+      want.kind === 'chip'
+        ? (xs[want.index] ?? xs[want.index - 1] ?? addBtn)
+        : (addBtn ?? xs[xs.length - 1])
+    ;(target ?? tabStops(b)[0])?.focus()
+  })
+
+  const closePicker = (): void => {
+    setPicking(false)
+    setQuery('')
+    refocus.current = { kind: 'add' }
+  }
+  escape.current = () => (picking ? closePicker() : onClose())
 
   if (!store) return null
 
@@ -178,17 +277,14 @@ export function RecognizeDialog({
     e.stopPropagation()
     if (e.key === 'Escape') {
       e.preventDefault()
-      if (picking) setPicking(false)
-      else onClose()
+      escape.current()
       return
     }
     if (e.key !== 'Tab' || !box.current) return
-    const focusable = [
-      ...box.current.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled)')
-    ]
-    if (focusable.length === 0) return
-    const first = focusable[0]
-    const last = focusable[focusable.length - 1]
+    const stops = tabStops(box.current)
+    if (stops.length === 0) return
+    const first = stops[0]
+    const last = stops[stops.length - 1]
     if (e.shiftKey && document.activeElement === first) {
       e.preventDefault()
       last.focus()
@@ -207,8 +303,11 @@ export function RecognizeDialog({
   const downloaded = addable.filter((l) => !INCLUDED_LANGS.some((i) => i.code === l.code))
   const add = (code: string): void => {
     setLangs((ls) => (ls.length >= MAX_LANGS || ls.includes(code) ? ls : [...ls, code]))
-    setQuery('')
-    setPicking(false)
+    closePicker()
+  }
+  const removeLang = (index: number): void => {
+    setLangs((ls) => ls.filter((_, i) => i !== index))
+    refocus.current = { kind: 'chip', index }
   }
 
   const canSubmit = keys.length > 0 && langs.length > 0 && !submitting
@@ -218,7 +317,6 @@ export function RecognizeDialog({
     try {
       await store.setSettings({
         'ocr.languages': langs,
-        'ocr.fixOrientation': orientation,
         'ocr.autoRecognizeImports': autoImports,
         'ocr.autoRecognizeOpened': autoOpened,
         'ocr.includeInExports': include
@@ -269,14 +367,14 @@ export function RecognizeDialog({
         <fieldset className="ocr-fieldset">
           <legend>Languages</legend>
           <div className="ocr-langs">
-            {langs.map((code) => (
+            {langs.map((code, i) => (
               <span key={code} className="ocr-lang-chip">
                 {langLabel(code)}
                 <button
                   className="ocr-lang-x"
                   aria-label={`Remove ${langLabel(code)}`}
                   disabled={langs.length === 1}
-                  onClick={() => setLangs((ls) => ls.filter((l) => l !== code))}
+                  onClick={() => removeLang(i)}
                 >
                   <CloseIcon size={10} />
                 </button>
@@ -284,9 +382,9 @@ export function RecognizeDialog({
             ))}
             {langs.length < MAX_LANGS && (
               <button
-                className="sign-link"
+                className="sign-link ocr-add-lang"
                 aria-expanded={picking}
-                onClick={() => setPicking((p) => !p)}
+                onClick={() => (picking ? closePicker() : setPicking(true))}
               >
                 + Add language
               </button>
@@ -339,17 +437,6 @@ export function RecognizeDialog({
           <p className="sign-module-hint">{DIALOG_COPY.langHint}</p>
         </fieldset>
 
-        <label className="sign-check">
-          <input
-            type="checkbox"
-            checked={orientation}
-            onChange={(e) => setOrientation(e.target.checked)}
-          />
-          <span>
-            {DIALOG_COPY.orientation}{' '}
-            <span className="sign-hint-muted">{DIALOG_COPY.orientationNote}</span>
-          </span>
-        </label>
         <label className="sign-check">
           <input
             type="checkbox"

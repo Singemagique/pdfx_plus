@@ -6,6 +6,7 @@ import { describe, expect, it } from 'vitest'
 import type { DocEntry } from '../types'
 import type { OcrBatchView, OcrPageState } from './ocr-store'
 import {
+  batchAttention,
   batchToast,
   createAnnouncer,
   INCLUDED_LANGS,
@@ -16,6 +17,8 @@ import {
   nextRuns,
   overallProgress,
   pageIssue,
+  removedCopy,
+  removeTargets,
   runProgress,
   summarizeOcr,
   unavailableDetails
@@ -44,6 +47,7 @@ const batch = (b: Partial<OcrBatchView> = {}): OcrBatchView => ({
   failed: 0,
   inflightFrac: 0,
   etaMs: null,
+  keys: [],
   ...b
 })
 
@@ -246,6 +250,62 @@ describe('createAnnouncer (a11y: every 10% or 5 pages, plus a final announcement
 
   it('says nothing while idle without a final message', () => {
     expect(createAnnouncer().next({ running: false, done: 0, total: 0 })).toBeNull()
+  })
+
+  it('without a final message the end clears the region (the toast says how it ended)', () => {
+    const a = createAnnouncer()
+    a.next({ running: true, done: 0, total: 3 })
+    expect(a.next({ running: false, done: 3, total: 3 })).toBe('')
+    expect(a.next({ running: false, done: 3, total: 3 })).toBeNull()
+  })
+})
+
+describe('batchAttention: the toast counts attention like the chip', () => {
+  const page = (src: string, i: number): DocEntry['pages'][number] =>
+    ({ id: `${src}-${i}`, source: { id: src }, pageIndex: i, width: 1, height: 1 }) as never
+  const docs: DocEntry[] = [{ id: 'd', name: 'd', pages: [0, 1, 2].map((i) => page('a', i)) }]
+  const states: Record<string, OcrPageState> = {
+    'a#0': state({ status: 'ok', hasText: true }),
+    'a#1': state({ status: 'ok', hasText: true, rotateBy: 90 }), // recognised, but sideways
+    'a#2': state({ status: 'ok', hasText: true })
+  }
+  const summary = summarizeOcr(docs, { getPageState: (k) => states[k] ?? null })
+
+  it('a sideways page that was recognised still needs attention: no "now searchable"', () => {
+    const b = batch({ total: 3, done: 3, recognized: 3, keys: ['a#0', 'a#1', 'a#2'] })
+    expect(batchAttention(b, summary)).toBe(summary.attention)
+    expect(batchAttention(b, summary)).toBe(1)
+    expect(batchToast(b, batchAttention(b, summary))).toEqual({
+      message: 'Text recognized on 3 pages · 1 needs attention',
+      action: 'details'
+    })
+  })
+
+  it('counts only the batch’s own pages, once each', () => {
+    expect(batchAttention(batch({ keys: ['a#0', 'a#2'] }), summary)).toBe(0)
+    expect(batchAttention(batch({ keys: ['a#1', 'a#1'] }), summary)).toBe(1)
+    expect(batchToast(batch({ recognized: 10, failed: 2 }), 3)!.message).toBe(
+      'Text recognized on 10 of 12 pages · 3 need attention'
+    )
+  })
+})
+
+describe('removeTargets (Document ▸ Remove Recognized Text)', () => {
+  const s = { replaceable: ['a#0', 'a#2', 'b#1'] }
+
+  it('the page in view (or selected) only, when it has recognised text', () => {
+    expect(removeTargets(s, 'a#2').keys).toEqual(['a#2'])
+  })
+  it('a page in view without recognised text: nothing, and says so', () => {
+    expect(removeTargets(s, 'a#1')).toEqual({ keys: [], none: 'This page has no recognized text' })
+  })
+  it('no page in view: every page with recognised text', () => {
+    expect(removeTargets(s, null).keys).toEqual(['a#0', 'a#2', 'b#1'])
+    expect(removeTargets({ replaceable: [] }, null)).toEqual({
+      keys: [],
+      none: 'No recognized text to remove'
+    })
+    expect(removedCopy(3)).toBe('Recognized text removed from 3 pages · Undo brings it back')
   })
 })
 

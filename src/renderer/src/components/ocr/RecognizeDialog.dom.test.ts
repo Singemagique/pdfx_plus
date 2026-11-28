@@ -15,14 +15,21 @@ import {
   doc,
   eagerIdle,
   nativeText,
+  okResult,
   pageOf,
+  recognisedPage,
   settle,
   source,
   triaged
 } from '../../ocr/test-utils/fake-ocr'
 import { defaultSettings, type Settings } from '../../../../shared/settings'
 import type { DocEntry } from '../../types'
-import { DIALOG_COPY, RecognizeDialog, type RecognizeDialogProps } from './RecognizeDialog'
+import {
+  DIALOG_COPY,
+  RecognizeDialog,
+  tabStops,
+  type RecognizeDialogProps
+} from './RecognizeDialog'
 ;(globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true
 
 const scan = source('scan')
@@ -149,13 +156,11 @@ describe('RecognizeDialog', () => {
     expect(radios()[2]).toBe('Selected page')
   })
 
-  it('has the final copy: languages hint, orientation, privacy, layer, D7 and D8', async () => {
+  it('has the final copy: languages hint, privacy, layer, D7 and D8', async () => {
     await open()
     const t = dialog().textContent!
     for (const s of [
       'Pick every language on these pages. Fewer is faster.',
-      'Fix page orientation for reading',
-      '(never changes how the page looks)',
       'Recognize imported photos automatically',
       'Recognize scanned pages when I open PDFs',
       'Runs on this computer. Nothing is uploaded.',
@@ -164,12 +169,21 @@ describe('RecognizeDialog', () => {
       'Recognition is kept while the file is open. Export or save as .pdfx to keep it.'
     ])
       expect(t).toContain(s)
-    // The remembered settings: orientation on, imports on, opened PDFs off, exports on (D4, D7).
-    expect(checked(DIALOG_COPY.orientation)).toBe(true)
+    // The remembered settings: imports on, opened PDFs off, exports on (D4, D7).
     expect(checked(DIALOG_COPY.autoImports)).toBe(true)
     expect(checked(DIALOG_COPY.autoOpened)).toBe(false)
     expect(checked(DIALOG_COPY.include)).toBe(true)
     expect(t).not.toContain('digital signature')
+  })
+
+  it('offers no orientation box the engine would ignore (it always reads the page upright)', async () => {
+    await open()
+    expect(dialog().textContent).not.toContain('Fix page orientation')
+    expect(dialog().textContent).not.toContain('never changes how the page looks')
+    await act(async () => button('Recognize 3 pages')!.click())
+    await act(async () => settle())
+    expect(saved).toHaveLength(1)
+    expect(saved[0]).not.toHaveProperty('ocr.fixOrientation')
   })
 
   it('shows the signed-source note when a source carries a signature', async () => {
@@ -239,7 +253,6 @@ describe('RecognizeDialog', () => {
     expect(saved).toEqual([
       {
         'ocr.languages': ['eng', 'fra'],
-        'ocr.fixOrientation': true,
         'ocr.autoRecognizeImports': true,
         'ocr.autoRecognizeOpened': false,
         'ocr.includeInExports': false
@@ -267,9 +280,9 @@ describe('RecognizeDialog', () => {
     const onWindowKey = vi.fn()
     window.addEventListener('keydown', onWindowKey)
     await open()
-    const focusables = [
-      ...dialog().querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled)')
-    ]
+    const focusables = tabStops(dialog())
+    expect(focusables[0]).toBe(container.querySelector('input[type="radio"]:checked'))
+    expect(focusables[focusables.length - 1].textContent).toBe('Recognize 3 pages')
     focusables[focusables.length - 1].focus()
     await key(document.activeElement!, 'Tab')
     expect(document.activeElement).toBe(focusables[0])
@@ -278,6 +291,133 @@ describe('RecognizeDialog', () => {
     await key(document.activeElement!, 'Delete')
     expect(onWindowKey).not.toHaveBeenCalled()
     window.removeEventListener('keydown', onWindowKey)
+  })
+
+  it('Esc in the language picker closes the picker only, and focus goes to "+ Add language"', async () => {
+    const props = await open()
+    await act(async () => button('+ Add language')!.click())
+    const search = container.querySelector<HTMLInputElement>('.ocr-picker input')!
+    expect(document.activeElement).toBe(search)
+    await key(search, 'Escape')
+    expect(container.querySelector('.ocr-picker')).toBeNull()
+    expect(dialog()).not.toBeNull()
+    expect(props.onClose).not.toHaveBeenCalled()
+    expect(document.activeElement).toBe(button('+ Add language'))
+    // A second Esc closes the dialog.
+    await key(document.activeElement!, 'Escape')
+    expect(props.onClose).toHaveBeenCalledTimes(1)
+  })
+
+  it('focus never falls to <body> when the picker or a chip unmounts', async () => {
+    const onWindowKey = vi.fn()
+    window.addEventListener('keydown', onWindowKey)
+    try {
+      await open()
+      // Choosing a language (Enter in the search) closes the picker: "+ Add language" gets focus.
+      await act(async () => button('+ Add language')!.click())
+      await key(container.querySelector('.ocr-picker input')!, 'Enter')
+      expect(document.activeElement).toBe(button('+ Add language'))
+      // Clicking an option (mouse or keyboard) closes it too; with three languages the "+ Add
+      // language" button is gone, so the last chip's ✕ gets it.
+      await act(async () => button('+ Add language')!.click())
+      await act(async () => button('Français — French')!.click())
+      expect(button('+ Add language')).toBeUndefined()
+      expect(document.activeElement?.getAttribute('aria-label')).toBe('Remove Français — French')
+      // Removing a chip: the chip that takes its place.
+      const x = container.querySelector<HTMLButtonElement>('[aria-label="Remove English"]')!
+      x.focus()
+      await act(async () => x.click())
+      expect(document.activeElement?.getAttribute('aria-label')).toBe('Remove Deutsch — German')
+      expect(document.activeElement).not.toBe(document.body)
+      await key(document.activeElement!, 'Delete')
+      expect(onWindowKey).not.toHaveBeenCalled()
+    } finally {
+      window.removeEventListener('keydown', onWindowKey)
+    }
+  })
+
+  it('a key that still lands outside the box is the dialog’s: Delete never reaches the app, Esc closes', async () => {
+    const onWindowKey = vi.fn()
+    window.addEventListener('keydown', onWindowKey)
+    try {
+      const props = await open()
+      ;(document.activeElement as HTMLElement).blur()
+      expect(document.activeElement).toBe(document.body)
+      await key(document.body, 'Delete')
+      await key(document.body, 'Backspace')
+      expect(onWindowKey).not.toHaveBeenCalled()
+      // Tab from outside comes back in.
+      await key(document.body, 'Tab')
+      expect(dialog().contains(document.activeElement)).toBe(true)
+      ;(document.activeElement as HTMLElement).blur()
+      await key(document.body, 'Escape')
+      expect(props.onClose).toHaveBeenCalledTimes(1)
+    } finally {
+      window.removeEventListener('keydown', onWindowKey)
+    }
+  })
+
+  it('focus moved to the app behind is pulled back into the box', async () => {
+    const outside = document.createElement('button')
+    document.body.appendChild(outside)
+    try {
+      await open()
+      await act(async () => outside.focus())
+      expect(dialog().contains(document.activeElement)).toBe(true)
+    } finally {
+      outside.remove()
+    }
+  })
+
+  it('Shift+Tab from the checked radio wraps when it is not the first radio (radio group = one stop)', async () => {
+    await open()
+    const rs = [...container.querySelectorAll<HTMLInputElement>('input[type="radio"]')]
+    await act(async () => rs[1].click()) // "all documents": not the first radio
+    rs[1].focus()
+    // The stops in document order, one per radio group: the checked radio is the first stop.
+    const stops = tabStops(dialog())
+    expect(stops[0]).toBe(rs[1])
+    expect(stops.filter((s) => s instanceof HTMLInputElement && s.type === 'radio')).toEqual([
+      rs[1]
+    ])
+    expect(stops[stops.length - 1].textContent).toBe('Recognize 4 pages')
+    await key(rs[1], 'Tab', { shiftKey: true })
+    expect(document.activeElement).toBe(stops[stops.length - 1]) // wrapped to the last stop
+    // And Tab from the last comes back to the checked radio, not the first radio.
+    await key(document.activeElement!, 'Tab')
+    expect(document.activeElement).toBe(rs[1])
+  })
+
+  it('offers only scopes with pages, and no page scope once the page has left', async () => {
+    // d2's only page is recognised: "this document (0)" is not offered.
+    store.recognize([otherKey])
+    await settle()
+    const r = port.recognizes().at(-1)!
+    port.emit({
+      result: { jobId: r.jobId, src: r.src, index: 0, page: okResult(recognisedPage(['x'])) }
+    })
+    await settle()
+    await open({ focusDocId: 'd2', focusPageKey: otherKey, inFullView: false })
+    expect(radios()).toEqual(['Scanned pages in all documents (3)', 'Selected page'])
+    // The selected page is deleted behind the dialog: its scope goes with it.
+    await open({ focusDocId: 'd2', focusPageKey: 'gone#0', inFullView: false })
+    expect(radios()).toEqual(['Scanned pages in all documents (3)'])
+  })
+
+  it('closing after its opener is gone puts focus on the activity pill, not <body>', async () => {
+    const opener = document.createElement('button')
+    const pill = document.createElement('button')
+    pill.className = 'ocr-pill'
+    document.body.append(opener, pill)
+    try {
+      opener.focus()
+      await open()
+      opener.remove()
+      await act(async () => root.render(null))
+      expect(document.activeElement).toBe(pill)
+    } finally {
+      pill.remove()
+    }
   })
 
   it('Replace mode for fixed pages: "Replace text on 1 page" records the choice and re-recognises', async () => {

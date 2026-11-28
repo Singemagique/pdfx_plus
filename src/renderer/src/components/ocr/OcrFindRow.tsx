@@ -29,7 +29,15 @@ export function OcrFindRow(): React.JSX.Element | null {
         className="sign-link"
         // Keep focus in the input so typing can go on after a click.
         onMouseDown={(e) => e.preventDefault()}
-        onClick={() => actions.recognizeNow(summary.unrecognized)}
+        onClick={(e) => {
+          // The row goes away once the pages are queued: from the keyboard (Tab, Enter) focus would
+          // fall to <body>, where Esc and Delete reach the window shortcuts instead of Find.
+          e.currentTarget
+            .closest('.findbar')
+            ?.querySelector<HTMLInputElement>('.findbar-input')
+            ?.focus()
+          actions.recognizeNow(summary.unrecognized)
+        }}
       >
         Recognize text
       </button>

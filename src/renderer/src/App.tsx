@@ -20,28 +20,28 @@ import { useFindShortcuts } from './search/useFindShortcuts'
 import { FindProvider } from './search/FindContext'
 import type { FindMatch } from './search/find-controller'
 import { FindBarHost } from './components/FindBar'
+import { CloseIcon } from './components/icons'
 import type { FullViewNav } from './components/full-view/use-full-view-controls'
 import { OcrExportPrompt } from './components/OcrExportPrompt'
 import { createOcrStore } from './ocr/ocr-store'
 import { createOcrFindSupply } from './ocr/ocr-find-supply'
 import { OcrUiProvider, type OcrActions, type OcrDialogRequest } from './ocr/OcrContext'
-import { pagesWord, summarizeOcr, UNAVAILABLE_COPY, unavailableDetails } from './ocr/ocr-ui'
+import {
+  removedCopy,
+  removeTargets,
+  summarizeOcr,
+  UNAVAILABLE_COPY,
+  unavailableDetails
+} from './ocr/ocr-ui'
+import { useBannerSeen } from './ocr/useBannerSeen'
 import { copyPageText } from './ocr/copy-page-text'
 import { isSignedSource } from './ocr/signed-source'
 import { OcrToolbarItems } from './components/ocr/OcrToolbarItems'
 import { RecognizeDialog } from './components/ocr/RecognizeDialog'
 import { OcrBanner } from './components/ocr/OcrBanner'
 import { OcrSummaryPopover } from './components/ocr/OcrSummaryPopover'
-import {
-  OcrMenuSync,
-  OcrSignDialog,
-  OcrToasts,
-  type ToastAction
-} from './components/ocr/OcrAppParts'
-
-const TOAST_MS = 4000
-/** A toast with a button stays longer: it has to be read and reached. */
-const ACTION_TOAST_MS = 8000
+import { OcrMenuSync, OcrSignDialog, OcrToasts } from './components/ocr/OcrAppParts'
+import { useToast } from './app/useToast'
 
 export default function App(): React.JSX.Element {
   // Ref-count busy instead of a plain boolean: overlapping operations (a 2nd-instance open / Explorer
@@ -66,15 +66,10 @@ export default function App(): React.JSX.Element {
   const awaitingPlacement = useRef(false)
   const [scale, setScale] = useState(1)
   const [renderVersion, setRenderVersion] = useState(0)
-  const [toast, setToast] = useState<{ message: string; action?: ToastAction } | null>(null)
-  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const canvasRef = useRef<CanvasHandle | null>(null)
 
-  const flash = useCallback((message: string, action?: ToastAction) => {
-    if (toastTimer.current) clearTimeout(toastTimer.current)
-    setToast({ message, action })
-    toastTimer.current = setTimeout(() => setToast(null), action ? ACTION_TOAST_MS : TOAST_MS)
-  }, [])
+  // A toast with a button ([Resume], [Details]) stays until it is used or dismissed (useToast).
+  const { toast, flash, dismiss: dismissToast } = useToast()
 
   const collection = useCollection(flash)
   const fullViewState = useFullView()
@@ -175,8 +170,13 @@ export default function App(): React.JSX.Element {
   })
 
   const onPaste = useCallback(() => void handlePaste(), [handlePaste])
+  const [ocrDialog, setOcrDialog] = useState<OcrDialogRequest | null>(null)
+  const modalOpen = (signOpen && !placing) || padOpen || !!ocrDialog
+  const modalOpenRef = useRef(modalOpen)
+  modalOpenRef.current = modalOpen
   useKeyboardShortcuts({
-    active: !fullViewState.fullView,
+    // Never behind a modal dialog: a key that lands outside it must not delete or copy a page.
+    active: !fullViewState.fullView && !modalOpen,
     selected: collection.selected,
     onDeletePage: collection.deletePage,
     onDuplicate: collection.duplicatePage,
@@ -194,10 +194,6 @@ export default function App(): React.JSX.Element {
   const hiddenPageIdRef = useRef(fullViewState.hiddenPageId)
   hiddenPageIdRef.current = fullViewState.hiddenPageId
   const fullViewNavRef = useRef<FullViewNav | null>(null)
-  const [ocrDialog, setOcrDialog] = useState<OcrDialogRequest | null>(null)
-  const modalOpen = (signOpen && !placing) || padOpen || !!ocrDialog
-  const modalOpenRef = useRef(modalOpen)
-  modalOpenRef.current = modalOpen
   const getAnchorPageId = useCallback(
     () =>
       fullViewState.fullViewRef.current
@@ -267,24 +263,7 @@ export default function App(): React.JSX.Element {
     docId: string | null
   } | null>(null)
   // The full-view banner shows at most once per document per session.
-  const [bannerSeen, setBannerSeen] = useState<ReadonlySet<string>>(() => new Set())
-  const bannerShownFor = useRef<string | null>(null)
-  const markBannerSeen = useCallback((docId: string) => {
-    setBannerSeen((s) => (s.has(docId) ? s : new Set([...s, docId])))
-  }, [])
-  const onBannerShown = useCallback(
-    (docId: string) => {
-      const prev = bannerShownFor.current
-      if (prev && prev !== docId) markBannerSeen(prev)
-      bannerShownFor.current = docId
-    },
-    [markBannerSeen]
-  )
-  useEffect(() => {
-    if (fullView || !bannerShownFor.current) return
-    markBannerSeen(bannerShownFor.current)
-    bannerShownFor.current = null
-  }, [fullView, markBannerSeen])
+  const banner = useBannerSeen(fullView ? (focus?.docId ?? fullView.docId) : null)
 
   // What the actions read when they run (they are created once, so the context stays stable).
   const latestOcr = useRef({ docs, focus, fullViewState })
@@ -332,14 +311,13 @@ export default function App(): React.JSX.Element {
         if (keys.length === 0) flash('No scanned pages are waiting for text recognition')
         else ocrActions.recognizeNow(keys)
       } else if (action === 'remove-recognized-text') {
-        const s = summarizeOcr(liveDocs, ocrStore)
-        const keys = f && s.replaceable.includes(f.key) ? [f.key] : f ? [] : s.replaceable
+        const { keys, none } = removeTargets(summarizeOcr(liveDocs, ocrStore), f?.key ?? null)
         if (keys.length === 0) {
-          flash(f ? 'This page has no recognized text' : 'No recognized text to remove')
+          flash(none)
           return
         }
-        ocrStore.remove(keys)
-        flash(`Recognized text removed from ${pagesWord(keys.length)} · Undo brings it back`)
+        ocrStore.remove(keys) // one undo step for all of them
+        flash(removedCopy(keys.length))
       } else if (action === 'show-recognized-text') setShowRecognizedText((v) => !v)
       else if (action === 'include-recognized-text') {
         const next = !ocrStore.settings()['ocr.includeInExports']
@@ -504,9 +482,9 @@ export default function App(): React.JSX.Element {
                       <OcrBanner
                         docId={focus.docId}
                         pageKey={focus.key}
-                        seen={bannerSeen}
-                        onShown={onBannerShown}
-                        onDone={markBannerSeen}
+                        seen={banner.seen}
+                        onShown={banner.onShown}
+                        onDone={banner.onDone}
                       />
                     )
                   }
@@ -581,20 +559,35 @@ export default function App(): React.JSX.Element {
             />
             <OcrMenuSync showRecognizedText={showRecognizedText} />
 
+            {/* Always mounted, so a new message is a change a screen reader announces (a live
+                region that mounts with its text already in it is often not read). */}
+            <div className="sr-only" role="status" aria-live="polite" aria-atomic="true">
+              {toast?.message ?? ''}
+            </div>
             {toast && (
-              <div className="toast" role="status">
+              <div className="toast">
                 {toast.message}
                 {toast.action && (
-                  <button
-                    className="toast-action"
-                    onClick={() => {
-                      const run = toast.action!.run
-                      setToast(null)
-                      run()
-                    }}
-                  >
-                    {toast.action.label}
-                  </button>
+                  <>
+                    <button
+                      className="toast-action"
+                      onClick={() => {
+                        const run = toast.action!.run
+                        dismissToast()
+                        run()
+                      }}
+                    >
+                      {toast.action.label}
+                    </button>
+                    <button
+                      className="toast-dismiss"
+                      aria-label="Dismiss"
+                      title="Dismiss"
+                      onClick={dismissToast}
+                    >
+                      <CloseIcon size={11} />
+                    </button>
+                  </>
                 )}
               </div>
             )}

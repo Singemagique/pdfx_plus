@@ -25,6 +25,12 @@ export function Popover({
 }: PopoverProps): React.JSX.Element {
   const box = useRef<HTMLDivElement | null>(null)
   const [pos, setPos] = useState<{ left: number; top: number }>(() => place(anchor, null))
+  // Callers pass inline closures (a new one per render). The latest one is read when it is
+  // called, so the effect below runs once per opening: re-running it on every owner render (the
+  // job popover's owner re-renders on each progress tick) moved focus anchor → first button
+  // each time, pulling a keyboard user back from wherever they had tabbed to.
+  const onCloseRef = useRef(onClose)
+  onCloseRef.current = onClose
 
   useLayoutEffect(() => {
     setPos(place(anchor, box.current))
@@ -35,14 +41,14 @@ export function Popover({
     const onDown = (e: PointerEvent): void => {
       const t = e.target as Node | null
       if (box.current?.contains(t) || anchor?.contains(t)) return
-      onClose()
+      onCloseRef.current()
     }
     window.addEventListener('pointerdown', onDown, true)
     return () => {
       window.removeEventListener('pointerdown', onDown, true)
       if (anchor?.isConnected) anchor.focus()
     }
-  }, [anchor, onClose])
+  }, [anchor])
 
   return createPortal(
     <div
@@ -58,7 +64,7 @@ export function Popover({
         e.stopPropagation()
         if (e.key === 'Escape') {
           e.preventDefault()
-          onClose()
+          onCloseRef.current()
         }
       }}
     >

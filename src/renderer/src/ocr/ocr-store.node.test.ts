@@ -7,6 +7,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { defaultSettings, type Settings } from '../../../shared/settings'
+import { emptyEditState, selectOcrInHistory, type EditState } from '../edit/edit-history'
+import { initHistory, undo } from '../edit/history'
 import { makePageKey } from '../edit/model'
 import type { EditLayer } from '../pdfx/build'
 import type { DocEntry, PdfSource } from '../types'
@@ -915,7 +917,7 @@ describe('export snapshot and choices', () => {
     // Replace records the choice FIRST (undoable), then recognises the page again.
     const hash = ocrConfig(['fra']).hash
     store.replace([keyOf(s, 0)], ['fra'])
-    expect(select).toHaveBeenCalledWith(keyOf(s, 0), hash)
+    expect(select).toHaveBeenCalledWith(keyOf(s, 0), hash, expect.any(String))
     await settle()
     expect(port.recognizes()[0].opts.langs).toEqual(['fra'])
     answerAll(port, ['neu'])
@@ -932,12 +934,38 @@ describe('export snapshot and choices', () => {
     const select = vi.fn()
     store.syncEdits({ selectOcr: select })
     store.remove([key])
-    expect(select).toHaveBeenCalledWith(key, null)
+    expect(select).toHaveBeenCalledWith(key, null, expect.any(String))
     // EditProvider records the op and hands the new ocrSelect back.
     store.syncEdits({ ocrSelect: new Map([[key, null]]) })
     expect(store.exportSource.snapshotFor(d, emptyLayer(new Map([[key, null]])))).toBeUndefined()
     expect(store.pageSupply(key)?.page).toBeUndefined()
     expect(store.getPageState(key)).toMatchObject({ hasText: false })
+  })
+
+  it('Remove / Replace over several pages is ONE undo step (one group per command)', async () => {
+    const texts = new Map()
+    const s = scan('multi', 3, texts)
+    const { store, port } = rig({ texts })
+    const ks = [0, 1, 2].map((i) => keyOf(s, i))
+    // The real edit history behind the store, as EditProvider wires it.
+    let h = initHistory<EditState>(emptyEditState())
+    store.syncEdits({ selectOcr: (k, c, g) => (h = selectOcrInHistory(h, k, c, g)) })
+    store.reconcile([
+      doc(
+        'd',
+        ks.map((_, i) => pageOf(s, i))
+      )
+    ])
+    await settle()
+    answerTriage(port, 'scanned')
+    store.remove(ks)
+    expect(h.present.ocrSelect).toEqual({ [ks[0]]: null, [ks[1]]: null, [ks[2]]: null })
+    expect(h.past).toHaveLength(1)
+    // One Undo brings every page back ("Undo brings it back").
+    expect(undo(h).present.ocrSelect).toEqual({})
+    store.replace(ks.slice(0, 2), ['deu'])
+    expect(h.past).toHaveLength(2)
+    expect(undo(h).present.ocrSelect).toEqual({ [ks[0]]: null, [ks[1]]: null, [ks[2]]: null })
   })
 
   it('undoing a Replace brings back the original automatic text (lossless Replace)', async () => {

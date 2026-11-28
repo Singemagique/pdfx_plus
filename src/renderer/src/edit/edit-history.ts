@@ -34,16 +34,23 @@ export const emptyEditState = (): EditState => ({
 /**
  * Record a Replace (`configHash`) or Remove (null) Recognized Text choice for a page as one undoable
  * step, the `ocrSelect` op (§3.5.2). Undo restores the previous choice, whose results are still in
- * the OCR store; choosing what the page already has records no step.
+ * the OCR store; choosing what the page already has records no step. Consecutive calls sharing a
+ * `group` (one command over several pages: Remove Recognized Text on every page) fold into ONE
+ * step, so a single Undo brings every page of the command back.
  */
 export function selectOcrInHistory(
   h: History<EditState>,
   pageKey: string,
-  configHash: string | null
+  configHash: string | null,
+  group?: string
 ): History<EditState> {
-  return apply(h, (d) => {
-    d.ocrSelect[pageKey] = configHash
-  })
+  return apply(
+    h,
+    (d) => {
+      d.ocrSelect[pageKey] = configHash
+    },
+    group
+  )
 }
 
 /** Rotate a page by `delta` degrees (normalized to [0,360)); a net-zero rotation drops the key. */

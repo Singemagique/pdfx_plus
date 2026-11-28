@@ -265,6 +265,31 @@ describe('App · Document menu (OCR, DESIGN.md §3.8)', () => {
     expect(setMenuChecked()).toHaveBeenLastCalledWith('include-recognized-text', true)
   })
 
+  it('no Document command runs behind the open Recognize dialog (it is modal)', async () => {
+    await act(async () => root.render(createElement(App)))
+    await menu('recognize-text')
+    expect(container.querySelector('.ocr-dialog')).not.toBeNull()
+    for (const a of ['remove-recognized-text', 'copy-page-text', 'recognize-all-scanned']) {
+      await menu(a)
+      expect(toast()).toBeNull()
+    }
+    expect(container.querySelector('.ocr-dialog h2')?.textContent).toBe('Recognize Text')
+  })
+
+  it('the toast text goes through an always-mounted live region (announced, not just shown)', async () => {
+    await act(async () => root.render(createElement(App)))
+    const region = (): Element | null =>
+      [...container.querySelectorAll('.sr-only[role="status"][aria-live="polite"]')].find(
+        (e) => !e.closest('.toolbar')
+      ) ?? null
+    expect(region()).not.toBeNull() // there before any toast
+    expect(region()!.textContent).toBe('')
+    await menu('recognize-all-scanned')
+    expect(region()!.textContent).toBe('No scanned pages are waiting for text recognition')
+    // The visible toast is not a second live region.
+    expect(container.querySelector('.toast')!.getAttribute('role')).toBeNull()
+  })
+
   it('Copy Page Text, Remove and Recognize All say what they could not do', async () => {
     await act(async () => root.render(createElement(App)))
     await menu('copy-page-text')

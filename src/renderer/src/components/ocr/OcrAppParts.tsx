@@ -4,13 +4,11 @@
 import { useEffect, useRef } from 'react'
 import { useOcrSettings, useOcrSummary } from '../../ocr/OcrContext'
 import type { OcrStore } from '../../ocr/ocr-store'
-import { batchToast, UNAVAILABLE_COPY, unavailableDetails } from '../../ocr/ocr-ui'
+import { batchAttention, batchToast, UNAVAILABLE_COPY, unavailableDetails } from '../../ocr/ocr-ui'
 import { SignDialog } from '../SignDialog'
 
-export interface ToastAction {
-  label: string
-  run: () => void
-}
+import type { ToastAction } from '../../app/useToast'
+export type { ToastAction }
 
 export type Flash = (message: string, action?: ToastAction) => void
 
@@ -53,7 +51,7 @@ export function OcrToasts({
   flash: Flash
   onDetails: () => void
 }): null {
-  const { snapshot } = useOcrSummary()
+  const { snapshot, summary } = useOcrSummary()
   const seen = useRef(new Map<string, string>())
   const unavailable = useRef(snapshot.unavailable)
   const details = useRef(onDetails)
@@ -66,7 +64,9 @@ export function OcrToasts({
       if (b.state === 'running') continue
       // Only the end of a run speaks (a crashed request a later one took over says nothing more).
       if (prev !== undefined && prev !== 'running') continue
-      const t = batchToast(b)
+      // Attention by the chip's rule, so "now searchable" never sits next to "1 page needs
+      // attention" (a Sideways or Low-confidence page was recognised, and still needs a look).
+      const t = batchToast(b, batchAttention(b, summary))
       if (!t) continue
       if (t.action === 'resume')
         flash(t.message, { label: 'Resume', run: () => store.resume(b.id) })
@@ -80,6 +80,6 @@ export function OcrToasts({
       if (reason && reason !== 'no-port')
         flash(UNAVAILABLE_COPY, { label: 'Details', run: () => flash(unavailableDetails(reason)) })
     }
-  }, [snapshot, store, flash])
+  }, [snapshot, summary, store, flash])
   return null
 }

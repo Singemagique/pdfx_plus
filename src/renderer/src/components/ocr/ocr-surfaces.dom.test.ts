@@ -35,7 +35,7 @@ import { OcrDocChip } from './OcrDocChip'
 import { OcrFindRow } from './OcrFindRow'
 import { BADGE_COPY, OcrPageBadge } from './OcrPageBadge'
 import { OcrRedactionNote, REDACTION_NOTE } from './OcrRedactionNote'
-import { OcrToasts, type Flash } from './OcrAppParts'
+import { OcrSignDialog, OcrToasts, type Flash } from './OcrAppParts'
 import { OcrToolbarItems, RECOGNIZE_TOOLTIP } from './OcrToolbarItems'
 import { OcrExportPrompt } from '../OcrExportPrompt'
 ;(globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true
@@ -264,7 +264,7 @@ describe('while recognising', () => {
     await tick()
     await act(async () => port.disconnected('crashed'))
     await tick()
-    expect(q('.ocr-pill')?.textContent).toBe('Text recognition stopped')
+    expect(q('.ocr-pill .ocr-pill-long')?.textContent).toBe('Text recognition stopped')
     const call = flash.mock.calls.find((c) => /stopped unexpectedly/.test(c[0]))!
     expect(call[0]).toBe('Text recognition stopped unexpectedly; 0 of 3 pages done.')
     expect(call[1]!.label).toBe('Resume')
@@ -285,15 +285,222 @@ describe('finished', () => {
       answer(2)
     })
     await tick()
-    expect(flash).toHaveBeenCalledWith('Text recognized on 3 pages — now searchable')
+    // Low confidence was recognised but needs a look: the toast says so, like the chip.
+    expect(flash).toHaveBeenCalledWith(
+      'Text recognized on 3 pages · 1 needs attention',
+      expect.objectContaining({ label: 'Details' })
+    )
     expect(badge(keys[0])).toBeNull()
     expect(badge(keys[1])?.classList.contains('dot')).toBe(true)
     expect(badge(keys[1])?.getAttribute('aria-label')).toBe(BADGE_COPY.low)
     expect(chip()?.textContent).toBe('1 page needs attention')
     expect(q('.findbar-row2')).toBeNull()
-    expect(q('.sr-only[role="status"]')?.textContent).toBe(
-      'Text recognized on 3 pages — now searchable'
+  })
+
+  it('a Sideways page: the toast agrees with the chip (needs attention, [Details]), never "all is well"', async () => {
+    await mount()
+    await act(async () => void store.recognize(keys))
+    await tick()
+    await act(async () => {
+      answer(0)
+      answer(1, { rotateBy: 90 })
+      answer(2)
+    })
+    await tick()
+    expect(chip()?.textContent).toBe('1 page needs attention')
+    expect(flash).toHaveBeenCalledWith(
+      'Text recognized on 3 pages · 1 needs attention',
+      expect.objectContaining({ label: 'Details' })
     )
+    expect(flash.mock.calls.some((c) => /now searchable/.test(c[0]))).toBe(false)
+  })
+
+  it('one live region for progress: the pill does not repeat the toast’s final sentence', async () => {
+    await mount()
+    await act(async () => void store.recognize(keys))
+    await tick()
+    const live = (): string[] =>
+      [...document.querySelectorAll('[role="status"], [aria-live]')].map((e) => e.textContent ?? '')
+    expect(live()).toEqual(['Recognizing text on 3 pages'])
+    // The chip is not a live region (it would repeat the pill's numbers).
+    expect(chip()?.closest('[role="status"]')).toBeNull()
+    await act(async () => {
+      answer(0)
+      answer(1)
+      answer(2)
+    })
+    await tick()
+    expect(flash).toHaveBeenCalledWith('Text recognized on 3 pages — now searchable')
+    // The end is the toast's to say (App's always-mounted toast region): the pill clears.
+    expect(live()).toEqual([''])
+  })
+
+  it('Remove Recognized Text: the page shows no "not recognized" badge, and the chip offers nothing', async () => {
+    await mount()
+    store.syncEdits({
+      selectOcr: (k, c) => store.syncEdits({ ocrSelect: new Map([[k, c]]) })
+    })
+    await act(async () => void store.recognize(keys))
+    await tick()
+    await act(async () => {
+      answer(0)
+      answer(1)
+      answer(2)
+    })
+    await tick()
+    await act(async () => store.remove([keys[0]]))
+    await tick()
+    expect(store.getPageState(keys[0])).toMatchObject({ removed: true, hasText: false })
+    expect(badge(keys[0])).toBeNull()
+    expect(chip()?.textContent ?? null).not.toBe('Scanned · Recognize text')
+    expect(q('.findbar-row2')).toBeNull()
+  })
+
+  it('a page that crashed the process twice gets no [Try again] (§3.3.2: never retried)', async () => {
+    await mount()
+    await act(async () => void store.recognize(keys))
+    await tick()
+    await act(async () => {
+      answer(0, { status: 'failed', reason: 'recognize-crash', recognition: null })
+      answer(1, { status: 'failed', reason: 'render', recognition: null })
+      answer(2)
+    })
+    await tick()
+    await click(chip())
+    const rows = [...document.querySelectorAll('.ocr-summary-row')]
+    expect(rows).toHaveLength(2)
+    expect(rows[0].textContent).toContain('Page 1')
+    expect(rows[0].querySelector('button')).toBeNull()
+    expect(rows[1].textContent).toContain('Try again') // a plain failure may be asked again
+    // [Try again] goes through the one-click path (it says "couldn't start" when OCR is off).
+    await click(buttonByText('Try again'))
+    expect(actions.recognizeNow).toHaveBeenLastCalledWith([keys[1]])
+  })
+})
+
+describe('keyboard focus follows the one-click controls', () => {
+  it('chip "Scanned · Recognize text" → focus on its ✕ "Stop recognizing text", never <body>', async () => {
+    await mount()
+    chip()!.focus()
+    await click(chip())
+    await tick()
+    expect(document.activeElement?.getAttribute('aria-label')).toBe('Stop recognizing text')
+  })
+
+  it('the toolbar button turns into the pill: focus goes to the pill', async () => {
+    await mount()
+    const b = buttonByText(/^Recognize Text$/)!
+    b.focus()
+    await act(async () => void store.recognize(keys))
+    await tick()
+    expect(buttonByText(/^Recognize Text$/)).toBeUndefined()
+    expect(document.activeElement).toBe(q('.ocr-pill'))
+  })
+
+  it('the Find row’s [Recognize text] leaves focus in the find input', async () => {
+    const state: FindBarState = { ...NULL_FIND_CONTROLLER.getBarState(), open: true, query: 'x' }
+    const ctl: FindController = { ...NULL_FIND_CONTROLLER, getRawQuery: () => 'x' }
+    await mount(createElement(FindBar, { controller: ctl, state }))
+    const b = [...document.querySelectorAll<HTMLButtonElement>('.findbar .findbar-row2 button')][0]
+    b.focus()
+    await click(b)
+    await tick()
+    expect(q('.findbar .findbar-row2')).toBeNull()
+    expect(document.activeElement).toBe(q('.findbar .findbar-input'))
+  })
+
+  it('the job popover keeps focus where the user put it while progress re-renders its owner', async () => {
+    await mount()
+    // Two of three pages: the popover has two controls ("Recognize Text…" for the third, Stop all).
+    await act(async () => void store.recognize([keys[0], keys[1]]))
+    await tick()
+    await click(q('.ocr-pill'))
+    const stop = buttonByText('Stop all')!
+    expect(buttonByText('Recognize Text…')).toBeDefined()
+    stop.focus()
+    const moves: string[] = []
+    const log = (e: FocusEvent): void => void moves.push((e.target as HTMLElement).className)
+    document.addEventListener('focusin', log)
+    await act(async () => answer(0)) // a progress tick re-renders OcrToolbarItems
+    await tick()
+    document.removeEventListener('focusin', log)
+    expect(q('.ocr-pill')?.textContent).toContain('50%')
+    expect(moves).toEqual([])
+    expect(document.activeElement).toBe(stop)
+  })
+})
+
+describe('toolbar button', () => {
+  it('is disabled while the app is busy', async () => {
+    await act(async () =>
+      root.render(
+        createElement(OcrUiProvider, {
+          value: { store, supply: null, actions },
+          docs,
+          children: createElement(OcrToolbarItems, { busy: true })
+        } as never)
+      )
+    )
+    await tick()
+    expect(buttonByText(/^Recognize Text$/)!.disabled).toBe(true)
+  })
+})
+
+describe('Sign dialog: the D7 box shows only when recognised text exists', () => {
+  it('OcrSignDialog over the real store: absent before recognition, present after one page', async () => {
+    const box = (): HTMLInputElement | null =>
+      [...document.querySelectorAll('label')]
+        .find((l) => l.textContent === 'Include recognized text (machine-generated, not reviewed)')
+        ?.querySelector('input') ?? null
+    const signProps = {
+      busy: false,
+      onSign: vi.fn(),
+      onSignCard: vi.fn(),
+      listTokens: vi.fn(async () => []),
+      findModules: vi.fn(async () => []),
+      listWindowsCerts: vi.fn(async () => []),
+      onSignWindowsCert: vi.fn(),
+      platform: 'linux',
+      pathForFile: () => '',
+      placementLabel: null,
+      onClearPlacement: vi.fn(),
+      onPlaceRequest: vi.fn(),
+      hasSavedSignature: false,
+      onDrawSignature: vi.fn(),
+      onClose: vi.fn()
+    }
+    await mount(createElement(OcrSignDialog, signProps as never))
+    expect(box()).toBeNull()
+    await act(async () => void store.recognize([keys[0]]))
+    await tick()
+    expect(box()).toBeNull() // still running: no text yet
+    await act(async () => answer(0))
+    await tick()
+    expect(box()).not.toBeNull()
+    expect(box()!.checked).toBe(false) // unticked by default (D7)
+  })
+})
+
+describe('finished: toasts and summary rows', () => {
+  it('a crashed request that a later one takes over says nothing more', async () => {
+    await mount()
+    await act(async () => void store.recognize(keys))
+    await tick()
+    await act(async () => port.disconnected('crashed'))
+    await tick()
+    // Asking again takes over the pages the crash holds.
+    await act(async () => void store.recognize(keys))
+    await tick()
+    await act(async () => {
+      answer(0)
+      answer(1)
+      answer(2)
+    })
+    await tick()
+    const said = flash.mock.calls.map((c) => c[0])
+    expect(said.filter((m) => /stopped unexpectedly/.test(m))).toHaveLength(1)
+    expect(said.filter((m) => /^Stopped\./.test(m))).toHaveLength(0)
+    expect(said.filter((m) => /^Text recognized/.test(m))).toHaveLength(1)
   })
 
   it('the summary popover: Low confidence row with [View] [Replace…], and its footer', async () => {
@@ -465,18 +672,43 @@ describe('full-view banner', () => {
     const onDone = vi.fn()
     await mount(banner(keys[1], new Set(), onShown, onDone))
     const b = q('.ocr-banner')!
-    expect(b.getAttribute('role')).toBe('status')
+    // Not a live region: the pill's throttled region announces progress, once.
+    expect(b.getAttribute('role')).toBeNull()
     expect(b.textContent).toContain(
       'This page is a scanned image. Recognize its text to search it and to make exported PDFs searchable.'
     )
     expect(onShown).toHaveBeenCalledWith('d1')
-    await click(buttonByText('Just this page'))
+    const just = buttonByText('Just this page')!
+    just.focus()
+    await click(just)
     expect(actions.recognizeNow).toHaveBeenLastCalledWith([keys[1]])
     await tick()
-    // Running: "Recognizing text… page 1 of 1 [Stop]".
+    // Running: "Recognizing text… page 1 of 1 [Stop]", and the focus went to [Stop].
     expect(q('.ocr-banner')?.textContent).toContain('Recognizing text… page 1 of 1')
+    expect(document.activeElement).toBe(buttonByText('Stop'))
     await click(buttonByText('Stop'))
     expect(onDone).toHaveBeenCalledWith('d1')
+  })
+
+  it('a document already seen gets no running banner either (recognition started from the chip)', async () => {
+    await mount(banner(keys[0], new Set(['d1'])))
+    await act(async () => void store.recognize(keys))
+    await tick()
+    expect(chip()?.textContent).toContain('Recognizing 0 / 3')
+    expect(q('.ocr-banner')).toBeNull()
+  })
+
+  it('with one page left to recognise: [Recognize this page] [Not now], no "Recognize 1 pages"', async () => {
+    await act(async () => void store.recognize([keys[0], keys[1]]))
+    await settle()
+    await act(async () => {
+      answer(0)
+      answer(1)
+    })
+    await settle()
+    await mount(banner(keys[2], new Set()))
+    const labels = [...q('.ocr-banner')!.querySelectorAll('button')].map((b) => b.textContent)
+    expect(labels).toEqual(['Recognize this page', 'Not now'])
   })
 
   it('Recognize 3 pages and Not now', async () => {

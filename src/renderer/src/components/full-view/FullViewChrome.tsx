@@ -24,11 +24,12 @@ export function FullViewChrome({
     <div className="full-chrome" style={{ opacity: chromeOpacity }}>
       <header className={`full-bar${isMac ? ' mac' : ''}`}>
         <span className="full-title">{docName}</span>
+        {/* The OCR banner shares the bar's strip, so it never covers the page below it. */}
+        {banner}
         <button className="icon-btn" title="Close (Esc)" onClick={runClose}>
           <CloseIcon size={16} />
         </button>
       </header>
-      {banner && <div className="full-banner-slot">{banner}</div>}
 
       <button
         className="full-nav prev"

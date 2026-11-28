@@ -17,7 +17,7 @@ interface Props {
 }
 
 export function OcrSummaryPopover({ anchor, docId, onClose }: Props): React.JSX.Element {
-  const { store, actions } = useOcrStore()
+  const { actions } = useOcrStore()
   const { summary } = useOcrSummary()
   const docs = docId ? summary.docs.filter((d) => d.docId === docId) : summary.docs
   const groups = docs.filter((d) => d.issues.length > 0)
@@ -60,7 +60,8 @@ export function OcrSummaryPopover({ anchor, docId, onClose }: Props): React.JSX.
             </button>
           )}
           {issue.retry && (
-            <button className="sign-link" onClick={() => store?.recognize([p.key])}>
+            // The one-click path: says "couldn't start" when OCR is unavailable, like the others.
+            <button className="sign-link" onClick={() => actions.recognizeNow([p.key])}>
               Try again
             </button>
           )}

@@ -92,8 +92,11 @@ export interface EditStore {
    * result's `configHash`, or null for Remove. Also on `editLayer`, for the export snapshot.
    */
   ocrSelect: Map<string, string | null>
-  /** Record a Replace (`configHash`) or Remove (null) for a page: one undoable step. */
-  selectOcr: (pageKey: string, configHash: string | null) => void
+  /**
+   * Record a Replace (`configHash`) or Remove (null) for a page: one undoable step, shared by
+   * consecutive calls with the same `group` (one command over several pages).
+   */
+  selectOcr: (pageKey: string, configHash: string | null, group?: string) => void
   /** Upsert a form field's value as a formValue overlay (empty string / false clears it). For
    *  radios, `geom` is the chosen option's rect and `control` is 'radio'. */
   setFormValue: (
@@ -170,8 +173,9 @@ export function useEditStore(): EditStore {
   }, [])
 
   // Replace / Remove Recognized Text: only the choice goes into history, never words (§3.5.2).
-  const selectOcr = useCallback((pageKey: string, configHash: string | null) => {
-    setHistory((h) => selectOcrInHistory(h, pageKey, configHash))
+  // One command over several pages passes one `group`: a single undo step for all of them.
+  const selectOcr = useCallback((pageKey: string, configHash: string | null, group?: string) => {
+    setHistory((h) => selectOcrInHistory(h, pageKey, configHash, group))
   }, [])
 
   const setFormValue = useCallback(

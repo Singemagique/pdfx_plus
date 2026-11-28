@@ -268,11 +268,24 @@ export function overallProgress(batches: readonly OcrBatchView[]): {
 export const pagesWord = (n: number): string => `${n} page${n === 1 ? '' : 's'}`
 
 /**
+ * How many of a batch's pages need attention, by the chip's own rule (`pageIssue` / `isAttention`
+ * over the summary), so the toast and the chip never disagree: a Sideways or Low-confidence page
+ * counts though it was recognised.
+ */
+export function batchAttention(b: OcrBatchView, summary: Pick<CollectionOcr, 'byKey'>): number {
+  let n = 0
+  for (const k of new Set(b.keys)) if (isAttention(summary.byKey.get(k)?.issue ?? null)) n++
+  return n
+}
+
+/**
  * The toast for a batch that just ended (§3.8 "Toasts"), or null when there is nothing to say.
- * `action` names the toast's button: Resume (a crash), Details (the summary).
+ * `action` names the toast's button: Resume (a crash), Details (the summary). `attention` is the
+ * batch's pages that need attention (`batchAttention`); without it, its failures.
  */
 export function batchToast(
-  b: OcrBatchView
+  b: OcrBatchView,
+  attention: number = b.failed
 ): { message: string; action?: 'resume' | 'details' } | null {
   const total = b.total
   if (b.state === 'stopped') {
@@ -288,18 +301,42 @@ export function batchToast(
   if (b.state !== 'done') return null
   if (total === 0)
     return b.kind === 'auto' ? null : { message: 'Nothing to recognize — no scanned pages left' }
-  if (b.recognized === total)
-    return { message: `Text recognized on ${pagesWord(total)} — now searchable` }
-  if (b.failed > 0)
+  const needs = (n: number): string => `${n} need${n === 1 ? 's' : ''} attention`
+  if (attention > 0)
     return {
-      message: `Text recognized on ${b.recognized} of ${total} pages · ${b.failed} need${b.failed === 1 ? 's' : ''} attention`,
+      message:
+        b.recognized === total
+          ? `Text recognized on ${pagesWord(total)} · ${needs(attention)}`
+          : `Text recognized on ${b.recognized} of ${total} pages · ${needs(attention)}`,
       action: 'details'
     }
+  if (b.recognized === total)
+    return { message: `Text recognized on ${pagesWord(total)} — now searchable` }
   return {
     message: `Text recognized on ${b.recognized} of ${total} pages · ${b.skipped} skipped`,
     action: 'details'
   }
 }
+
+/**
+ * Document ▸ Remove Recognized Text: the page in view (or the selected one) when there is one,
+ * else every page with recognised text. `none` is what to say when there is nothing to remove.
+ */
+export function removeTargets(
+  summary: Pick<CollectionOcr, 'replaceable'>,
+  focusKey: string | null
+): { keys: string[]; none: string } {
+  if (focusKey)
+    return {
+      keys: summary.replaceable.includes(focusKey) ? [focusKey] : [],
+      none: 'This page has no recognized text'
+    }
+  return { keys: [...summary.replaceable], none: 'No recognized text to remove' }
+}
+
+/** The toast after Remove Recognized Text: one Undo step brings every page of it back. */
+export const removedCopy = (n: number): string =>
+  `Recognized text removed from ${pagesWord(n)} · Undo brings it back`
 
 /** The session-wide failure toast (§3.8 "Errors": "Text recognition couldn't start. [Details]"). */
 export const UNAVAILABLE_COPY = 'Text recognition couldn’t start.'
@@ -313,13 +350,17 @@ export function unavailableDetails(reason: OcrSnapshot['unavailable']): string {
 // Screen-reader announcements (§3.8 "Accessibility").
 
 export interface Announcer {
-  /** Feed the current progress; returns the text to announce now, or null. */
+  /**
+   * Feed the current progress; returns the text to announce now ('' clears the region), or null
+   * for no change.
+   */
   next(p: { running: boolean; done: number; total: number; final?: string | null }): string | null
 }
 
 /**
  * Throttled progress announcements: once when a run starts, then every 10% or every 5 pages
- * (whichever comes first), and a final announcement when it ends.
+ * (whichever comes first), and `final` when it ends. Without a `final` the end clears the region
+ * (''): the app's toast region speaks how the run ended, and the same sentence twice is noise.
  */
 export function createAnnouncer(): Announcer {
   let active = false
@@ -330,7 +371,7 @@ export function createAnnouncer(): Announcer {
       if (!running) {
         if (!active) return final ?? null
         active = false
-        return final ?? 'Text recognition finished'
+        return final ?? ''
       }
       if (!active) {
         active = true

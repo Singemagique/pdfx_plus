@@ -1833,11 +1833,50 @@ body {
   }
 }
 
-/* Toolbar: the Recognize Text button and the activity pill. */
+/* Toolbar: the Recognize Text button and the activity pill. Their wrapper only tracks focus; its
+   children are the toolbar's own flex items. */
+.ocr-toolbar-items,
+.ocr-chip-slot {
+  display: contents;
+}
+
 .ocr-recognize-btn {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+}
+
+.ocr-pill-short {
+  display: none;
+}
+
+/* The toolbar has no room to spare at the window's minimum width (720 px): below 1000 px the OCR
+   items fold to an icon (with its accessible name) and a bare percentage, and with one of them up
+   the toolbar's gaps tighten, so Sign stays on screen. */
+@media (max-width: 1000px) {
+  .ocr-recognize-btn {
+    padding-left: 11px;
+    padding-right: 11px;
+  }
+  .ocr-recognize-btn .ocr-btn-label,
+  .ocr-pill-long,
+  .ocr-pill-bar {
+    display: none;
+  }
+  .ocr-pill-short {
+    display: inline;
+  }
+}
+
+@media (max-width: 860px) {
+  .toolbar:has(.ocr-recognize-btn, .ocr-pill) {
+    gap: 8px;
+    padding-left: 12px;
+    padding-right: 12px;
+  }
+  .toolbar.mac:has(.ocr-recognize-btn, .ocr-pill) {
+    padding-left: 84px;
+  }
 }
 
 .ocr-pill {
@@ -2057,36 +2096,48 @@ button.ocr-chip:hover {
   background: transparent;
 }
 
-/* Full-view banner, under the full-view bar. */
-.full-banner-slot {
-  position: absolute;
-  top: 56px;
-  left: 0;
-  right: 0;
-  z-index: 3;
-  display: flex;
-  justify-content: center;
-  padding: 0 16px;
-  pointer-events: none;
-}
-
+/* Full-view banner: one row inside the full-view bar, between the title and the close button, so it
+   shares the strip the bar already takes and never covers the page below it (§3.8 "under
+   full-bar"). Full view is dark in both themes, and so is the banner: its tokens are pinned to the
+   dark values here, so the glass buttons inside get a dark fill under their light ink in the light
+   theme too (the light theme's white --btn-glass-bg under full view's near-white ink made "Just
+   this page", "Not now" and "Stop" blank white pills). */
 .ocr-banner {
+  --btn-glass-bg: rgba(255, 255, 255, 0.14);
+  --btn-glass-bg-hover: rgba(255, 255, 255, 0.24);
+  --hairline: rgba(255, 255, 255, 0.14);
+  --ink: rgba(255, 255, 245, 0.92);
+  --ink-soft: rgba(255, 255, 245, 0.6);
   display: flex;
+  flex: 0 1 auto;
   align-items: center;
-  flex-wrap: wrap;
-  gap: 10px 16px;
-  max-width: min(760px, 100%);
-  padding: 10px 12px 10px 16px;
-  border-radius: 12px;
-  /* Opaque: it sits over the page, whose content must not show through the copy. */
+  gap: 14px;
+  min-width: 0;
+  margin: 0 auto;
+  padding: 4px 6px 4px 14px;
+  border-radius: 999px;
+  /* Opaque: the bar's strip can lie over the top of a page fitted to the window. */
   background: #26272d;
   color: var(--ink);
-  font-size: 13px;
-  line-height: 1.4;
+  font-size: 12.5px;
+  line-height: 1.3;
+  white-space: nowrap;
   box-shadow:
-    0 8px 28px rgba(0, 0, 0, 0.4),
+    0 6px 20px rgba(0, 0, 0, 0.35),
     inset 0 0 0 1px var(--hairline);
   pointer-events: auto;
+}
+
+.ocr-banner .btn.glass {
+  /* The light theme lifts glass pills with a light-page shadow; on the dark banner it reads as a
+     smudge. */
+  box-shadow: none;
+}
+
+.ocr-banner-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .ocr-banner strong {
@@ -2095,13 +2146,13 @@ button.ocr-chip:hover {
 
 .ocr-banner-actions {
   display: flex;
-  gap: 8px;
-  margin-left: auto;
+  flex: none;
+  gap: 6px;
 }
 
 .ocr-banner .btn {
-  padding: 5px 12px;
-  font-size: 12.5px;
+  padding: 4px 11px;
+  font-size: 12px;
 }
 
 /* The Recognize dialog (Sign dialog pattern). */
@@ -2254,6 +2305,28 @@ button.ocr-chip:hover {
   font-weight: 600;
   text-decoration: underline;
   cursor: pointer;
+}
+
+.toast-dismiss {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  margin-left: 10px;
+  margin-right: -8px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: inherit;
+  vertical-align: middle;
+  cursor: pointer;
+  opacity: 0.75;
+}
+
+.toast-dismiss:hover {
+  opacity: 1;
 }
 
 .ocr-redaction-note {

@@ -97,6 +97,12 @@ export interface OcrBatchView {
   inflightFrac: number
   /** EWMA estimate of the time left, ms; null until 3 pages are done. */
   etaMs: number | null
+  /**
+   * The live page keys the request covers (asked for and not already recognised with its
+   * configuration): the end-of-run toast counts the ones that need attention among them, with the
+   * same rule as the chip (ocr-ui `pageIssue`).
+   */
+  keys: readonly string[]
 }
 
 export type OcrLinkState = 'idle' | 'connecting' | 'connected' | 'unavailable'
@@ -283,6 +289,8 @@ interface Batch {
   config: OcrConfig
   state: BatchState
   works: Set<Work>
+  /** The page keys it covers (OcrBatchView.keys). */
+  keys: string[]
   recognized: number
   skipped: number
   failed: number
@@ -354,7 +362,7 @@ export interface OcrStore {
   syncEdits(edits: {
     ocrSelect?: ReadonlyMap<string, string | null>
     rotations?: ReadonlyMap<string, number>
-    selectOcr?: (pageKey: string, configHash: string | null) => void
+    selectOcr?: (pageKey: string, configHash: string | null, group?: string) => void
   }): void
   /** The page in view (recognised first, §3.3.6), or null. */
   setFocus(pageKey: string | null): void
@@ -412,7 +420,7 @@ export function createOcrStore(opts: OcrStoreOptions): OcrStore {
   // ---- edits
   let ocrSelect: ReadonlyMap<string, string | null> = new Map()
   let rotations: ReadonlyMap<string, number> = new Map()
-  let selectOcr: ((pageKey: string, configHash: string | null) => void) | undefined
+  let selectOcr: ((pageKey: string, configHash: string | null, group?: string) => void) | undefined
   let focusKey: string | null = null
 
   // ---- settings
@@ -528,7 +536,8 @@ export function createOcrStore(opts: OcrStoreOptions): OcrStore {
       skipped: b.skipped,
       failed: b.failed,
       inflightFrac,
-      etaMs: b.samples >= 3 && b.ewma !== null && b.state === 'running' ? b.ewma * remaining : null
+      etaMs: b.samples >= 3 && b.ewma !== null && b.state === 'running' ? b.ewma * remaining : null,
+      keys: b.keys
     }
   }
 
@@ -940,6 +949,7 @@ export function createOcrStore(opts: OcrStoreOptions): OcrStore {
       config,
       state: 'running',
       works: new Set(),
+      keys: [],
       recognized: 0,
       skipped: 0,
       failed: 0,
@@ -961,6 +971,8 @@ export function createOcrStore(opts: OcrStoreOptions): OcrStore {
       seen.add(id)
       const r = rec(ls.so, info.index)
       if (r.results.has(config.hash)) continue // already recognised with this config
+      // An automatic request says nothing about a page it leaves alone (two crashes, below).
+      if (explicit || r.crashes < 2) b.keys.push(key)
       if (ls.so.gate === 'refused') {
         // The coordinator refused the whole source (too large, unreadable): nothing will be sent,
         // so the page fails now, with the refusal's reason, instead of waiting forever.
@@ -1790,11 +1802,14 @@ export function createOcrStore(opts: OcrStoreOptions): OcrStore {
       if (link === 'unavailable' || langs.length === 0) return null
       const config = ocrConfig(langs)
       // The choice first (undoable, §3.5.2): an export while the new text runs knows it is missing.
-      for (const key of pageKeys) if (keyInfo.has(key)) selectOcr?.(key, config.hash)
+      // One command, one undo step, however many pages it covers.
+      const group = mint('ocr-select:')
+      for (const key of pageKeys) if (keyInfo.has(key)) selectOcr?.(key, config.hash, group)
       return startBatch('replace', pageKeys, config.langs, true)
     },
     remove(pageKeys) {
-      for (const key of pageKeys) if (keyInfo.has(key)) selectOcr?.(key, null)
+      const group = mint('ocr-select:')
+      for (const key of pageKeys) if (keyInfo.has(key)) selectOcr?.(key, null, group)
     },
     cancel(batchId) {
       for (const b of batches) if (!batchId || b.id === batchId) cancelBatch(b)

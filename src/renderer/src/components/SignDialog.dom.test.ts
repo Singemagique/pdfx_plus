@@ -172,25 +172,60 @@ describe('SignDialog: Include recognized text (D7)', () => {
     )
   })
 
-  it('ticked, it is passed on as includeRecognizedText (every credential path)', async () => {
-    const props = makeProps({ recognizedTextAvailable: true, platform: 'linux' })
-    await mount(props)
-    await act(async () => box()!.click())
-    expect(box()!.checked).toBe(true)
-    // Certificate-file path: pick a .p12 so the submit goes through onSign.
-    const file = container.querySelector<HTMLInputElement>('input[type="file"]')!
-    Object.defineProperty(file, 'files', {
-      value: [new File([new Uint8Array([1, 2, 3])], 'me.p12')],
-      configurable: true
+  const typeInto = (input: HTMLInputElement, value: string): Promise<void> =>
+    act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(input, value)
+      input.dispatchEvent(new Event('input', { bubbles: true }))
     })
-    await act(async () => {
-      file.dispatchEvent(new Event('change', { bubbles: true }))
-    })
-    await act(async () => {})
-    await submitViaEnter()
-    expect(props.onSign).toHaveBeenCalledWith(
-      expect.any(Uint8Array),
-      expect.objectContaining({ includeRecognizedText: true })
-    )
-  })
+
+  it.each(['file', 'card', 'wincert'] as const)(
+    'ticked, it is passed on as includeRecognizedText (%s path)',
+    async (mode) => {
+      const props = makeProps({
+        recognizedTextAvailable: true,
+        platform: mode === 'wincert' ? 'win32' : 'linux',
+        findModules: vi.fn(async () => [{ path: '/usr/lib/opensc-pkcs11.so', name: 'OpenSC' }])
+      })
+      await mount(props)
+      await act(async () => box()!.click())
+      expect(box()!.checked).toBe(true)
+      if (mode === 'file') {
+        // Pick a .p12 so the submit goes through onSign.
+        const file = container.querySelector<HTMLInputElement>('input[type="file"]')!
+        Object.defineProperty(file, 'files', {
+          value: [new File([new Uint8Array([1, 2, 3])], 'me.p12')],
+          configurable: true
+        })
+        await act(async () => {
+          file.dispatchEvent(new Event('change', { bubbles: true }))
+        })
+        await act(async () => {})
+      } else if (mode === 'card') {
+        await act(async () => byText(/Smart card/).click())
+        await act(async () => {}) // the module probe fills the path
+        expect(
+          container.querySelector<HTMLInputElement>('input[placeholder="PKCS#11 module path"]')!
+            .value
+        ).toBe('/usr/lib/opensc-pkcs11.so')
+        await typeInto(
+          container.querySelector<HTMLInputElement>('input[placeholder="Card PIN"]')!,
+          '1234'
+        )
+      }
+      // The box stays ticked across the mode switch.
+      expect(box()!.checked).toBe(true)
+      await submitViaEnter()
+      const call =
+        mode === 'file'
+          ? props.onSign
+          : mode === 'card'
+            ? props.onSignCard
+            : props.onSignWindowsCert
+      expect(call).toHaveBeenCalledTimes(1)
+      expect(call).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ includeRecognizedText: true })
+      )
+    }
+  )
 })
