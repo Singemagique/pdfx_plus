@@ -21,6 +21,7 @@ import {
   OcrSupervisor,
   RING_BYTES,
   SERVICE_NAME,
+  isV8FatalOom,
   signedExitCode,
   type ChildLike,
   type ForkOptions,
@@ -1114,6 +1115,127 @@ describe('liveness: a hung child (PR0b, Linux: no exit, no child-process-gone)',
     child.hang()
     await vi.advanceTimersByTimeAsync(1_000)
     expect(child.killed).toBe(true)
+  })
+
+  // Electron 38 main, after a synchronous stall, runs the due timer BEFORE it delivers the
+  // utility-process messages that queued meanwhile [measured, scratch experiment]. So the deadline
+  // firing up to an interval late, with the child's heartbeats right behind it, is the normal shape
+  // of a 15–20 s main stall, and must not kill a child that never stopped sending.
+  it.each([1, 3_000, OCR_HEARTBEAT_INTERVAL_MS])(
+    'a main stall that ends %i ms past the deadline does not kill a child whose heartbeats queued behind it',
+    async (lateMs) => {
+      const ctx = setup()
+      const { wc, child } = await connected(ctx)
+      // Heartbeats by hand: the "queue" is whatever is said after the timers ran.
+      child.hang()
+      child.say(HB)
+      // Main is blocked from here to `end`. Then every timer that came due runs at once, each
+      // seeing `end` as the time...
+      const end = Date.now() + LIVENESS_MS + lateMs
+      const now = vi.spyOn(Date, 'now').mockReturnValue(end)
+      await vi.advanceTimersByTimeAsync(LIVENESS_MS + lateMs)
+      now.mockRestore()
+      // ...and only then do the heartbeats the child sent meanwhile arrive.
+      child.say(HB)
+      child.say(HB)
+      child.say(HB)
+      expect(child.killCalls).toBe(0)
+      child.responsive = true
+      await vi.advanceTimersByTimeAsync(60_000)
+      expect(child.killCalls).toBe(0)
+      expect(ctx.sup.lastExit).toBeNull()
+      expect(ctx.sup.state).toBe('running')
+      expect(wc.disconnects()).toEqual([])
+    }
+  )
+
+  it('suspicion alone never kills: a heartbeat in the last interval clears it', async () => {
+    const ctx = setup()
+    const { child } = await connected(ctx)
+    child.hang()
+    child.say(HB)
+    // Past the suspect point, inside the confirmation interval.
+    await vi.advanceTimersByTimeAsync(LIVENESS_MS - OCR_HEARTBEAT_INTERVAL_MS + 1)
+    expect(child.killCalls).toBe(0)
+    child.say(HB)
+    await vi.advanceTimersByTimeAsync(LIVENESS_MS - 1)
+    expect(child.killCalls).toBe(0)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(child.killCalls).toBe(1)
+    expect(ctx.sup.lastExit).toMatchObject({ reason: 'hung' })
+  })
+})
+
+describe('a V8 heap abort (the thread caps do not contain every runaway; budget.ts)', () => {
+  // Measured stderr of a utility process whose capped worker grew one array / Map past the cap.
+  const ABORT = [
+    '\r\n<--- Last few GCs --->\r\n',
+    '[56408:0000412C00628000]      574 ms: Mark-Compact (reduce) 639.3 (642.6) -> 384.2 (386.0) MB\r\n',
+    'FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory\r\n',
+    '----- Native stack trace -----\r\n',
+    ' 1: 00007FF78628A6BA llhttp_get_upgrade+45290\r\n'
+  ].join('')
+
+  it('recognises the abort line, and only at the start of a line', () => {
+    expect(isV8FatalOom(ABORT)).toBe(true)
+    expect(
+      isV8FatalOom(
+        'FATAL ERROR: CALL_AND_RETRY_LAST Allocation failed - JavaScript heap out of memory'
+      )
+    ).toBe(true)
+    expect(isV8FatalOom('FATAL ERROR: Zone Allocation failed - process out of memory\n')).toBe(true)
+    expect(isV8FatalOom('')).toBe(false)
+    expect(isV8FatalOom('FATAL ERROR: v8::ToLocalChecked Empty MaybeLocal\n')).toBe(false)
+    // Text that merely contains it (a page's words echoed by a library, say) is not the abort.
+    expect(
+      isV8FatalOom('warn: "FATAL ERROR: x Allocation failed - JavaScript heap out of memory"\n')
+    ).toBe(false)
+  })
+
+  it("an abort reported as 'crashed' 134 is a 'v8-oom': a crash that halves the concurrency", async () => {
+    const ctx = setup()
+    const { wc, child } = await connected(ctx)
+    child.stderr.write(ABORT)
+    await tick()
+    child.exit(134)
+    ctx.gone({ reason: 'crashed', exitCode: 134 })
+    await tick()
+    expect(ctx.sup.lastExit).toMatchObject({ reason: 'v8-oom', exitCode: 134 })
+    expect(ctx.sup.concurrencyDivisor).toBe(2)
+    expect(wc.disconnects()).toEqual([{ reason: 'crashed' }])
+    expect(ctx.sup.state).toBe('backoff')
+    // The respawned child is told the halved divisor.
+    await vi.advanceTimersByTimeAsync(BACKOFF_MS[0])
+    ctx.children[1].say(READY)
+    await tick()
+    expect(ctx.children[1].messages('init')).toMatchObject([{ init: { limits: { divisor: 2 } } }])
+    // Never the output itself in a packaged build.
+    expect(ctx.logs.join('\n')).not.toContain('Reached heap limit')
+  })
+
+  it('the Linux shape (the aborting child hangs until killed) is a v8-oom too', async () => {
+    const ctx = setup({}, { killMode: 'linux' })
+    const { child } = await connected(ctx)
+    child.stderr.write(ABORT)
+    await tick()
+    child.hang()
+    await vi.advanceTimersByTimeAsync(LIVENESS_MS)
+    expect(child.killCalls).toBe(1)
+    expect(ctx.sup.lastExit).toMatchObject({ reason: 'v8-oom', exitCode: -1 })
+    expect(ctx.sup.concurrencyDivisor).toBe(2)
+    expect(ctx.logs.filter((l) => l.includes('hung') && l.includes('V8 heap'))).toHaveLength(1)
+  })
+
+  it('a crash without the abort line leaves the concurrency alone', async () => {
+    const ctx = setup()
+    const { child } = await connected(ctx)
+    child.stderr.write('some other output\n')
+    await tick()
+    child.exit(134)
+    ctx.gone({ reason: 'crashed', exitCode: 134 })
+    await tick()
+    expect(ctx.sup.lastExit).toMatchObject({ reason: 'crashed' })
+    expect(ctx.sup.concurrencyDivisor).toBe(1)
   })
 })
 

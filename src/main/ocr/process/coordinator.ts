@@ -190,10 +190,14 @@ const DEFAULT_LIMITS: OcrHostLimits = {
   divisor: 1
 }
 
-/** An error that looks like memory exhaustion (halves n for the session; §3.3.4). */
+/**
+ * An error that looks like memory exhaustion (halves n for the session; §3.3.4). Not a stack
+ * overflow: V8 and WASM report one as RangeError "Maximum call stack size exceeded", but the stack is
+ * a fixed 4 MiB per thread (budget.ts), so fewer threads cannot help.
+ */
 export function isOomShaped(name: string, message: string): boolean {
   return (
-    name === 'RangeError' ||
+    (name === 'RangeError' && !/Maximum call stack size exceeded/i.test(message)) ||
     /out of memory|Cannot enlarge memory|memory access out of bounds|Array buffer allocation failed/i.test(
       message
     )

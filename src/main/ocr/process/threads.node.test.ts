@@ -4,6 +4,7 @@
 // as PR4a's first test), the posted WebAssembly.Module reaching the recognize thread, transferred
 // grey bitmaps, and every thread's tripwire counter at 0.
 
+import { spawnSync } from 'node:child_process'
 import { readFile } from 'node:fs/promises'
 import { availableParallelism, totalmem } from 'node:os'
 import { fileURLToPath } from 'node:url'
@@ -17,6 +18,7 @@ import { Coordinator, isThreadOom } from './coordinator'
 import { DEFAULT_RASTER_LIMITS } from './raster-core'
 import { STUB_ENGINE_WASM } from './stub-engine'
 import type { FromRaster, ToRaster } from './thread-messages'
+import { isV8FatalOom } from '../supervisor'
 import { bundleEntry, type Bundled } from '../test-utils/bundle'
 import { FakeParent, FakePort, INIT } from '../test-utils/fake-threads'
 import { PDFIUM_WASM_PATH } from '../test-utils/pdfium-node'
@@ -273,7 +275,7 @@ describe('the thread heap caps (budget.ts threadOptions, PR0b §f)', () => {
     )
   })
 
-  it('a JS-heap runaway is ERR_WORKER_OUT_OF_MEMORY, a thread OOM to the coordinator; this process lives', async () => {
+  it('a runaway of small objects is ERR_WORKER_OUT_OF_MEMORY, a thread OOM to the coordinator; this process lives', async () => {
     const r = await run('const a = []; for (;;) a.push({ x: new Array(64).fill(Math.random()) })')
     expect(r.error).toMatchObject({ code: 'ERR_WORKER_OUT_OF_MEMORY' })
     expect(isThreadOom(r.error)).toBe(true)
@@ -282,6 +284,26 @@ describe('the thread heap caps (budget.ts threadOptions, PR0b §f)', () => {
     const again = await run("require('worker_threads').parentPort.postMessage('alive')")
     expect(again.message).toBe('alive')
   }, 30_000)
+
+  it('does NOT contain a runaway that grows one big array: V8 aborts the whole process, and says so on stderr', () => {
+    // In a child process, since this one would die. Node lets a capped worker overrun its limit by
+    // only 16 MiB while it stops it; an array's backing store grows by ~50 % at a time, so past the
+    // cap one allocation asks for far more and V8 aborts (exit 134 / SIGABRT). The supervisor must
+    // recognise exactly this output (supervisor.ts isV8FatalOom).
+    const script = [
+      "const { Worker } = require('node:worker_threads')",
+      'const resourceLimits = JSON.parse(process.argv[1])',
+      "new Worker('const a = []; for (let i = 0; ; i++) a.push(i + 0.5)', { eval: true, resourceLimits })",
+      "  .on('error', (e) => { console.log('contained:' + e.code); process.exit(0) })"
+    ].join('\n')
+    const r = spawnSync(process.execPath, ['-e', script, JSON.stringify(THREAD_RESOURCE_LIMITS)], {
+      encoding: 'utf8',
+      timeout: 60_000
+    })
+    expect(r.stdout).not.toContain('contained:')
+    expect(r.status === 0).toBe(false)
+    expect(isV8FatalOom(r.stderr)).toBe(true)
+  }, 90_000)
 
   it('does not cap the WASM memories or buffers the engines need (they live outside the V8 heap)', async () => {
     // 512 MiB of WASM memory (more than the whole heap cap) plus 256 MiB of ArrayBuffers, and a

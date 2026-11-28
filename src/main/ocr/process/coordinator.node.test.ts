@@ -210,6 +210,8 @@ describe('budgets', () => {
     expect(isOomShaped('RuntimeError', 'Aborted(Cannot enlarge memory arrays)')).toBe(true)
     expect(isOomShaped('Error', 'Array buffer allocation failed')).toBe(true)
     expect(isOomShaped('RuntimeError', 'unreachable')).toBe(false)
+    // A stack overflow is a RangeError too, and no memory shortage: the stack is fixed per thread.
+    expect(isOomShaped('RangeError', 'Maximum call stack size exceeded')).toBe(false)
   })
 })
 
@@ -759,6 +761,8 @@ describe('recognize failure policy (§3.3.4)', () => {
     expect(isThreadOom(new RangeError('Invalid array length'))).toBe(true)
     expect(isThreadOom(new Error('thread crashed'))).toBe(false)
     expect(isThreadOom(undefined)).toBe(false)
+    // What a capped thread's runaway recursion emits [measured: Electron 38 utility process].
+    expect(isThreadOom(new RangeError('Maximum call stack size exceeded'))).toBe(false)
   })
 
   it('the watchdog terminates a stuck thread and marks the page timeout', async () => {

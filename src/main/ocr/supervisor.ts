@@ -31,13 +31,17 @@
 //   for minutes (PR0b, with and without the sandbox and inside unshare). So a child that sends
 //   nothing for LIVENESS_MISSES intervals, busy or idle, ready or not, is killed and classified
 //   'hung': a crash for the respawn/backoff policy and the renderer ('crashed', Resume), whatever
-//   exit code it reports afterwards (Linux: 0 after ~2 s).
+//   exit code it reports afterwards (Linux: 0 after ~2 s). The last interval is a separate
+//   confirmation timer, so a main-process stall is never mistaken for a silent child
+//   (LIVENESS_LATE_MS).
+// - A V8 heap abort in any thread (the heap caps do not contain every shape of runaway) is read off
+//   the child's stderr and classified 'v8-oom', which halves the concurrency like 'oom'.
 // - Exits: `child-process-gone` is filtered on details.name === 'pdfx-ocr' (serviceName is
 //   'node.mojom.NodeService' for every utility process). On Windows exit 1 reads as 'killed', our
 //   own kill() gives exit 0 and NO child-process-gone, and 'abnormal-exit' was never seen; on Linux
 //   our kill() gives exit 0 too. An exit code cannot tell a crash from a clean exit on every OS, so
 //   `killRequested` is set before every kill(), and any exit without it is a crash whatever the
-//   reason or code: respawn with backoff, at most 3 in 60 s. 'oom' / 'memory-eviction' also halve
+//   reason or code: respawn with backoff, at most 3 in 60 s. 'oom' / 'memory-eviction' / 'v8-oom' halve
 //   the concurrency for the session; 'launch-failed' is fatal. Crash codes come from
 //   child-process-gone.exitCode when there is one: the 'exit' code is lossy for native crashes
 //   (Windows reports process.crash()'s −36861 as the uint64 wrap 18446744073709515000; macOS 11).
@@ -85,6 +89,18 @@ export const HEARTBEAT_TIMEOUT_MS = 5_000
 export const LIVENESS_MISSES = 3
 export const LIVENESS_MS = LIVENESS_MISSES * OCR_HEARTBEAT_INTERVAL_MS
 /**
+ * The silence is checked in two steps: after LIVENESS_MISSES − 1 intervals the child is only
+ * suspected, and it is killed when the last interval also passes with no message. A deadline timer
+ * cannot tell on its own whether the child or main was silent: after main blocked (a long synchronous
+ * call, a debugger), Electron 38 runs the due libuv timer BEFORE it delivers the utility-process
+ * messages that queued meanwhile [measured: a 10x-scaled copy of this rule in Electron 38.8.6 main,
+ * scratch experiment; one-step rule: stalls of 1.6–1.95 s (16–19.5 s real) killed a child that
+ * kept sending; two-step: no stall from 1.2 to 3.5 s killed it, a silent child died at 1.50 s]. The
+ * confirmation timer is armed only once main runs again, so the queued heartbeats get there first. A
+ * confirmation that itself fires more than LIVENESS_LATE_MS late (main blocked again) is re-armed.
+ */
+export const LIVENESS_LATE_MS = 1_000
+/**
  * How long a child we killed may still report its child-process-gone before it exits. Linux reaped
  * a hung child 2.0–2.3 s after kill() (PR0b); after its exit, LATE_GONE_MS applies.
  */
@@ -100,6 +116,27 @@ export function signedExitCode(code: number): number {
   if (code >= 2 ** 63) return code - 2 ** 64
   if (code >= 2 ** 31 && code < 2 ** 32) return code - 2 ** 32
   return code
+}
+
+/**
+ * What Node prints on stderr when V8 runs out of heap and aborts the process (node::OOMErrorHandler:
+ * "FATAL ERROR: <where> Allocation failed - JavaScript heap out of memory").
+ *
+ * The thread heap caps (budget.ts) do NOT turn every thread OOM into ERR_WORKER_OUT_OF_MEMORY. Node
+ * gives a capped worker only 16 MiB past its limit to stop in, so a runaway built from small objects
+ * is contained, but one that grows a single big array, Map or backing store asks for more than that
+ * in one allocation and aborts the WHOLE process [measured: Electron 38.8.6 utility process with
+ * THREAD_RESOURCE_LIMITS, `a.push(x)` / `new Array(8e7).fill()` / `Map.set` runaways: exit 134,
+ * child-process-gone 'crashed', this line on stderr; small-object runaways: ERR_WORKER_OUT_OF_MEMORY,
+ * process alive, nothing on stderr. Same split in Node 24.12; threads.node.test.ts]. Such an exit is
+ * classified 'v8-oom' and treated as an OOM (the concurrency halves), not as a generic crash.
+ */
+const V8_FATAL_OOM =
+  /^FATAL ERROR: [^\n]*Allocation failed - (?:JavaScript heap|process) out of memory/m
+
+/** Did this output end in V8's fatal out-of-memory abort? (Matches a fixed line; never logged.) */
+export function isV8FatalOom(output: string): boolean {
+  return V8_FATAL_OOM.test(output)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -187,7 +224,8 @@ export type SupervisorState =
 export interface ExitInfo {
   /**
    * child-process-gone's reason; without one 'clean-exit' (code 0) or 'abnormal-exit'; 'hung' for a
-   * child killed by the liveness check. Every one of them is a crash to the respawn policy.
+   * child killed by the liveness check; 'v8-oom' over any of those when the child's stderr ends in
+   * V8's heap abort (`isV8FatalOom`). Every one of them is a crash to the respawn policy.
    */
   reason: string
   exitCode: number
@@ -256,6 +294,9 @@ interface Gen {
   /** When the liveness timer is due (Date.now() ms), to tell a silent child from a stalled main. */
   livenessDue: number
 }
+
+/** The 'exit' / child-process-gone reasons that halve the concurrency for the session. */
+const OOM_REASONS = new Set(['oom', 'memory-eviction', 'v8-oom'])
 
 type Owner =
   | { kind: 'wc'; wc: WebContentsLike; detach: () => void }
@@ -681,11 +722,17 @@ export class OcrSupervisor {
     return this.deps.livenessMs ?? LIVENESS_MS
   }
 
+  /** The last interval of the window: the confirmation step (LIVENESS_LATE_MS). */
+  private get confirmMs(): number {
+    return Math.round(this.livenessMs / LIVENESS_MISSES)
+  }
+
+  /** Any message: a fresh window. Silence for all but its last interval only makes it a suspect. */
   private armLiveness(gen: Gen): void {
     this.clearLiveness(gen)
-    const ms = this.livenessMs
+    const ms = this.livenessMs - this.confirmMs
     gen.livenessDue = Date.now() + ms
-    gen.liveness = setTimeout(() => this.onSilent(gen), ms)
+    gen.liveness = setTimeout(() => this.onSuspect(gen), ms)
   }
 
   private clearLiveness(gen: Gen): void {
@@ -693,14 +740,34 @@ export class OcrSupervisor {
     gen.liveness = null
   }
 
-  private onSilent(gen: Gen): void {
+  private onSuspect(gen: Gen): void {
     gen.liveness = null
     if (gen !== this.gen || !gen.alive || gen.classified) return
     // Fired more than an interval late: main itself was blocked (a long synchronous save, a
-    // suspended laptop), and the child's heartbeats may be queued behind this very timer. Give it a
-    // fresh window instead of killing a child that only main failed to listen to.
-    if (Date.now() - gen.livenessDue > OCR_HEARTBEAT_INTERVAL_MS) {
+    // suspended laptop). Give the child a fresh window instead of judging a silence main caused.
+    if (Date.now() - gen.livenessDue > this.confirmMs) {
       this.armLiveness(gen)
+      return
+    }
+    // Never a kill from here: the heartbeats that queued while main was blocked are delivered after
+    // this callback (Electron 38 order), and any of them re-arms the window.
+    this.confirmLiveness(gen)
+  }
+
+  private confirmLiveness(gen: Gen): void {
+    this.clearLiveness(gen)
+    const ms = this.confirmMs
+    gen.livenessDue = Date.now() + ms
+    gen.liveness = setTimeout(() => this.onSilent(gen), ms)
+  }
+
+  private onSilent(gen: Gen): void {
+    gen.liveness = null
+    if (gen !== this.gen || !gen.alive || gen.classified) return
+    // Late again: main was blocked during the confirmation too, and the child's messages may be
+    // queued behind this very timer. Confirm once more rather than kill a child main did not hear.
+    if (Date.now() - gen.livenessDue > Math.min(LIVENESS_LATE_MS, this.confirmMs)) {
+      this.confirmLiveness(gen)
       return
     }
     gen.hung = true
@@ -813,15 +880,20 @@ export class OcrSupervisor {
         this.killChild(gen)
       }
     }
-    const reason = gen.hung
-      ? 'hung'
-      : (gen.gone?.reason ?? (gen.exitCode === 0 ? 'clean-exit' : 'abnormal-exit'))
+    // A V8 heap abort is 'crashed' (Windows) or a hang (Linux) to Electron; its stderr says what it
+    // was. It outranks both: it is the cause, and it decides the policy below.
+    const v8Oom = isV8FatalOom(gen.ring.text())
+    const reason = v8Oom
+      ? 'v8-oom'
+      : gen.hung
+        ? 'hung'
+        : (gen.gone?.reason ?? (gen.exitCode === 0 ? 'clean-exit' : 'abnormal-exit'))
     // child-process-gone's code is exact for native crashes; 'exit' is lossy there (PR0, PR0b).
     const exitCode = gen.hung ? -1 : (gen.gone?.exitCode ?? gen.exitCode ?? -1)
     this.lastExit = { reason, exitCode, lines: gen.ring.lines, bytes: gen.ring.total }
     this.deps.log(
       gen.hung
-        ? `ocr: utility process hung (no message in ${Math.round(this.livenessMs / 1000)} s); ${gen.ring.lines} line(s) of output`
+        ? `ocr: utility process hung (no message in ${Math.round(this.livenessMs / 1000)} s${v8Oom ? ', V8 heap out of memory' : ''}); ${gen.ring.lines} line(s) of output`
         : `ocr: utility process exited unexpectedly (${reason}, code ${exitCode}); ${gen.ring.lines} line(s) of output`
     )
     // The output itself only in development builds: it can quote document content.
@@ -838,8 +910,7 @@ export class OcrSupervisor {
       this.becomeFatal()
       return
     }
-    if (reason === 'oom' || reason === 'memory-eviction')
-      this.divisor = Math.min(64, this.divisor * 2)
+    if (OOM_REASONS.has(reason)) this.divisor = Math.min(64, this.divisor * 2)
 
     // Every unrequested exit is a crash: respawn with backoff, at most MAX_RESPAWNS in the window.
     const now = Date.now()

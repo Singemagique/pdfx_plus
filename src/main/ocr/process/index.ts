@@ -34,7 +34,8 @@ process.exitCode = 0
 
 function spawn(path: string): WorkerLike {
   // stdout/stderr of the threads go to this process's pipes, which the supervisor drains. The heap
-  // caps turn a thread's V8 OOM into ERR_WORKER_OUT_OF_MEMORY instead of a dead or hung process.
+  // caps turn most of a thread's V8 OOMs into ERR_WORKER_OUT_OF_MEMORY instead of a dead or hung
+  // process; one big allocation past the cap still aborts the process (budget.ts).
   return new Worker(path, threadOptions())
 }
 

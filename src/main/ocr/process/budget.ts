@@ -74,6 +74,13 @@ export const DEFAULT_BUDGETS: Budgets = defaultBudgets()
  * (64 MB in PR0b) every OS gave ERR_WORKER_OUT_OF_MEMORY and the process lived. (`execArgv
  * --max-old-space-size` on the fork is accepted but not honoured: PR0b.)
  *
+ * Contained, not every shape: Node lets a capped worker go only 16 MiB past its limit while it stops
+ * it, so a runaway of small objects (PR0b's, and the one in threads.node.test.ts) is contained, but
+ * one that grows a single big array, Map or backing store needs more than that in one allocation and
+ * V8 aborts the WHOLE process ("FATAL ERROR: … JavaScript heap out of memory", exit 134) [measured:
+ * Electron 38.8.6 utility process and Node 24.12 with these caps]. The supervisor reads that line off
+ * the child's stderr and treats the exit as an OOM (supervisor.ts `isV8FatalOom`).
+ *
  * The caps bound the JS heap only. The WASM memories (PDFium's, Tesseract's) and ArrayBuffers are
  * outside it, so they do not constrain the measured workloads (threads.node.test.ts proves 512 MiB
  * of WASM memory plus 256 MiB of buffers under these caps).

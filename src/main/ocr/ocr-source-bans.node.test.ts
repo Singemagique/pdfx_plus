@@ -3,7 +3,9 @@
 // the "pdfx-ocr" process or its threads must not import Electron or any network module, must not
 // read a network global (`fetch` needs no import), and must not load a module by a computed name.
 // The tripwire, no-network.ts, is the one file allowed to name those APIs: it is what replaces
-// them. src/shared/ocr/** gets the same network rules from src/shared/dom-free.node.test.ts.
+// them. src/shared/ocr/** gets the same network rules from src/shared/dom-free.node.test.ts, and
+// every src/shared module the process and thread bundles import (`bundleClosure`) gets ALL of the
+// rules below, since it runs in the process too.
 //
 // On top of the module and global bans: the native escape hatches (process.binding,
 // process._linkedBinding, process.dlopen) and a Worker started from a string of code (`eval: true`)
@@ -14,7 +16,7 @@
 // Two robustness rules from PR0b ride along: every thread is started with the V8 heap caps
 // (`threadOptions()`), and nothing in the process reads its environment (which Electron extends).
 
-import { readdirSync, readFileSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { dirname, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import ts from 'typescript'
@@ -55,6 +57,44 @@ const THIRD_PARTY = ['node_modules/@embedpdf/pdfium/dist/index.cjs']
 
 const ESCAPE_MEMBERS = new Set(['binding', '_linkedBinding', 'dlopen'])
 
+/** `e` without the TypeScript wrappers that do not change its value: (e), e as T, <T>e, e!, e satisfies T. */
+function unwrap(e: ts.Expression): ts.Expression {
+  for (;;) {
+    if (
+      ts.isParenthesizedExpression(e) ||
+      ts.isAsExpression(e) ||
+      ts.isTypeAssertionExpression(e) ||
+      ts.isNonNullExpression(e) ||
+      ts.isSatisfiesExpression(e)
+    )
+      e = e.expression
+    else return e
+  }
+}
+
+/** Is `e` the process object: `process` or `globalThis.process`, through any cast? */
+function isProcess(e: ts.Expression): boolean {
+  const u = unwrap(e)
+  if (ts.isIdentifier(u)) return u.text === 'process'
+  return (
+    ts.isPropertyAccessExpression(u) &&
+    u.name.text === 'process' &&
+    ts.isIdentifier(unwrap(u.expression)) &&
+    (unwrap(u.expression) as ts.Identifier).text === 'globalThis'
+  )
+}
+
+/**
+ * The member a `process.x` / `process['x']` access names (casts and `globalThis.process` included),
+ * or null when `n` is no such access or the key is computed.
+ */
+function processMember(n: ts.Node): string | null {
+  if (!(ts.isPropertyAccessExpression(n) || ts.isElementAccessExpression(n))) return null
+  if (!isProcess(n.expression)) return null
+  if (ts.isPropertyAccessExpression(n)) return n.name.text
+  return ts.isStringLiteralLike(n.argumentExpression) ? n.argumentExpression.text : null
+}
+
 /**
  * `process.binding` / `process._linkedBinding` / `process.dlopen` (dotted or bracketed, called or
  * not) and any `new …Worker(…)` given an `eval` option. Returns `line:column name` entries.
@@ -67,18 +107,8 @@ function escapeHatches(source: string, file: string): string[] {
     out.push(`${line + 1}:${character + 1} ${name}`)
   }
   const visit = (n: ts.Node): void => {
-    if (
-      (ts.isPropertyAccessExpression(n) || ts.isElementAccessExpression(n)) &&
-      ts.isIdentifier(n.expression) &&
-      n.expression.text === 'process'
-    ) {
-      const member = ts.isPropertyAccessExpression(n)
-        ? n.name.text
-        : ts.isStringLiteralLike(n.argumentExpression)
-          ? n.argumentExpression.text
-          : null
-      if (member !== null && ESCAPE_MEMBERS.has(member)) at(n, `process.${member}`)
-    }
+    const member = processMember(n)
+    if (member !== null && ESCAPE_MEMBERS.has(member)) at(n, `process.${member}`)
     if (ts.isNewExpression(n) && /Worker$/.test(n.expression.getText(sf))) {
       const options = n.arguments?.[1]
       if (
@@ -134,24 +164,12 @@ function envReads(source: string, file: string): string[] {
     out.push(`${line + 1}:${character + 1}`)
   }
   const visit = (n: ts.Node): void => {
-    if (
-      (ts.isPropertyAccessExpression(n) || ts.isElementAccessExpression(n)) &&
-      ts.isIdentifier(n.expression) &&
-      n.expression.text === 'process'
-    ) {
-      const member = ts.isPropertyAccessExpression(n)
-        ? n.name.text
-        : ts.isStringLiteralLike(n.argumentExpression)
-          ? n.argumentExpression.text
-          : null
-      if (member === 'env') at(n)
-    }
+    if (processMember(n) === 'env') at(n)
     // const { env } = process
     if (
       ts.isVariableDeclaration(n) &&
       n.initializer &&
-      ts.isIdentifier(n.initializer) &&
-      n.initializer.text === 'process' &&
+      isProcess(n.initializer) &&
       ts.isObjectBindingPattern(n.name) &&
       n.name.elements.some((e) => (e.propertyName ?? e.name).getText(sf) === 'env')
     )
@@ -204,12 +222,50 @@ function specifiers(source: string, file: string): string[] {
   return out
 }
 
-describe('src/main/ocr/process/** source bans', () => {
-  const files = sourceFiles(PROCESS_DIR)
+const RESOLVE_SUFFIXES = ['', '.ts', '.tsx', '.mts', '.cts', '.js', '.mjs', '.cjs', '/index.ts']
 
-  it('covers the process and thread entries', () => {
+/**
+ * Every repo file the process and thread bundles take in through a relative import, the entries
+ * included: their src/shared modules run in the utility process too, so they get its rules, not only
+ * src/shared's network ones (dom-free.node.test.ts has no ban on process.binding, process.env,
+ * child_process or `new Worker`). Type-only imports are followed as well (conservative). A relative
+ * specifier that resolves to no file is returned in `unresolved`: the scan cannot vouch for it.
+ */
+function bundleClosure(): { files: string[]; unresolved: string[] } {
+  const seen = new Set<string>()
+  const unresolved: string[] = []
+  const queue = ENTRIES.map((e) => resolve(REPO_ROOT, e))
+  while (queue.length > 0) {
+    const file = queue.pop()!
+    if (seen.has(file)) continue
+    seen.add(file)
+    for (const spec of specifiers(readFileSync(file, 'utf8'), file)) {
+      if (!spec.startsWith('.')) continue
+      const base = resolve(dirname(file), spec.split('?')[0])
+      const hit = RESOLVE_SUFFIXES.map((s) => base + s).find(
+        (p) => existsSync(p) && statSync(p).isFile()
+      )
+      if (hit) queue.push(hit)
+      else unresolved.push(`${rel(file)} → ${spec}`)
+    }
+  }
+  return { files: [...seen], unresolved }
+}
+
+describe('src/main/ocr/process/** source bans', () => {
+  const closure = bundleClosure()
+  // The folder (anything in it may be bundled later) plus whatever its bundles reach outside it.
+  const files = [...new Set([...sourceFiles(PROCESS_DIR), ...closure.files])]
+
+  it('covers the process and thread entries and the shared modules their bundles reach', () => {
     const names = files.map(rel)
     for (const e of [...ENTRIES, TRIPWIRE]) expect(names).toContain(e)
+    // Not vacuous: the protocol (and the PR2 types it re-exports) run in the process too.
+    expect(names).toContain('src/shared/ocr/protocol.ts')
+    expect(names).toContain('src/shared/ocr/types.ts')
+    expect(closure.unresolved).toEqual([])
+    // Nothing outside the process folder and src/shared (the folder rule below says the same).
+    expect(names.filter((n) => !/^src\/(main\/ocr\/process|shared)\//.test(n))).toEqual([])
   })
 
   it('imports no electron or network module and reads no network global (tripwire excepted)', () => {
@@ -317,6 +373,10 @@ describe('src/main/ocr/process/** source bans', () => {
     expect(envReads("const a = process['env']", 'x.ts')).toHaveLength(1)
     expect(envReads('const { env } = process', 'x.ts')).toHaveLength(1)
     expect(envReads('const { platform } = process', 'x.ts')).toHaveLength(0)
+    // Through a cast or globalThis, as TypeScript code often reaches process members.
+    expect(envReads('const a = (process as any).env', 'x.ts')).toHaveLength(1)
+    expect(envReads('const a = globalThis.process.env.HOME', 'x.ts')).toHaveLength(1)
+    expect(envReads('const { env } = process as NodeJS.Process', 'x.ts')).toHaveLength(1)
   })
 
   it('makes the tripwire the first import of every process and thread entry', () => {
@@ -360,5 +420,13 @@ describe('src/main/ocr/process/** source bans', () => {
     expect(hatches('new wt.Worker(code, { eval })')).toEqual(['Worker eval'])
     expect(hatches('new Worker(rasterThreadPath)')).toEqual([])
     expect(hatches('process.memoryUsage.rss()')).toEqual([])
+    // Casts do not hide them (the process's index.ts reaches parentPort exactly like this).
+    expect(hatches("(process as any).binding('tcp_wrap')")).toEqual(['process.binding'])
+    expect(
+      hatches("(process as unknown as Record<string, Function>)['_linkedBinding']('x')")
+    ).toEqual(['process._linkedBinding'])
+    expect(hatches('(<any>process)!.dlopen(m, f)')).toEqual(['process.dlopen'])
+    expect(hatches("globalThis.process.binding('tcp_wrap')")).toEqual(['process.binding'])
+    expect(hatches('(process as unknown as { parentPort: P }).parentPort')).toEqual([])
   })
 })
