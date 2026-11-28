@@ -1,5 +1,7 @@
+import { useCallback } from 'react'
 import type { DocEntry } from '../../types'
 import type { View } from './geometry'
+import { clampPan } from './page-display'
 import { FullViewPage } from './FullViewPage'
 import { useFullViewDrag } from './use-full-view-drag'
 
@@ -31,6 +33,17 @@ export function FullViewPages(props: FullViewPagesProps): React.JSX.Element {
   const { scrollRef, drag, draggedRef, docs, viewport, di, pi } = props
   const { view, fit, vw, vh, zoomed, interactive, animating, flip, flipTransition } = props
   const { renderVersion, setView, resetView, applyZoom, runClose } = props
+
+  // The recognized-text overlay pans a zoomed page to the low-confidence word it steps to (a pan
+  // the clamp refuses, as on a page that fits, changes nothing).
+  const panBy = useCallback(
+    (dx: number, dy: number) =>
+      setView((v) => {
+        const next = clampPan(v, v.x + dx, v.y + dy, fit, { w: vw, h: vh })
+        return next.x === v.x && next.y === v.y ? v : next
+      }),
+    [setView, fit, vw, vh]
+  )
 
   const { onPointerDown, onPointerMove, endDrag } = useFullViewDrag({
     drag,
@@ -80,6 +93,7 @@ export function FullViewPages(props: FullViewPagesProps): React.JSX.Element {
               renderVersion={renderVersion}
               resetView={resetView}
               applyZoom={applyZoom}
+              panBy={panBy}
             />
           ))}
         </section>

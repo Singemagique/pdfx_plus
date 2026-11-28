@@ -1,4 +1,4 @@
-import { act, createElement } from 'react'
+import { act, createElement, Fragment } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -22,7 +22,9 @@ const stubs = vi.hoisted(() => {
     oneDoc,
     noop: (): void => {},
     /** The renderer's menu listener, as registered through window.api.onMenu. */
-    menu: null as ((action: string) => void) | null
+    menu: null as ((action: string) => void) | null,
+    /** The canvas's "open this page in full view" (a double-click on a page in the real canvas). */
+    openPage: null as ((docId: string, pageId: string) => void) | null
   }
   // jsdom ships no `CSS` global, and useFullView.openPage escapes the page id with CSS.escape.
   const host = globalThis as { CSS?: { escape?: (s: string) => string } }
@@ -57,15 +59,50 @@ const stubs = vi.hoisted(() => {
 })
 
 vi.mock('./canvas/layout', () => ({ computeLayout: () => ({ docs: [], width: 0, height: 0 }) }))
-vi.mock('./components/CollectionCanvas', () => ({ CollectionCanvas: () => null }))
+vi.mock('./components/CollectionCanvas', () => ({
+  CollectionCanvas: (props: { onOpenPage: (docId: string, pageId: string) => void }) => {
+    stubs.openPage = props.onOpenPage
+    return null
+  }
+}))
 vi.mock('./components/edit/EditTools', () => ({ EditTools: () => null }))
 vi.mock('./components/edit/SignaturePad', () => ({ SignaturePad: () => null }))
-// Stand-in for the real FullView: the only thing this test needs from it is the ability to fire the
-// same `onClose` that window-level Escape reaches via use-full-view-input → runClose.
-vi.mock('./components/FullView', () => ({
-  FullView: (props: { onClose: () => void }) =>
-    createElement('button', { className: 'fv-close', onClick: props.onClose }, 'close full view')
-}))
+// Stand-in for the real FullView: it fires the same `onClose` that window-level Escape reaches via
+// use-full-view-input → runClose, and mounts the REAL "Show recognized text" overlay on the start
+// page (its header lands in <body>: no bar slot here), so the Document menu's wiring to it is real.
+vi.mock('./components/FullView', async () => {
+  const { RecognizedTextLayer } = await vi.importActual<
+    typeof import('./components/full-view/RecognizedTextLayer')
+  >('./components/full-view/RecognizedTextLayer')
+  // The page's file has no PDFx OCR layer (saved-layer.ts reads it through pdf.js).
+  const pdf = { getPage: () => Promise.reject(new Error('no pdf.js here')) }
+  return {
+    FullView: (props: {
+      onClose: () => void
+      docs: Array<{ id: string; pages: Array<{ id: string; source: object }> }>
+      startDocId: string
+      startPageId: string
+    }) => {
+      const page = props.docs
+        .find((d) => d.id === props.startDocId)
+        ?.pages.find((p) => p.id === props.startPageId)
+      return createElement(
+        Fragment,
+        null,
+        createElement(
+          'button',
+          { className: 'fv-close', onClick: props.onClose },
+          'close full view'
+        ),
+        page &&
+          createElement(RecognizedTextLayer, {
+            page: { ...page, source: { ...page.source, pdf } } as never,
+            active: true
+          })
+      )
+    }
+  }
+})
 vi.mock('./app/useCollection', () => ({
   useCollection: () => ({
     docs: stubs.docs,
@@ -122,6 +159,7 @@ vi.mock('./app/useDragController', () => ({
 }))
 
 import App from './App'
+import { isRecognizedTextShown, setRecognizedTextShown } from './ocr/recognized-text'
 ;(globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true
 
 let container: HTMLDivElement
@@ -129,6 +167,8 @@ let root: Root
 
 beforeEach(() => {
   stubs.install([stubs.oneDoc()])
+  // The overlay toggle is session state outside React: off at launch, as in the app.
+  setRecognizedTextShown(false)
   container = document.createElement('div')
   document.body.appendChild(container)
   root = createRoot(container)
@@ -254,15 +294,61 @@ describe('App · Document menu (OCR, DESIGN.md §3.8)', () => {
 
   it('the two checkboxes: Show toggles (and is mirrored), Include flips the export setting', async () => {
     await act(async () => root.render(createElement(App)))
+    // Mounted with the toggle off: the native checkbox is told so.
+    expect(setMenuChecked()).toHaveBeenCalledWith('show-recognized-text', false)
     setMenuChecked().mockClear()
+    // Show drives the overlay's own toggle (recognized-text.ts), with or without full view open.
     await menu('show-recognized-text')
+    expect(isRecognizedTextShown()).toBe(true)
     expect(setMenuChecked()).toHaveBeenCalledWith('show-recognized-text', true)
     await menu('show-recognized-text')
+    expect(isRecognizedTextShown()).toBe(false)
     expect(setMenuChecked()).toHaveBeenLastCalledWith('show-recognized-text', false)
     await menu('include-recognized-text')
     expect(setMenuChecked()).toHaveBeenCalledWith('include-recognized-text', false)
     await menu('include-recognized-text')
     expect(setMenuChecked()).toHaveBeenLastCalledWith('include-recognized-text', true)
+  })
+
+  it('Show Recognized Text shows the full-view overlay; its Hide unticks the menu', async () => {
+    await act(async () => root.render(createElement(App)))
+    const header = (): Element | null => document.body.querySelector('.ocr-text-header')
+    const lastShow = (): unknown =>
+      setMenuChecked()
+        .mock.calls.filter((c) => c[0] === 'show-recognized-text')
+        .at(-1)?.[1]
+    await act(async () => stubs.openPage!('d1', 'p1'))
+    expect(container.querySelector('.fv-close')).not.toBeNull()
+    expect(header()).toBeNull()
+
+    await menu('show-recognized-text')
+    expect(header()).not.toBeNull()
+    // No OCR ran: the overlay says so rather than drawing nothing silently.
+    expect(header()!.textContent).toContain('No recognized text on this page')
+    expect(lastShow()).toBe(true)
+
+    // Hide, from inside the overlay: the toggle goes off and the native checkbox follows.
+    await click(header()!.querySelector('.ocr-text-header-hide')!)
+    expect(header()).toBeNull()
+    expect(isRecognizedTextShown()).toBe(false)
+    expect(lastShow()).toBe(false)
+
+    // Closing full view keeps the session toggle (and so the tick); reopening shows it again.
+    await menu('show-recognized-text')
+    expect(lastShow()).toBe(true)
+    await click(container.querySelector('.fv-close')!)
+    expect(container.querySelector('.fv-close')).toBeNull()
+    expect(header()).toBeNull()
+    expect(isRecognizedTextShown()).toBe(true)
+    expect(lastShow()).toBe(true)
+    await act(async () => stubs.openPage!('d1', 'p1'))
+    expect(header()).not.toBeNull()
+    // Unticked from the menu outside full view, the next full view opens without it.
+    await click(container.querySelector('.fv-close')!)
+    await menu('show-recognized-text')
+    expect(lastShow()).toBe(false)
+    await act(async () => stubs.openPage!('d1', 'p1'))
+    expect(header()).toBeNull()
   })
 
   it('no Document command runs behind the open Recognize dialog (it is modal)', async () => {

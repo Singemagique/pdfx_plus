@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useImperativeHandle, useRef } from 'react'
+import { useCallback, useEffect, useImperativeHandle, useRef, useState } from 'react'
 import type { DocEntry, PageEntry } from '../types'
 import { useEdits } from '../edit/EditProvider'
 import { frameOf } from '../page-geometry'
@@ -10,6 +10,7 @@ import { useFullViewEffects } from './full-view/use-full-view-effects'
 import { useFullViewInput } from './full-view/use-full-view-input'
 import { FullViewChrome } from './full-view/FullViewChrome'
 import { FullViewPages } from './full-view/FullViewPages'
+import { FullViewHeaderSlot } from './full-view/header-slot'
 
 interface FullViewProps {
   docs: DocEntry[]
@@ -124,42 +125,47 @@ export function FullView({
   })
 
   const chromeOpacity = s.revealed ? 1 : 0
+  // The bar's slot for the current page's header (header-slot.ts).
+  const [headerSlot, setHeaderSlot] = useState<HTMLElement | null>(null)
 
   return (
-    <div className="full-view">
-      <div className="full-backdrop" style={{ opacity: chromeOpacity }} />
-      <FullViewPages
-        scrollRef={s.scrollRef}
-        drag={s.drag}
-        draggedRef={s.draggedRef}
-        docs={docs}
-        viewport={s.viewport}
-        di={s.di}
-        pi={s.pi}
-        view={s.view}
-        fit={s.fit}
-        vw={s.vw}
-        vh={s.vh}
-        zoomed={s.zoomed}
-        interactive={s.interactive}
-        animating={animating}
-        flip={s.flip}
-        flipTransition={s.flipTransition}
-        renderVersion={s.renderVersion}
-        setView={s.setView}
-        resetView={controls.resetView}
-        applyZoom={controls.applyZoom}
-        runClose={controls.runClose}
-      />
-      <FullViewChrome
-        chromeOpacity={chromeOpacity}
-        docName={s.doc.name}
-        pi={s.pi}
-        pageCount={s.doc.pages.length}
-        runClose={controls.runClose}
-        navByKey={controls.navByKey}
-        banner={banner}
-      />
-    </div>
+    <FullViewHeaderSlot.Provider value={headerSlot}>
+      <div className="full-view">
+        <div className="full-backdrop" style={{ opacity: chromeOpacity }} />
+        <FullViewPages
+          scrollRef={s.scrollRef}
+          drag={s.drag}
+          draggedRef={s.draggedRef}
+          docs={docs}
+          viewport={s.viewport}
+          di={s.di}
+          pi={s.pi}
+          view={s.view}
+          fit={s.fit}
+          vw={s.vw}
+          vh={s.vh}
+          zoomed={s.zoomed}
+          interactive={s.interactive}
+          animating={animating}
+          flip={s.flip}
+          flipTransition={s.flipTransition}
+          renderVersion={s.renderVersion}
+          setView={s.setView}
+          resetView={controls.resetView}
+          applyZoom={controls.applyZoom}
+          runClose={controls.runClose}
+        />
+        <FullViewChrome
+          chromeOpacity={chromeOpacity}
+          docName={s.doc.name}
+          pi={s.pi}
+          pageCount={s.doc.pages.length}
+          runClose={controls.runClose}
+          navByKey={controls.navByKey}
+          banner={banner}
+          headerSlotRef={setHeaderSlot}
+        />
+      </div>
+    </FullViewHeaderSlot.Provider>
   )
 }

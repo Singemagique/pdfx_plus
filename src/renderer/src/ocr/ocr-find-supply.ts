@@ -82,7 +82,19 @@ export interface OcrFindSupply {
    * no redaction, or a pass that failed).
    */
   redactionOutcome(pageKey: string): 'unknown' | 'pixels' | 'whole'
-  /** A removal report came in (redactionOutcome may have changed). */
+  /**
+   * The page has recognised words that the fail-safe holds back only until the removal report
+   * for its source's current redactions is in (`filteredPage` is null meanwhile): the overlay
+   * says so instead of claiming the page has no text. False once the report is in, even when the
+   * pass failed (the words then stay out for good).
+   */
+  isPending(pageKey: string): boolean
+  /**
+   * Called whenever `filteredPage`, `isPending` or `redactionOutcome` may answer differently: new
+   * results or choices, a new edit layer, a removal report landing (the "Show recognized text"
+   * overlay and the scan-redaction note re-read on it). Listeners must be cheap and idempotent: it
+   * fires often.
+   */
   onChange(listener: () => void): () => void
   dispose(): void
 }
@@ -129,6 +141,16 @@ export function createOcrFindSupply(opts: OcrFindSupplyOptions): OcrFindSupply {
   let disposed = false
   let syncQueued = false
   const changeListeners = new Set<() => void>()
+
+  function notifyChange(): void {
+    for (const l of [...changeListeners]) {
+      try {
+        l()
+      } catch (err) {
+        console.error(err)
+      }
+    }
+  }
 
   /**
    * The redactions of every live page of one source (by source id: what one redaction pass sees),
@@ -247,6 +269,7 @@ export function createOcrFindSupply(opts: OcrFindSupplyOptions): OcrFindSupply {
     for (const key of [...supplied.keys()]) if (!pages.has(key)) supplied.delete(key)
     for (const key of pages.keys()) syncKey(key)
     schedulePrediction(false)
+    notifyChange()
   }
 
   function queueSync(): void {
@@ -310,7 +333,7 @@ export function createOcrFindSupply(opts: OcrFindSupplyOptions): OcrFindSupply {
         predictions.set(key, { sig, gone: report?.get(key) ?? null })
       }
       for (const key of keys) syncKey(key)
-      for (const l of [...changeListeners]) l()
+      notifyChange()
     })().finally(() => {
       predicting = null
       if (rerun) {
@@ -363,14 +386,16 @@ export function createOcrFindSupply(opts: OcrFindSupplyOptions): OcrFindSupply {
       const whole = pred.gone.some((b) => area > 0 && (b.w * b.h) / area >= WHOLE_SCAN_SHARE)
       return whole ? 'whole' : 'pixels'
     },
+    isPending(pageKey) {
+      return pages.has(pageKey) && needsPrediction(pageKey)
+    },
     onChange(listener) {
       changeListeners.add(listener)
-      return () => {
-        changeListeners.delete(listener)
-      }
+      return () => void changeListeners.delete(listener)
     },
     dispose() {
       disposed = true
+      changeListeners.clear()
       unsubscribe()
       if (predictTimer) clearTimeout(predictTimer)
     }

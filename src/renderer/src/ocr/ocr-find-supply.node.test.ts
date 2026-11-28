@@ -171,8 +171,10 @@ describe('Find supply', () => {
   it('a scanned page becomes findable when its results arrive', async () => {
     const r = await rig()
     expect(hits(r.engine, 'hello')).toEqual([])
+    expect(r.supply.isPending(r.key)).toBe(false)
     await recognise(r, ['hello', 'world'])
     expect(hits(r.engine, 'hello world')).toEqual([r.key])
+    expect(r.supply.isPending(r.key)).toBe(false)
     expect(r.supply.filteredPage(r.key)?.text).toBe('helloworld')
   })
 
@@ -221,6 +223,7 @@ describe('Find supply', () => {
     // Pending: even the word the box does not touch is held back.
     expect(hits(r.engine, 'world')).toEqual([])
     expect(r.supply.filteredPage(r.key)).toBeNull()
+    expect(r.supply.isPending(r.key)).toBe(true)
     expect(predict).toHaveBeenCalledTimes(1)
     // The predictor runs the pass on the redacted OCR'd page only.
     const [layer] = vi.mocked(predict).mock.calls[0]
@@ -228,6 +231,7 @@ describe('Find supply', () => {
     // Pixel redaction applied: nothing removed whole; only the word under the box goes.
     release(new Map([[r.key, []]]))
     await settle()
+    expect(r.supply.isPending(r.key)).toBe(false)
     expect(hits(r.engine, 'world')).toEqual([r.key])
     expect(hits(r.engine, 'hello')).toEqual([])
   })
@@ -240,6 +244,8 @@ describe('Find supply', () => {
     await settle()
     expect(hits(r.engine, 'world')).toEqual([])
     expect(r.supply.filteredPage(r.key)).toBeNull()
+    // Removed whole: not pending, simply none.
+    expect(r.supply.isPending(r.key)).toBe(false)
   })
 
   it('a failed prediction, or one with no entry for the page, keeps the words out (fail-safe)', async () => {
@@ -255,8 +261,31 @@ describe('Find supply', () => {
       r.supply.sync(r.docs, r.layer([overHello(r.key)]))
       await settle()
       expect(hits(r.engine, 'world')).toEqual([])
+      // The report is in (failed or empty): held back for good, not pending.
+      expect(r.supply.isPending(r.key)).toBe(false)
     }
     warn.mockRestore()
+  })
+
+  it('onChange fires on new results, on a new edit layer and when a removal report lands', async () => {
+    let release: (report: RemovedReport) => void = () => {}
+    const predict = (() => new Promise<RemovedReport>((r) => (release = r))) as RemovalPredictor
+    const r = await rig({ predict })
+    const seen: Array<string | null> = []
+    const off = r.supply.onChange(() => seen.push(r.supply.filteredPage(r.key)?.text ?? null))
+    await recognise(r, ['hello', 'world'])
+    expect(seen.at(-1)).toBe('helloworld')
+    const n = seen.length
+    r.supply.sync(r.docs, r.layer([overHello(r.key)]))
+    expect(seen.length).toBe(n + 1)
+    expect(seen.at(-1)).toBeNull()
+    await settle()
+    release(new Map([[r.key, []]]))
+    await settle()
+    expect(seen.at(-1)).toBe('world')
+    off()
+    r.supply.sync(r.docs, r.layer())
+    expect(seen.at(-1)).toBe('world')
   })
 
   it('undoing the redaction brings the words back', async () => {
@@ -517,6 +546,10 @@ describe('redactionOutcome (the scan-redaction note, PR8)', () => {
     const changed = vi.fn()
     whole.supply.onChange(changed)
     whole.supply.sync(whole.docs, whole.layer([overHello(whole.key)]))
+    // The sync itself notifies too (PR10's overlay re-reads on it): the report landing must
+    // notify again on its own, since that is when redactionOutcome changes.
+    expect(whole.supply.redactionOutcome(whole.key)).toBe('unknown')
+    changed.mockClear()
     await settle()
     expect(changed).toHaveBeenCalled()
     expect(whole.supply.redactionOutcome(whole.key)).toBe('whole')

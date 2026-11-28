@@ -9,6 +9,8 @@ interface FullViewChromeProps {
   runClose: () => void
   navByKey: (axis: 'x' | 'y', dir: 1 | -1) => void
   banner?: React.ReactNode
+  /** Receives the bar's header slot (header-slot.ts): between the title and the close button. */
+  headerSlotRef?: (el: HTMLDivElement | null) => void
 }
 
 export function FullViewChrome({
@@ -18,14 +20,18 @@ export function FullViewChrome({
   pageCount,
   runClose,
   navByKey,
-  banner
+  banner,
+  headerSlotRef
 }: FullViewChromeProps): React.JSX.Element {
   return (
     <div className="full-chrome" style={{ opacity: chromeOpacity }}>
       <header className={`full-bar${isMac ? ' mac' : ''}`}>
-        <span className="full-title">{docName}</span>
+        <span className="full-title" title={docName}>
+          {docName}
+        </span>
         {/* The OCR banner shares the bar's strip, so it never covers the page below it. */}
         {banner}
+        <div className="full-bar-slot" ref={headerSlotRef} />
         <button className="icon-btn" title="Close (Esc)" onClick={runClose}>
           <CloseIcon size={16} />
         </button>

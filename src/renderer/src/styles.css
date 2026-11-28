@@ -856,8 +856,25 @@ body {
 }
 
 .full-title {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-size: 13px;
   font-weight: 600;
+}
+
+/* The current page's header (the recognized-text overlay's, header-slot.ts) between the title and
+   the close button: it takes the room the bar has, so a long title is never covered. The negative
+   margin keeps the two-line header from growing the bar. */
+.full-bar-slot {
+  flex: 1 1 0;
+  min-width: 0;
+  display: flex;
+  justify-content: center;
+  margin: -8px 0;
 }
 
 .full-bar .icon-btn {
@@ -962,6 +979,122 @@ body {
 .find-hl.current {
   background: var(--find-fill-current);
   box-shadow: 0 0 0 1.5px var(--find-ring-current);
+}
+
+/* "Show recognized text" (RecognizedTextLayer.tsx): read-only, under the overlay layer (z 2), so a
+   redaction box still covers its area, and under the Find matches (same z, earlier in the DOM):
+   they multiply over it and keep their colour. Each word's box and text at 60%. */
+.ocr-text-layer {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 1;
+  pointer-events: none;
+  overflow: visible;
+}
+
+.ocr-text-layer .ocr-w {
+  opacity: 0.6;
+}
+
+.ocr-text-layer .ocr-w rect {
+  fill: #ffffff;
+  stroke: #2f6fdb;
+  stroke-width: 0.75px;
+  vector-effect: non-scaling-stroke;
+}
+
+.ocr-text-layer .ocr-w text {
+  fill: #0d2b66;
+  font-family:
+    system-ui,
+    -apple-system,
+    'Segoe UI',
+    sans-serif;
+  white-space: pre;
+}
+
+.ocr-text-layer .ocr-low {
+  stroke: #d9480f;
+  stroke-width: 2px;
+  stroke-dasharray: 1 3;
+  stroke-linecap: round;
+  vector-effect: non-scaling-stroke;
+}
+
+.ocr-text-layer .ocr-focus {
+  fill: none;
+  stroke: #ff8a00;
+  stroke-width: 2.5px;
+  vector-effect: non-scaling-stroke;
+}
+
+/* Its header: portalled into the full-view bar's slot (the page box is transformed). */
+.ocr-text-header {
+  position: relative;
+  pointer-events: auto;
+  -webkit-app-region: no-drag;
+  min-width: 0;
+  max-width: 100%;
+  padding: 5px 12px 6px;
+  border-radius: 10px;
+  background: rgba(19, 19, 22, 0.86);
+  color: rgba(255, 255, 245, 0.92);
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.35);
+  font-size: 12px;
+  line-height: 1.35;
+  text-align: center;
+}
+
+.ocr-text-header-row {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  white-space: nowrap;
+}
+
+.ocr-text-header-main {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ocr-text-header-step {
+  color: #ffb366;
+}
+
+.ocr-text-header-hide {
+  font: inherit;
+  font-size: 11px;
+  color: inherit;
+  background: rgba(255, 255, 255, 0.12);
+  border: 0;
+  border-radius: 6px;
+  padding: 1px 8px;
+  cursor: pointer;
+}
+
+.ocr-text-header-hide:hover {
+  background: rgba(255, 255, 255, 0.22);
+}
+
+.ocr-text-header-note {
+  font-size: 11px;
+  color: rgba(255, 255, 245, 0.6);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ocr-text-header .visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
 }
 
 /* Live edit overlays, drawn over the page canvas inside .full-page. */
