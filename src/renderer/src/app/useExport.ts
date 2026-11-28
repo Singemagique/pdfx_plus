@@ -3,7 +3,11 @@ import { zipSync } from 'fflate'
 import { buildPdf, buildPdfx, stripExtension } from '../pdfx/format'
 import type { EditLayer } from '../pdfx/build'
 import { toExportPage, type ExportPageRef } from '../pdfx/source'
-import { applyRedactedBytes, buildRedactedSources } from '../pdfx/redact-export'
+import {
+  applyRedactedBytes,
+  buildRedactedSources,
+  type RedactedSources
+} from '../pdfx/redact-export'
 import { countRedactedOverlays } from '../pdfx/mirror'
 import { withSignatureAppearance, type AppearanceOptions } from '../pdfx/signature-appearance'
 import { summarizeDss, dssNote } from '../pdfx/dss-info'
@@ -18,8 +22,6 @@ const ZIP_FILTER = { name: 'ZIP', extensions: ['zip'] }
 const ILLEGAL_FILENAME_CHARS = /[\\/:*?"<>|]/g
 
 type SaveFilter = { name: string; extensions: string[] }
-/** sourceKey -> redacted bytes, as buildRedactedSources returns them. */
-type RedactedSources = Map<string, Uint8Array>
 
 /** Every page of every document, in order, with redacted source bytes swapped in. */
 const flatExportPages = (docs: DocEntry[], redacted: RedactedSources): ExportPageRef[] =>
@@ -104,15 +106,16 @@ export function useExport(
           return
         }
         const filename = path.split(/[\\/]/).pop() ?? defaultName
-        // Redactions are applied destructively to the source bytes first (every export kind).
-        const redacted = await buildRedactedSources(editLayer, docs)
-        // A COPY of the edit layer with the recognised text; pages with a redaction get none (the
-        // removed-object report that allows finer filtering arrives with PR3b). With the setting
-        // off, layers the sources already carry are dropped too (ocrPassthrough).
+        // Redactions are applied destructively to the source bytes first (every export kind), with
+        // the report of every object the pass removed (DESIGN.md §3.7.3 rule 2).
+        const redacted = await buildRedactedSources(editLayer, docs, { report: true })
+        // A COPY of the edit layer with the recognised text, minus every word under a redaction or
+        // over a removed object (the whole page's layer when the report cannot tell). With the
+        // setting off, layers the sources already carry are dropped too (ocrPassthrough).
         const layer = withOcrLayer(
           editLayer,
           includeOcr ? ocr.snapshotFor(docs, editLayer) : undefined,
-          { include: includeOcr }
+          { include: includeOcr, removed: redacted.removed }
         )
         const bytes = await build(redacted, filename, layer, docs)
         const saved = await window.api.writeFile(path, bytes)
@@ -187,13 +190,14 @@ export function useExport(
           signaturePlacement && appearance
             ? await withSignatureAppearance(editLayer, signaturePlacement, appearance)
             : editLayer
-        const redacted = await buildRedactedSources(signedLayer, docs)
-        // Baked inside buildPdf, before sign(), so the signature covers the text when included.
+        const redacted = await buildRedactedSources(signedLayer, docs, { report: true })
+        // Baked inside buildPdf, before sign(), so the signature covers the text when included,
+        // filtered against the redactions and the removed-object report like every export.
         // Unticked, a layer a reopened source already carries is dropped as well (ocrPassthrough).
         const layer = withOcrLayer(
           signedLayer,
           includeRecognizedText ? ocr.snapshotFor(docs, editLayer) : undefined,
-          { include: includeRecognizedText }
+          { include: includeRecognizedText, removed: redacted.removed }
         )
         const flat = await buildPdf(
           flatExportPages(docs, redacted),

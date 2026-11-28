@@ -4,6 +4,7 @@ import {
   PDFDict,
   PDFHexString,
   PDFName,
+  PDFNumber,
   PDFPage,
   PDFRef,
   PDFString,
@@ -35,8 +36,15 @@ import {
   ocrLayerEngines,
   type OcrPageSpace
 } from './ocr-layer'
-import { catalogLang, dropWordsOutside, ocrAllowed, type OcrPassthrough } from './ocr-export'
+import {
+  catalogLang,
+  dropWordsOutside,
+  redactOcrPage,
+  type OcrPassthrough,
+  type RemovedReport
+} from './ocr-export'
 import { markOcrDocument, readCatalogLang } from './ocr-marking'
+import { pruneDetached } from './reachable'
 
 /**
  * The optional edit layer baked into pages on export (PRD §4.4). Overlays are keyed by
@@ -56,6 +64,12 @@ export interface EditLayer {
    * on EditProvider's layer: useExport adds it to a copy (`withOcrLayer`, ocr-export.ts).
    */
   ocr?: Map<string, PackedOcrPage>
+  /**
+   * The redaction pass's removed-object report the `ocr` words were filtered against (ocr-export.ts
+   * `RemovedReport`); `withOcrLayer` sets it, and the bake applies the same filter again. Absent:
+   * every page with a redaction overlay gets no OCR layer at all (fail-safe).
+   */
+  ocrRemoved?: RemovedReport
   /**
    * What to do with a PDFx OCR layer a SOURCE page already carries (ocr-export.ts
    * `OcrPassthrough`); `withOcrLayer` sets it from the export setting or the Sign box. Absent:
@@ -113,13 +127,16 @@ function passExistingOcr(
 }
 
 /**
- * The recognised page to bake for `key`, or undefined. Re-checks the export gate (ocr-export.ts
- * `ocrAllowed`) so a layer handed over without `withOcrLayer` still never puts text on a page
- * that has a redaction.
+ * The recognised page to bake for `key`, or undefined. Re-applies the redaction filter
+ * (ocr-export.ts `redactOcrPage`, against the layer's redactions and `ocrRemoved`), so a layer
+ * handed over without `withOcrLayer` still never puts a redacted word on a page: without a report,
+ * a page with a redaction gets no layer at all.
  */
 function ocrPageFor(edits: EditLayer | undefined, key: string): PackedOcrPage | undefined {
   const page = edits?.ocr?.get(key)
-  return page && edits && ocrAllowed(edits, key) ? page : undefined
+  return page && edits
+    ? (redactOcrPage(page, edits, key, edits.ocrRemoved) ?? undefined)
+    : undefined
 }
 
 /**
@@ -237,13 +254,25 @@ export function intrinsicMatrix(
 
 /**
  * The overlay frame → user space pair of a page: the view-box origin translation and, for a source
- * /Rotate of 90/180/270, `intrinsicMatrix`. Overlays and the OCR layer both go through it.
+ * /Rotate of 90/180/270, `intrinsicMatrix`, plus (innermost) 1 / its /UserUnit `unit`, because
+ * pdf.js scales the frame by it. Overlays and the OCR layer both go through it.
  */
-export function pageSpace(intrinsic: number, view0: Box): OcrPageSpace {
-  return {
+export function pageSpace(intrinsic: number, view0: Box, unit = 1): OcrPageSpace {
+  const space: OcrPageSpace = {
     view: { x: view0.x, y: view0.y },
     intrinsic: intrinsicMatrix(intrinsic, view0.width, view0.height)
   }
+  return unit === 1 ? space : { ...space, scale: 1 / unit }
+}
+
+/** A /UserUnit as pdf.js reads it: a positive finite number, else 1. */
+export const userUnitOf = (u: unknown): number =>
+  typeof u === 'number' && Number.isFinite(u) && u > 0 ? u : 1
+
+/** A page's /UserUnit (PDF 1.6), as pdf.js reads it. */
+export function pageUserUnit(page: PDFPage): number {
+  const u = page.node.lookup(PDFName.of('UserUnit'))
+  return userUnitOf(u instanceof PDFNumber ? u.asNumber() : undefined)
 }
 
 /**
@@ -267,9 +296,10 @@ async function withPageSpace(
   page: PDFPage,
   intrinsic: number,
   view0: Box,
-  draw: { prepend?: (space: OcrPageSpace) => void; append?: () => Promise<void> }
+  draw: { prepend?: (space: OcrPageSpace) => void; append?: () => Promise<void> },
+  unit = 1
 ): Promise<void> {
-  const space = pageSpace(intrinsic, view0)
+  const space = pageSpace(intrinsic, view0, unit)
   // pdf-lib wraps the existing content in q … Q (normalize) the first time it appends operators.
   // Doing that now, before the prepend, keeps the OCR layer the FIRST stream of /Contents.
   if (draw.prepend && draw.append) page.node.normalize()
@@ -277,10 +307,12 @@ async function withPageSpace(
   if (!draw.append) return
   const m = space.intrinsic
   const shift = view0.x !== 0 || view0.y !== 0
-  if (!m && !shift) return draw.append()
+  const s = space.scale
+  if (!m && !shift && s === undefined) return draw.append()
   page.pushOperators(pushGraphicsState())
   if (shift) page.pushOperators(concatTransformationMatrix(1, 0, 0, 1, view0.x, view0.y))
   if (m) page.pushOperators(concatTransformationMatrix(...m))
+  if (s !== undefined) page.pushOperators(concatTransformationMatrix(s, 0, 0, s, 0, 0))
   await draw.append()
   page.pushOperators(popGraphicsState())
 }
@@ -378,6 +410,8 @@ async function bakePage(
   // rotation-baked "visual" space, which we reconcile with pdf-lib's unrotated space below.
   const intrinsic = (((page.getRotation().angle % 360) + 360) % 360) as number
   const view0 = viewBox(page.getCropBox(), page.getMediaBox())
+  // The editor frame is in UserUnit-scaled units (pdf.js scales its viewport by /UserUnit).
+  const unit = pageUserUnit(page)
   const rot = edits.rotations?.get(key)
   if (rot) {
     page.setRotation(degrees((((intrinsic + rot) % 360) + 360) % 360))
@@ -386,7 +420,8 @@ async function bakePage(
   if (crop && crop.w > 0 && crop.h > 0) {
     // Map the crop into unrotated user space, then offset by the view-box origin so pages whose
     // box does not start at (0,0) crop correctly.
-    const u = unrotateCrop(crop, intrinsic, view0.width, view0.height)
+    const user = { x: crop.x / unit, y: crop.y / unit, w: crop.w / unit, h: crop.h / unit }
+    const u = unrotateCrop(user, intrinsic, view0.width, view0.height)
     page.setCropBox(view0.x + u.x, view0.y + u.y, u.w, u.h)
   }
   const list = edits.overlays.get(key)
@@ -408,8 +443,8 @@ async function bakePage(
   if (ocrPage) {
     const quarter = intrinsic === 90 || intrinsic === 270
     const visual = quarter
-      ? { width: view0.height, height: view0.width }
-      : { width: view0.width, height: view0.height }
+      ? { width: view0.height * unit, height: view0.width * unit }
+      : { width: view0.width * unit, height: view0.height * unit }
     ocrPage = dropWordsOutside(ocrPage, visibleBox(visual, crop)) ?? undefined
   }
   const layer = ocrPage ? { ...ocr, page: ocrPage } : undefined
@@ -417,12 +452,18 @@ async function bakePage(
   // replaced by a new one. (Its words are not re-filtered by the edit crop: like the page's other
   // native text and the scan pixels outside the CropBox, it is source content the export keeps.)
   passExistingOcr(page, edits.ocrPassthrough ?? 'keep', !!layer, ocr.bake)
-  await withPageSpace(page, intrinsic, view0, {
-    prepend: layer
-      ? (space) => void bakeOcrLayer(page, layer.page, layer.bake, layer.ordinal, space)
-      : undefined,
-    append: sorted && res ? () => flattenPageOverlays(page, sorted, res) : undefined
-  })
+  await withPageSpace(
+    page,
+    intrinsic,
+    view0,
+    {
+      prepend: layer
+        ? (space) => void bakeOcrLayer(page, layer.page, layer.bake, layer.ordinal, space)
+        : undefined,
+      append: sorted && res ? () => flattenPageOverlays(page, sorted, res) : undefined
+    },
+    unit
+  )
   // Form fill paints the value as page content; drop the matching interactive widget so its own
   // appearance (the original value) doesn't render on top of — and double with — the painted one.
   // Deliberately computed from the FULL list, not `visible`: a formValue overlay a redaction covers
@@ -569,6 +610,7 @@ export async function buildPdf(
     }
   }
   finishOcr(output, bake, pages.length, sources, `PDFX ${PDFX_VERSION}`)
+  pruneDetached(output)
   try {
     return await output.save()
   } catch (e) {
@@ -612,9 +654,13 @@ export async function buildPdfx(
       if (!ocrPage) continue
       const intrinsic = ((page.getRotation().angle % 360) + 360) % 360
       const view0 = viewBox(page.getCropBox(), page.getMediaBox())
-      await withPageSpace(page, intrinsic, view0, {
-        prepend: (space) => void bakeOcrLayer(page, ocrPage, bake, i, space)
-      })
+      await withPageSpace(
+        page,
+        intrinsic,
+        view0,
+        { prepend: (space) => void bakeOcrLayer(page, ocrPage, bake, i, space) },
+        pageUserUnit(page)
+      )
     } catch (e) {
       throw pageError(i + 1, ordered[i], e)
     }
@@ -636,6 +682,8 @@ export async function buildPdfx(
   // Font tables, Producer + XMP marking and the catalog /Lang, before computeIntegrity and save;
   // after the mirror, because the Producer names the manifest version, which it can raise to 1.1.
   finishOcr(output, bake, ordered.length, sources, `PDFX ${manifest.pdfx}`)
+  // What copyPages dragged in through links to pages the output does not have (see reachable.ts).
+  pruneDetached(output)
 
   // pdfx-canon/1 tamper record over the assembled page content, computed BEFORE the manifest is
   // attached so the manifest itself is excluded from the hash (PRD §4.6). Best-effort: the record is

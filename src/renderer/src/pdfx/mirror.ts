@@ -90,8 +90,11 @@ export function footprint(g: Geom): Rect {
   return { x0: Math.min(...xs), y0: Math.min(...ys), x1: Math.max(...xs), y1: Math.max(...ys) }
 }
 
-/** Do two overlays' (rotation-aware) footprints overlap at all? */
-function bboxesIntersect(a: Geom, b: Geom): boolean {
+/**
+ * Do two overlays' (rotation-aware) footprints overlap at all? Strict: boxes that only touch do
+ * not. Also the OCR export's redaction test (ocr-export.ts `redactOcrPage`, DESIGN.md §3.7.3).
+ */
+export function bboxesIntersect(a: Geom, b: Geom): boolean {
   const p = footprint(a)
   const q = footprint(b)
   return p.x0 < q.x1 && q.x0 < p.x1 && p.y0 < q.y1 && q.y0 < p.y1

@@ -66,6 +66,11 @@ export interface OcrPageSpace {
   view: { x: number; y: number }
   /** build.ts `intrinsicMatrix` for a source /Rotate of 90/180/270; null when unrotated. */
   intrinsic: Matrix | null
+  /**
+   * Frame → user-space scale, applied innermost: 1 / the page's /UserUnit (pdf.js scales the frame
+   * by it). Absent: 1.
+   */
+  scale?: number
 }
 
 export interface OcrLayerOptions {
@@ -189,6 +194,8 @@ export function ocrLayerContent(
   if (space && (space.view.x !== 0 || space.view.y !== 0))
     ops.push(`1 0 0 1 ${num(space.view.x)} ${num(space.view.y)} cm`)
   if (space?.intrinsic) ops.push(`${space.intrinsic.map((v) => num(v, 6)).join(' ')} cm`)
+  if (space?.scale !== undefined && space.scale !== 1)
+    ops.push(`${num(space.scale, 6)} 0 0 ${num(space.scale, 6)} 0 0 cm`)
   ops.push(
     `/${OCR_MARK} <</Lang ${pdfLiteral(lang)} /MachineGenerated true /Engine ${pdfLiteral(engine)}>> BDC`
   )

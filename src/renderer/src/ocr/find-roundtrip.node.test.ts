@@ -10,7 +10,7 @@ import { PDFDocument } from 'pdf-lib'
 import { getDocument } from 'pdfjs-dist/legacy/build/pdf.mjs'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
-import { buildPageText, extractPageText } from '../search/extract'
+import { extractPageText } from '../search/extract'
 import { nativeRuns } from '../search/redact-filter'
 
 import { copyFidelity, iou, type FindGtWord } from '../../../shared/ocr/test-utils/metrics'
@@ -23,17 +23,6 @@ import { createFindHarness, toPageRect, type FindHarness } from './test-utils/fi
 const PRESETS = ['clean300', 'skew2', 'rot90page', 'latin-diacritics']
 /** §3.9.4: hit-on-target among hits (IoU > 0.5). */
 const HIT_ON_TARGET = 0.95
-/**
- * Post-export on-target recall through the app's real extraction today (seed 7) [measured:
- * clean300 0.846, skew2 0.962, rot90page 0.846, latin-diacritics 1.000; twocol 0.941 and
- * numbers-table 1.000 off this list]. See the "after export" test.
- */
-const KNOWN_MONO_FLOOR: Record<string, number> = {
-  clean300: 0.84,
-  skew2: 0.96,
-  rot90page: 0.84,
-  'latin-diacritics': 1
-}
 
 const synthCache = new Map<string, Promise<SynthResult>>()
 function synth(preset: string): Promise<SynthResult> {
@@ -89,41 +78,23 @@ describe.each(PRESETS)('Find recall on synth %s (real engine)', (preset) => {
     expect(copy.cer.rate).toBe(0)
   })
 
-  it('after export: the baked layer, reopened, finds every word', async () => {
-    const baked = await bakeLayer(s.pdfBytes, [ocr])
-    const h = await harness([{ native: baked.bytes, height: s.gt.page.height }])
-    const sc = await h.scores(gtWords(s))
-    // Every word's text is found on its page...
-    expect(sc.words.filter((w) => !w.anyHitOnPage).map((w) => w.query)).toEqual([])
-    // ...but not every highlight lands on its word yet: pdf.js flags the layer's glyphless font
-    // FixedPitch (every /W width is 500, pdf.js's `extractWidths` heuristic), so extract.ts marks
-    // its items `mono` and search/geometry.ts splits a whole merged line evenly per character,
-    // although each word was stretched with its own Tz. Open item (ocr-font.ts or extract.ts);
-    // these floors pin today's numbers [measured, seed 7] so a regression still shows.
-    expect(sc.recall).toBeGreaterThanOrEqual(KNOWN_MONO_FLOOR[preset])
-    const copy = copyFidelity(gtLines(s), h.copyText(0))
-    expect(copy.joins).toBe(0)
-    expect(copy.blankLineRuns).toBe(0)
-    expect(copy.cer.rate).toBe(0)
-  })
-
-  it('after export, with the even split for "monospace" items off: every word on target', async () => {
-    // The fix target of the open item above: the same reopened page with its items' `mono`
-    // cleared (the Helvetica-weighted estimate) passes the release gates exactly.
+  it('after export: the baked layer, reopened, finds every word on target', async () => {
+    // The OCR font's monospace guard (ocr-font.ts) keeps pdf.js from flagging the glyphless font
+    // FixedPitch, so extract.ts never marks its items `mono` and highlights land on their words.
     const baked = await bakeLayer(s.pdfBytes, [ocr])
     const pdf = await getDocument({ data: baked.bytes.slice(), verbosity: 0 }).promise
     const pt = await extractPageText(pdf as never, 0)
     await pdf.destroy()
-    expect(pt.items.some((i) => i.mono)).toBe(true)
-    const weighted = buildPageText(
-      pt.items.map((i) => ({ ...i, mono: false, hasEOL: !!i.hasEOL })),
-      pt.vt
-    )
-    const h = await harness([{ native: weighted, height: s.gt.page.height }])
+    expect(pt.items.some((i) => i.mono)).toBe(false)
+    const h = await harness([{ native: baked.bytes, height: s.gt.page.height }])
     const sc = await h.scores(gtWords(s))
     expect(sc.words.filter((w) => !w.found).map((w) => w.query)).toEqual([])
     expect(sc.recall).toBe(1)
     expect(sc.hitOnTarget).toBeGreaterThanOrEqual(HIT_ON_TARGET)
+    const copy = copyFidelity(gtLines(s), h.copyText(0))
+    expect(copy.joins).toBe(0)
+    expect(copy.blankLineRuns).toBe(0)
+    expect(copy.cer.rate).toBe(0)
   })
 })
 
@@ -203,11 +174,10 @@ describe('reopened OCR page (ocr-ours): native text that is OCR text', () => {
 })
 
 describe('reopened OCR page (ocr-ours): boxing any word removes every character of it', () => {
-  // pdf.js merges the layer's per-word Tj's into one item per line and flags the glyphless font
-  // FixedPitch, although each word was stretched by its own Tz: an even split of the line
-  // misplaces characters by more than a character width [measured: "little" and "after" kept a
-  // letter on clean300 / rot90page seed 7 before the redaction filter took the union of its
-  // estimates]. Every GT word of each page, boxed in turn with its exact box.
+  // pdf.js merges the layer's per-word Tj's into one item per line, although each word was
+  // stretched by its own Tz, so per-character positions inside an item are estimates (before the
+  // OCR font's monospace guard, an even FixedPitch split left "little" and "after" with a letter
+  // on clean300 / rot90page seed 7). Every GT word of each page, boxed in turn with its exact box.
   const cases = [
     ...['clean300', 'skew2', 'rot90page', 'twocol', 'latin-diacritics'].flatMap((preset) =>
       [7, 11].map((seed) => ({ name: `${preset} seed ${seed}`, preset, seed, font: undefined }))
@@ -222,7 +192,7 @@ describe('reopened OCR page (ocr-ours): boxing any word removes every character 
     const pdf = await getDocument({ data: baked.bytes.slice(), verbosity: 0 }).promise
     const pt = await extractPageText(pdf as never, 0)
     await pdf.destroy()
-    expect(pt.items.some((i) => i.mono)).toBe(true)
+    expect(pt.items.some((i) => i.mono)).toBe(false)
     const all = pt.items.map((i) => i.str).join('')
     const starts: number[] = []
     let at = 0
