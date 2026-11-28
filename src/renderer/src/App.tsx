@@ -43,6 +43,7 @@ import { OcrBanner } from './components/ocr/OcrBanner'
 import { OcrSummaryPopover } from './components/ocr/OcrSummaryPopover'
 import { OcrMenuSync, OcrSignDialog, OcrToasts } from './components/ocr/OcrAppParts'
 import { useToast } from './app/useToast'
+import { connectRecognizedText } from './ocr/recognized-text'
 
 export default function App(): React.JSX.Element {
   // Ref-count busy instead of a plain boolean: overlapping operations (a 2nd-instance open / Explorer
@@ -248,6 +249,8 @@ export default function App(): React.JSX.Element {
     [ocrStore, ocrSelect, rotations, selectOcr]
   )
   useEffect(() => ocrSupply.sync(docs, editLayer), [ocrSupply, docs, editLayer])
+  // "Show recognized text" (full view) draws the supply's filtered words (PR10).
+  useEffect(() => connectRecognizedText(ocrSupply), [ocrSupply])
   // The page in view is recognised first (§3.3.6): the full-view page, else the selected one.
   const focusPageId = fullView ? fullViewState.hiddenPageId : (collection.selected?.pageId ?? null)
   const focus = useMemo(() => {

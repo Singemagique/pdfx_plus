@@ -2,6 +2,7 @@ import type { PageEntry } from '../../types'
 import { PageView } from '../PageView'
 import { OverlayLayer } from '../edit/OverlayLayer'
 import { FindHighlights } from './FindHighlights'
+import { RecognizedTextLayer } from './RecognizedTextLayer'
 import { useEdits } from '../../edit/EditProvider'
 import { frameOf, windowFractions } from '../../page-geometry'
 import type { View } from './geometry'
@@ -21,6 +22,8 @@ interface FullViewPageProps {
   renderVersion: number
   resetView: () => void
   applyZoom: (nextZoom: (z: number) => number, focal?: { x: number; y: number }) => void
+  /** Pan the zoomed current page by screen px (clamped): the recognized-text overlay's reveal. */
+  panBy?: (dx: number, dy: number) => void
 }
 
 export function FullViewPage(props: FullViewPageProps): React.JSX.Element {
@@ -100,6 +103,14 @@ export function FullViewPage(props: FullViewPageProps): React.JSX.Element {
               page={p}
               box={fullFit}
               window={frame.cropped ? frame.window : undefined}
+            />
+          )}
+          {isCurrent && !animating && (
+            <RecognizedTextLayer
+              page={p}
+              window={frame.cropped ? frame.window : undefined}
+              active={interactive}
+              panBy={props.panBy}
             />
           )}
           {isCurrent && (

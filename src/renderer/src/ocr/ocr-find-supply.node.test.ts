@@ -259,6 +259,27 @@ describe('Find supply', () => {
     warn.mockRestore()
   })
 
+  it('onChange fires on new results, on a new edit layer and when a removal report lands', async () => {
+    let release: (report: RemovedReport) => void = () => {}
+    const predict = (() => new Promise<RemovedReport>((r) => (release = r))) as RemovalPredictor
+    const r = await rig({ predict })
+    const seen: Array<string | null> = []
+    const off = r.supply.onChange(() => seen.push(r.supply.filteredPage(r.key)?.text ?? null))
+    await recognise(r, ['hello', 'world'])
+    expect(seen.at(-1)).toBe('helloworld')
+    const n = seen.length
+    r.supply.sync(r.docs, r.layer([overHello(r.key)]))
+    expect(seen.length).toBe(n + 1)
+    expect(seen.at(-1)).toBeNull()
+    await settle()
+    release(new Map([[r.key, []]]))
+    await settle()
+    expect(seen.at(-1)).toBe('world')
+    off()
+    r.supply.sync(r.docs, r.layer())
+    expect(seen.at(-1)).toBe('world')
+  })
+
   it('undoing the redaction brings the words back', async () => {
     const r = await rig({ predict: async () => new Map([[makePageKey('scan', 0), []]]) })
     await recognise(r, ['hello', 'world'])
