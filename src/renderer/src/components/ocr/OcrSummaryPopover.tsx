@@ -1,10 +1,14 @@
 // The summary popover (DESIGN.md §3.8 "Summary popover"): one row per page with an issue, for one
 // document (the DocHeader chip) or every document (the job popover, a toast's [Details]). Rows act
 // in place: [View] opens the page, [Replace…] the dialog for it, [Rotate] the existing undoable
-// rotate by the turn recognition measured, [Try again] asks for the page again.
+// rotate by the turn recognition measured, [Try again] asks for the page again. "Needs Russian
+// language data [Download]" (PR9) asks for consent in the row; once the language is installed the
+// pages that needed it are recognised again with the languages they asked for.
 
-import { useOcrStore, useOcrSummary } from '../../ocr/OcrContext'
-import type { OcrPageView } from '../../ocr/ocr-ui'
+import { useState } from 'react'
+import { useLangPacks, useOcrStore, useOcrSummary } from '../../ocr/OcrContext'
+import { missingLangs, needsLanguageCopy, type OcrPageView } from '../../ocr/ocr-ui'
+import { LangDownloadPrompt } from './LangDownloadPrompt'
 import { Popover } from './Popover'
 
 export const SUMMARY_FOOTER = 'Recognized with the built-in engine (Tesseract)'
@@ -17,18 +21,52 @@ interface Props {
 }
 
 export function OcrSummaryPopover({ anchor, docId, onClose }: Props): React.JSX.Element {
-  const { actions } = useOcrStore()
+  const { actions, store } = useOcrStore()
   const { summary } = useOcrSummary()
+  const { langs: packs, snapshot: packSnap } = useLangPacks()
+  const installed = packs?.installed() ?? new Set<string>()
+  /** The row whose [Download] consent is open: its key and the language. */
+  const [asking, setAsking] = useState<{ key: string; code: string } | null>(null)
+  /** Recognise again every page that needed exactly these languages. */
+  const retryNeeding = (langs: readonly string[]): void => {
+    const want = langs.join('+')
+    const keys = summary.issues
+      .filter((v) => v.issue?.kind === 'needs-language' && (v.state.langs ?? []).join('+') === want)
+      .map((v) => v.key)
+    if (keys.length > 0) store?.recognize([...new Set(keys)], { langs: [...langs] })
+  }
   const docs = docId ? summary.docs.filter((d) => d.docId === docId) : summary.docs
   const groups = docs.filter((d) => d.issues.length > 0)
   const many = !docId && groups.length > 1
   const row = (p: OcrPageView): React.JSX.Element => {
     const issue = p.issue!
+    const needs = issue.kind === 'needs-language'
+    const missing = needs ? missingLangs(p.state.langs, installed) : []
+    const first = missing.length > 0 ? packSnap.list.find((l) => l.code === missing[0]) : undefined
+    const rowKey = `${p.docId}|${p.key}`
+    const prompt =
+      asking && asking.key === rowKey
+        ? packSnap.list.find((l) => l.code === asking.code)
+        : undefined
     return (
-      <li key={`${p.docId}|${p.key}`} className="ocr-summary-row">
+      <li key={rowKey} className="ocr-summary-row">
         <span className="ocr-summary-page">Page {p.number}</span>
-        <span className="ocr-summary-text">{issue.text}</span>
+        <span className="ocr-summary-text">{needs ? needsLanguageCopy(missing) : issue.text}</span>
         <span className="ocr-summary-actions">
+          {needs && first && !prompt && (
+            <button
+              className="sign-link"
+              onClick={() => setAsking({ key: rowKey, code: first.code })}
+            >
+              Download
+            </button>
+          )}
+          {needs && missing.length === 0 && p.state.langs && p.state.langs.length > 0 && (
+            // Everything it asked for is installed now (a download elsewhere, Install from file…).
+            <button className="sign-link" onClick={() => retryNeeding(p.state.langs!)}>
+              Try again
+            </button>
+          )}
           {issue.kind === 'low-confidence' && (
             <>
               <button
@@ -66,6 +104,24 @@ export function OcrSummaryPopover({ anchor, docId, onClose }: Props): React.JSX.
             </button>
           )}
         </span>
+        {prompt && (
+          <div className="ocr-summary-prompt">
+            <LangDownloadPrompt
+              info={prompt}
+              onCancel={() => setAsking(null)}
+              onInstalled={(code) => {
+                const rest = missingLangs(p.state.langs, new Set([...installed, code]))
+                const next =
+                  rest.length > 0 ? packSnap.list.find((l) => l.code === rest[0]) : undefined
+                if (next) setAsking({ key: rowKey, code: next.code })
+                else {
+                  setAsking(null)
+                  if (p.state.langs) retryNeeding(p.state.langs)
+                }
+              }}
+            />
+          </div>
+        )}
       </li>
     )
   }

@@ -18,7 +18,7 @@ import rasterThreadPath from './raster-thread?modulePath'
 import recognizeThreadPath from './recognize-thread?modulePath'
 import { threadOptions } from './budget'
 import { Coordinator, type ParentLike, type WorkerLike } from './coordinator'
-import { loadEngine } from './engine-node'
+import { loadEngine, loadLanguage } from './engine-node'
 
 // The only files a worker_thread may be started from in this realm (no-network.ts guards Worker).
 allowThreadEntries([rasterThreadPath, recognizeThreadPath])
@@ -50,6 +50,7 @@ new Coordinator({
   spawnRecognize: () => spawn(recognizeThreadPath),
   loadPdfium: async (path) => WebAssembly.compile(await readFile(path)),
   loadEngine,
+  loadLanguage,
   system: () => ({
     totalmem: totalmem(),
     availableMemory: availableMemory(),

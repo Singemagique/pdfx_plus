@@ -9,6 +9,13 @@ import {
   type OcrLinkEvent,
   type ToOcr
 } from '../shared/ocr/protocol'
+import {
+  LANG_CHANNELS,
+  type LangDownloadResult,
+  type LangInstallResult,
+  type LangPackInfo,
+  type LangProgress
+} from '../shared/ocr/lang-packs'
 import type { Settings } from '../shared/settings'
 
 export type { FromOcr, OcrLinkEvent, Settings, ToOcr }
@@ -268,6 +275,24 @@ const api = {
       return () => {
         ocrListeners.delete(callback)
       }
+    }
+  },
+  /**
+   * Language packs (PR9): main owns the catalogue, the downloads and the file checks. Only a
+   * catalogue code ever crosses; Install from file… opens main's own dialog (no path from here).
+   */
+  ocrLangs: {
+    list: (): Promise<LangPackInfo[]> => ipcRenderer.invoke(LANG_CHANNELS.list),
+    /** Only after the user agreed to the consent prompt. */
+    download: (code: string): Promise<LangDownloadResult> =>
+      ipcRenderer.invoke(LANG_CHANNELS.download, code),
+    cancel: (code: string): Promise<void> => ipcRenderer.invoke(LANG_CHANNELS.cancel, code),
+    installFromFile: (): Promise<LangInstallResult> =>
+      ipcRenderer.invoke(LANG_CHANNELS.installFile),
+    onProgress: (callback: (p: LangProgress) => void): (() => void) => {
+      const listener = (_event: Electron.IpcRendererEvent, p: LangProgress): void => callback(p)
+      ipcRenderer.on(LANG_CHANNELS.progress, listener)
+      return () => ipcRenderer.removeListener(LANG_CHANNELS.progress, listener)
     }
   }
 }

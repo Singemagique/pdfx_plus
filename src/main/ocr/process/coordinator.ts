@@ -47,6 +47,12 @@
 //         The recognize message carries the page's edit rotation, the orientation tried first.
 // §3.4.6  Results map through their OCR copy's affine (pad, quarter turns, deskew); a near-scanned
 //         page's OCR words lying on its native text are dropped; `rotateBy` = (θ − r_edit) mod 360.
+// §3.2.5  PR9: languages beyond the bundled four come from main only (`init` or a later
+//         `languages` message), each checked against the compiled catalogue here before any thread
+//         sees it. One that fails is dropped (the pages asking for it end `needs-language`); OCR
+//         itself stays on, unlike a bundled file failing. A page waits to be recognised while a
+//         language it needs is still being checked, and new data reaches running threads with an
+//         `add-data` message.
 
 import {
   ELECTRON_NET_MEMBERS,
@@ -96,6 +102,7 @@ import type {
   ToRecognize
 } from './thread-messages'
 import type { TriagePage } from '../../../shared/ocr/triage'
+import { ENGINE_DATA } from './engine-manifest'
 
 // ---------------------------------------------------------------------------------------------
 // Injected surfaces (structural, so Node's Worker and Electron's MessagePortMain both fit).
@@ -135,6 +142,11 @@ export interface CoordinatorDeps {
    * language's verified .traineddata.gz (engine-node.ts). Main resolves the paths.
    */
   loadEngine(paths: OcrPaths): Promise<LoadedEngine>
+  /**
+   * One downloaded / installed catalogue language (engine-node.ts `loadLanguage`): its verified
+   * bytes and the hash pages carry. Absent: only the bundled languages are ever available.
+   */
+  loadLanguage?(lang: string, path: string): Promise<{ data: SharedArrayBuffer; sha256: string }>
   system(): SystemInfo
   /** This realm's tripwire count. */
   tripwire(): number
@@ -363,6 +375,8 @@ export class Coordinator {
   private engine: LoadedEngine | null = null
   /** Languages main gave paths for (known at init, before the engine has loaded). */
   private availableLangs = new Set<string>()
+  /** Catalogue languages main named that are still being checked (PR9). */
+  private readonly pendingLangs = new Set<string>()
   private port: PortLike | null = null
 
   private readonly sources = new Map<string, Source>()
@@ -495,8 +509,14 @@ export class Coordinator {
     if ('init' in msg) {
       this.limits = msg.init.limits
       this.pdfiumModule = this.deps.loadPdfium(msg.init.paths.pdfiumWasm)
-      this.availableLangs = new Set(Object.keys(msg.init.paths.tessdata))
-      this.engineModule = this.deps.loadEngine(msg.init.paths)
+      // The bundled languages load with the engine and must all verify (else OCR is off); the
+      // catalogue ones are checked one by one afterwards, and one failing only drops that language.
+      const bundled: Record<string, string> = {}
+      const extra: Record<string, string> = {}
+      for (const [l, p] of Object.entries(msg.init.paths.tessdata))
+        (Object.hasOwn(ENGINE_DATA, l) ? bundled : extra)[l] = p
+      this.availableLangs = new Set(Object.keys(bundled))
+      this.engineModule = this.deps.loadEngine({ ...msg.init.paths, tessdata: bundled })
       this.engineModule.then(
         (e) => {
           this.engine = e
@@ -520,6 +540,10 @@ export class Coordinator {
         })
       this.pdfiumModule.catch(fatal)
       this.engineModule.catch(fatal)
+      this.addLanguages(extra)
+    } else if ('languages' in msg) {
+      if (!this.engineModule) throw new OcrError('init', 'no init from main yet')
+      this.addLanguages(msg.languages.tessdata)
     } else if ('port' in msg) {
       const port = ports[0]
       if (!port) throw new OcrError('bad-message', 'port message without a port')
@@ -532,6 +556,67 @@ export class Coordinator {
     } else if ('shutdown' in msg) {
       this.dispose()
       this.deps.exit(0)
+    }
+  }
+
+  /**
+   * Check catalogue languages main named (PR9) and, once verified, make them available: into the
+   * engine assets later threads start with, to every live thread (`add-data`), then into
+   * `availableLangs`. Bundled codes, languages already available or being checked are ignored.
+   */
+  private addLanguages(tessdata: Record<string, string>): void {
+    const engineModule = this.engineModule
+    const load = this.deps.loadLanguage
+    if (!engineModule || !load) return
+    for (const [lang, path] of Object.entries(tessdata)) {
+      if (Object.hasOwn(ENGINE_DATA, lang)) continue
+      if (this.availableLangs.has(lang) || this.pendingLangs.has(lang)) continue
+      this.pendingLangs.add(lang)
+      engineModule
+        .then(async (engine) => ({ engine, loaded: await load(lang, path) }))
+        .then(
+          ({ engine, loaded }) =>
+            this.guard(() => {
+              this.pendingLangs.delete(lang)
+              if (this.disposed) return
+              engine.assets.data[lang] = loaded.data
+              engine.dataHashes[lang] = loaded.sha256
+              const msg: ToRecognize = { type: 'add-data', data: { [lang]: loaded.data } }
+              for (const s of this.recognizers) {
+                if (s.dead) continue
+                if (s.ready) s.worker.postMessage(msg)
+                else s.outbox.push({ msg })
+              }
+              this.availableLangs.add(lang)
+              this.pump()
+            }, false),
+          () =>
+            this.guard(() => {
+              this.pendingLangs.delete(lang)
+              if (this.disposed) return
+              this.endMissingLanguages()
+              this.pump()
+            }, false)
+        )
+    }
+  }
+
+  /** Does the job ask for a language that is neither available nor still being checked? */
+  private missingLanguage(job: Job): boolean {
+    return job.langs.some((l) => !this.availableLangs.has(l) && !this.pendingLangs.has(l))
+  }
+
+  /** A language failed its check: every page still waiting for it ends `needs-language`. */
+  private endMissingLanguages(): void {
+    for (const t of [...this.tasks]) {
+      if (t.state === 'recognizing' || !this.missingLanguage(t.job)) continue
+      t.bitmap = null
+      this.finalize(t, {
+        status: 'needs-language',
+        renderDpi: null,
+        raster: null,
+        recognition: null
+      })
     }
   }
 
@@ -912,8 +997,9 @@ export class Coordinator {
       progressDirty: true
     }
     this.jobs.set(job.jobId, job)
-    // A language that is neither bundled nor installed: nothing to recognise with (§3.5.1).
-    const missing = req.opts.langs.some((l) => !this.availableLangs.has(l))
+    // A language that is neither bundled nor installed: nothing to recognise with (§3.5.1). One
+    // main named that is still being checked counts as installed until the check says otherwise.
+    const missing = this.missingLanguage(job)
     req.pages.forEach((p, order) => {
       const t: Task = {
         id: ++this.taskSeq,
@@ -1098,9 +1184,11 @@ export class Coordinator {
       if (r.ready && !r.task && !r.triage) this.startTriage(r, triage)
     }
 
-    // Recognize: up to n threads; a big page runs alone.
+    // Recognize: up to n threads; a big page runs alone. A page whose language is still being
+    // checked waits (PR9).
+    const langsReady = (x: Task): boolean => !x.job.langs.some((l) => this.pendingLangs.has(l))
     for (;;) {
-      const t = this.pick('rendered')
+      const t = this.pick('rendered', langsReady)
       if (!t || !t.raster) break
       const busy = this.recognizers.filter((s) => s.task)
       if (busy.some((s) => s.big)) break

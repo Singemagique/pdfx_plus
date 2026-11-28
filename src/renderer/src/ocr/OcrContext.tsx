@@ -16,6 +16,7 @@ import {
   type ReactNode
 } from 'react'
 import type { DocEntry } from '../types'
+import type { LangPacksSnapshot, LangPacksStore } from './lang-packs'
 import type { OcrFindSupply } from './ocr-find-supply'
 import type { OcrPageState, OcrSnapshot, OcrStore } from './ocr-store'
 import { nextRuns, runProgress, summarizeOcr, type CollectionOcr } from './ocr-ui'
@@ -44,6 +45,8 @@ export interface OcrStoreValue {
   store: OcrStore | null
   supply: OcrFindSupply | null
   actions: OcrActions
+  /** Downloadable languages (PR9); absent or null: only the bundled ones are offered. */
+  langs?: LangPacksStore | null
 }
 
 const noop = (): void => {}
@@ -58,7 +61,8 @@ export const NULL_OCR_ACTIONS: OcrActions = {
 const OcrStoreContext = createContext<OcrStoreValue>({
   store: null,
   supply: null,
-  actions: NULL_OCR_ACTIONS
+  actions: NULL_OCR_ACTIONS,
+  langs: null
 })
 
 export interface OcrSummaryValue {
@@ -142,6 +146,23 @@ export function useOcrPageState(pageKey: string): OcrPageState | null {
   return useSyncExternalStore(store?.subscribe ?? noSubscribe, () =>
     store ? store.getPageState(pageKey) : null
   )
+}
+
+const EMPTY_LANGS: LangPacksSnapshot = Object.freeze({
+  list: Object.freeze([]) as LangPacksSnapshot['list'],
+  loaded: false,
+  progress: new Map(),
+  errors: new Map()
+}) as LangPacksSnapshot
+
+/** The language packs and their current state (re-renders on progress and list changes). */
+export function useLangPacks(): { langs: LangPacksStore | null; snapshot: LangPacksSnapshot } {
+  const { langs = null } = useOcrStore()
+  const snapshot = useSyncExternalStore(
+    langs?.subscribe ?? noSubscribe,
+    () => langs?.getSnapshot() ?? EMPTY_LANGS
+  )
+  return { langs, snapshot }
 }
 
 /** The store's settings (identity changes when they do). */

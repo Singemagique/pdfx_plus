@@ -24,6 +24,7 @@ import {
   RESOURCES_TESSDATA_DIR
 } from './process/engine-manifest'
 import { getMainWindow } from '../window'
+import { langPacks, registerOcrLangs } from './lang-host'
 import {
   OcrSupervisor,
   type ChildLike,
@@ -52,22 +53,31 @@ function pdfiumWasmPath(): string {
  * one against the compiled manifest before it uses it.
  */
 export function ocrEnginePaths(): Omit<OcrPaths, 'pdfiumWasm'> {
+  // Plus the downloaded / installed / admin-provisioned catalogue languages main has verified
+  // (PR9); the bundled files win for their own codes.
+  const installed = langPacks().paths()
   if (app.isPackaged) {
     const dir = join(process.resourcesPath, RESOURCES_OCR_DIR)
     const data = join(process.resourcesPath, RESOURCES_TESSDATA_DIR)
     return {
       ocrCore: dir,
-      tessdata: Object.fromEntries(
-        Object.entries(ENGINE_DATA).map(([lang, f]) => [lang, join(data, f.file)])
-      )
+      tessdata: {
+        ...installed,
+        ...Object.fromEntries(
+          Object.entries(ENGINE_DATA).map(([lang, f]) => [lang, join(data, f.file)])
+        )
+      }
     }
   }
   const root = app.getAppPath()
   return {
     ocrCore: dirname(join(root, ENGINE_CORE.wasm.source)),
-    tessdata: Object.fromEntries(
-      Object.entries(ENGINE_DATA).map(([lang, f]) => [lang, join(root, f.source)])
-    )
+    tessdata: {
+      ...installed,
+      ...Object.fromEntries(
+        Object.entries(ENGINE_DATA).map(([lang, f]) => [lang, join(root, f.source)])
+      )
+    }
   }
 }
 
@@ -134,6 +144,9 @@ export function registerOcr(): void {
     update()
   })
   app.on('before-quit', () => supervisor?.dispose())
+  // Language packs (PR9): a newly verified language goes to a running utility process at once; a
+  // child that starts later reads them in its init.
+  registerOcrLangs((paths) => supervisor?.setLanguages(paths))
 }
 
 /**
@@ -144,6 +157,10 @@ export function registerOcr(): void {
 export async function runOcrSelftest(outArg: string | undefined): Promise<number> {
   const started = performance.now()
   const out = resolve(outArg && !outArg.startsWith('--') ? outArg : 'ocr-selftest.json')
+  // Installed language packs are part of what the engine loads (and checks): find them first.
+  await langPacks()
+    .init()
+    .catch(() => {})
   const sup = getOcrSupervisor()
   let report: SelftestReport | null = null
   let error: string | null = null

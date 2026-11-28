@@ -27,7 +27,8 @@
     "test:coverage": "vitest run --coverage",
     "test:ocr": "vitest run --project ocr",
     "ocr:record": "node scripts/ocr-record.mjs",
-    "ocr:calibrate": "node scripts/ocr-calibrate.mjs"
+    "ocr:calibrate": "node scripts/ocr-calibrate.mjs",
+    "ocr:lang-catalogue": "node scripts/ocr-lang-catalogue.mjs"
   },
   "dependencies": {
     "@electron-toolkit/utils": "4.0.0",

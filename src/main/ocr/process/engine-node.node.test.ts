@@ -13,12 +13,19 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
 import { OcrError } from '../../../shared/ocr/protocol'
 import { REPO_ROOT, nodeModulesEnginePaths } from '../test-utils/engine-harness'
-import { ENGINE_CORE, ENGINE_DATA, type ManifestData } from './engine-manifest'
+import {
+  ENGINE_CORE,
+  ENGINE_DATA,
+  catalogueEntry,
+  manifestDataFor,
+  type ManifestData
+} from './engine-manifest'
 import {
   compileCore,
   gunzipTraineddata,
   loadEngine,
   loadGlue,
+  loadLanguage,
   loadTraineddataGz,
   sha256Hex,
   verifyBytes
@@ -154,11 +161,16 @@ describe('every engine file is checked against the manifest before use', () => {
     expect(() => gunzipTraineddata('xx', flipped, entry)).toThrow(
       /^traineddata xx: SHA-256 mismatch$/
     )
-    // A pinned file that is not a gzip at all.
-    const junk = new Uint8Array([1, 2, 3, 4])
+    // A pinned file with a gzip header that is not a valid gzip.
+    const junk = new Uint8Array([0x1f, 0x8b, 3, 4])
     expect(() =>
       gunzipTraineddata('xx', junk, { ...entry, bytes: 4, sha256: sha256Hex(junk) })
     ).toThrow(/not a valid gzip/)
+    // No gzip header: it is taken as a raw .traineddata (PR9), so only the raw pins can pass it.
+    const plain = new Uint8Array([1, 2, 3, 4])
+    expect(() =>
+      gunzipTraineddata('xx', plain, { ...entry, bytes: 4, sha256: sha256Hex(plain) })
+    ).toThrow(/^traineddata xx \(raw\): size 4, expected \d+$/)
     expect(() => gunzipTraineddata('zz', gz)).toThrow(/no manifest entry for zz/)
   })
 
@@ -174,4 +186,63 @@ describe('every engine file is checked against the manifest before use', () => {
       expect(engine.dataHashes[l], l).not.toBe(d.rawSha256)
     expect(Object.keys(engine.assets.data).sort()).toEqual(Object.keys(ENGINE_DATA).sort())
   }, 60_000)
+})
+
+// PR9: Install from file… may keep a raw .traineddata, and downloaded languages are checked
+// against the compiled catalogue. The same functions, the same hash rule.
+describe('raw .traineddata files and catalogue languages', () => {
+  const fraGz = (): Uint8Array =>
+    new Uint8Array(readFileSync(join(REPO_ROOT, ENGINE_DATA.fra.source)))
+  const fraRaw = (): Uint8Array => gunzipTraineddata('fra', fraGz())
+
+  it('a raw file is checked against the raw size and SHA-256, and passes through gunzip as-is', async () => {
+    const d = mkdtempSync(join(dir, 'raw-'))
+    const raw = fraRaw()
+    writeFileSync(join(d, 'fra.traineddata'), raw)
+    const sab = await loadTraineddataGz('fra', join(d, 'fra.traineddata'))
+    expect(sab.byteLength).toBe(ENGINE_DATA.fra.rawBytes)
+    expect(sha256Hex(gunzipTraineddata('fra', new Uint8Array(sab)))).toBe(ENGINE_DATA.fra.rawSha256)
+    const bad = raw.slice()
+    bad[bad.length >> 1] ^= 1
+    writeFileSync(join(d, 'fra.traineddata'), bad)
+    await expectInit(
+      () => loadTraineddataGz('fra', join(d, 'fra.traineddata')),
+      /SHA-256 mismatch/,
+      /^traineddata fra/,
+      d
+    )
+    expect(() => gunzipTraineddata('fra', bad)).toThrow(
+      /^traineddata fra \(raw\): SHA-256 mismatch$/
+    )
+  })
+
+  it('a catalogue language is held to the catalogue hashes; an unknown one is never read', async () => {
+    const rus = catalogueEntry('rus')!
+    expect(manifestDataFor('rus')).toMatchObject({
+      bytes: rus.bytes,
+      sha256: rus.sha256Gz,
+      rawBytes: rus.rawBytes,
+      rawSha256: rus.sha256Raw
+    })
+    // fra's bytes are not Russian, gzipped or raw.
+    const d = mkdtempSync(join(dir, 'rus-'))
+    writeFileSync(join(d, 'rus.traineddata.gz'), fraGz())
+    await expectInit(
+      () => loadLanguage('rus', join(d, 'rus.traineddata.gz')),
+      /size \d+, expected \d+/,
+      /^traineddata rus/,
+      d
+    )
+    expect(() => gunzipTraineddata('rus', fraRaw())).toThrow(/traineddata rus \(raw\): size/)
+    await expectInit(
+      () => loadLanguage('ara', join(d, 'rus.traineddata.gz')),
+      /no manifest entry for ara/,
+      /ara/,
+      d
+    )
+    // The bundled fra loads through the same entry point with its .gz hash.
+    expect((await loadLanguage('fra', join(REPO_ROOT, ENGINE_DATA.fra.source))).sha256).toBe(
+      ENGINE_DATA.fra.sha256
+    )
+  })
 })

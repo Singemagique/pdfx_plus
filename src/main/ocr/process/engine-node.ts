@@ -20,7 +20,12 @@ import { gunzipSync } from 'fflate'
 import { OcrError, type OcrPaths } from '../../../shared/ocr/protocol'
 import type { TessFactory } from '../../../shared/ocr/engine/tess-core'
 import type { LoadedEngine } from './coordinator'
-import { ENGINE_CORE, ENGINE_DATA, type ManifestData, type ManifestFile } from './engine-manifest'
+import {
+  ENGINE_CORE,
+  manifestDataFor,
+  type ManifestData,
+  type ManifestFile
+} from './engine-manifest'
 
 export function sha256Hex(bytes: Uint8Array): string {
   return createHash('sha256').update(bytes).digest('hex')
@@ -77,14 +82,44 @@ export function loadGlue(coreDir: string): TessFactory {
   return factory as TessFactory
 }
 
-/** Read and verify one bundled language's .traineddata.gz into a SharedArrayBuffer. */
+/** A gzip member starts 1f 8b; a .traineddata never does (it starts with its component count). */
+export function isGzip(bytes: Uint8Array): boolean {
+  return bytes.length >= 2 && bytes[0] === 0x1f && bytes[1] === 0x8b
+}
+
+/**
+ * Read and verify one language's data into a SharedArrayBuffer: a `.traineddata.gz` against the
+ * manifest's gzipped size and SHA-256, a raw `.traineddata` (Install from file... keeps the raw file
+ * when that is what matched, section 3.2.5) against the raw ones. Bundled languages and the
+ * catalogue alike (`manifestDataFor`); any other language is refused before a byte is read.
+ */
 export async function loadTraineddataGz(lang: string, path: string): Promise<SharedArrayBuffer> {
-  const want = Object.hasOwn(ENGINE_DATA, lang) ? ENGINE_DATA[lang] : undefined
+  const want = manifestDataFor(lang)
   if (!want) throw new OcrError('init', `no manifest entry for ${lang}`)
-  const bytes = await readVerified(path, want, `traineddata ${lang}`)
+  let bytes: Uint8Array<ArrayBuffer>
+  try {
+    bytes = new Uint8Array(await readFile(path))
+  } catch {
+    throw new OcrError('init', `traineddata ${lang}: not readable`)
+  }
+  if (isGzip(bytes)) verifyBytes(bytes, want, `traineddata ${lang}`)
+  else verifyBytes(bytes, { bytes: want.rawBytes, sha256: want.rawSha256 }, `traineddata ${lang}`)
   const sab = new SharedArrayBuffer(bytes.byteLength)
   new Uint8Array(sab).set(bytes)
   return sab
+}
+
+/**
+ * A downloaded or installed language for a running coordinator (PR9): its verified bytes and the
+ * SHA-256 that goes into every page's `dataHashes` (always the catalogue's gzipped hash, so one
+ * language has one identity whichever form is on disk).
+ */
+export async function loadLanguage(
+  lang: string,
+  path: string
+): Promise<{ data: SharedArrayBuffer; sha256: string }> {
+  const data = await loadTraineddataGz(lang, path)
+  return { data, sha256: manifestDataFor(lang)!.sha256 }
 }
 
 /**
@@ -99,7 +134,7 @@ export async function loadEngine(paths: OcrPaths): Promise<LoadedEngine> {
   const dataHashes: Record<string, string> = {}
   for (const [lang, path] of Object.entries(paths.tessdata)) {
     data[lang] = await loadTraineddataGz(lang, path)
-    dataHashes[lang] = ENGINE_DATA[lang].sha256
+    dataHashes[lang] = manifestDataFor(lang)!.sha256
   }
   return { assets: { module, coreDir: paths.ocrCore, data }, dataHashes }
 }
@@ -111,9 +146,15 @@ export async function loadEngine(paths: OcrPaths): Promise<LoadedEngine> {
 export function gunzipTraineddata(
   lang: string,
   gz: Uint8Array,
-  want: ManifestData | undefined = Object.hasOwn(ENGINE_DATA, lang) ? ENGINE_DATA[lang] : undefined
+  want: ManifestData | undefined = manifestDataFor(lang)
 ): Uint8Array {
   if (!want) throw new OcrError('init', `no manifest entry for ${lang}`)
+  if (!isGzip(gz)) {
+    // A raw .traineddata (installed from a file as-is): only the raw check applies.
+    const raw = gz.buffer instanceof SharedArrayBuffer ? new Uint8Array(gz) : gz
+    verifyBytes(raw, { bytes: want.rawBytes, sha256: want.rawSha256 }, `traineddata ${lang} (raw)`)
+    return raw
+  }
   verifyBytes(gz, want, `traineddata ${lang}`)
   // fflate's gunzipSync wants a plain Uint8Array; a SharedArrayBuffer view is copied first.
   const plain = gz.buffer instanceof SharedArrayBuffer ? new Uint8Array(gz) : gz

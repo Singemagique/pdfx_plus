@@ -4,6 +4,12 @@
 // summary popover can never disagree about which pages are "scanned and not recognised yet" or
 // which ones "need attention".
 
+import {
+  CJK_SCRIPTS,
+  type LangDownloadError,
+  type LangInstallResult,
+  type LangPackInfo
+} from '../../../shared/ocr/lang-packs'
 import { OCR_LIMITS } from '../../../shared/ocr/protocol'
 import { BUNDLED_LANGUAGES } from '../../../shared/settings'
 import { makePageKey } from '../edit/model'
@@ -45,7 +51,7 @@ export const ISSUE_COPY: Record<OcrIssueKind, string> = {
   'too-large': 'This page is too large for text recognition.',
   'user-unit': 'Unsupported page units',
   'image-format': 'This page’s image format isn’t supported for text recognition yet',
-  // The missing language is not reported per page yet; the Download action is PR9's.
+  // The generic row; the summary names the missing languages and offers [Download] (PR9).
   'needs-language': 'Needs language data that isn’t installed',
   timeout: 'Took too long and was skipped',
   oom: 'Couldn’t recognize (out of memory)',
@@ -406,10 +412,118 @@ const NATIVE: Record<string, [native: string, english: string]> = {
   spa: ['Español', 'Spanish']
 }
 
+/** Catalogue names main reported (lang-packs.ts registers them when the list arrives). */
+const CATALOGUE_NAMES = new Map<string, [native: string, english: string]>()
+
+/** Remember the catalogue's names, so chips and summary rows can name a downloaded language. */
+export function registerLangNames(
+  list: ReadonlyArray<Pick<LangPackInfo, 'code' | 'nativeName' | 'name'>>
+): void {
+  for (const l of list) CATALOGUE_NAMES.set(l.code, [l.nativeName, l.name])
+}
+
+const names = (code: string): [string, string] | undefined =>
+  Object.hasOwn(NATIVE, code) ? NATIVE[code] : CATALOGUE_NAMES.get(code)
+
 export function langLabel(code: string): string {
-  const n = NATIVE[code]
+  const n = names(code)
   if (!n) return code
   return n[0] === n[1] ? n[0] : `${n[0]} — ${n[1]}`
+}
+
+/** The English name ("Russian"), for sentences; the code when PDFx does not know it. */
+export function langName(code: string): string {
+  return names(code)?.[1] ?? code
+}
+
+/** Tesseract's CJK ceiling, said plainly (§3.2.5 "Quality labels"). */
+export const CJK_NOTE = '(printed text; photos may be less accurate)'
+
+/** "2.7 MB" (decimal megabytes, one decimal, as the design writes sizes). */
+export function formatSize(bytes: number): string {
+  const mb = bytes / 1_000_000
+  return `${mb < 0.1 ? mb.toFixed(2) : mb.toFixed(1)} MB`
+}
+
+/** A catalogue language as the picker lists it. */
+export interface LangOption extends LangInfo {
+  /** CJK: carries CJK_NOTE. */
+  cjk: boolean
+  /** Download group: "2.7 MB from cdn.jsdelivr.net". */
+  detail?: string
+}
+
+export function langOption(p: LangPackInfo): LangOption {
+  const label = p.nativeName === p.name ? p.name : `${p.nativeName} — ${p.name}`
+  return {
+    code: p.code,
+    label,
+    cjk: CJK_SCRIPTS.has(p.script),
+    ...(p.state !== 'installed' ? { detail: `${formatSize(p.bytes)} from ${p.host}` } : {})
+  }
+}
+
+/** The consent asked before any request (§3.2.5 "Consent wording"). */
+export function consentCopy(p: Pick<LangPackInfo, 'name' | 'bytes' | 'host'>): string {
+  return `Download ${p.name} language data (${formatSize(p.bytes)}) from ${p.host}? It’s stored on this computer and used offline after that.`
+}
+
+/** §3.2.5 "Offline wording" / §3.8 "Errors". */
+export function offlineCopy(name: string): string {
+  return `Connect to the internet once to add ${name}, or choose a language that’s already installed.`
+}
+
+/** Install from file… refused a file (§3.2.5). */
+export const INSTALL_REFUSED =
+  'This file isn’t one of the language files PDFx knows. PDFx 1.1.4 only installs its own language files.'
+
+/** What a download that did not finish says (never a path, never a server message). */
+export function downloadErrorCopy(error: LangDownloadError, name: string): string {
+  switch (error) {
+    case 'offline':
+      return offlineCopy(name)
+    case 'timeout':
+      return `The download of ${name} stopped responding. Try again, or choose a language that’s already installed.`
+    case 'proxy-auth':
+      return `Your network’s proxy asks for a sign-in PDFx can’t give. Get the file on another computer, then use Install from file…`
+    case 'http':
+      return `The server couldn’t provide ${name} language data right now. Try again later.`
+    case 'verify':
+      return `The downloaded ${name} language data didn’t match what PDFx expects, so it was deleted. Try again.`
+    case 'disk':
+      return `PDFx couldn’t save ${name} language data on this computer (is the disk full?).`
+    case 'unknown-language':
+      return `PDFx doesn’t offer ${name} language data.`
+    case 'cancelled':
+      return 'Download stopped.'
+  }
+}
+
+/** What Install from file… says when it did not install (null: nothing to say). */
+export function installErrorCopy(r: LangInstallResult): string | null {
+  if (r.ok || r.error === 'cancelled') return null
+  if (r.error === 'too-large') return `${INSTALL_REFUSED} (It is 100 MB or larger.)`
+  if (r.error === 'unreadable') return 'PDFx couldn’t read that file.'
+  if (r.error === 'disk') return 'PDFx couldn’t save the language data on this computer.'
+  return INSTALL_REFUSED
+}
+
+/** The summary row for a page needing languages that aren't installed (§3.8 "Summary popover"). */
+export function needsLanguageCopy(missing: readonly string[]): string {
+  if (missing.length === 0) return ISSUE_COPY['needs-language']
+  const list = missing.map(langName)
+  const named = list.length === 1 ? list[0] : `${list.slice(0, -1).join(', ')} and ${list.at(-1)}`
+  return `Needs ${named} language data`
+}
+
+/** The page's languages that are neither bundled nor installed. */
+export function missingLangs(
+  langs: readonly string[] | undefined,
+  installed: ReadonlySet<string>
+): string[] {
+  return (langs ?? []).filter(
+    (l) => !(BUNDLED_LANGUAGES as readonly string[]).includes(l) && !installed.has(l)
+  )
 }
 
 /** The Included group: the languages bundled with the app (D1). */

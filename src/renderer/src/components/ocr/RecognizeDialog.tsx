@@ -1,7 +1,8 @@
 // The Recognize Text… / Replace Recognized Text… dialog (DESIGN.md §3.8 "Dialog", "Language
 // picker"), in the Sign dialog's modal pattern (focus trap, Esc). Pages scope, language chips with
-// a searchable picker (Included and Installed groups; the Download group and "Install from file…"
-// are PR9's), the auto-recognise settings, the privacy line, the D8 wording and the D7 export
+// a searchable picker (Included, Installed and Download groups with native names, sizes and the
+// host; CJK labelled; "Install from file…" in its footer, PR9), the auto-recognise settings, the
+// privacy line, the D8 wording and the D7 export
 // setting. Opening it asks the store to triage the collection (Stage 0 gate (b)), so the counts
 // fill in as triage answers. Settings are saved when the user recognises, never on Cancel.
 //
@@ -15,15 +16,21 @@
 // dialog and Delete never removes the page behind it.
 
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import { useOcrSettings, useOcrStore, useOcrSummary } from '../../ocr/OcrContext'
+import { useLangPacks, useOcrSettings, useOcrStore, useOcrSummary } from '../../ocr/OcrContext'
 import {
+  CJK_NOTE,
   INCLUDED_LANGS,
   MAX_LANGS,
+  installErrorCopy,
   langLabel,
   langMatches,
+  langName,
+  langOption,
   pagesWord,
-  type LangInfo
+  type LangInfo,
+  type LangOption
 } from '../../ocr/ocr-ui'
+import { LangDownloadPrompt } from './LangDownloadPrompt'
 import { isSignedSource, SIGNED_SOURCE_NOTE } from '../../ocr/signed-source'
 import type { DocEntry } from '../../types'
 import { makePageKey } from '../../edit/model'
@@ -50,7 +57,7 @@ export interface RecognizeDialogProps {
   focusPageKey: string | null
   inFullView: boolean
   docs: readonly DocEntry[]
-  /** Downloaded language packs (PR9); none in 1.1.4 without them. */
+  /** Extra installed languages (tests); the language packs' own list is used as well. */
   installed?: readonly LangInfo[]
   onClose: () => void
 }
@@ -182,6 +189,11 @@ export function RecognizeDialog({
   const [include, setInclude] = useState(settings?.['ocr.includeInExports'] ?? true)
   const [picking, setPicking] = useState(false)
   const [query, setQuery] = useState('')
+  /** The Download option the consent prompt is open for. */
+  const [consent, setConsent] = useState<string | null>(null)
+  /** What the last Install from file… said. */
+  const [installNote, setInstallNote] = useState<string | null>(null)
+  const { langs: packs, snapshot: packSnap } = useLangPacks()
   const [submitting, setSubmitting] = useState(false)
 
   const signed = useMemo(
@@ -265,9 +277,15 @@ export function RecognizeDialog({
   const closePicker = (): void => {
     setPicking(false)
     setQuery('')
+    setConsent(null)
+    setInstallNote(null)
     refocus.current = { kind: 'add' }
   }
-  escape.current = () => (picking ? closePicker() : onClose())
+  const closeConsent = (): void => {
+    setConsent(null)
+    queueMicrotask(() => searchRef.current?.focus())
+  }
+  escape.current = () => (consent ? closeConsent() : picking ? closePicker() : onClose())
 
   if (!store) return null
 
@@ -294,16 +312,52 @@ export function RecognizeDialog({
     }
   }
 
-  const choices = [
-    ...INCLUDED_LANGS,
-    ...installed.filter((l) => !INCLUDED_LANGS.some((i) => i.code === l.code))
+  const isIncluded = (code: string): boolean => INCLUDED_LANGS.some((i) => i.code === code)
+  // In English-name order (the UI's language), whatever script the native name is in.
+  const packOptions = [...packSnap.list]
+    .filter((p) => !isIncluded(p.code))
+    .sort((a, b) => a.name.localeCompare(b.name, 'en'))
+    .map(langOption)
+  const installedOptions: LangOption[] = [
+    ...packOptions.filter((o) => packs?.installed().has(o.code)),
+    ...installed
+      .filter((l) => !isIncluded(l.code) && !packOptions.some((o) => o.code === l.code))
+      .map((l) => ({ ...l, cjk: false }))
   ]
-  const addable = choices.filter((l) => !langs.includes(l.code) && langMatches(l, query))
-  const included = addable.filter((l) => INCLUDED_LANGS.some((i) => i.code === l.code))
-  const downloaded = addable.filter((l) => !INCLUDED_LANGS.some((i) => i.code === l.code))
+  const downloadOptions = packOptions.filter((o) => !packs?.installed().has(o.code))
+  const usable = (l: LangInfo): boolean => !langs.includes(l.code) && langMatches(l, query)
+  const included = INCLUDED_LANGS.filter(usable)
+  const downloaded = installedOptions.filter(usable)
+  const downloadable = downloadOptions.filter(usable)
+  /** Enter takes the first language that needs no download. */
+  const addable = [...included, ...downloaded]
   const add = (code: string): void => {
     setLangs((ls) => (ls.length >= MAX_LANGS || ls.includes(code) ? ls : [...ls, code]))
     closePicker()
+  }
+  const consentInfo = consent ? packSnap.list.find((p) => p.code === consent) : undefined
+  const installFromFile = async (): Promise<void> => {
+    if (!packs) return
+    setInstallNote(null)
+    const r = await packs.installFromFile()
+    if (r.ok) {
+      if (langs.length < MAX_LANGS && !langs.includes(r.code)) add(r.code)
+      else setInstallNote(`${langName(r.code)} is installed.`)
+      return
+    }
+    setInstallNote(installErrorCopy(r))
+  }
+  const option = (l: LangOption | LangInfo, onPick: () => void): React.JSX.Element => {
+    const o = l as Partial<LangOption>
+    return (
+      <button key={l.code} role="option" aria-selected={false} onClick={onPick}>
+        <span className="ocr-picker-name">
+          {l.label}
+          {o.cjk && <span className="ocr-picker-note"> {CJK_NOTE}</span>}
+        </span>
+        {o.detail && <span className="ocr-picker-detail">{o.detail}</span>}
+      </button>
+    )
   }
   const removeLang = (index: number): void => {
     setLangs((ls) => ls.filter((_, i) => i !== index))
@@ -390,7 +444,16 @@ export function RecognizeDialog({
               </button>
             )}
           </div>
-          {picking && (
+          {picking && consentInfo && (
+            <div className="ocr-picker">
+              <LangDownloadPrompt
+                info={consentInfo}
+                onInstalled={(code) => add(code)}
+                onCancel={closeConsent}
+              />
+            </div>
+          )}
+          {picking && !consentInfo && (
             <div className="ocr-picker">
               <input
                 ref={searchRef}
@@ -409,29 +472,27 @@ export function RecognizeDialog({
               />
               <div className="ocr-picker-list" role="listbox" aria-label="Languages">
                 {included.length > 0 && <div className="ocr-picker-group">Included</div>}
-                {included.map((l) => (
-                  <button
-                    key={l.code}
-                    role="option"
-                    aria-selected={false}
-                    onClick={() => add(l.code)}
-                  >
-                    {l.label}
-                  </button>
-                ))}
+                {included.map((l) => option(l, () => add(l.code)))}
                 {downloaded.length > 0 && <div className="ocr-picker-group">Installed</div>}
-                {downloaded.map((l) => (
-                  <button
-                    key={l.code}
-                    role="option"
-                    aria-selected={false}
-                    onClick={() => add(l.code)}
-                  >
-                    {l.label}
-                  </button>
-                ))}
-                {addable.length === 0 && <p className="sign-module-hint">No other languages</p>}
+                {downloaded.map((l) => option(l, () => add(l.code)))}
+                {downloadable.length > 0 && <div className="ocr-picker-group">Download</div>}
+                {downloadable.map((l) => option(l, () => setConsent(l.code)))}
+                {addable.length === 0 && downloadable.length === 0 && (
+                  <p className="sign-module-hint">No other languages</p>
+                )}
               </div>
+              {packs && (
+                <div className="ocr-picker-footer">
+                  <button className="sign-link" onClick={() => void installFromFile()}>
+                    Install from file…
+                  </button>
+                  {installNote && (
+                    <p className="sign-module-hint" role="status">
+                      {installNote}
+                    </p>
+                  )}
+                </div>
+              )}
             </div>
           )}
           <p className="sign-module-hint">{DIALOG_COPY.langHint}</p>

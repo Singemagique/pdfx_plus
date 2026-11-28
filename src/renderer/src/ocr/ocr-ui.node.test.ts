@@ -21,7 +21,16 @@ import {
   removeTargets,
   runProgress,
   summarizeOcr,
-  unavailableDetails
+  unavailableDetails,
+  CJK_NOTE,
+  downloadErrorCopy,
+  formatSize,
+  installErrorCopy,
+  langName,
+  langOption,
+  missingLangs,
+  needsLanguageCopy,
+  registerLangNames
 } from './ocr-ui'
 
 const state = (s: Partial<OcrPageState> = {}): OcrPageState => ({
@@ -326,5 +335,73 @@ describe('languages', () => {
     expect(langMatches(fra, 'fra')).toBe(true)
     expect(langMatches(fra, 'german')).toBe(false)
     expect(langMatches(fra, '  ')).toBe(true)
+  })
+})
+
+describe('language packs copy (PR9)', () => {
+  const rus = {
+    code: 'rus',
+    name: 'Russian',
+    nativeName: 'Русский',
+    script: 'Cyrl' as const,
+    bytes: 2_679_598,
+    host: 'cdn.jsdelivr.net',
+    state: 'available' as const
+  }
+
+  it('sizes in decimal MB with one decimal, as the design writes them', () => {
+    expect(formatSize(2_679_598)).toBe('2.7 MB')
+    expect(formatSize(1_718_768)).toBe('1.7 MB')
+    expect(formatSize(639_438)).toBe('0.6 MB')
+    expect(formatSize(40_000)).toBe('0.04 MB')
+  })
+
+  it('options: native — English, the size and host for downloads, the CJK note for CJK only', () => {
+    expect(langOption(rus)).toEqual({
+      code: 'rus',
+      label: 'Русский — Russian',
+      cjk: false,
+      detail: '2.7 MB from cdn.jsdelivr.net'
+    })
+    expect(langOption({ ...rus, state: 'installed' }).detail).toBeUndefined()
+    for (const script of ['Hans', 'Hant', 'Jpan', 'Kore'] as const)
+      expect(langOption({ ...rus, script }).cjk).toBe(true)
+    for (const script of ['Latn', 'Cyrl', 'Grek', 'Deva'] as const)
+      expect(langOption({ ...rus, script }).cjk).toBe(false)
+    expect(CJK_NOTE).toBe('(printed text; photos may be less accurate)')
+  })
+
+  it('names catalogue languages once main has listed them', () => {
+    expect(langLabel('ukr')).toBe('ukr')
+    registerLangNames([{ code: 'ukr', name: 'Ukrainian', nativeName: 'Українська' }])
+    expect(langLabel('ukr')).toBe('Українська — Ukrainian')
+    expect(langName('ukr')).toBe('Ukrainian')
+    expect(langName('eng')).toBe('English')
+  })
+
+  it('the needs-language row names what is missing', () => {
+    registerLangNames([rus, { code: 'jpn', name: 'Japanese', nativeName: '日本語' }])
+    expect(missingLangs(['eng', 'rus', 'jpn'], new Set(['jpn']))).toEqual(['rus'])
+    expect(missingLangs(['eng', 'deu'], new Set())).toEqual([])
+    expect(missingLangs(undefined, new Set())).toEqual([])
+    expect(needsLanguageCopy(['rus'])).toBe('Needs Russian language data')
+    expect(needsLanguageCopy(['rus', 'jpn'])).toBe('Needs Russian and Japanese language data')
+    expect(needsLanguageCopy([])).toBe(ISSUE_COPY['needs-language'])
+  })
+
+  it('download and install outcomes never echo a path or a server message', () => {
+    expect(downloadErrorCopy('offline', 'Greek')).toBe(
+      'Connect to the internet once to add Greek, or choose a language that’s already installed.'
+    )
+    for (const e of ['timeout', 'proxy-auth', 'http', 'verify', 'disk'] as const)
+      expect(downloadErrorCopy(e, 'Greek').length).toBeGreaterThan(10)
+    expect(installErrorCopy({ ok: false, error: 'cancelled' })).toBeNull()
+    expect(installErrorCopy({ ok: true, code: 'rus' })).toBeNull()
+    expect(installErrorCopy({ ok: false, error: 'unknown-file' })).toBe(
+      'This file isn’t one of the language files PDFx knows. PDFx 1.1.4 only installs its own language files.'
+    )
+    expect(installErrorCopy({ ok: false, error: 'wrong-type' })).toBe(
+      installErrorCopy({ ok: false, error: 'unknown-file' })
+    )
   })
 })

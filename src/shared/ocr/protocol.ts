@@ -291,7 +291,12 @@ export interface OcrPaths {
   pdfiumWasm: string
   /** The directory holding tesseract-core-simd-lstm.{js,wasm} (resources/ocr when packaged). */
   ocrCore: string
-  /** Each bundled language's `<lang>.traineddata.gz` (resources/ocr/tessdata when packaged). */
+  /**
+   * Each language's data file: the bundled `<lang>.traineddata.gz` (resources/ocr/tessdata when
+   * packaged), plus the downloaded, installed or admin-provisioned catalogue languages main has
+   * verified (`<lang>.traineddata.gz` or a raw `<lang>.traineddata`, PR9). The coordinator checks
+   * each against the compiled manifest again before using it.
+   */
   tessdata: Record<string, string>
 }
 
@@ -306,6 +311,12 @@ export type MainToOcr =
   /** The new renderer port is `ports[0]` of the same event. Replaces any previous port. */
   | { port: Record<string, never> }
   | { limits: OcrHostLimits }
+  /**
+   * Languages that became available after `init` (a download or Install from file finished in
+   * main, or main's startup check of the installed files did): same shape and rules as
+   * `init.paths.tessdata`. Additive; never from the renderer.
+   */
+  | { languages: { tessdata: Record<string, string> } }
   /** Ask for an immediate heartbeat. */
   | { heartbeat: Record<string, never> }
   | { shutdown: Record<string, never> }
@@ -835,6 +846,26 @@ const absolutePath: Check<string> = (x, path) => {
   return x
 }
 
+/**
+ * `{ <lang>: <absolute path to <lang>.traineddata.gz or <lang>.traineddata> }`: only the file the
+ * manifest names for that language, never a directory or another name.
+ */
+const tessdataPaths: Check<Record<string, string>> = (x, path) => {
+  if (!isPlainObject(x)) fail(path, 'expected an object')
+  const keys = Object.keys(x)
+  if (keys.length > 64) fail(path, 'too many languages')
+  const out: Record<string, string> = {}
+  for (const k of keys) {
+    lang(k, `${path}.key`)
+    const p = absolutePath(x[k], `${path}.${k}`)
+    const name = [`${k}.traineddata.gz`, `${k}.traineddata`].find((n) => p.endsWith(n))
+    if (!name || !/[\\/]$/.test(p.slice(0, -name.length)))
+      fail(`${path}.${k}`, 'expected <lang>.traineddata.gz or <lang>.traineddata')
+    out[k] = p
+  }
+  return out
+}
+
 const mainToOcr = message<MainToOcr>(
   {
     init: object<OcrInit>({
@@ -846,25 +877,12 @@ const mainToOcr = message<MainToOcr>(
           return p
         },
         ocrCore: absolutePath,
-        tessdata: (x, path) => {
-          if (!isPlainObject(x)) fail(path, 'expected an object')
-          const keys = Object.keys(x)
-          if (keys.length > 64) fail(path, 'too many languages')
-          const out: Record<string, string> = {}
-          for (const k of keys) {
-            lang(k, `${path}.key`)
-            const p = absolutePath(x[k], `${path}.${k}`)
-            // Only the file the manifest names for that language.
-            if (!p.endsWith(`${k}.traineddata.gz`) || !/[\\/]$/.test(p.slice(0, -k.length - 15)))
-              fail(`${path}.${k}`, 'expected <lang>.traineddata.gz')
-            out[k] = p
-          }
-          return out
-        }
+        tessdata: tessdataPaths
       })
     }),
     port: empty,
     limits: hostLimits,
+    languages: object<{ tessdata: Record<string, string> }>({ tessdata: tessdataPaths }),
     heartbeat: empty,
     shutdown: empty
   },
