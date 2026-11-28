@@ -1349,6 +1349,27 @@ describe('native Type0 text in a subset font: its tables and outlines keep only 
     // ...nor of a page sharing the font that was not redacted at all.
     expect(raster(await sanitizeRedacted(bytes, []), 144).data).toEqual(raster(bytes, 144).data)
   })
+
+  it('a Form XObject showing text in the font its caller set keeps every glyph', async () => {
+    // The text font is graphics state: a form shows in whatever font was in effect at its Do.
+    const doc = await PDFDocument.create()
+    doc.registerFontkit(fontkit)
+    const font = await doc.embedFont(DEJAVU, { subset: true })
+    const p = doc.addPage([400, 400])
+    p.drawText('public', { x: 50, y: 300, size: 20, font })
+    const name = [...p.node.Resources()!.lookup(PDFName.of('Font'), PDFDict).keys()][0]
+    const shown = `BT 1 0 0 1 50 200 Tm ${font.encodeText('zqxw').toString()} Tj ET`
+    const formRef = doc.context.register(
+      doc.context.stream(shown, { Type: 'XObject', Subtype: 'Form', BBox: [0, 0, 400, 400] })
+    )
+    const x = p.node.newXObject('X', formRef)
+    const call = `q BT ${name.toString()} 20 Tf ET ${x.toString()} Do Q`
+    p.node.addContentStream(doc.context.register(doc.context.stream(call)))
+    const bytes = await doc.save({ useObjectStreams: false })
+    const clean = await sanitizeRedacted(bytes, [])
+    expect(raster(clean, 144).data).toEqual(raster(bytes, 144).data)
+    expect([...(await dejavuTables(clean)).text.values()].join('')).toContain('zqxw')
+  })
 })
 
 describe('a Unicode text overlay next to an OCR layer (both pdf-lib Type0 subsets)', () => {

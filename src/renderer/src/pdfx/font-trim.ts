@@ -16,7 +16,9 @@
 // Over-keeping is the safe direction for rendering, so every uncertainty keeps: a font set by an
 // ExtGState /Font, listed in the AcroForm /DR (field appearances are regenerated from it), or
 // reached from a stream that cannot be decoded is left untouched, as is a Type0 font whose
-// encoding is not Identity-H/V (its codes cannot be split without its CMap). Known residue, not
+// encoding is not Identity-H/V (its codes cannot be split without its CMap); and when any stream
+// shows text before its own Tf (a Form XObject drawing in the font its caller set), no font of the
+// document is trimmed, because the scan cannot tell which font that is. Known residue, not
 // rewritten: CFF and Type1 glyph programs (FontFile3, FontFile), simple TrueType glyph programs
 // (their code → glyph mapping goes through the program's own cmap), and the program's own
 // cmap/post/hmtx tables.
@@ -228,8 +230,17 @@ const asStream = (doc: PDFDocument, o: PDFObject | undefined): PDFStream | undef
   return r instanceof PDFStream ? r : undefined
 }
 
+/** The font an ExtGState /Font sets: already marked unknown, so what it shows is not recorded. */
+const GS_FONT: FontUse = { kind: 'other', codes: new Set(), unknown: true }
+
 class UsageScan {
   readonly uses = new Map<PDFDict, FontUse>()
+  /**
+   * Text was shown before any Tf in its stream: a Form XObject, pattern or appearance showing in
+   * the font its CALLER set (the text font is graphics state, which a form inherits). Which font
+   * that is depends on the caller, so no font may be trimmed.
+   */
+  inheritedFont = false
   private readonly seen = new Map<PDFStream, Set<PDFDict | undefined>>()
   private readonly seenRes = new Set<PDFDict>()
 
@@ -318,7 +329,11 @@ class UsageScan {
     const stack: (FontUse | undefined)[] = []
     let current: FontUse | undefined
     const show = (o: Operand | undefined): void => {
-      if (!current || o?.k !== 'str') return
+      if (o?.k !== 'str') return
+      if (!current) {
+        this.inheritedFont = true
+        return
+      }
       const b = o.v
       if (current.kind === 'identity')
         for (let k = 0; k + 1 < b.length; k += 2) current.codes.add((b[k] << 8) | b[k + 1])
@@ -338,7 +353,7 @@ class UsageScan {
           name?.k === 'name'
             ? asDict(this.doc, asDict(this.doc, res?.get(PDFName.of('ExtGState')))?.get(PDFName.of(name.v))) // prettier-ignore
             : undefined
-        if (gs?.get(PDFName.of('Font'))) current = undefined
+        if (gs?.get(PDFName.of('Font'))) current = GS_FONT
       } else if (op === 'Tj' || op === "'") show(operands[operands.length - 1])
       else if (op === '"') show(operands[operands.length - 1])
       else if (op === 'TJ') {
@@ -617,6 +632,8 @@ export interface TrimResult {
 export function trimFonts(doc: PDFDocument): TrimResult {
   const result: TrimResult = { fonts: 0, programs: 0, unlinked: [] }
   const scan = scanDocument(doc)
+  // A show in an inherited font (see UsageScan): its codes are unknown, so every font keeps.
+  if (scan.inheritedFont) for (const use of scan.uses.values()) use.unknown = true
   const programs = new Map<PDFStream, Program>()
   const ctx = doc.context
   const unlink = (o: PDFObject | undefined): void => {
