@@ -15,9 +15,36 @@ export interface EditState {
   rotations: Record<string, number>
   /** Per-page crop rectangle (PDF points, bottom-left), keyed by page key. */
   crops: Record<string, CropBox>
+  /**
+   * The Replace / Remove Recognized Text choice per page key (DESIGN.md §3.5.2, §3.7.6): the
+   * `configHash` of the recognition result the page exports with (Replace), or null for none
+   * (Remove). An absent key is the default (the page's automatic result, or its own source layer
+   * on a reopened PDFx export). CHOICES ONLY: the words stay in the OCR store, outside history.
+   */
+  ocrSelect: Record<string, string | null>
 }
 
-export const emptyEditState = (): EditState => ({ overlays: [], rotations: {}, crops: {} })
+export const emptyEditState = (): EditState => ({
+  overlays: [],
+  rotations: {},
+  crops: {},
+  ocrSelect: {}
+})
+
+/**
+ * Record a Replace (`configHash`) or Remove (null) Recognized Text choice for a page as one undoable
+ * step, the `ocrSelect` op (§3.5.2). Undo restores the previous choice, whose results are still in
+ * the OCR store; choosing what the page already has records no step.
+ */
+export function selectOcrInHistory(
+  h: History<EditState>,
+  pageKey: string,
+  configHash: string | null
+): History<EditState> {
+  return apply(h, (d) => {
+    d.ocrSelect[pageKey] = configHash
+  })
+}
 
 /** Rotate a page by `delta` degrees (normalized to [0,360)); a net-zero rotation drops the key. */
 export function rotateInHistory(
@@ -77,7 +104,10 @@ export function loadIntoHistory(
   const merged: EditState = {
     overlays: [...h.present.overlays, ...s.overlays], // invariant 1: append, never prepend
     rotations: { ...h.present.rotations, ...Object.fromEntries(s.rotations) },
-    crops: { ...h.present.crops, ...Object.fromEntries(s.crops) }
+    crops: { ...h.present.crops, ...Object.fromEntries(s.crops) },
+    // A .pdfx stores no choices (the chosen layer is baked into its pages); the ones already made
+    // are kept, keyed like rotations (invariant 2).
+    ocrSelect: h.present.ocrSelect
   }
   // invariant 3: close the top retained step so no post-load edit coalesces into a pre-load one.
   const past = h.past.length

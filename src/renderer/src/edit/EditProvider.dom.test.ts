@@ -137,3 +137,25 @@ describe('useEditStore identity', () => {
     expect(seen[seen.length - 1].canUndo).toBe(true)
   })
 })
+
+describe('selectOcr (Replace / Remove Recognized Text, the ocrSelect op)', () => {
+  it('puts the choice on editLayer, and Ctrl/Cmd+Z restores the previous one', async () => {
+    const layer0 = latest.editLayer
+    expect(layer0.ocrSelect?.size).toBe(0)
+    await act(async () => latest.selectOcr('src-1#0', 'cfg-b'))
+    expect(latest.editLayer.ocrSelect).toEqual(new Map([['src-1#0', 'cfg-b']]))
+    await act(async () => latest.selectOcr('src-1#0', null))
+    expect(latest.ocrSelect).toEqual(new Map([['src-1#0', null]]))
+    expect(latest.editLayer.ocrSelect).toBe(latest.ocrSelect)
+    await act(async () => latest.undo())
+    expect(latest.editLayer.ocrSelect).toEqual(new Map([['src-1#0', 'cfg-b']]))
+    await act(async () => latest.undo())
+    expect(latest.editLayer.ocrSelect?.size).toBe(0)
+    expect(latest.canUndo).toBe(false)
+    await act(async () => latest.redo())
+    expect(latest.editLayer.ocrSelect).toEqual(new Map([['src-1#0', 'cfg-b']]))
+    // Overlays are untouched by the op (the layer carries choices, never words).
+    expect(latest.editLayer.overlays.size).toBe(0)
+    expect(latest.editLayer.ocr).toBeUndefined()
+  })
+})

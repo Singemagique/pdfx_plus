@@ -399,6 +399,18 @@ export function dropOcrLayers(page: PDFPage): number {
 }
 
 /**
+ * Unbind every PDFx OCR font from `page` (as `dropOcrLayers` does after dropping the streams) and
+ * delete what nothing else reaches. For a page whose layer text another pass already removed.
+ * Returns the number of fonts unbound.
+ */
+export function unbindOcrFonts(page: PDFPage): number {
+  const candidates: PDFRef[] = []
+  const n = unbindFonts(page, candidates)
+  deleteUnreachable(page.node.context, candidates)
+  return n
+}
+
+/**
  * Unbind every PDFx OCR font (BaseFont /PDFxOCR-GlyphLess) from `page`'s own /Resources /Font,
  * replacing (never mutating) the containers, and push what became unlinked onto `candidates`.
  * Returns the number of fonts unbound.
@@ -461,6 +473,59 @@ export function existingOcrLayer(page: PDFPage): { streams: PDFStream[]; font: b
   return { streams, font: ocrFontNames(page).length > 0 }
 }
 
+/** The page's resolved /Contents streams, in order (read-only: never registers anything). */
+export function pageContentStreams(page: PDFPage): PDFStream[] {
+  const ctx = page.node.context
+  const entry = page.node.get(PDFName.of('Contents'))
+  const resolved = entry instanceof PDFRef ? ctx.lookup(entry) : entry
+  const list = resolved instanceof PDFArray ? resolved.asArray() : [resolved]
+  const out: PDFStream[] = []
+  for (const r of list) {
+    const s = r instanceof PDFRef ? ctx.lookup(r) : r
+    if (s instanceof PDFStream) out.push(s)
+  }
+  return out
+}
+
+/** A stream's decoded bytes as latin1 text, or null when it cannot be decoded. */
+function streamText(s: PDFStream): string | null {
+  try {
+    const bytes = s instanceof PDFRawStream ? decodePDFRawStream(s).decode() : s.getContents()
+    return new TextDecoder('latin1').decode(bytes)
+  } catch {
+    return null
+  }
+}
+
+const escapeRegExp = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+
+/**
+ * Does `page` carry PDFx OCR text OUTSIDE its tagged layer streams: a layer whose streams a later
+ * content rewrite merged into the page's other content (§3.7.6), which `dropOcrLayers` cannot
+ * separate? True when an untagged content stream opens the `/PDFxOCR` marked content, or selects a
+ * PDFx OCR font bound on the page (`/FOcr 12 Tf`). An undecodable untagged stream counts as merged
+ * when an OCR font is bound (it cannot be proved clean). Read-only.
+ */
+export function hasMergedOcrText(page: PDFPage): boolean {
+  const fonts = ocrFontNames(page)
+  // `/PDFxOCR <<…>> BDC` (an inline property list, as we and PDFium write it) or `/PDFxOCR /P0 BDC`
+  // (a /Properties resource): the operator, so a text string that merely spells the tag is no hit.
+  const mark = new RegExp(`/${OCR_MARK}\\s*(?:<<[^]*?>>|/[^\\s()<>\\[\\]{}/%]+)\\s*BDC`)
+  const font = fonts.length
+    ? new RegExp(`/(?:${fonts.map(escapeRegExp).join('|')})\\s+[-+.\\d]+\\s+Tf`)
+    : null
+  for (const s of pageContentStreams(page)) {
+    if (isOcrLayerStream(s)) continue
+    const text = streamText(s)
+    if (text === null) {
+      if (font) return true
+      continue
+    }
+    if (mark.test(text) || font?.test(text)) return true
+  }
+  return false
+}
+
 /**
  * The engine ids named by the BDC property lists of tagged layer `streams` (`/Engine (…)`, as
  * `ocrLayerContent` writes it); empty when none can be read.
@@ -468,13 +533,8 @@ export function existingOcrLayer(page: PDFPage): { streams: PDFStream[]; font: b
 export function ocrLayerEngines(streams: readonly PDFStream[]): string[] {
   const out: string[] = []
   for (const s of streams) {
-    let text: string
-    try {
-      const bytes = s instanceof PDFRawStream ? decodePDFRawStream(s).decode() : s.getContents()
-      text = new TextDecoder('latin1').decode(bytes)
-    } catch {
-      continue
-    }
+    const text = streamText(s)
+    if (text === null) continue
     for (const m of text.matchAll(/\/PDFxOCR\s*<<[^>]*?\/Engine\s*\(((?:\\.|[^\\)])*)\)/g))
       out.push(m[1].replace(/\\(.)/g, '$1'))
   }

@@ -307,6 +307,26 @@ describe('every save path shares the same shell', () => {
     }
   )
 
+  it.each(ocrPaths)(
+    '%s: the Replace / Remove choices (ocrSelect) reach the snapshot and the build',
+    async (name, run) => {
+      const ocr = fakeOcr()
+      const ocrSelect = new Map<string, string | null>([
+        [KEY, 'cfg-b'],
+        ['other#0', null]
+      ])
+      const edits = { ...layer(), ocrSelect }
+      const handles = await mountExport(oneDoc(), edits, vi.fn(), vi.fn(), ocr)
+      await act(async () => {
+        await run(handles)
+      })
+      // snapshotFor applies them (ocr-select.ts); the bake drops a reopened page's own layer
+      // wherever one is recorded (build.ts dropsSourceOcr).
+      expect((ocr.snapshotFor.mock.calls[0][1] as EditLayer).ocrSelect).toBe(ocrSelect)
+      expect(builtLayer(name).ocrSelect).toBe(ocrSelect)
+    }
+  )
+
   it.each(paths)(
     '%s: no recognised text when "Include Recognized Text When Exporting" is off',
     async (name, run) => {

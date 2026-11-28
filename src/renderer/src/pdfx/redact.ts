@@ -77,6 +77,11 @@ export interface PdfiumModule {
   FPDFTextObj_GetFontSize(obj: number, sizePtr: number): boolean
   FPDFTextObj_GetTextRenderMode(obj: number): number
   FPDFFont_GetBaseFontName(font: number, buffer: number, length: number): number
+  /** Number of content marks (BDC/BMC tags, enclosing ones included) on a page object. */
+  FPDFPageObj_CountMarks(obj: number): number
+  FPDFPageObj_GetMark(obj: number, index: number): number
+  /** The mark's tag as UTF-16LE into `buffer`; `outLen` receives the byte length incl. the NUL. */
+  FPDFPageObjMark_GetName(mark: number, buffer: number, length: number, outLen: number): boolean
   pdfium: {
     HEAPU8: Uint8Array
     wasmExports: { malloc(size: number): number; free(ptr: number): void }
@@ -424,6 +429,93 @@ export function redactPdf(
   opts: RedactOptions = {}
 ): Uint8Array {
   return redactPdfReport(pdfium, bytes, pages, opts).bytes
+}
+
+/** The marked-content tag of the PDFx OCR layer (ocr-layer.ts `OCR_MARK`, kept free of pdf-lib). */
+const OCR_MARK_NAME = 'PDFxOCR'
+
+/** Does page object `obj` sit inside a `/PDFxOCR` marked-content sequence? `buf`: ≥ 2 KB scratch. */
+function hasOcrMark(pdfium: PdfiumModule, obj: number, buf: number, len: number): boolean {
+  const rt = pdfium.pdfium
+  const n = pdfium.FPDFPageObj_CountMarks(obj)
+  for (let i = 0; i < n; i++) {
+    const mark = pdfium.FPDFPageObj_GetMark(obj, i)
+    if (!mark) continue
+    // UTF-16LE name, NUL-terminated; outLen (bytes, NUL included) at the end of the buffer.
+    const outLen = buf + len - 4
+    if (!pdfium.FPDFPageObjMark_GetName(mark, buf, len - 4, outLen)) continue
+    const bytes = rt.getValue(outLen, 'i32')
+    if (bytes !== (OCR_MARK_NAME.length + 1) * 2) continue
+    let name = ''
+    for (let k = 0; k < OCR_MARK_NAME.length; k++)
+      name += String.fromCharCode(rt.HEAPU8[buf + 2 * k] | (rt.HEAPU8[buf + 2 * k + 1] << 8))
+    if (name === OCR_MARK_NAME) return true
+  }
+  return false
+}
+
+/**
+ * Remove the PDFx OCR text layer from `pages` (page indices) of `bytes` when its streams were MERGED
+ * into the page's other content by an earlier rewrite (DESIGN.md §3.7.6 fallback): no tagged
+ * stream is left to drop with pdf-lib, but the layer's text objects still carry the `/PDFxOCR`
+ * mark. Every text object inside that mark, or shown in the PDFx OCR font (a rewrite that lost the
+ * marks), is removed, then the page content is regenerated (`FPDFPage_GenerateContent`, the same
+ * mechanics as `redactPdf`; such a page was already regenerated once) and the document rewritten
+ * in full (FPDF_NO_INCREMENTAL). A text object in the font draws nothing (3 Tr, glyphless), so
+ * no visible content goes with it. With no text object left in the font, GenerateContent also
+ * unbinds it from the page's resources [measured, ocr-replace.node.test.ts].
+ *
+ * Returns the rewritten bytes and the number of objects removed per page. Pages with nothing to
+ * remove are not regenerated. Fails closed: any PDFium failure throws.
+ */
+export function stripOcrText(
+  pdfium: PdfiumModule,
+  bytes: Uint8Array,
+  pages: Iterable<number>
+): { bytes: Uint8Array; removed: Map<number, number> } {
+  const removed = new Map<number, number>()
+  const rt = pdfium.pdfium
+  const { malloc, free } = rt.wasmExports
+  const filePtr = malloc(bytes.length)
+  rt.HEAPU8.set(bytes, filePtr)
+  const doc = pdfium.FPDF_LoadMemDocument(filePtr, bytes.length, '')
+  if (!doc) {
+    free(filePtr)
+    throw new Error('ocr: failed to load PDF to remove its recognized text')
+  }
+  const NAME_BUF = 2048
+  const buf = malloc(NAME_BUF)
+  try {
+    for (const pageIndex of new Set(pages)) {
+      const page = pdfium.FPDF_LoadPage(doc, pageIndex)
+      if (!page) throw new Error(`ocr: FPDF_LoadPage failed for page ${pageIndex}`)
+      try {
+        const doomed: number[] = []
+        const count = pdfium.FPDFPage_CountObjects(page)
+        for (let i = 0; i < count; i++) {
+          const obj = pdfium.FPDFPage_GetObject(page, i)
+          if (!obj || pdfium.FPDFPageObj_GetType(obj) !== FPDF_PAGEOBJ_TEXT) continue
+          if (hasOcrMark(pdfium, obj, buf, NAME_BUF) || isOcrText(pdfium, obj)) doomed.push(obj)
+        }
+        removed.set(pageIndex, doomed.length)
+        if (!doomed.length) continue
+        for (const obj of doomed) {
+          if (!pdfium.FPDFPage_RemoveObject(page, obj))
+            throw new Error('ocr: FPDFPage_RemoveObject failed')
+          pdfium.FPDFPageObj_Destroy(obj)
+        }
+        if (!pdfium.FPDFPage_GenerateContent(page))
+          throw new Error('ocr: FPDFPage_GenerateContent failed')
+      } finally {
+        pdfium.FPDF_ClosePage(page)
+      }
+    }
+    return { bytes: saveDocument(pdfium, doc), removed }
+  } finally {
+    free(buf)
+    pdfium.FPDF_CloseDocument(doc)
+    free(filePtr)
+  }
 }
 
 /** `redactPdf`'s output plus what it removed: pageIndex → `RemovedObject`s (§3.7.3 rule 2). */
