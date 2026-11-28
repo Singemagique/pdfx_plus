@@ -246,6 +246,15 @@ describe('parseFromOcr (coordinator → renderer)', () => {
     for (const m of good) expect(parseFromOcr(m)).toEqual(m)
   })
 
+  it('progress may name the pages in flight: page indices, bounded', () => {
+    const p = { jobId: 'j1', doneOrFailed: 3, total: 9, inflightFrac: 1.4 }
+    expect(parseFromOcr({ progress: { ...p, inflight: [4, 5] } })).toEqual({
+      progress: { ...p, inflight: [4, 5] }
+    })
+    for (const bad of [[-1], [1.5], ['2'], null, Array.from({ length: 65 }, (_, i) => i)])
+      expect(() => parseFromOcr({ progress: { ...p, inflight: bad } })).toThrow(OcrError)
+  })
+
   it("accepts every OcrStatus of the result model (types.ts) and nothing PR2's model lacks", () => {
     // The type-level half (a status missing from the list fails to compile) is in protocol.ts.
     const all: OcrStatus[] = [

@@ -223,7 +223,16 @@ export interface ProgressInfo {
   total: number
   /** Estimated progress of the pages in flight, 0..1 of one page each, summed. */
   inflightFrac: number
+  /**
+   * The page indices rendering or recognising right now (at most `MAX_INFLIGHT_REPORT`). The
+   * renderer keeps the last set it saw: when the process dies, those are the pages implicated in
+   * the crash (§3.3.2: a page implicated in two crashes is `failed`). Absent = none.
+   */
+  inflight?: number[]
 }
+
+/** At most this many in-flight page indices ride on one progress message. */
+export const MAX_INFLIGHT_REPORT = 64
 
 export type FromOcr =
   | { opened: { src: string; pageCount: number } }
@@ -771,12 +780,15 @@ const fromOcr = message<FromOcr>(
       pages: array(triagePage, OCR_LIMITS.maxPagesPerJob),
       done: bool
     }),
-    progress: object<ProgressInfo>({
-      jobId: token,
-      doneOrFailed: count,
-      total: count,
-      inflightFrac: num(0, OCR_LIMITS.maxPagesPerJob)
-    }),
+    progress: object<ProgressInfo>(
+      {
+        jobId: token,
+        doneOrFailed: count,
+        total: count,
+        inflightFrac: num(0, OCR_LIMITS.maxPagesPerJob)
+      },
+      { inflight: array(pageIndex, MAX_INFLIGHT_REPORT) }
+    ),
     jobDone: object<{ jobId: string; done: number; failed: number; cancelled: boolean }>({
       jobId: token,
       done: count,

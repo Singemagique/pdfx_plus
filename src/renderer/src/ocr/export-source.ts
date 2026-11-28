@@ -1,7 +1,7 @@
 // What useExport needs from the OCR side (DESIGN.md §3.7.1), as an injectable interface so the
-// export wiring can land and be tested before the store exists. The real implementation is the
-// renderer OCR store (`ocr-store.ts`, PR7b); until then `noOcrExportSource` is used, which never
-// adds a layer.
+// export wiring stays testable on its own. The real implementation is the renderer OCR store's
+// `exportSource` (`ocr-store.ts`), which App passes to useExport; `noOcrExportSource` (never adds a
+// layer) is the default for callers and tests without a store.
 
 import type { PackedOcrPage } from '../../../shared/ocr/types'
 import type { EditLayer } from '../pdfx/build'

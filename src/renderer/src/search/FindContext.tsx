@@ -35,7 +35,13 @@ export const NULL_FIND_CONTROLLER: FindController = {
   prev: noop,
   setDocs: noop,
   setOverlays: noop,
-  cancelTimers: noop
+  cancelTimers: noop,
+  text: {
+    setSupplement: () => false,
+    readNative: async () => undefined,
+    onNativeText: () => noop,
+    getPageText: () => undefined
+  }
 }
 
 const FindContext = createContext<FindController>(NULL_FIND_CONTROLLER)
