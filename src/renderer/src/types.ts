@@ -4,6 +4,11 @@ export interface PdfSource {
   id: string
   bytes: Uint8Array
   pdf: PDFDocumentProxy
+  /**
+   * `'image'` when PDFx made these bytes from an imported image (imageToPdf's Producer marker,
+   * read at load): such a source skips OCR triage and is auto-recognised (DESIGN.md §3.4.1, D4).
+   */
+  origin?: 'image'
 }
 
 export interface PageEntry {

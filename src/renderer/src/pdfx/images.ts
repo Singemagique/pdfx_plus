@@ -1,4 +1,6 @@
-import { PDFDocument } from 'pdf-lib'
+import { PDFDocument, beginMarkedContent, endMarkedContent } from 'pdf-lib'
+
+import { IMAGE_IMPORT_PRODUCER, IMPORTED_IMAGE_MARK } from '../../../shared/ocr/triage'
 
 import { jpegOrientation } from './exif'
 import { embedPngFaithful } from './png-embed'
@@ -187,11 +189,33 @@ async function rasterToPng(bitmap: ImageBitmap): Promise<Uint8Array> {
   return new Uint8Array(await blob.arrayBuffer())
 }
 
+/** The exact byte arrays imageToPdf returned in this renderer (held weakly). */
+const madeHere = new WeakSet<Uint8Array>()
+
+/**
+ * Did imageToPdf make these bytes, in this session? The Producer marker alone cannot say so: any
+ * PDF on disk can carry `PDFx image import`, and an image-origin source skips triage (and with it
+ * the protected, OCR-layer and JPX checks) and is auto-recognised (D4). So loadSource trusts the
+ * marker only on the very array imageToPdf returned, which every import path hands it unchanged.
+ */
+export const isFreshImageImport = (bytes: Uint8Array): boolean => madeHere.has(bytes)
+
+/**
+ * One page showing the image: fitted (aspect kept, centred) to `pageSize` when given — the
+ * neighbouring page on append, paste and drop — else a page of the image's own size in pt.
+ *
+ * It also writes the image-origin marker (DESIGN.md §3.4.1) itself, so every import path carries it
+ * with no call site having to remember: the document Producer is `PDFx image import` (loadSource
+ * reads it, on bytes this function just returned, to set `PdfSource.origin = 'image'`), and the
+ * image is drawn inside `/PDFxImportedImage BMC … EMC`, which lives in the page content and so
+ * survives copyPages, .pdfx save and reopen, and export (OCR triage reads it).
+ */
 export async function imageToPdf(
   data: Uint8Array,
   pageSize?: { width: number; height: number }
 ): Promise<Uint8Array> {
   const doc = await PDFDocument.create()
+  doc.setProducer(IMAGE_IMPORT_PRODUCER)
   const tooLarge = new Error('Image is too large to import')
   let image
   if (isPng(data)) {
@@ -231,11 +255,15 @@ export async function imageToPdf(
   const height = image.height * scale
 
   const page = doc.addPage([pageWidth, pageHeight])
+  page.pushOperators(beginMarkedContent(IMPORTED_IMAGE_MARK))
   page.drawImage(image, {
     x: (pageWidth - width) / 2,
     y: (pageHeight - height) / 2,
     width,
     height
   })
-  return doc.save()
+  page.pushOperators(endMarkedContent())
+  const bytes = await doc.save()
+  madeHere.add(bytes)
+  return bytes
 }

@@ -58,19 +58,43 @@ abstract class FakeWorker<In, Out> extends EventEmitter implements WorkerLike {
 }
 
 export type RenderMsg = Extract<ToRaster, { type: 'render' }>
+export type TriageMsg = Extract<ToRaster, { type: 'triage' }>
+/** What a scripted raster thread does with one triage chunk. */
+export type TriageScript = (msg: TriageMsg, thread: FakeRaster) => FromRaster | 'hang' | 'crash'
+
+/** A triage answer: every page of the chunk `scanned` at 300 DPI. */
+export function triaged(msg: TriageMsg, thread: FakeRaster): FromRaster {
+  return {
+    type: 'triaged',
+    taskId: msg.taskId,
+    pages: msg.pages.map((index) => ({
+      index,
+      pageClass: 'scanned' as const,
+      renderDpi: 300,
+      raster: { width: 2550, height: 3300 },
+      effectiveDpi: 300,
+      bitsPerPixel: 1,
+      imageOrigin: false
+    })),
+    heap: thread.heap,
+    tripwire: thread.tripwire
+  }
+}
 /** What a scripted raster thread does with one render: a reply, or 'hang' (never answers). */
 export type RasterScript = (msg: RenderMsg, thread: FakeRaster) => FromRaster | 'hang' | 'crash'
 
 export class FakeRaster extends FakeWorker<ToRaster, FromRaster> {
   heap = 20 * 2 ** 20
   readonly renders: RenderMsg[] = []
+  readonly triages: TriageMsg[] = []
   readonly closed: string[] = []
 
   constructor(
     private readonly script: RasterScript,
     private readonly pageCount: (src: string) => number,
     /** What opening (and counting) `src` does instead of answering `opened`, if anything. */
-    private readonly onOpen?: (src: string, thread: FakeRaster) => FromRaster | 'crash' | undefined
+    private readonly onOpen?: (src: string, thread: FakeRaster) => FromRaster | 'crash' | undefined,
+    private readonly onTriage: TriageScript = triaged
   ) {
     super()
   }
@@ -90,7 +114,12 @@ export class FakeRaster extends FakeWorker<ToRaster, FromRaster> {
           tripwire: this.tripwire
         })
     } else if (msg.type === 'close') this.closed.push(msg.src)
-    else if (msg.type === 'render') {
+    else if (msg.type === 'triage') {
+      this.triages.push(msg)
+      const out = this.onTriage(msg, this)
+      if (out === 'crash') this.crash(new Error('raster thread died triaging'))
+      else if (out !== 'hang') this.reply(out)
+    } else if (msg.type === 'render') {
       this.renders.push(msg)
       const out = this.script(msg, this)
       if (out === 'crash') this.crash(new Error('raster thread died'))
@@ -243,6 +272,8 @@ export interface HarnessOptions {
   holdRecognizeReady?: boolean
   /** See FakeRaster: what a counted open of a source does instead of `opened`. */
   rasterOpen?: (src: string, thread: FakeRaster) => FromRaster | 'crash' | undefined
+  /** What a raster thread does with a triage chunk (default: every page `scanned`). */
+  rasterTriage?: TriageScript
 }
 
 /** A passing self-check, as index.ts reports it. */
@@ -264,7 +295,8 @@ export function harness(opts: HarnessOptions = {}): Harness {
       const r = new FakeRaster(
         opts.raster ?? ((m, t) => rendered(m, t)),
         opts.pageCount ?? (() => 10),
-        opts.rasterOpen
+        opts.rasterOpen,
+        opts.rasterTriage
       )
       rasters.push(r)
       return r

@@ -24,6 +24,7 @@
 // DOM-free and Electron-free (src/shared), so the preload, main, the utility process and vitest
 // Node all import the same file.
 
+import type { JpxRefusal, NativeWord, TriagePage } from './triage'
 import type { OcrStatus, PageClass } from './types'
 
 export const OCR_PROTOCOL_VERSION = 1
@@ -32,7 +33,36 @@ export const OCR_PROTOCOL_VERSION = 1
 // Shared vocabulary. The page class and status types belong to the result model (types.ts, §3.5.1);
 // this file re-exports them and adds the runtime list its validator needs.
 
-export type { OcrStatus, PageClass }
+export type { NativeWord, OcrStatus, PageClass, TriagePage }
+
+/** Every PageClass, for the validator (complete: checked against the type below). */
+export const PAGE_CLASSES = [
+  'scanned',
+  'near-scanned',
+  'ocr-ours',
+  'ocr-foreign',
+  'broken-text',
+  'mixed',
+  'text',
+  'blank',
+  'protected'
+] as const satisfies readonly PageClass[]
+const _allClasses: Exclude<PageClass, (typeof PAGE_CLASSES)[number]> extends never ? true : never =
+  true
+void _allClasses
+
+/** Every JPX pre-check refusal (§3.4.1). */
+export const JPX_REFUSALS = [
+  'jpx-malformed',
+  'jpx-subsampled',
+  'jpx-components',
+  'jpx-no-colour-space',
+  'too-complex'
+] as const satisfies readonly JpxRefusal[]
+const _allRefusals: Exclude<JpxRefusal, (typeof JPX_REFUSALS)[number]> extends never
+  ? true
+  : never = true
+void _allRefusals
 
 /** Every `OcrStatus`, for the validator. Checked against the type both ways (below). */
 export const OCR_STATUSES = [
@@ -61,7 +91,8 @@ export const PAGE_REASONS = [
   'raster-crash', // the raster thread trapped or timed out twice on this page (§3.3.4)
   'recognize-crash', // a recognize thread trapped twice on this page
   'watchdog', // the per-page recognize watchdog fired
-  'source-too-large' // the source is over the 1.5 GB ceiling
+  'source-too-large', // the source is over the 1.5 GB ceiling
+  'image-format' // triage's JPX pre-check refused an image on the page (§3.4.1)
 ] as const
 export type PageReason = (typeof PAGE_REASONS)[number]
 
@@ -72,7 +103,7 @@ export const OCR_ERROR_CODES = [
   'duplicate', // a source token or job id was reused while still live
   'open-failed', // PDFium could not open the source
   'too-large', // the source is over the ceiling
-  'unsupported', // the request is valid but not implemented yet (triage until PR4b)
+  'unsupported', // the request is valid but not implemented yet
   'init', // the process or an engine failed to start
   'internal' // a bug; the message carries no content
 ] as const
@@ -186,6 +217,11 @@ export type FromOcr =
   /** The byte-budgeted LRU dropped this source; `open` it again before the next request. */
   | { evicted: { src: string } }
   | { result: { jobId: string; src: string; index: number; page: PageResult } }
+  /**
+   * Triage results for some of the requested pages, in request order (§3.4.1). A request is answered
+   * in one or more of these; the last has `done: true`.
+   */
+  | { triaged: { src: string; pages: TriagePage[]; done: boolean } }
   | { progress: ProgressInfo }
   | { jobDone: { jobId: string; done: number; failed: number; cancelled: boolean } }
   | { error: { code: OcrErrorCode; message: string; src?: string; jobId?: string } }
@@ -525,6 +561,50 @@ const pageResult = object<PageResult>(
   { reason: oneOf(PAGE_REASONS) }
 )
 
+/** At most this many native words per page, and characters per word, cross the port. */
+export const TRIAGE_WORD_LIMITS = { words: 20_000, length: 256 } as const
+
+const coord = num(-OCR_LIMITS.maxPageSidePt, OCR_LIMITS.maxPageSidePt)
+
+const nativeWord = object<NativeWord>({
+  t: (x, path) => {
+    if (typeof x !== 'string' || x.length === 0 || x.length > TRIAGE_WORD_LIMITS.length)
+      fail(path, 'expected a word')
+    return x
+  },
+  x0: coord,
+  y0: coord,
+  x1: coord,
+  y1: coord
+})
+
+const nullable =
+  <T>(check: Check<T>): Check<T | null> =>
+  (x, path) =>
+    x === null ? null : check(x, path)
+
+const triagePage = object<TriagePage>(
+  {
+    index: pageIndex,
+    pageClass: nullable(oneOf(PAGE_CLASSES)),
+    renderDpi: nullable(num(0, 10_000, { minExclusive: true })),
+    raster: nullable(
+      object<{ width: number; height: number }>({
+        width: int(1, 1_000_000),
+        height: int(1, 1_000_000)
+      })
+    ),
+    effectiveDpi: nullable(num(0, 1e6, { minExclusive: true })),
+    bitsPerPixel: nullable(int(1, 1024)),
+    imageOrigin: bool
+  },
+  {
+    failure: oneOf(['page-missing', 'render', 'raster-crash'] as const),
+    refused: oneOf(JPX_REFUSALS),
+    nativeWords: array(nativeWord, TRIAGE_WORD_LIMITS.words)
+  }
+)
+
 const fromOcr = message<FromOcr>(
   {
     opened: object<{ src: string; pageCount: number }>({
@@ -537,6 +617,11 @@ const fromOcr = message<FromOcr>(
       src: token,
       index: pageIndex,
       page: pageResult
+    }),
+    triaged: object<{ src: string; pages: TriagePage[]; done: boolean }>({
+      src: token,
+      pages: array(triagePage, OCR_LIMITS.maxPagesPerJob),
+      done: bool
     }),
     progress: object<ProgressInfo>({
       jobId: token,
@@ -557,6 +642,14 @@ const fromOcr = message<FromOcr>(
   },
   'FromOcr'
 )
+
+/**
+ * Validate one triage result (the coordinator runs this on every page a raster thread returns, so
+ * one bad page becomes a failure entry instead of making the renderer reject the whole batch).
+ */
+export function parseTriagePage(x: unknown, path = 'TriagePage'): TriagePage {
+  return triagePage(x, path)
+}
 
 /** Validate a coordinator → renderer message (the renderer's ocr-store runs this). */
 export function parseFromOcr(x: unknown): FromOcr {

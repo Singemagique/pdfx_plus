@@ -256,7 +256,7 @@ describe('the happy path', () => {
     port.send({ triage: { src: 's1' } })
     port.send({ recognize: { jobId: 'j', src: 'nope', pages: pages(0), opts: { langs: ['eng'] } } })
     await settle()
-    expect(errors(port).map((e) => e.code)).toEqual(['bad-message', 'unsupported', 'not-open'])
+    expect(errors(port).map((e) => e.code)).toEqual(['bad-message', 'not-open', 'not-open'])
     expect(h.rasters).toHaveLength(0)
   })
 

@@ -23,7 +23,9 @@
 //   the thread reports it and is never trusted again.
 
 import type { PageReason } from '../../../shared/ocr/protocol'
+import { fitRaster, type TriagePage } from '../../../shared/ocr/triage'
 import type { RasterLimits } from './thread-messages'
+import { jpxRefusalOf, triagePages, type PdfiumTriage, type TriageContext } from './triage-pdfium'
 
 /** The PDFium calls this module needs (a structural subset of `@embedpdf/pdfium`'s wrapper). */
 export interface PdfiumRaster {
@@ -102,36 +104,12 @@ interface Source {
 
 const ENLARGE_RE = /Cannot enlarge memory/
 
-/** The DPI and size a page renders at once the pixel caps are applied (DPI only ever goes down). */
-export function fitRaster(
-  widthPt: number,
-  heightPt: number,
-  dpi: number,
-  limits: Pick<RasterLimits, 'maxLongSide' | 'maxPixels'>
-): { dpi: number; width: number; height: number } {
-  const size = (d: number): { width: number; height: number } => ({
-    width: Math.max(1, Math.round((widthPt * d) / 72)),
-    height: Math.max(1, Math.round((heightPt * d) / 72))
-  })
-  let d = dpi
-  let s = size(d)
-  const over = (): boolean =>
-    Math.max(s.width, s.height) > limits.maxLongSide || s.width * s.height > limits.maxPixels
-  if (over()) {
-    const k = Math.min(
-      limits.maxLongSide / Math.max(s.width, s.height),
-      Math.sqrt(limits.maxPixels / (s.width * s.height))
-    )
-    d = Math.floor(dpi * k * 100) / 100
-    s = size(d)
-    // Rounding can land one pixel over; step down until it fits.
-    while (over() && d > 1) {
-      d = Math.floor((d - 0.01) * 100) / 100
-      s = size(d)
-    }
-  }
-  return { dpi: d, ...s }
-}
+/**
+ * The DPI and size a page renders at once the pixel caps are applied (DPI only ever goes down).
+ * It lives in src/shared/ocr/triage.ts since PR4b: triage's DPI selection (§3.4.3) must cap
+ * exactly the way the render does.
+ */
+export { fitRaster }
 
 /**
  * The `printErr` the raster thread hands PDFium's Emscripten glue: every line goes to the engine's
@@ -157,7 +135,7 @@ export class RasterEngine {
   readonly stderrTail: string[] = []
 
   constructor(
-    private readonly mod: PdfiumRaster,
+    private readonly mod: PdfiumRaster & PdfiumTriage,
     private readonly limits: RasterLimits = DEFAULT_RASTER_LIMITS
   ) {}
 
@@ -202,6 +180,28 @@ export class RasterEngine {
     for (const src of [...this.sources.keys()]) this.close(src)
   }
 
+  /**
+   * Triage `pages` of `src` (§3.4.1): PDFium signals and the class, render DPI and native words of
+   * every page, without rendering anything. PDFium's open error code when the source cannot open.
+   */
+  triage(
+    src: string,
+    pages: readonly number[],
+    onSignals?: TriageContext['onSignals']
+  ): TriagePage[] | { pdfiumError: number } {
+    const s = this.sources.get(src)
+    if (!s) return { pdfiumError: -1 }
+    // Triage reads content streams (and JPX image data), which PDFium retains like a render's.
+    if (s.open && s.open.served.bytes > this.limits.reopenWatermark) this.closeDoc(s)
+    const doc = this.ensureOpen(s)
+    if (typeof doc !== 'number') return doc
+    return triagePages(this.mod, doc, pages, {
+      file: s.bytes,
+      caps: { maxLongSide: this.limits.maxLongSide, maxPixels: this.limits.maxPixels },
+      onSignals
+    })
+  }
+
   render(req: RenderRequest): RenderOutcome {
     const s = this.sources.get(req.src)
     if (!s) return { kind: 'failed', status: 'failed', reason: 'render' }
@@ -229,6 +229,9 @@ export class RasterEngine {
         Math.abs(ph - req.frame.height) > FRAME_TOLERANCE_PT
       )
         return { kind: 'failed', status: 'failed', reason: 'frame-mismatch' }
+      // Never hand PDFium a JPX image it decodes wrongly or traps on (§3.4.1's SIZ pre-check).
+      if (jpxRefusalOf(m, page, s.bytes))
+        return { kind: 'failed', status: 'failed', reason: 'image-format' }
 
       const fit = fitRaster(pw, ph, req.dpi, this.limits)
       const need = fit.width * fit.height + this.limits.decodeAllowance
