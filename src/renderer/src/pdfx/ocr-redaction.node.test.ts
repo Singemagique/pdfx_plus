@@ -1348,7 +1348,8 @@ describe('native Type0 text in a subset font: its tables and outlines keep only 
     expect(raster(clean, 144).data).toEqual(raster(redacted, 144).data)
     // ...nor of a page sharing the font that was not redacted at all.
     expect(raster(await sanitizeRedacted(bytes, []), 144).data).toEqual(raster(bytes, 144).data)
-  })
+    // Four 144-dpi renders: ~1 s alone, but it passed the 5 s default under a loaded machine.
+  }, 30_000)
 
   it('a Form XObject showing text in the font its caller set keeps every glyph', async () => {
     // The text font is graphics state: a form shows in whatever font was in effect at its Do.
