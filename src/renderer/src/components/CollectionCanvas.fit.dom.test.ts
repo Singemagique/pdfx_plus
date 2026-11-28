@@ -190,30 +190,30 @@ describe('fit on import', () => {
   })
 
   it('does not move the view on a reorder, delete, or page dragged out to a new document', async () => {
-    await act(async () => setDocs([a, b]))
+    const c = doc('c', 20)
+    await act(async () => setDocs([a, b, c]))
     await settle()
     await wheel(250)
     const before = transform()
 
+    await act(async () => setDocs([b, a, c]))
+    await settle()
+    expect(transform()).toEqual(before)
+
+    // Deleting c shortens the content, but the view — on b, near the top — is still well short of
+    // the new end: it stays exactly where it is. (A view left past the new end is pulled back to
+    // it; see "pulls a view scrolled to the end back…".)
+    const end = VP_H - FIT_BOTTOM_MARGIN - layoutOf([b, a]).contentHeight * before.k
+    expect(before.y).toBeGreaterThan(end + 100)
     await act(async () => setDocs([b, a]))
     await settle()
     expect(transform()).toEqual(before)
 
-    // Deleting a shortens the content under a view scrolled near its end: the view stays where it
-    // is unless that is now past the end, and then it only moves back as far as the end.
-    await act(async () => setDocs([b]))
-    await settle()
-    const afterDelete = transform()
-    expect(afterDelete.k).toBe(before.k)
-    expect(afterDelete.x).toBe(before.x)
-    const end = VP_H - FIT_BOTTOM_MARGIN - layoutOf([b]).contentHeight * before.k
-    expect(afterDelete.y).toBeCloseTo(Math.max(before.y, end))
-
     await act(async () =>
-      setDocs(movePageToNewDoc([b], { docId: 'b', pageId: 'b-p3' }, 1, 'split'))
+      setDocs(movePageToNewDoc([b, a], { docId: 'b', pageId: 'b-p3' }, 1, 'split'))
     )
     await settle()
-    expect(transform()).toEqual(afterDelete)
+    expect(transform()).toEqual(before)
   })
 })
 

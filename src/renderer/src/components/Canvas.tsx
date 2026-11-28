@@ -21,6 +21,12 @@ interface CanvasProps {
    * page" button straddling a card's edge); the fit still frames `contentWidth`.
    */
   reachWidth?: number
+  /**
+   * Screen px below the top edge that the top of the content may be scrolled down to when floating
+   * chrome covers the top of the view (the find bar: REVEAL_TOP_MARGIN); default the toolbar
+   * margin. Raising it never moves the view; lowering it pulls a view past the new bound back up.
+   */
+  panTopReach?: number
   /** Set (a fresh object) when documents were just imported: fit and scroll to world y `focus.y`. */
   focus?: FitFocus | null
   dragging?: boolean
@@ -41,6 +47,7 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
     contentWidth,
     contentHeight,
     reachWidth = contentWidth,
+    panTopReach,
     focus = null,
     dragging,
     onScaleChange,
@@ -61,7 +68,7 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
   const draggingRef = useRef(dragging)
   draggingRef.current = dragging
 
-  const { zoomRef, fitTransform } = useZoomBehavior({
+  const { zoomRef, panBoundsRef, fitTransform } = useZoomBehavior({
     viewportRef,
     worldRef,
     overlayRef,
@@ -81,12 +88,15 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
   const { refit, reveal, pendingTarget } = useAutoFit({
     viewportRef,
     zoomRef,
+    panBoundsRef,
     userMovedRef,
     draggingRef,
+    dragging: !!dragging,
     fitTransform,
     contentWidth,
     contentHeight,
     reachWidth,
+    topReach: panTopReach,
     focus,
     viewportWidth: viewportSize.width,
     viewportHeight: viewportSize.height

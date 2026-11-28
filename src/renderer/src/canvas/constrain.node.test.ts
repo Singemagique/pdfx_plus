@@ -4,8 +4,9 @@ import {
   boundTransform,
   boundToViewport,
   panConstrain,
-  PAN_PADDING,
-  type Extent
+  PAN_BOUNDS,
+  type Extent,
+  type PanBounds
 } from './constrain'
 import { computeFitTransform } from './fit-transform'
 import { computeRevealTransform } from './reveal-transform'
@@ -62,7 +63,7 @@ const SCALES = [MIN_SCALE, 0.1, 0.5, 1, 2, 7, MAX_SCALE]
 
 describe('boundTransform', () => {
   it('uses the toolbar, bottom and side margins as its padding', () => {
-    expect(PAN_PADDING).toEqual({ top: 72, bottom: 24, side: 24 })
+    expect(PAN_BOUNDS).toEqual({ top: 72, bottom: 24, side: 24, topReach: 72, overhang: 0 })
   })
 
   it('leaves an in-bounds transform untouched (the same object)', () => {
@@ -155,6 +156,103 @@ describe('boundTransform', () => {
     ]
     const t = at(-1e9, 1e9, 3)
     expect(boundTransform(t, VIEW, free)).toBe(t)
+  })
+
+  it('leaves the transform as it is, never NaN, for a NaN content box', () => {
+    const bad: Extent = [
+      [0, 0],
+      [NaN, NaN]
+    ]
+    const t = at(-1e9, 1e9, 3)
+    expect(boundTransform(t, VIEW, bad)).toBe(t)
+  })
+})
+
+describe('boundTransform: the edge add-page overhang', () => {
+  // One wide row of cards, with a round "Add page" button's outer half (16 world px) past its edge.
+  const ROW = box(1300, 6000)
+  const withOverhang: PanBounds = { ...PAN_BOUNDS, overhang: 16 }
+  const x0 = PAN_SIDE_MARGIN
+  const x1 = W - PAN_SIDE_MARGIN
+
+  it('lets the whole button be brought into view at an ordinary zoom', () => {
+    for (const k of [2, 7, 20]) {
+      const b = boundTransform(at(-1e7, 0, k), VIEW, ROW, withOverhang)
+      expect(b.applyX(1300 + 16)).toBeCloseTo(x1)
+    }
+  })
+
+  it('never lets the view be panned to an empty screen, however far it is zoomed in', () => {
+    // At MAX_SCALE the overhang alone is 16 × 90 = 1440 px, wider than the window: uncapped, the
+    // cards' right edge would end up left of the screen.
+    expect(16 * MAX_SCALE).toBeGreaterThan(x1 - x0)
+    for (const k of [20, 41, 42, 60, MAX_SCALE]) {
+      const b = boundTransform(at(-1e9, -1e9, k), VIEW, ROW, withOverhang)
+      const right = b.applyX(1300)
+      // The cards still reach at least halfway across the window…
+      expect(right).toBeGreaterThanOrEqual((x0 + x1) / 2 - 1e-6)
+      // …and they intersect it.
+      expect(right).toBeGreaterThan(0)
+      expect(b.applyX(0)).toBeLessThan(W)
+    }
+  })
+
+  it('is continuous in the scale where the cap takes over', () => {
+    const kCap = (x1 - x0) / (2 * 16)
+    let prev: number | null = null
+    for (let i = -200; i <= 200; i++) {
+      const k = kCap * (1 + i / 4000)
+      const right = boundTransform(at(-1e9, 0, k), VIEW, ROW, withOverhang).applyX(1300)
+      if (prev !== null) expect(Math.abs(right - prev)).toBeLessThan(1)
+      prev = right
+    }
+  })
+
+  it('changes nothing without an overhang', () => {
+    const b = boundTransform(at(-1e9, 0, MAX_SCALE), VIEW, ROW, { ...PAN_BOUNDS, overhang: 0 })
+    expect(b.applyX(1300)).toBeCloseTo(x1)
+  })
+})
+
+describe('boundTransform: the top reach (the find bar open)', () => {
+  const findOpen: PanBounds = { ...PAN_BOUNDS, topReach: 124 }
+
+  it('lets the top of tall content come down to the reach, and no further', () => {
+    expect(boundTransform(at(0, 5000, 1), VIEW, TALL, findOpen).y).toBe(124)
+    // Its end is still held at the bottom margin.
+    expect(boundTransform(at(0, -1e6, 1), VIEW, TALL, findOpen).y).toBe(
+      H - PAN_BOTTOM_MARGIN - 6000
+    )
+  })
+
+  it('keeps short content inside the usual window: raising the reach moves nothing', () => {
+    const inside = at(300, PAN_TOP_MARGIN, 1)
+    expect(boundTransform(inside, VIEW, SHORT, findOpen)).toBe(inside)
+    expect(boundTransform(at(300, -5000, 1), VIEW, SHORT, findOpen).y).toBe(PAN_TOP_MARGIN)
+  })
+
+  it('only widens the bounds: whatever was in bounds without it still is', () => {
+    for (const k of SCALES) {
+      for (const c of [TALL, SHORT, WIDE]) {
+        for (const y of [-1e7, -3000, 0, 500, 1e7]) {
+          const b = boundTransform(at(0, y, k), VIEW, c)
+          expect(boundTransform(b, VIEW, c, findOpen)).toBe(b)
+        }
+      }
+    }
+  })
+
+  it('is continuous in the scale across the content-fits-the-window threshold', () => {
+    const kStar = (H - PAN_TOP_MARGIN - PAN_BOTTOM_MARGIN) / 6000
+    for (const y of [1e6, -1e6]) {
+      let prev: ZoomTransform | null = null
+      for (let i = -200; i <= 200; i++) {
+        const k = kStar * (1 + i / 2000)
+        const b = boundTransform(at(0, y, k), VIEW, TALL, findOpen)
+        if (prev) expect(Math.abs(b.y - prev.y)).toBeLessThan(1)
+        prev = b
+      }
+    }
   })
 })
 

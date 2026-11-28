@@ -6,20 +6,26 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, createElement, useState, type ReactNode } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
-import { zoomTransform } from 'd3-zoom'
+import { zoomTransform, type ZoomTransform } from 'd3-zoom'
 
 vi.mock('./collection/DocLayer', () => ({ DocLayer: () => null }))
 vi.mock('./collection/HeaderLayer', () => ({ HeaderLayer: () => null }))
 
 import { CollectionCanvas } from './CollectionCanvas'
 import type { CanvasHandle } from './Canvas'
-import { computeLayout, panReachWidth, wrapWidthForViewport } from '../canvas/layout'
+import { computeLayout, panReachWidth, wrapWidthForViewport, type Rect } from '../canvas/layout'
+import { boundTransform } from '../canvas/constrain'
+import { computeRevealTransform } from '../canvas/reveal-transform'
 import {
   FIT_ANIMATION_MS,
+  MAX_SCALE,
   MIN_SCALE,
   PAN_BOTTOM_MARGIN,
   PAN_SIDE_MARGIN,
-  PAN_TOP_MARGIN
+  PAN_TOP_MARGIN,
+  REVEAL_BOTTOM_MARGIN,
+  REVEAL_SIDE_MARGIN,
+  REVEAL_TOP_MARGIN
 } from '../canvas/zoom-constants'
 import { doc } from '../canvas/test-utils/layout-fixtures'
 import type { DocEntry } from '../types'
@@ -27,12 +33,18 @@ import type { DocEntry } from '../types'
 const vpSize = { w: 1400, h: 900 }
 
 let setDocs: (docs: DocEntry[]) => void = () => {}
+let setFindOpen: (open: boolean) => void = () => {}
+let setDragKind: (kind: 'internal' | null) => void = () => {}
 let handle: CanvasHandle | null = null
 
 function Harness({ initial }: { initial: DocEntry[] }): ReactNode {
   const [docs, set] = useState(initial)
   const [wrap, setWrap] = useState<number | undefined>(undefined)
+  const [findOpen, setFind] = useState(false)
+  const [dragKind, setDrag] = useState<'internal' | null>(null)
   setDocs = set
+  setFindOpen = setFind
+  setDragKind = setDrag
   const layout = computeLayout(docs, undefined, wrap)
   const noop = (): void => {}
   return createElement(CollectionCanvas, {
@@ -43,11 +55,12 @@ function Harness({ initial }: { initial: DocEntry[] }): ReactNode {
     renderVersion: 0,
     selected: null,
     hiddenPageId: null,
-    dragKind: null,
+    dragKind,
     draggingPage: null,
     dropTarget: null,
     collapsedId: null,
     externalCount: 0,
+    findOpen,
     canvasRef: (h: CanvasHandle | null) => {
       handle = h
     },
@@ -141,13 +154,16 @@ const win = (): { top: number; bottom: number; left: number; right: number } => 
   right: vpSize.w - PAN_SIDE_MARGIN
 })
 
-/** Asserts the bounds hold on both axes, whatever the content's size on screen. */
-function expectInBounds(): void {
+/**
+ * Asserts the bounds hold on both axes, whatever the content's size on screen. `topReach`: how far
+ * down the top of tall content may be (the find bar open: REVEAL_TOP_MARGIN).
+ */
+function expectInBounds(topReach: number = PAN_TOP_MARGIN): void {
   const s = screen()
   const w = win()
   const eps = 1e-6
   if (s.bottom - s.top >= w.bottom - w.top) {
-    expect(s.top).toBeLessThanOrEqual(w.top + eps)
+    expect(s.top).toBeLessThanOrEqual(topReach + eps)
     expect(s.bottom).toBeGreaterThanOrEqual(w.bottom - eps)
   } else {
     expect(s.top).toBeGreaterThanOrEqual(w.top - eps)
@@ -281,7 +297,7 @@ describe('wheel scrolling', () => {
 })
 
 describe('the edge add-page button', () => {
-  it('can be scrolled fully into view however far the view is zoomed in', async () => {
+  it('can be scrolled fully into view when zoomed well in', async () => {
     // Five letter pages fill the row, so the round "Add page" button straddles the card's edge.
     await mount([doc('a', 5)])
     const layout = computeLayout(docs, undefined, wrapWidthForViewport(vpSize.w))
@@ -411,6 +427,211 @@ describe('programmatic moves', () => {
     await mount(many())
     docs = [...many(), doc('e', 1)]
     await act(async () => setDocs(docs))
+    await settle()
+    expectInBounds()
+    expect(screen().bottom).toBeCloseTo(win().bottom)
+  })
+})
+
+describe('the edge add-page button, zoomed all the way in', () => {
+  it('never lets the view be panned right to an empty screen', async () => {
+    await mount([doc('a', 5)])
+    const layout = computeLayout(docs, undefined, wrapWidthForViewport(vpSize.w))
+    expect(layout.items[0].addPage.edge).toBe(true)
+    await wheelMany(40, { deltaY: -50, ctrlKey: true, clientX: 700, clientY: 450 })
+    expect(screen().k).toBeCloseTo(MAX_SCALE)
+    for (let i = 0; i < 200; i++) await wheel({ deltaX: 3000 })
+    for (let i = 0; i < 200; i++) await wheel({ deltaY: 3000 })
+    // The button's outer half is 16 × 90 = 1440 px here, wider than the pane: the cards still fill
+    // at least half of it.
+    const s = screen()
+    expect(s.right).toBeGreaterThanOrEqual(vpSize.w / 2 - 1e-6)
+    expect(s.left).toBeLessThan(0)
+    expect(s.top).toBeLessThan(0)
+    expect(s.bottom).toBeCloseTo(win().bottom)
+  })
+})
+
+describe('tween frames', () => {
+  it('keeps every frame of the zoom-out back to the fit inside the bounds', async () => {
+    await mount(many())
+    // Zoomed far in at the top-left corner: the fit tween from here zooms out across it.
+    await wheelMany(20, { deltaY: -50, ctrlKey: true, clientX: 0, clientY: 0 })
+    expect(screen().k).toBeGreaterThan(3)
+    await act(async () => handle!.reset())
+    const seen = new Set<string>()
+    for (let i = 0; i < 60; i++) {
+      await act(() => new Promise<void>((resolve) => setTimeout(resolve, 8)))
+      expectInBounds()
+      const t = zoomTransform(viewport())
+      seen.add(`${t.x},${t.y},${t.k}`)
+    }
+    expect(seen.size).toBeGreaterThan(3)
+  })
+})
+
+describe("Find's reveal", () => {
+  const margins = { top: REVEAL_TOP_MARGIN, bottom: REVEAL_BOTTOM_MARGIN, side: REVEAL_SIDE_MARGIN }
+  const layoutNow = (): ReturnType<typeof computeLayout> =>
+    computeLayout(docs, undefined, wrapWidthForViewport(vpSize.w))
+  const firstPage = (): Rect => layoutNow().items[0].pages[0]
+
+  it('measures a reveal asked for mid-tween against the BOUNDED target of the running one', async () => {
+    await mount(many())
+    await wheelMany(10, { deltaY: 400 })
+    const t0 = zoomTransform(viewport())
+    const page0 = firstPage()
+    const { contentWidth, contentHeight } = layoutNow()
+    const raw1 = computeRevealTransform(t0, vpSize, page0, margins, contentHeight)!
+    const b1 = boundTransform(
+      raw1,
+      [
+        [0, 0],
+        [vpSize.w, vpSize.h]
+      ],
+      [
+        [0, 0],
+        [contentWidth, contentHeight]
+      ]
+    )
+    // The reveal of the first page is held by the 72 px top bound.
+    expect(b1.y).toBeLessThan(raw1.y - 26)
+    // A rect whose bottom is 50 px above the pane's bottom under the bounded target — in view
+    // there — but, under the raw one, 52 px further down: past the bottom reveal margin.
+    const h = 100
+    const r2: Rect = { x: page0.x, y: b1.invertY(vpSize.h - 50) - h, w: page0.w, h }
+    await act(async () => handle!.revealRect(page0))
+    await act(() => new Promise<void>((resolve) => setTimeout(resolve, 40)))
+    await act(async () => handle!.revealRect(r2))
+    await settle()
+    const end = zoomTransform(viewport())
+    expect(end.x).toBeCloseTo(b1.x)
+    expect(end.y).toBeCloseTo(b1.y)
+    expect(end.k).toBeCloseTo(b1.k)
+  })
+
+  it('runs no tween when the bounded reveal goes nowhere', async () => {
+    // A narrow pane: the fit comes up below 100%, so the first page's top (72 + 52k) is above the
+    // find bar's 124 px, and — the bar closed — the reveal can't bring it lower than the top bound
+    // already holds it. A do-nothing tween would still end by marking the view user-moved.
+    vpSize.w = 700
+    await mount(many())
+    const before = zoomTransform(viewport())
+    expect(before.k).toBeLessThan(1)
+    expect(before.applyY(0)).toBeCloseTo(PAN_TOP_MARGIN)
+    const { contentHeight } = layoutNow()
+    expect(computeRevealTransform(before, vpSize, firstPage(), margins, contentHeight)).not.toBe(
+      null
+    )
+    const raf = vi.spyOn(globalThis, 'requestAnimationFrame')
+    try {
+      await act(async () => handle!.revealRect(firstPage()))
+      await settle()
+      expect(raf).not.toHaveBeenCalled()
+    } finally {
+      raf.mockRestore()
+    }
+    expect(zoomTransform(viewport())).toEqual(before)
+  })
+
+  it('with the find bar open, brings a first-row page fully below it, then gives the space back', async () => {
+    vpSize.w = 700
+    await mount(many())
+    const before = zoomTransform(viewport())
+    expect(before.k).toBeLessThan(1)
+    // Opening the bar moves nothing.
+    await act(async () => setFindOpen(true))
+    expect(zoomTransform(viewport())).toEqual(before)
+    await act(async () => handle!.revealRect(firstPage()))
+    await settle()
+    // The content's top comes down to the bar's bottom: the page is fully below the bar.
+    const t = zoomTransform(viewport())
+    expect(screen().top).toBeCloseTo(REVEAL_TOP_MARGIN)
+    expect(t.applyY(firstPage().y)).toBeGreaterThan(REVEAL_TOP_MARGIN)
+    expectInBounds(REVEAL_TOP_MARGIN)
+    // The content's top can't come further down than the bar's bottom.
+    for (let i = 0; i < 10; i++) {
+      await wheel({ deltaY: -400 })
+      expectInBounds(REVEAL_TOP_MARGIN)
+    }
+    expect(screen().top).toBeCloseTo(REVEAL_TOP_MARGIN)
+    // Closing the bar pulls the top back to the toolbar margin.
+    await act(async () => setFindOpen(false))
+    expectInBounds()
+    expect(screen().top).toBeCloseTo(PAN_TOP_MARGIN)
+  })
+})
+
+describe('reduced motion', () => {
+  let savedMatchMedia: PropertyDescriptor | undefined
+  beforeEach(() => {
+    savedMatchMedia = Object.getOwnPropertyDescriptor(window, 'matchMedia')
+    Object.defineProperty(window, 'matchMedia', {
+      configurable: true,
+      writable: true,
+      value: (query: string) => ({
+        matches: query.includes('prefers-reduced-motion: reduce'),
+        media: query,
+        addEventListener: () => {},
+        removeEventListener: () => {},
+        addListener: () => {},
+        removeListener: () => {},
+        onchange: null,
+        dispatchEvent: () => false
+      })
+    })
+  })
+  afterEach(() => {
+    if (savedMatchMedia) Object.defineProperty(window, 'matchMedia', savedMatchMedia)
+    else delete (window as { matchMedia?: unknown }).matchMedia
+  })
+
+  /** Scrolled to the end, the content gets shorter: the view must follow it to the new end. */
+  async function shrinkAtEnd(): Promise<void> {
+    await wheelMany(40, { deltaY: 2000 })
+    expect(screen().bottom).toBeCloseTo(win().bottom)
+    docs = [doc('a', 12)]
+    await act(async () => setDocs(docs))
+    await settle()
+    expectInBounds()
+    expect(screen().bottom).toBeCloseTo(win().bottom)
+  }
+
+  it('keeps the view in bounds after a fit (the reset button)', async () => {
+    await mount(many())
+    await wheelMany(3, { deltaY: 400 })
+    await act(async () => handle!.reset())
+    await shrinkAtEnd()
+  })
+
+  it('keeps the view in bounds after an import', async () => {
+    await mount(many().slice(0, 3))
+    docs = many()
+    await act(async () => setDocs(docs))
+    await settle()
+    await shrinkAtEnd()
+  })
+
+  it("keeps the view in bounds after Find's reveal", async () => {
+    await mount(many())
+    const layout = computeLayout(docs, undefined, wrapWidthForViewport(vpSize.w))
+    await act(async () => handle!.revealRect(layout.items[2].pages[6]))
+    await settle()
+    await shrinkAtEnd()
+  })
+})
+
+describe('mid-drag', () => {
+  it('leaves the view alone while a drag is in flight, and bounds it once the drag ends', async () => {
+    await mount(many())
+    await wheelMany(40, { deltaY: 2000 })
+    await act(async () => setDragKind('internal'))
+    const during: ZoomTransform = zoomTransform(viewport())
+    docs = [doc('a', 12)]
+    await act(async () => setDocs(docs))
+    await settle()
+    expect(zoomTransform(viewport())).toEqual(during)
+    await act(async () => setDragKind(null))
     await settle()
     expectInBounds()
     expect(screen().bottom).toBeCloseTo(win().bottom)

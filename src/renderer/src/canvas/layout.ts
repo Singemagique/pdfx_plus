@@ -329,7 +329,8 @@ export function computeLayout(
 /**
  * The world width the view can be panned across (see boundTransform): the collection's width, plus
  * the outer half of any round "Add page" button straddling a card's right edge, so that button can
- * always be brought fully into view however far the view is zoomed in.
+ * be brought fully into view when zoomed in (up to the point where that half alone would fill half
+ * the window: PanBounds.overhang).
  */
 export function panReachWidth(layout: CanvasLayout): number {
   let right = layout.contentWidth

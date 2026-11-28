@@ -2,8 +2,20 @@ import { useCallback, useEffect, useLayoutEffect, useRef, type RefObject } from 
 import { select } from 'd3-selection'
 import { zoomIdentity, zoomTransform, type ZoomBehavior, type ZoomTransform } from 'd3-zoom'
 import { animateZoomTo } from './animate-transform'
-import { boundToViewport } from './constrain'
-import { FIT_ANIMATION_MS, FIT_TOP_MARGIN, REVEAL_ANIMATION_MS } from './zoom-constants'
+import { boundToViewport, PAN_BOUNDS, type PanBounds } from './constrain'
+import {
+  FIT_ANIMATION_MS,
+  FIT_TOP_MARGIN,
+  PAN_TOP_MARGIN,
+  REVEAL_ANIMATION_MS
+} from './zoom-constants'
+
+/** True when `a` and `b` are the same view to within a hundredth of a screen px. */
+function sameTransform(a: ZoomTransform, b: ZoomTransform): boolean {
+  return (
+    Math.abs(a.x - b.x) < 0.01 && Math.abs(a.y - b.y) < 0.01 && Math.abs(a.k - b.k) < 1e-6 * b.k
+  )
+}
 
 /** A request to bring world y `y` (the top of a just-imported document) to the top of the view. */
 export interface FitFocus {
@@ -13,13 +25,25 @@ export interface FitFocus {
 interface AutoFitArgs {
   viewportRef: RefObject<HTMLDivElement | null>
   zoomRef: RefObject<ZoomBehavior<HTMLDivElement, unknown> | null>
+  /** The pan bounds the zoom's gestures read (see useZoomBehavior); kept current here. */
+  panBoundsRef: RefObject<PanBounds>
   userMovedRef: RefObject<boolean>
   draggingRef: RefObject<boolean | undefined>
+  /**
+   * The same as draggingRef, as a value: the end of a drag re-runs the bounds check, for a content
+   * change that landed mid-drag (when the view is left alone).
+   */
+  dragging?: boolean
   fitTransform: (focusY?: number) => ZoomTransform
   contentWidth: number
   contentHeight: number
   /** The world width the view can be panned across (default contentWidth; see panReachWidth). */
   reachWidth?: number
+  /**
+   * Screen px below the top edge the top of the content may be brought down to (default
+   * PAN_TOP_MARGIN): more while the find bar covers the top of the view (see PanBounds.topReach).
+   */
+  topReach?: number
   /**
    * A new object (by identity) each time documents are imported — the same object again for later
    * commits of one import batch; null otherwise.
@@ -50,12 +74,15 @@ interface AutoFitArgs {
 export function useAutoFit({
   viewportRef,
   zoomRef,
+  panBoundsRef,
   userMovedRef,
   draggingRef,
+  dragging = false,
   fitTransform,
   contentWidth,
   contentHeight,
   reachWidth = contentWidth,
+  topReach = PAN_TOP_MARGIN,
   focus,
   viewportWidth,
   viewportHeight
@@ -87,7 +114,36 @@ export function useAutoFit({
   const bounded = (t: ZoomTransform): ZoomTransform => {
     const vp = viewportRef.current
     const zoom = zoomRef.current
-    return vp && zoom ? boundToViewport(vp, zoom, t) : t
+    return vp && zoom ? boundToViewport(vp, zoom, t, panBoundsRef.current) : t
+  }
+
+  /**
+   * Run a tween in the shared slot. `onDone` runs when it ends or is cancelled. On the immediate
+   * path (reduced motion, no animation clock) animateZoomTo finishes before it returns: the slot is
+   * then left empty, not holding a spent cancel — that would read as a tween forever running, and
+   * keepInBounds would never pull the view back again.
+   */
+  const startTween = (target: ZoomTransform, duration: number, onDone: () => void): void => {
+    const vp = viewportRef.current
+    const zoom = zoomRef.current
+    if (!vp || !zoom) return
+    animTarget.current = target
+    let done = false
+    const cancel = animateZoomTo(
+      vp,
+      zoom,
+      target,
+      duration,
+      () => userMovedRef.current,
+      () => {
+        done = true
+        cancelAnim.current = null
+        animTarget.current = null
+        onDone()
+      },
+      bounded
+    )
+    if (!done) cancelAnim.current = cancel
   }
 
   const animateTo = (focusY: number): void => {
@@ -98,21 +154,10 @@ export function useAutoFit({
     animAnchor.current = focusY
     userMovedRef.current = false
     const target = bounded(fitTransform(focusY))
-    animTarget.current = target
     fitK.current = target.k
-    cancelAnim.current = animateZoomTo(
-      vp,
-      zoom,
-      target,
-      FIT_ANIMATION_MS,
-      () => userMovedRef.current,
-      () => {
-        cancelAnim.current = null
-        animAnchor.current = null
-        animTarget.current = null
-      },
-      bounded
-    )
+    startTween(target, FIT_ANIMATION_MS, () => {
+      animAnchor.current = null
+    })
   }
 
   const jumpTo = (focusY: number): void => {
@@ -147,16 +192,30 @@ export function useAutoFit({
       [vp.clientWidth, vp.clientHeight]
     ])
     // The pan bounds' content box (see boundTransform): the column of document cards, which spans
-    // the collection's width (and any edge "Add page" button), down to the end of the trailing
-    // "Add document" row.
+    // the collection's width, down to the end of the trailing "Add document" row — plus, past its
+    // right edge, the outer half of any edge "Add page" button.
     zoom.translateExtent([
       [0, 0],
-      [Math.max(contentWidth, reachWidth), contentHeight]
+      [contentWidth, contentHeight]
     ])
+    panBoundsRef.current = {
+      ...PAN_BOUNDS,
+      topReach: Math.max(PAN_BOUNDS.top, topReach),
+      overhang: Math.max(0, reachWidth - contentWidth)
+    }
     if (contentWidth <= 1 || contentHeight <= 1) return
     place()
     keepInBounds()
-  }, [contentWidth, contentHeight, reachWidth, focus, viewportWidth, viewportHeight])
+  }, [
+    contentWidth,
+    contentHeight,
+    reachWidth,
+    topReach,
+    focus,
+    viewportWidth,
+    viewportHeight,
+    dragging
+  ])
 
   /** Decide whether, and how, the content/viewport change that ran the layout effect re-fits. */
   const place = (): void => {
@@ -257,24 +316,16 @@ export function useAutoFit({
     const zoom = zoomRef.current
     if (!vp || !zoom) return
     stopAnim()
-    userMovedRef.current = false
     // Bounded like any other view: a page near the top of the content can't be brought lower than
     // the content's top is allowed to go.
     const target = bounded(requested)
-    animTarget.current = target
-    cancelAnim.current = animateZoomTo(
-      vp,
-      zoom,
-      target,
-      REVEAL_ANIMATION_MS,
-      () => userMovedRef.current,
-      () => {
-        cancelAnim.current = null
-        animTarget.current = null
-        userMovedRef.current = true
-      },
-      bounded
-    )
+    // Already there (a first-row page held at the top bound): nothing to animate, and a view the
+    // user never moved stays un-moved, so later content changes still re-fit it.
+    if (sameTransform(target, zoomTransform(vp))) return
+    userMovedRef.current = false
+    startTween(target, REVEAL_ANIMATION_MS, () => {
+      userMovedRef.current = true
+    })
   }, [])
 
   // A tween the user aborted (wheel/drag) has not reached its target: only a live one counts.
