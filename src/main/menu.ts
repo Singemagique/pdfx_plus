@@ -1,5 +1,88 @@
-import { Menu } from 'electron'
+import { ipcMain, Menu } from 'electron'
 import { getMainWindow, toggleDevTools } from './window'
+
+/** The Document menu's checkboxes whose state the renderer owns (it pushes it: `pdfx:menu-checked`). */
+export const MENU_CHECKBOXES = ['show-recognized-text', 'include-recognized-text'] as const
+export type MenuCheckbox = (typeof MENU_CHECKBOXES)[number]
+
+/** The checkbox states last pushed by the renderer (used when the menu is (re)built). */
+const checkedState: Record<MenuCheckbox, boolean> = {
+  'show-recognized-text': false,
+  'include-recognized-text': true
+}
+
+/** Set a Document-menu checkbox (the renderer is the source of truth; Electron flips it on click). */
+export function setMenuChecked(id: MenuCheckbox, checked: boolean): void {
+  checkedState[id] = checked
+  const item = Menu.getApplicationMenu()?.getMenuItemById(id)
+  if (item) item.checked = checked
+}
+
+/**
+ * `pdfx:menu-checked` (renderer → main): the Document menu's checkbox states. Only the main window
+ * may set them, only the known ids, only booleans.
+ */
+export function registerMenuStateIpc(): void {
+  ipcMain.on('pdfx:menu-checked', (event, id: unknown, checked: unknown) => {
+    if (event.sender !== getMainWindow()?.webContents) return
+    if (!(MENU_CHECKBOXES as readonly unknown[]).includes(id) || typeof checked !== 'boolean')
+      return
+    setMenuChecked(id as MenuCheckbox, checked)
+  })
+}
+
+/**
+ * The Document menu (DESIGN.md §3.8). Recognize Text… shows Ctrl/Cmd+Shift+R but does NOT register
+ * it: window.ts's before-input-event handler delivers that key (the toolkit's watchWindowShortcuts
+ * preventDefaults every Ctrl/Cmd+R in packaged builds, which also blocks a menu accelerator), and a
+ * registered accelerator would fire a second time in dev builds.
+ */
+export function documentItems(
+  sendMenu: (action: string) => () => void
+): Electron.MenuItemConstructorOptions[] {
+  return [
+    {
+      id: 'recognize-text',
+      label: 'Recognize Text…',
+      accelerator: 'CommandOrControl+Shift+R',
+      registerAccelerator: false,
+      click: sendMenu('recognize-text')
+    },
+    {
+      id: 'recognize-all-scanned',
+      label: 'Recognize Text on All Scanned Pages',
+      click: sendMenu('recognize-all-scanned')
+    },
+    { type: 'separator' },
+    {
+      id: 'replace-recognized-text',
+      label: 'Replace Recognized Text…',
+      click: sendMenu('replace-recognized-text')
+    },
+    {
+      id: 'remove-recognized-text',
+      label: 'Remove Recognized Text',
+      click: sendMenu('remove-recognized-text')
+    },
+    { type: 'separator' },
+    {
+      id: 'show-recognized-text',
+      label: 'Show Recognized Text',
+      type: 'checkbox',
+      checked: checkedState['show-recognized-text'],
+      click: sendMenu('show-recognized-text')
+    },
+    {
+      id: 'include-recognized-text',
+      label: 'Include Recognized Text When Exporting',
+      type: 'checkbox',
+      checked: checkedState['include-recognized-text'],
+      click: sendMenu('include-recognized-text')
+    },
+    { type: 'separator' },
+    { id: 'copy-page-text', label: 'Copy Page Text', click: sendMenu('copy-page-text') }
+  ]
+}
 
 /**
  * What `role: 'editMenu'` expands to on each platform, spelled out so Find… can join it. Keep it
@@ -76,6 +159,7 @@ export function buildMenu(): void {
       label: 'Edit',
       submenu: [...editItems(isMac), { type: 'separator' }, findItem]
     },
+    { label: 'Document', submenu: documentItems(sendMenu) },
     {
       label: 'View',
       submenu: [

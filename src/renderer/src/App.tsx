@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { computeLayout } from './canvas/layout'
 import { Toolbar } from './components/Toolbar'
-import { SignDialog } from './components/SignDialog'
 import { FullView } from './components/FullView'
 import { CollectionCanvas } from './components/CollectionCanvas'
 import type { CanvasHandle } from './components/Canvas'
@@ -21,12 +20,28 @@ import { useFindShortcuts } from './search/useFindShortcuts'
 import { FindProvider } from './search/FindContext'
 import type { FindMatch } from './search/find-controller'
 import { FindBarHost } from './components/FindBar'
+import { CloseIcon } from './components/icons'
 import type { FullViewNav } from './components/full-view/use-full-view-controls'
 import { OcrExportPrompt } from './components/OcrExportPrompt'
 import { createOcrStore } from './ocr/ocr-store'
 import { createOcrFindSupply } from './ocr/ocr-find-supply'
-
-const TOAST_MS = 4000
+import { OcrUiProvider, type OcrActions, type OcrDialogRequest } from './ocr/OcrContext'
+import {
+  removedCopy,
+  removeTargets,
+  summarizeOcr,
+  UNAVAILABLE_COPY,
+  unavailableDetails
+} from './ocr/ocr-ui'
+import { useBannerSeen } from './ocr/useBannerSeen'
+import { copyPageText } from './ocr/copy-page-text'
+import { isSignedSource } from './ocr/signed-source'
+import { OcrToolbarItems } from './components/ocr/OcrToolbarItems'
+import { RecognizeDialog } from './components/ocr/RecognizeDialog'
+import { OcrBanner } from './components/ocr/OcrBanner'
+import { OcrSummaryPopover } from './components/ocr/OcrSummaryPopover'
+import { OcrMenuSync, OcrSignDialog, OcrToasts } from './components/ocr/OcrAppParts'
+import { useToast } from './app/useToast'
 
 export default function App(): React.JSX.Element {
   // Ref-count busy instead of a plain boolean: overlapping operations (a 2nd-instance open / Explorer
@@ -51,15 +66,10 @@ export default function App(): React.JSX.Element {
   const awaitingPlacement = useRef(false)
   const [scale, setScale] = useState(1)
   const [renderVersion, setRenderVersion] = useState(0)
-  const [toast, setToast] = useState<string | null>(null)
-  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const canvasRef = useRef<CanvasHandle | null>(null)
 
-  const flash = useCallback((message: string) => {
-    if (toastTimer.current) clearTimeout(toastTimer.current)
-    setToast(message)
-    toastTimer.current = setTimeout(() => setToast(null), TOAST_MS)
-  }, [])
+  // A toast with a button ([Resume], [Details]) stays until it is used or dismissed (useToast).
+  const { toast, flash, dismiss: dismissToast } = useToast()
 
   const collection = useCollection(flash)
   const fullViewState = useFullView()
@@ -160,8 +170,13 @@ export default function App(): React.JSX.Element {
   })
 
   const onPaste = useCallback(() => void handlePaste(), [handlePaste])
+  const [ocrDialog, setOcrDialog] = useState<OcrDialogRequest | null>(null)
+  const modalOpen = (signOpen && !placing) || padOpen || !!ocrDialog
+  const modalOpenRef = useRef(modalOpen)
+  modalOpenRef.current = modalOpen
   useKeyboardShortcuts({
-    active: !fullViewState.fullView,
+    // Never behind a modal dialog: a key that lands outside it must not delete or copy a page.
+    active: !fullViewState.fullView && !modalOpen,
     selected: collection.selected,
     onDeletePage: collection.deletePage,
     onDuplicate: collection.duplicatePage,
@@ -179,9 +194,6 @@ export default function App(): React.JSX.Element {
   const hiddenPageIdRef = useRef(fullViewState.hiddenPageId)
   hiddenPageIdRef.current = fullViewState.hiddenPageId
   const fullViewNavRef = useRef<FullViewNav | null>(null)
-  const modalOpen = (signOpen && !placing) || padOpen
-  const modalOpenRef = useRef(modalOpen)
-  modalOpenRef.current = modalOpen
   const getAnchorPageId = useCallback(
     () =>
       fullViewState.fullViewRef.current
@@ -233,12 +245,117 @@ export default function App(): React.JSX.Element {
   useEffect(() => ocrSupply.sync(docs, editLayer), [ocrSupply, docs, editLayer])
   // The page in view is recognised first (§3.3.6): the full-view page, else the selected one.
   const focusPageId = fullView ? fullViewState.hiddenPageId : (collection.selected?.pageId ?? null)
-  useEffect(() => {
-    const page = focusPageId
-      ? docs.flatMap((d) => d.pages).find((p) => p.id === focusPageId)
-      : undefined
-    ocrStore.setFocus(page ? makePageKey(page.source.id, page.pageIndex) : null)
-  }, [ocrStore, docs, focusPageId])
+  const focus = useMemo(() => {
+    if (!focusPageId) return null
+    for (const d of docs) {
+      const page = d.pages.find((p) => p.id === focusPageId)
+      if (page) return { docId: d.id, key: makePageKey(page.source.id, page.pageIndex) }
+    }
+    return null
+  }, [docs, focusPageId])
+  const focusKey = focus?.key ?? null
+  useEffect(() => ocrStore.setFocus(focusKey), [ocrStore, focusKey])
+
+  // ---- Text recognition UI (DESIGN.md §3.8)
+  const [showRecognizedText, setShowRecognizedText] = useState(false)
+  const [summaryAt, setSummaryAt] = useState<{
+    anchor: HTMLElement | null
+    docId: string | null
+  } | null>(null)
+  // The full-view banner shows at most once per document per session.
+  const banner = useBannerSeen(fullView ? (focus?.docId ?? fullView.docId) : null)
+
+  // What the actions read when they run (they are created once, so the context stays stable).
+  const latestOcr = useRef({ docs, focus, fullViewState })
+  latestOcr.current = { docs, focus, fullViewState }
+  const { rotatePage } = editStore
+  const ocrActions = useMemo<OcrActions>(
+    () => ({
+      openDialog: (req) => {
+        if (modalOpenRef.current) return
+        setOcrDialog(req ?? {})
+      },
+      recognizeNow: (keys) => {
+        if (keys.length === 0) return
+        if (ocrStore.recognize(keys) === null) {
+          const reason = ocrStore.getSnapshot().unavailable
+          flash(UNAVAILABLE_COPY, {
+            label: 'Details',
+            run: () => flash(unavailableDetails(reason))
+          })
+        }
+      },
+      openSummary: (anchor, docId) => setSummaryAt({ anchor, docId }),
+      viewPage: (docId, pageId) => {
+        const fv = latestOcr.current.fullViewState
+        if (fv.fullViewRef.current) fullViewNavRef.current?.goTo(docId, pageId)
+        else fv.openPage(docId, pageId)
+      },
+      rotatePage: (pageKey, delta) => rotatePage(pageKey, delta)
+    }),
+    [ocrStore, flash, rotatePage]
+  )
+  const ocrValue = useMemo(
+    () => ({ store: ocrStore, supply: ocrSupply, actions: ocrActions }),
+    [ocrStore, ocrSupply, ocrActions]
+  )
+
+  /** The Document menu's commands (§3.8): the page in view, else the selected page. */
+  const onOcrMenu = useCallback(
+    async (action: string): Promise<void> => {
+      const { docs: liveDocs, focus: f } = latestOcr.current
+      if (action === 'recognize-text') ocrActions.openDialog({ mode: 'recognize' })
+      else if (action === 'replace-recognized-text') ocrActions.openDialog({ mode: 'replace' })
+      else if (action === 'recognize-all-scanned') {
+        const keys = summarizeOcr(liveDocs, ocrStore).unrecognized
+        if (keys.length === 0) flash('No scanned pages are waiting for text recognition')
+        else ocrActions.recognizeNow(keys)
+      } else if (action === 'remove-recognized-text') {
+        const { keys, none } = removeTargets(summarizeOcr(liveDocs, ocrStore), f?.key ?? null)
+        if (keys.length === 0) {
+          flash(none)
+          return
+        }
+        ocrStore.remove(keys) // one undo step for all of them
+        flash(removedCopy(keys.length))
+      } else if (action === 'show-recognized-text') setShowRecognizedText((v) => !v)
+      else if (action === 'include-recognized-text') {
+        const next = !ocrStore.settings()['ocr.includeInExports']
+        try {
+          await ocrStore.setSettings({ 'ocr.includeInExports': next })
+        } catch (err) {
+          console.warn('ocr: could not save the export setting', err)
+        }
+        // Electron flipped the checkbox on click: put back what the setting really is.
+        window.api.setMenuChecked?.(
+          'include-recognized-text',
+          ocrStore.settings()['ocr.includeInExports']
+        )
+      } else if (action === 'copy-page-text') {
+        if (!f) {
+          flash('Select a page to copy its text')
+          return
+        }
+        const r = await copyPageText(f.key, {
+          text: find.text,
+          supply: ocrSupply,
+          write: (t) => window.api.writeClipboardText(t)
+        })
+        flash(
+          r.copied
+            ? 'Page text copied'
+            : r.reason === 'empty'
+              ? 'This page has no text to copy'
+              : 'Couldn’t copy the page text'
+        )
+      }
+    },
+    [ocrActions, ocrStore, ocrSupply, flash, find]
+  )
+  const signedSources = useMemo(
+    () => docs.some((d) => d.pages.some((p) => isSignedSource(p.source?.bytes))),
+    [docs]
+  )
 
   const {
     exportCollection,
@@ -283,8 +400,11 @@ export default function App(): React.JSX.Element {
       else if (action === 'export-pdf') void exportCollection('pdf')
       else if (action === 'export-zip') void exportZip()
       else if (action === 'find' && !modalOpenRef.current) find.open()
+      else if (action === 'show-recognized-text' || action === 'include-recognized-text')
+        void onOcrMenu(action) // settings: fine with a dialog open
+      else if (!modalOpenRef.current) void onOcrMenu(action)
     })
-  }, [openViaDialog, exportCollection, exportZip, find])
+  }, [openViaDialog, exportCollection, exportZip, find, onOcrMenu])
 
   const totalPages = docs.reduce((sum, d) => sum + d.pages.length, 0)
   const fullViewDoc = fullView ? docs.find((d) => d.id === fullView.docId) : undefined
@@ -292,115 +412,187 @@ export default function App(): React.JSX.Element {
   return (
     <EditProvider store={editStore}>
       <FindProvider value={find}>
-        <div
-          className={
-            'app' + (drag.committing ? ' committing' : '') + (drag.dragKind ? ' dragging' : '')
-          }
-          onDragEnter={drag.handlers.onDragEnter}
-          onDragOver={drag.handlers.onDragOver}
-          onDragLeave={drag.handlers.onDragLeave}
-          onDrop={drag.handlers.onDrop}
-        >
-          <Toolbar
-            documentCount={docs.length}
-            pageCount={totalPages}
-            busy={busy}
-            zoom={scale}
-            onZoomIn={() => canvasRef.current?.zoomIn()}
-            onZoomOut={() => canvasRef.current?.zoomOut()}
-            onZoomReset={() => canvasRef.current?.reset()}
-            onOpen={openViaDialog}
-            onExport={() => exportCollection('pdfx')}
-            onExportPdf={() => exportCollection('pdf')}
-            onExportZip={exportZip}
-            onSign={() => setSignOpen(true)}
-          />
-
-          <CollectionCanvas
-            docs={docs}
-            layout={layout}
-            busy={busy}
-            pagesDraggable={totalPages >= 2}
-            renderVersion={renderVersion}
-            selected={collection.selected}
-            hiddenPageId={fullViewState.hiddenPageId}
-            dragKind={drag.dragKind}
-            draggingPage={drag.draggingPage}
-            dropTarget={drag.dropTarget}
-            collapsedId={drag.collapsedId}
-            externalCount={drag.externalCount}
-            canvasRef={canvasRef}
-            onScaleChange={onScaleChange}
-            onSettle={onSettle}
-            onBackgroundClick={collection.clearSelection}
-            onWrapWidthChange={setWrapWidth}
-            onOpen={openViaDialog}
-            onSelectPage={collection.selectPage}
-            onOpenPage={fullViewState.openPage}
-            onPageDragStart={drag.startPageDrag}
-            onPageDragEnd={drag.clearDrag}
-            onAddPage={addPagesToDoc}
-            onMoveDoc={collection.moveDoc}
-            onRemoveDoc={collection.removeDoc}
-            onRenameDoc={collection.renameDoc}
-          />
-
-          {fullView && fullViewDoc && (
-            <>
-              <FullView
-                docs={docs}
-                startDocId={fullView.docId}
-                startPageId={fullView.pageId}
-                originRect={fullView.originRect}
-                onActivePageChange={fullViewState.setHiddenPageId}
-                onClose={fullViewState.closeFullView}
-                navRef={fullViewNavRef}
-              />
-              <EditTools />
-            </>
-          )}
-
-          {signOpen && (
-            <SignDialog
+        <OcrUiProvider value={ocrValue} docs={docs} showRecognizedText={showRecognizedText}>
+          <div
+            className={
+              'app' + (drag.committing ? ' committing' : '') + (drag.dragKind ? ' dragging' : '')
+            }
+            onDragEnter={drag.handlers.onDragEnter}
+            onDragOver={drag.handlers.onDragOver}
+            onDragLeave={drag.handlers.onDragLeave}
+            onDrop={drag.handlers.onDrop}
+          >
+            <Toolbar
+              documentCount={docs.length}
+              pageCount={totalPages}
               busy={busy}
-              hidden={placing}
-              onSign={signAndExport}
-              onSignCard={signWithCardAndExport}
-              listTokens={(modulePath) => window.api.listCardTokens(modulePath)}
-              findModules={() => window.api.findCardModules()}
-              listWindowsCerts={() => window.api.listWindowsCerts()}
-              onSignWindowsCert={signWithWindowsCertAndExport}
-              platform={window.api.platform}
-              pathForFile={(file) => window.api.getPathForFile(file)}
-              placementLabel={editStore.signaturePlacement?.label ?? null}
-              onClearPlacement={() => editStore.setSignaturePlacement(null)}
-              onPlaceRequest={requestPlacement}
-              hasSavedSignature={!!editStore.savedSignature}
-              onDrawSignature={() => setPadOpen(true)}
-              onClose={() => {
-                awaitingPlacement.current = false
-                setPlacing(false)
-                setSignOpen(false)
-              }}
+              zoom={scale}
+              onZoomIn={() => canvasRef.current?.zoomIn()}
+              onZoomOut={() => canvasRef.current?.zoomOut()}
+              onZoomReset={() => canvasRef.current?.reset()}
+              onOpen={openViaDialog}
+              onExport={() => exportCollection('pdfx')}
+              onExportPdf={() => exportCollection('pdf')}
+              onExportZip={exportZip}
+              onSign={() => setSignOpen(true)}
+              ocr={<OcrToolbarItems busy={busy} />}
             />
-          )}
 
-          {padOpen && (
-            <SignaturePad
-              onSave={(bytes) => {
-                editStore.setSavedSignature(bytes)
-                setPadOpen(false)
-              }}
-              onClose={() => setPadOpen(false)}
+            <CollectionCanvas
+              docs={docs}
+              layout={layout}
+              busy={busy}
+              pagesDraggable={totalPages >= 2}
+              renderVersion={renderVersion}
+              selected={collection.selected}
+              hiddenPageId={fullViewState.hiddenPageId}
+              dragKind={drag.dragKind}
+              draggingPage={drag.draggingPage}
+              dropTarget={drag.dropTarget}
+              collapsedId={drag.collapsedId}
+              externalCount={drag.externalCount}
+              canvasRef={canvasRef}
+              onScaleChange={onScaleChange}
+              onSettle={onSettle}
+              onBackgroundClick={collection.clearSelection}
+              onWrapWidthChange={setWrapWidth}
+              onOpen={openViaDialog}
+              onSelectPage={collection.selectPage}
+              onOpenPage={fullViewState.openPage}
+              onPageDragStart={drag.startPageDrag}
+              onPageDragEnd={drag.clearDrag}
+              onAddPage={addPagesToDoc}
+              onMoveDoc={collection.moveDoc}
+              onRemoveDoc={collection.removeDoc}
+              onRenameDoc={collection.renameDoc}
             />
-          )}
 
-          <FindBarHost controller={find} />
+            {fullView && fullViewDoc && (
+              <>
+                <FullView
+                  docs={docs}
+                  startDocId={fullView.docId}
+                  startPageId={fullView.pageId}
+                  originRect={fullView.originRect}
+                  onActivePageChange={fullViewState.setHiddenPageId}
+                  onClose={fullViewState.closeFullView}
+                  navRef={fullViewNavRef}
+                  banner={
+                    focus && (
+                      <OcrBanner
+                        docId={focus.docId}
+                        pageKey={focus.key}
+                        seen={banner.seen}
+                        onShown={banner.onShown}
+                        onDone={banner.onDone}
+                      />
+                    )
+                  }
+                />
+                <EditTools />
+              </>
+            )}
 
-          <OcrExportPrompt store={ocrStore} />
+            {signOpen && (
+              <OcrSignDialog
+                busy={busy}
+                hidden={placing}
+                onSign={signAndExport}
+                onSignCard={signWithCardAndExport}
+                listTokens={(modulePath) => window.api.listCardTokens(modulePath)}
+                findModules={() => window.api.findCardModules()}
+                listWindowsCerts={() => window.api.listWindowsCerts()}
+                onSignWindowsCert={signWithWindowsCertAndExport}
+                platform={window.api.platform}
+                pathForFile={(file) => window.api.getPathForFile(file)}
+                placementLabel={editStore.signaturePlacement?.label ?? null}
+                onClearPlacement={() => editStore.setSignaturePlacement(null)}
+                onPlaceRequest={requestPlacement}
+                hasSavedSignature={!!editStore.savedSignature}
+                onDrawSignature={() => setPadOpen(true)}
+                onClose={() => {
+                  awaitingPlacement.current = false
+                  setPlacing(false)
+                  setSignOpen(false)
+                }}
+              />
+            )}
 
-          {toast && <div className="toast">{toast}</div>}
-        </div>
+            {padOpen && (
+              <SignaturePad
+                onSave={(bytes) => {
+                  editStore.setSavedSignature(bytes)
+                  setPadOpen(false)
+                }}
+                onClose={() => setPadOpen(false)}
+              />
+            )}
+
+            <FindBarHost controller={find} />
+
+            <OcrExportPrompt store={ocrStore} signedNote={signedSources} />
+
+            {ocrDialog && (
+              <RecognizeDialog
+                mode={ocrDialog.mode ?? 'recognize'}
+                fixedKeys={ocrDialog.keys}
+                focusDocId={focus?.docId ?? null}
+                focusPageKey={focus?.key ?? null}
+                inFullView={!!fullView}
+                docs={docs}
+                onClose={() => setOcrDialog(null)}
+              />
+            )}
+
+            {summaryAt && (
+              <OcrSummaryPopover
+                anchor={summaryAt.anchor}
+                docId={summaryAt.docId}
+                onClose={() => setSummaryAt(null)}
+              />
+            )}
+
+            <OcrToasts
+              store={ocrStore}
+              flash={flash}
+              onDetails={() => ocrActions.openSummary(null, null)}
+            />
+            <OcrMenuSync showRecognizedText={showRecognizedText} />
+
+            {/* Always mounted, so a new message is a change a screen reader announces (a live
+                region that mounts with its text already in it is often not read). */}
+            <div className="sr-only" role="status" aria-live="polite" aria-atomic="true">
+              {toast?.message ?? ''}
+            </div>
+            {toast && (
+              <div className="toast">
+                {toast.message}
+                {toast.action && (
+                  <>
+                    <button
+                      className="toast-action"
+                      onClick={() => {
+                        const run = toast.action!.run
+                        dismissToast()
+                        run()
+                      }}
+                    >
+                      {toast.action.label}
+                    </button>
+                    <button
+                      className="toast-dismiss"
+                      aria-label="Dismiss"
+                      title="Dismiss"
+                      onClick={dismissToast}
+                    >
+                      <CloseIcon size={11} />
+                    </button>
+                  </>
+                )}
+              </div>
+            )}
+          </div>
+        </OcrUiProvider>
       </FindProvider>
     </EditProvider>
   )

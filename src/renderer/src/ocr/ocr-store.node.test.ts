@@ -7,6 +7,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { defaultSettings, type Settings } from '../../../shared/settings'
+import { emptyEditState, selectOcrInHistory, type EditState } from '../edit/edit-history'
+import { initHistory, undo } from '../edit/history'
 import { makePageKey } from '../edit/model'
 import type { EditLayer } from '../pdfx/build'
 import type { DocEntry, PdfSource } from '../types'
@@ -915,7 +917,7 @@ describe('export snapshot and choices', () => {
     // Replace records the choice FIRST (undoable), then recognises the page again.
     const hash = ocrConfig(['fra']).hash
     store.replace([keyOf(s, 0)], ['fra'])
-    expect(select).toHaveBeenCalledWith(keyOf(s, 0), hash)
+    expect(select).toHaveBeenCalledWith(keyOf(s, 0), hash, expect.any(String))
     await settle()
     expect(port.recognizes()[0].opts.langs).toEqual(['fra'])
     answerAll(port, ['neu'])
@@ -932,12 +934,38 @@ describe('export snapshot and choices', () => {
     const select = vi.fn()
     store.syncEdits({ selectOcr: select })
     store.remove([key])
-    expect(select).toHaveBeenCalledWith(key, null)
+    expect(select).toHaveBeenCalledWith(key, null, expect.any(String))
     // EditProvider records the op and hands the new ocrSelect back.
     store.syncEdits({ ocrSelect: new Map([[key, null]]) })
     expect(store.exportSource.snapshotFor(d, emptyLayer(new Map([[key, null]])))).toBeUndefined()
     expect(store.pageSupply(key)?.page).toBeUndefined()
     expect(store.getPageState(key)).toMatchObject({ hasText: false })
+  })
+
+  it('Remove / Replace over several pages is ONE undo step (one group per command)', async () => {
+    const texts = new Map()
+    const s = scan('multi', 3, texts)
+    const { store, port } = rig({ texts })
+    const ks = [0, 1, 2].map((i) => keyOf(s, i))
+    // The real edit history behind the store, as EditProvider wires it.
+    let h = initHistory<EditState>(emptyEditState())
+    store.syncEdits({ selectOcr: (k, c, g) => (h = selectOcrInHistory(h, k, c, g)) })
+    store.reconcile([
+      doc(
+        'd',
+        ks.map((_, i) => pageOf(s, i))
+      )
+    ])
+    await settle()
+    answerTriage(port, 'scanned')
+    store.remove(ks)
+    expect(h.present.ocrSelect).toEqual({ [ks[0]]: null, [ks[1]]: null, [ks[2]]: null })
+    expect(h.past).toHaveLength(1)
+    // One Undo brings every page back ("Undo brings it back").
+    expect(undo(h).present.ocrSelect).toEqual({})
+    store.replace(ks.slice(0, 2), ['deu'])
+    expect(h.past).toHaveLength(2)
+    expect(undo(h).present.ocrSelect).toEqual({ [ks[0]]: null, [ks[1]]: null, [ks[2]]: null })
   })
 
   it('undoing a Replace brings back the original automatic text (lossless Replace)', async () => {
@@ -1082,5 +1110,81 @@ describe('flushOrConfirm', () => {
     await expect(store.exportSource.flushOrConfirm(d)).resolves.toBe(false)
     store.answerPrompt('cancel')
     await expect(a).resolves.toBe(false)
+  })
+})
+
+describe('PR8 reads: page-state fields and notifications for the OCR surfaces', () => {
+  it('"Sideways — rotate?" is against the rotation the page was recognised at, and goes once turned', async () => {
+    const texts = new Map<string, ReturnType<typeof nativeText>>()
+    const s = scan('rot', 1, texts)
+    const { store, port } = rig({ texts })
+    const key = keyOf(s, 0)
+    store.syncEdits({ rotations: new Map([[key, 90]]) })
+    store.reconcile([doc('d', [pageOf(s, 0)])])
+    await settle()
+    answerTriage(port, 'scanned')
+    store.recognize([key])
+    await settle()
+    const r = port.recognizes()[0]
+    expect(r.pages[0].editRotation).toBe(90)
+    port.emit({
+      result: {
+        jobId: r.jobId,
+        src: r.src,
+        index: 0,
+        page: { ...okResult(recognisedPage(['x'])), rotateBy: 180 }
+      }
+    })
+    await settle()
+    expect(store.getPageState(key)?.rotateBy).toBe(180)
+    // Turned a quarter more: a quarter the other way is still left.
+    store.syncEdits({ rotations: new Map([[key, 180]]) })
+    expect(store.getPageState(key)?.rotateBy).toBe(90)
+    // Turned by exactly what was offered (the summary's [Rotate]): upright, no offer.
+    store.syncEdits({ rotations: new Map([[key, 270]]) })
+    expect(store.getPageState(key)?.rotateBy).toBeUndefined()
+  })
+
+  it('a rotation change notifies subscribers (the summary row must go)', async () => {
+    vi.useFakeTimers()
+    const { store } = rig()
+    const listener = vi.fn()
+    store.subscribe(listener)
+    store.syncEdits({ rotations: new Map([['k', 90]]) })
+    await vi.advanceTimersByTimeAsync(200)
+    expect(listener).toHaveBeenCalled()
+  })
+
+  it('loading the stored settings notifies (the dialog, menu and Sign defaults follow them)', async () => {
+    vi.useFakeTimers()
+    const { store } = rig({ settings: { 'ocr.includeInExports': false } })
+    const listener = vi.fn()
+    store.subscribe(listener)
+    await vi.advanceTimersByTimeAsync(200)
+    expect(listener).toHaveBeenCalled()
+    expect(store.settings()['ocr.includeInExports']).toBe(false)
+  })
+
+  it('scan / removed / triaged: an imported image is a scan before triage; Remove is "removed"', async () => {
+    const img = source('img', { origin: 'image', bytes: new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]) })
+    const { store, port } = rig({ settings: { 'ocr.autoRecognizeImports': false } })
+    const key = keyOf(img, 0)
+    const selections = new Map<string, string | null>()
+    store.syncEdits({
+      ocrSelect: selections,
+      selectOcr: (k, h) => {
+        selections.set(k, h)
+        store.syncEdits({ ocrSelect: new Map(selections) })
+      }
+    })
+    store.reconcile([doc('d', [pageOf(img, 0)])])
+    await settle()
+    expect(store.getPageState(key)).toMatchObject({ scan: true, triaged: false, removed: false })
+    store.prepare([key])
+    await settle()
+    answerTriage(port, 'text')
+    expect(store.getPageState(key)).toMatchObject({ scan: false, triaged: true })
+    store.remove([key])
+    expect(store.getPageState(key)?.removed).toBe(true)
   })
 })

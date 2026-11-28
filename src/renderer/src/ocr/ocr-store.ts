@@ -97,6 +97,12 @@ export interface OcrBatchView {
   inflightFrac: number
   /** EWMA estimate of the time left, ms; null until 3 pages are done. */
   etaMs: number | null
+  /**
+   * The live page keys the request covers (asked for and not already recognised with its
+   * configuration): the end-of-run toast counts the ones that need attention among them, with the
+   * same rule as the chip (ocr-ui `pageIssue`).
+   */
+  keys: readonly string[]
 }
 
 export type OcrLinkState = 'idle' | 'connecting' | 'connected' | 'unavailable'
@@ -126,6 +132,15 @@ export interface OcrPageState {
   /** Recognised text this page currently exports / searches (its choice, or its auto result). */
   hasText: boolean
   meanConfCal: number | null
+  /**
+   * A scan for the OCR surfaces (PR8): scanned / near-scanned, or an imported image triage has not
+   * classed yet (it is a photo of a page by construction).
+   */
+  scan: boolean
+  /** Remove Recognized Text chose no text for the page (`ocrSelect … null`). */
+  removed: boolean
+  /** Triage answered for the page. */
+  triaged: boolean
 }
 
 /** The mid-job export prompt (§3.8 "Export mid-job"); OcrExportPrompt renders it. */
@@ -188,7 +203,13 @@ interface PageRec {
    * triage could not classify the page, since the user asked for exactly this text.
    */
   autoExplicit?: boolean
-  last?: { status: OcrStatus; reason?: PageReason; rotateBy?: 90 | 180 | 270 }
+  last?: {
+    status: OcrStatus
+    reason?: PageReason
+    rotateBy?: 90 | 180 | 270
+    /** The edit rotation the page had when `rotateBy` was measured (the request's). */
+    editRotation?: 0 | 90 | 180 | 270
+  }
   skip?: OcrPageState['skip']
   /** Crashes this page was in flight for (§3.3.2: two → failed, never retried). */
   crashes: number
@@ -247,6 +268,8 @@ interface Work {
   /** User / replace requests name their pages: a page that is not recognised counts as skipped. */
   explicit: boolean
   job?: CJob
+  /** The edit rotation sent with the page's recognize request (what its `rotateBy` is against). */
+  sentRotation?: 0 | 90 | 180 | 270
 }
 
 interface CJob {
@@ -266,6 +289,8 @@ interface Batch {
   config: OcrConfig
   state: BatchState
   works: Set<Work>
+  /** The page keys it covers (OcrBatchView.keys). */
+  keys: string[]
   recognized: number
   skipped: number
   failed: number
@@ -337,7 +362,7 @@ export interface OcrStore {
   syncEdits(edits: {
     ocrSelect?: ReadonlyMap<string, string | null>
     rotations?: ReadonlyMap<string, number>
-    selectOcr?: (pageKey: string, configHash: string | null) => void
+    selectOcr?: (pageKey: string, configHash: string | null, group?: string) => void
   }): void
   /** The page in view (recognised first, §3.3.6), or null. */
   setFocus(pageKey: string | null): void
@@ -395,7 +420,7 @@ export function createOcrStore(opts: OcrStoreOptions): OcrStore {
   // ---- edits
   let ocrSelect: ReadonlyMap<string, string | null> = new Map()
   let rotations: ReadonlyMap<string, number> = new Map()
-  let selectOcr: ((pageKey: string, configHash: string | null) => void) | undefined
+  let selectOcr: ((pageKey: string, configHash: string | null, group?: string) => void) | undefined
   let focusKey: string | null = null
 
   // ---- settings
@@ -403,7 +428,11 @@ export function createOcrStore(opts: OcrStoreOptions): OcrStore {
   const settingsReady: Promise<void> = (async () => {
     try {
       const s = await opts.getSettings?.()
-      if (s) currentSettings = s
+      if (s) {
+        currentSettings = s
+        // The dialog, the menu checkboxes and the Sign/export defaults follow the stored values.
+        changed()
+      }
     } catch {
       // Defaults: D4 on, D7 on, English.
     }
@@ -507,7 +536,8 @@ export function createOcrStore(opts: OcrStoreOptions): OcrStore {
       skipped: b.skipped,
       failed: b.failed,
       inflightFrac,
-      etaMs: b.samples >= 3 && b.ewma !== null && b.state === 'running' ? b.ewma * remaining : null
+      etaMs: b.samples >= 3 && b.ewma !== null && b.state === 'running' ? b.ewma * remaining : null,
+      keys: b.keys
     }
   }
 
@@ -584,14 +614,24 @@ export function createOcrStore(opts: OcrStoreOptions): OcrStore {
     if (ws) status = ws === 'sent' ? 'running' : ws === 'held' ? 'held' : 'queued'
     const hash = chosenHash(key, r)
     const page = hash ? r.results.get(hash) : undefined
+    const cls = r.triage?.pageClass ?? null
     const state: OcrPageState = {
-      pageClass: r.triage?.pageClass ?? null,
+      pageClass: cls,
       status,
       hasText: !!page,
-      meanConfCal: page?.meanConfCal ?? null
+      meanConfCal: page?.meanConfCal ?? null,
+      scan: SCANS.has(cls) || (cls === null && !r.triage && live.get(src)?.origin === 'image'),
+      removed: hash === null,
+      triaged: !!r.triage
     }
     if (r.last?.reason) state.reason = r.last.reason
-    if (r.last?.rotateBy) state.rotateBy = r.last.rotateBy
+    // "Sideways — rotate?" is against the rotation the page had when it was recognised: once the
+    // user turns it by that much (or any way that makes it upright), the offer goes.
+    if (r.last?.rotateBy) {
+      const turned = quarter(rotations.get(key)) - (r.last.editRotation ?? 0)
+      const left = quarter(r.last.rotateBy - turned)
+      if (left) state.rotateBy = left
+    }
     if (r.skip) state.skip = r.skip
     return state
   }
@@ -604,7 +644,10 @@ export function createOcrStore(opts: OcrStoreOptions): OcrStore {
       a.skip === b.skip &&
       a.rotateBy === b.rotateBy &&
       a.hasText === b.hasText &&
-      a.meanConfCal === b.meanConfCal
+      a.meanConfCal === b.meanConfCal &&
+      a.scan === b.scan &&
+      a.removed === b.removed &&
+      a.triaged === b.triaged
     )
   }
 
@@ -906,6 +949,7 @@ export function createOcrStore(opts: OcrStoreOptions): OcrStore {
       config,
       state: 'running',
       works: new Set(),
+      keys: [],
       recognized: 0,
       skipped: 0,
       failed: 0,
@@ -927,6 +971,8 @@ export function createOcrStore(opts: OcrStoreOptions): OcrStore {
       seen.add(id)
       const r = rec(ls.so, info.index)
       if (r.results.has(config.hash)) continue // already recognised with this config
+      // An automatic request says nothing about a page it leaves alone (two crashes, below).
+      if (explicit || r.crashes < 2) b.keys.push(key)
       if (ls.so.gate === 'refused') {
         // The coordinator refused the whole source (too large, unreadable): nothing will be sent,
         // so the page fails now, with the refusal's reason, instead of waiting forever.
@@ -1219,10 +1265,11 @@ export function createOcrStore(opts: OcrStoreOptions): OcrStore {
         if (!post({ recognize: { jobId: job.id, src, pages, opts: { langs: b.config.langs } } }))
           continue
         jobs.set(job.id, job)
-        for (const index of order) {
+        for (const [i, index] of order.entries()) {
           const w = byIndex.get(index)!
           w.state = 'sent'
           w.job = job
+          w.sentRotation = pages[i].editRotation ?? 0
           job.pages.set(index, w)
         }
       }
@@ -1394,7 +1441,10 @@ export function createOcrStore(opts: OcrStoreOptions): OcrStore {
       const r = rec(ls.so, index)
       r.last = { status: page.status }
       if (page.reason) r.last.reason = page.reason
-      if (page.rotateBy) r.last.rotateBy = page.rotateBy
+      if (page.rotateBy) {
+        r.last.rotateBy = page.rotateBy
+        r.last.editRotation = w?.sentRotation ?? 0
+      }
       if (page.status === 'skipped-protected') r.skip = 'protected'
       if (page.recognition && RECOGNISED.has(page.status)) {
         r.results.set(j.batch.config.hash, page.recognition)
@@ -1731,9 +1781,12 @@ export function createOcrStore(opts: OcrStoreOptions): OcrStore {
         ocrSelect = edits.ocrSelect
         sel = true
       }
+      // A rotation changes what "Sideways — rotate?" still offers (getPageState).
+      const turned = !!edits.rotations && edits.rotations !== rotations
       if (edits.rotations) rotations = edits.rotations
       if (edits.selectOcr) selectOcr = edits.selectOcr
       if (sel) resultsChanged()
+      else if (turned) changed()
     },
     setFocus(pageKey) {
       if (pageKey === focusKey) return
@@ -1749,11 +1802,14 @@ export function createOcrStore(opts: OcrStoreOptions): OcrStore {
       if (link === 'unavailable' || langs.length === 0) return null
       const config = ocrConfig(langs)
       // The choice first (undoable, §3.5.2): an export while the new text runs knows it is missing.
-      for (const key of pageKeys) if (keyInfo.has(key)) selectOcr?.(key, config.hash)
+      // One command, one undo step, however many pages it covers.
+      const group = mint('ocr-select:')
+      for (const key of pageKeys) if (keyInfo.has(key)) selectOcr?.(key, config.hash, group)
       return startBatch('replace', pageKeys, config.langs, true)
     },
     remove(pageKeys) {
-      for (const key of pageKeys) if (keyInfo.has(key)) selectOcr?.(key, null)
+      const group = mint('ocr-select:')
+      for (const key of pageKeys) if (keyInfo.has(key)) selectOcr?.(key, null, group)
     },
     cancel(batchId) {
       for (const b of batches) if (!batchId || b.id === batchId) cancelBatch(b)

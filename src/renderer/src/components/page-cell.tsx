@@ -6,6 +6,7 @@ import { fullPageInWindow, pageFrame, windowFractions } from '../page-geometry'
 import { PageView } from './PageView'
 import { buildPageDragImage } from './page-drag-image'
 import { usePageFindStatus } from '../search/FindContext'
+import { OcrPageBadge } from './ocr/OcrPageBadge'
 
 interface PageCellProps {
   docId: string
@@ -153,6 +154,7 @@ function PageCellImpl({
       onDragEnd={onPageDragEnd}
     >
       {content}
+      <OcrPageBadge pageKey={pageKey} />
       <span className="page-number">{visibleNumber}</span>
     </div>
   )

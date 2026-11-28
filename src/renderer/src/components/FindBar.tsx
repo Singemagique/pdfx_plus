@@ -3,6 +3,7 @@ import { FIND_HIGHLIGHTS_EVENT } from './full-view/FindHighlights'
 import type { FindBarState, FindController } from '../search/find-controller'
 import { useFindBarState } from '../search/FindContext'
 import { ChevronDownIcon, ChevronUpIcon, CloseIcon, SearchIcon } from './icons'
+import { OcrFindRow, unsearchedSuffix, useUnsearchedScans } from './ocr/OcrFindRow'
 
 /** Renders the find bar while it is open. */
 export function FindBarHost({
@@ -15,14 +16,14 @@ export function FindBarHost({
   return <FindBar controller={controller} state={state} />
 }
 
-function countLabel(state: FindBarState): string {
+function countLabel(state: FindBarState, unsearched = 0): string {
   if (!state.query) return ''
   if (state.total > 0) {
     const k = state.currentIndex >= 0 ? state.currentIndex + 1 : 0
     const pages = `${state.pagesMatched} ${state.pagesMatched === 1 ? 'page' : 'pages'}`
     return `${k} of ${state.total}${state.capped ? '+' : ''} · ${pages}`
   }
-  return state.indexing ? 'Indexing…' : 'No results'
+  return state.indexing ? 'Indexing…' : `No results${unsearchedSuffix(unsearched)}`
 }
 
 /** The bar's inset from the window edge, either side (.findbar's right / .findbar.dodge's left). */
@@ -105,7 +106,8 @@ export function FindBar({ controller, state }: FindBarProps): React.JSX.Element 
     input.select()
   }, [state.focusNonce])
 
-  const label = countLabel(state)
+  const unsearched = useUnsearchedScans()
+  const label = countLabel(state, unsearched)
   const showIndexing = state.indexing && state.total > 0
   const none = state.total === 0
 
@@ -132,73 +134,76 @@ export function FindBar({ controller, state }: FindBarProps): React.JSX.Element 
         }
       }}
     >
-      <span className="findbar-icon" aria-hidden="true">
-        <SearchIcon size={15} />
-      </span>
-      <input
-        ref={inputRef}
-        className="findbar-input"
-        type="text"
-        placeholder="Find in documents"
-        aria-label="Find in documents"
-        spellCheck={false}
-        autoComplete="off"
-        value={value}
-        onChange={(e) => {
-          setValue(e.target.value)
-          controller.setQuery(e.target.value)
-        }}
-        onKeyDown={(e) => {
-          if (e.nativeEvent.isComposing) {
-            e.stopPropagation()
-            return
-          }
-          const mod = e.metaKey || e.ctrlKey
-          const key = e.key.toLowerCase()
-          if (e.key === 'Enter' || e.key === 'F3' || (mod && key === 'g')) {
-            e.preventDefault()
-            if (e.shiftKey) controller.prev()
-            else controller.next()
-          } else if (mod && key === 'f') {
-            e.preventDefault()
-            e.currentTarget.select()
-          }
-        }}
-      />
-      <span className="findbar-count" aria-live="polite">
-        {label}
-      </span>
-      {showIndexing && <span className="findbar-status">Indexing…</span>}
-      <button
-        className="icon-btn"
-        title="Previous match (Shift+Enter)"
-        aria-label="Previous match"
-        disabled={none}
-        // Keep focus in the input so typing can go on after a click.
-        onMouseDown={(e) => e.preventDefault()}
-        onClick={() => controller.prev()}
-      >
-        <ChevronUpIcon size={15} />
-      </button>
-      <button
-        className="icon-btn"
-        title="Next match (Enter)"
-        aria-label="Next match"
-        disabled={none}
-        onMouseDown={(e) => e.preventDefault()}
-        onClick={() => controller.next()}
-      >
-        <ChevronDownIcon size={15} />
-      </button>
-      <button
-        className="icon-btn"
-        title="Close (Esc)"
-        aria-label="Close find"
-        onMouseDown={(e) => e.preventDefault()}
-        onClick={() => controller.close()}
-      >
-        <CloseIcon size={15} />
-      </button>
+      <div className="findbar-main">
+        <span className="findbar-icon" aria-hidden="true">
+          <SearchIcon size={15} />
+        </span>
+        <input
+          ref={inputRef}
+          className="findbar-input"
+          type="text"
+          placeholder="Find in documents"
+          aria-label="Find in documents"
+          spellCheck={false}
+          autoComplete="off"
+          value={value}
+          onChange={(e) => {
+            setValue(e.target.value)
+            controller.setQuery(e.target.value)
+          }}
+          onKeyDown={(e) => {
+            if (e.nativeEvent.isComposing) {
+              e.stopPropagation()
+              return
+            }
+            const mod = e.metaKey || e.ctrlKey
+            const key = e.key.toLowerCase()
+            if (e.key === 'Enter' || e.key === 'F3' || (mod && key === 'g')) {
+              e.preventDefault()
+              if (e.shiftKey) controller.prev()
+              else controller.next()
+            } else if (mod && key === 'f') {
+              e.preventDefault()
+              e.currentTarget.select()
+            }
+          }}
+        />
+        <span className="findbar-count" aria-live="polite">
+          {label}
+        </span>
+        {showIndexing && <span className="findbar-status">Indexing…</span>}
+        <button
+          className="icon-btn"
+          title="Previous match (Shift+Enter)"
+          aria-label="Previous match"
+          disabled={none}
+          // Keep focus in the input so typing can go on after a click.
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={() => controller.prev()}
+        >
+          <ChevronUpIcon size={15} />
+        </button>
+        <button
+          className="icon-btn"
+          title="Next match (Enter)"
+          aria-label="Next match"
+          disabled={none}
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={() => controller.next()}
+        >
+          <ChevronDownIcon size={15} />
+        </button>
+        <button
+          className="icon-btn"
+          title="Close (Esc)"
+          aria-label="Close find"
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={() => controller.close()}
+        >
+          <CloseIcon size={15} />
+        </button>
+      </div>
+      <OcrFindRow />
     </div>
   )
 }

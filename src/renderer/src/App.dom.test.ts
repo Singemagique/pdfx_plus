@@ -47,7 +47,8 @@ const stubs = vi.hoisted(() => {
       getPathForFile: () => '',
       listCardTokens: async () => [],
       findCardModules: async () => [],
-      listWindowsCerts: async () => []
+      listWindowsCerts: async () => [],
+      setMenuChecked: vi.fn()
     },
     configurable: true,
     writable: true
@@ -225,5 +226,77 @@ describe('App · Find', () => {
     await click(button(/^Sign$/))
     await act(async () => stubs.menu?.('find'))
     expect(container.querySelector('.findbar')).toBeNull()
+  })
+})
+
+describe('App · Document menu (OCR, DESIGN.md §3.8)', () => {
+  const menu = (action: string): Promise<void> =>
+    act(async () => {
+      stubs.menu!(action)
+      await new Promise((r) => setTimeout(r, 0))
+    })
+  const toast = (): string | null => container.querySelector('.toast')?.textContent ?? null
+  const setMenuChecked = (): ReturnType<typeof vi.fn> =>
+    (window.api as unknown as { setMenuChecked: ReturnType<typeof vi.fn> }).setMenuChecked
+
+  it('Recognize Text… (also Ctrl/Cmd+Shift+R) opens the dialog; Replace… opens it in Replace mode', async () => {
+    await act(async () => root.render(createElement(App)))
+    await menu('recognize-text')
+    expect(container.querySelector('.ocr-dialog h2')?.textContent).toBe('Recognize Text')
+    // A second command while the dialog is open is ignored (it is modal).
+    await menu('replace-recognized-text')
+    expect(container.querySelector('.ocr-dialog h2')?.textContent).toBe('Recognize Text')
+    await click(button(/^Cancel$/))
+    expect(container.querySelector('.ocr-dialog')).toBeNull()
+    await menu('replace-recognized-text')
+    expect(container.querySelector('.ocr-dialog h2')?.textContent).toBe('Replace Recognized Text')
+  })
+
+  it('the two checkboxes: Show toggles (and is mirrored), Include flips the export setting', async () => {
+    await act(async () => root.render(createElement(App)))
+    setMenuChecked().mockClear()
+    await menu('show-recognized-text')
+    expect(setMenuChecked()).toHaveBeenCalledWith('show-recognized-text', true)
+    await menu('show-recognized-text')
+    expect(setMenuChecked()).toHaveBeenLastCalledWith('show-recognized-text', false)
+    await menu('include-recognized-text')
+    expect(setMenuChecked()).toHaveBeenCalledWith('include-recognized-text', false)
+    await menu('include-recognized-text')
+    expect(setMenuChecked()).toHaveBeenLastCalledWith('include-recognized-text', true)
+  })
+
+  it('no Document command runs behind the open Recognize dialog (it is modal)', async () => {
+    await act(async () => root.render(createElement(App)))
+    await menu('recognize-text')
+    expect(container.querySelector('.ocr-dialog')).not.toBeNull()
+    for (const a of ['remove-recognized-text', 'copy-page-text', 'recognize-all-scanned']) {
+      await menu(a)
+      expect(toast()).toBeNull()
+    }
+    expect(container.querySelector('.ocr-dialog h2')?.textContent).toBe('Recognize Text')
+  })
+
+  it('the toast text goes through an always-mounted live region (announced, not just shown)', async () => {
+    await act(async () => root.render(createElement(App)))
+    const region = (): Element | null =>
+      [...container.querySelectorAll('.sr-only[role="status"][aria-live="polite"]')].find(
+        (e) => !e.closest('.toolbar')
+      ) ?? null
+    expect(region()).not.toBeNull() // there before any toast
+    expect(region()!.textContent).toBe('')
+    await menu('recognize-all-scanned')
+    expect(region()!.textContent).toBe('No scanned pages are waiting for text recognition')
+    // The visible toast is not a second live region.
+    expect(container.querySelector('.toast')!.getAttribute('role')).toBeNull()
+  })
+
+  it('Copy Page Text, Remove and Recognize All say what they could not do', async () => {
+    await act(async () => root.render(createElement(App)))
+    await menu('copy-page-text')
+    expect(toast()).toBe('Select a page to copy its text')
+    await menu('remove-recognized-text')
+    expect(toast()).toBe('No recognized text to remove')
+    await menu('recognize-all-scanned')
+    expect(toast()).toBe('No scanned pages are waiting for text recognition')
   })
 })

@@ -77,7 +77,23 @@ export interface OpenedFile {
 
 export type ZoomAction = 'in' | 'out' | 'reset'
 
-export type MenuAction = 'open' | 'export-pdfx' | 'export-pdf' | 'export-zip' | 'find'
+export type MenuAction =
+  | 'open'
+  | 'export-pdfx'
+  | 'export-pdf'
+  | 'export-zip'
+  | 'find'
+  // The Document menu (DESIGN.md §3.8); 'recognize-text' also comes from Ctrl/Cmd+Shift+R.
+  | 'recognize-text'
+  | 'recognize-all-scanned'
+  | 'replace-recognized-text'
+  | 'remove-recognized-text'
+  | 'show-recognized-text'
+  | 'include-recognized-text'
+  | 'copy-page-text'
+
+/** The Document menu's checkboxes (their state lives in the renderer; main mirrors it). */
+export type MenuCheckbox = 'show-recognized-text' | 'include-recognized-text'
 
 export interface SaveFilter {
   name: string
@@ -209,6 +225,9 @@ const api = {
     ipcRenderer.on('pdfx:menu', listener)
     return () => ipcRenderer.removeListener('pdfx:menu', listener)
   },
+  /** Mirror a Document-menu checkbox's state into the native menu. */
+  setMenuChecked: (id: MenuCheckbox, checked: boolean): void =>
+    ipcRenderer.send('pdfx:menu-checked', id, checked),
   /** App settings (userData/settings.json), validated in main. */
   getSettings: (): Promise<Settings> => ipcRenderer.invoke('pdfx:settings-get'),
   /** Merge a patch; main rejects unknown keys or invalid values. Resolves with the new settings. */

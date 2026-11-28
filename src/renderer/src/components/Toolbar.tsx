@@ -11,6 +11,8 @@ interface ToolbarProps {
   onExportPdf: () => void
   onExportZip: () => void
   onSign: () => void
+  /** The OCR items (Recognize Text button, activity pill), placed before Export PDF. */
+  ocr?: React.ReactNode
 }
 
 const isMac = window.api.platform === 'darwin'
@@ -27,7 +29,8 @@ export function Toolbar({
   onExport,
   onExportPdf,
   onExportZip,
-  onSign
+  onSign,
+  ocr
 }: ToolbarProps): React.JSX.Element {
   return (
     <header className={`toolbar${isMac ? ' mac' : ''}`}>
@@ -76,6 +79,7 @@ export function Toolbar({
       <button className="btn glass" onClick={onOpen} disabled={busy}>
         Open
       </button>
+      {ocr}
       <button
         className="btn glass"
         onClick={onExportPdf}

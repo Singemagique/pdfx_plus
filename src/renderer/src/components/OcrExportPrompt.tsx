@@ -9,6 +9,7 @@
 
 import { useEffect, useRef, useSyncExternalStore } from 'react'
 import type { OcrPrompt, OcrPromptAnswer, OcrStore } from '../ocr/ocr-store'
+import { SIGNED_SOURCE_NOTE } from '../ocr/signed-source'
 
 const pages = (n: number): string => `${n} page${n === 1 ? '' : 's'}`
 
@@ -23,10 +24,12 @@ interface ModalProps {
   text: string
   buttons: Array<{ label: string; answer: OcrPromptAnswer; primary?: boolean }>
   onAnswer: (a: OcrPromptAnswer) => void
+  /** The signed-source note (§3.7.7), when a source carries a digital signature. */
+  note?: string
 }
 
 /** The modal: focus on the primary button, Tab cycles inside, Esc cancels. */
-function Modal({ title, text, buttons, onAnswer }: ModalProps): React.JSX.Element {
+function Modal({ title, text, buttons, onAnswer, note }: ModalProps): React.JSX.Element {
   const box = useRef<HTMLDivElement | null>(null)
   useEffect(() => {
     const previous = document.activeElement as HTMLElement | null
@@ -69,6 +72,7 @@ function Modal({ title, text, buttons, onAnswer }: ModalProps): React.JSX.Elemen
         <p id="ocr-export-prompt-text" className="sign-hint">
           {text}
         </p>
+        {note && <p className="sign-module-hint">{note}</p>}
         <div className="sign-actions">
           {buttons.map((b) => (
             <button
@@ -85,7 +89,11 @@ function Modal({ title, text, buttons, onAnswer }: ModalProps): React.JSX.Elemen
   )
 }
 
-function view(p: OcrPrompt, onAnswer: (a: OcrPromptAnswer) => void): React.JSX.Element {
+function view(
+  p: OcrPrompt,
+  onAnswer: (a: OcrPromptAnswer) => void,
+  note?: string
+): React.JSX.Element {
   if (p.kind === 'waiting')
     return (
       <div className="ocr-export-waiting" role="status" aria-live="polite">
@@ -106,6 +114,7 @@ function view(p: OcrPrompt, onAnswer: (a: OcrPromptAnswer) => void): React.JSX.E
       <Modal
         title="Text recognition is running"
         text={`Text recognition is still running (${p.done} of ${pages(p.total)}). Export now without the remaining pages, or wait?`}
+        note={note}
         buttons={[
           { label: 'Cancel', answer: 'cancel' },
           { label: 'Export now', answer: 'now' },
@@ -140,8 +149,14 @@ function view(p: OcrPrompt, onAnswer: (a: OcrPromptAnswer) => void): React.JSX.E
 }
 
 /** Renders whatever the store is asking; nothing otherwise. */
-export function OcrExportPrompt({ store }: { store: OcrStore }): React.JSX.Element | null {
+export function OcrExportPrompt({
+  store,
+  signedNote = false
+}: {
+  store: OcrStore
+  signedNote?: boolean
+}): React.JSX.Element | null {
   const p = useSyncExternalStore(store.subscribe, store.getPrompt)
   if (!p) return null
-  return view(p, store.answerPrompt)
+  return view(p, store.answerPrompt, signedNote ? SIGNED_SOURCE_NOTE : undefined)
 }

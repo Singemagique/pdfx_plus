@@ -40,6 +40,21 @@ describe('selectOcrInHistory (the ocrSelect op: Replace / Remove Recognized Text
     expect(JSON.stringify(h.present.ocrSelect)).toBe('{"p1":"cfg-a"}')
   })
 
+  it('one command over several pages (one group) is ONE step: a single undo restores them all', () => {
+    let h = rotateInHistory(start(), 'q', 90)
+    for (const k of ['p1', 'p2', 'p3']) h = selectOcrInHistory(h, k, null, 'remove-1')
+    expect(h.past).toHaveLength(2)
+    h = undo(h)
+    expect(h.present.ocrSelect).toEqual({})
+    expect(h.present.rotations).toEqual({ q: 90 })
+    h = redo(h)
+    expect(h.present.ocrSelect).toEqual({ p1: null, p2: null, p3: null })
+    // A later command is its own step.
+    h = selectOcrInHistory(h, 'p1', 'cfg-a', 'replace-2')
+    expect(h.past).toHaveLength(3)
+    expect(undo(h).present.ocrSelect).toEqual({ p1: null, p2: null, p3: null })
+  })
+
   it('survives loading a .pdfx (which stores no choices) and stays undoable', () => {
     let h = selectOcrInHistory(start(), 'p1', null)
     h = loadIntoHistory(h, { overlays: [], rotations: [['q1', 90]], crops: [] })

@@ -8,6 +8,7 @@ interface FullViewChromeProps {
   pageCount: number
   runClose: () => void
   navByKey: (axis: 'x' | 'y', dir: 1 | -1) => void
+  banner?: React.ReactNode
 }
 
 export function FullViewChrome({
@@ -16,12 +17,15 @@ export function FullViewChrome({
   pi,
   pageCount,
   runClose,
-  navByKey
+  navByKey,
+  banner
 }: FullViewChromeProps): React.JSX.Element {
   return (
     <div className="full-chrome" style={{ opacity: chromeOpacity }}>
       <header className={`full-bar${isMac ? ' mac' : ''}`}>
         <span className="full-title">{docName}</span>
+        {/* The OCR banner shares the bar's strip, so it never covers the page below it. */}
+        {banner}
         <button className="icon-btn" title="Close (Esc)" onClick={runClose}>
           <CloseIcon size={16} />
         </button>

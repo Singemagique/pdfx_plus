@@ -74,8 +74,21 @@ export interface OcrFindSupply {
    * filtered (rules 1–3), or null when there are none or the fail-safe holds them back.
    */
   filteredPage(pageKey: string): PackedOcrPage | null
+  /**
+   * What the export's redaction pass does to a redacted page's scan, as far as its last removal
+   * report says (the scan-redaction note, §3.8): 'whole' when it removes an object covering at least
+   * half the page (the whole scan image: pixel redaction did not apply), 'pixels' when the report is
+   * in and removes no such object, 'unknown' before that (or with no report: no recognised words,
+   * no redaction, or a pass that failed).
+   */
+  redactionOutcome(pageKey: string): 'unknown' | 'pixels' | 'whole'
+  /** A removal report came in (redactionOutcome may have changed). */
+  onChange(listener: () => void): () => void
   dispose(): void
 }
+
+/** An object covering at least this share of the page is "the whole scan". */
+const WHOLE_SCAN_SHARE = 0.5
 
 const redactionsOf = (overlays: readonly Overlay[] | undefined): Overlay[] =>
   overlays?.filter((o) => o.type === 'redaction') ?? []
@@ -115,6 +128,7 @@ export function createOcrFindSupply(opts: OcrFindSupplyOptions): OcrFindSupply {
   let rerun = false
   let disposed = false
   let syncQueued = false
+  const changeListeners = new Set<() => void>()
 
   /**
    * The redactions of every live page of one source (by source id: what one redaction pass sees),
@@ -296,6 +310,7 @@ export function createOcrFindSupply(opts: OcrFindSupplyOptions): OcrFindSupply {
         predictions.set(key, { sig, gone: report?.get(key) ?? null })
       }
       for (const key of keys) syncKey(key)
+      for (const l of [...changeListeners]) l()
     })().finally(() => {
       predicting = null
       if (rerun) {
@@ -339,6 +354,20 @@ export function createOcrFindSupply(opts: OcrFindSupplyOptions): OcrFindSupply {
     },
     filteredPage(pageKey) {
       return effective(pageKey)?.page ?? null
+    },
+    redactionOutcome(pageKey) {
+      const pred = predictions.get(pageKey)
+      const entry = pages.get(pageKey)
+      if (!pred || !pred.gone || !entry || pred.sig !== sigOf(pageKey)) return 'unknown'
+      const area = entry.width * entry.height
+      const whole = pred.gone.some((b) => area > 0 && (b.w * b.h) / area >= WHOLE_SCAN_SHARE)
+      return whole ? 'whole' : 'pixels'
+    },
+    onChange(listener) {
+      changeListeners.add(listener)
+      return () => {
+        changeListeners.delete(listener)
+      }
     },
     dispose() {
       disposed = true
