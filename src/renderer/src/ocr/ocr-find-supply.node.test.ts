@@ -546,6 +546,10 @@ describe('redactionOutcome (the scan-redaction note, PR8)', () => {
     const changed = vi.fn()
     whole.supply.onChange(changed)
     whole.supply.sync(whole.docs, whole.layer([overHello(whole.key)]))
+    // The sync itself notifies too (PR10's overlay re-reads on it): the report landing must
+    // notify again on its own, since that is when redactionOutcome changes.
+    expect(whole.supply.redactionOutcome(whole.key)).toBe('unknown')
+    changed.mockClear()
     await settle()
     expect(changed).toHaveBeenCalled()
     expect(whole.supply.redactionOutcome(whole.key)).toBe('whole')
