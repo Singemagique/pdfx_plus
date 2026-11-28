@@ -21,20 +21,40 @@
 // - `Tz` before EVERY `Tj`: Poppler does not carry Tz across BT/ET (OCRmyPDF #1632). Word width
 //   comes from Tz, never from splitting a word; `Tw` is never used (it ignores 2-byte codes).
 // - An explicit U+0020 between words AND the real geometric gap: extractors that build words from
-//   gaps (pdf.js, Preview) and those that trust space characters (PDFium copy) agree.
+//   gaps (pdf.js, Preview) and those that trust space characters (PDFium copy) agree. Where the
+//   engine's boxes touch or overlap (italics, kerned pairs, tight justification), the previous
+//   word is narrowed so at least MIN_WORD_GAP_EM separates the two: pdf.js joined words up to
+//   0.02 em apart despite the space glyph, PDFium from ~0.1 em of overlap [measured].
+// - Upside-down lines (angle π: an orientation-180 scan the user did not turn upright) read
+//   correctly in pdf.js but come out of PDFium (Chrome/Edge copy) in reversed word order: PDFium
+//   orders a line's text objects by display x, and one Tj per word makes every word its own
+//   object. Content order cannot change that, and one object per line would make a redaction
+//   remove the whole line. Once the page is turned upright with /Rotate (the "looks upside down —
+//   Rotate?" offer, §3.4.5), PDFium's display frame includes the rotation and the order is right.
+//   Known PDFium limitation, pinned in the layer suite.
 // - One Tj per word, so a later PDFium redaction removes exactly the words it touches.
 // - Oblique lines (not a multiple of 90°) all share one page-wide Tz and take each word's width
 //   from `Tc`: pdf.js 5.7.284 reads a Tz change on a tilted baseline as a line break (see `show`).
 // - CJK: no space where `needsSpaceBetween` says so (shared with the Find supply, §3.6.1); the
 //   previous word's Tz is stretched to meet the next one when the gap is ≤ 2 em.
 
-import { PDFArray, PDFBool, PDFDict, PDFName, PDFRef, PDFStream, type PDFPage } from 'pdf-lib'
+import {
+  PDFArray,
+  PDFBool,
+  PDFDict,
+  PDFName,
+  PDFRef,
+  PDFStream,
+  type PDFObject,
+  type PDFPage
+} from 'pdf-lib'
 
 import { bcp47FromTesseract } from '../../../shared/ocr/lang'
 import { needsSpaceBetween } from '../../../shared/ocr/spacing'
 import { cleanOcrText } from '../../../shared/ocr/text'
 import { ocrLines, type OcrLine, type PackedOcrPage } from '../../../shared/ocr/types'
 import { isOcrFontDict, OCR_NARROW, type OcrFontCache } from './ocr-font'
+import { deleteUnreachable } from './reachable'
 
 export type Matrix = [number, number, number, number, number, number]
 
@@ -85,6 +105,13 @@ export const OBLIQUE_TC_MAX = 0.05
 export const OBLIQUE_TZ_QUANTILE = 0.5
 /** Up to this gap (in em) a CJK word's Tz stretches to meet the next CJK word. */
 export const MAX_CJK_STRETCH_EM = 2
+/**
+ * The least separation (in em) between two space-separated words along the baseline: a closer
+ * word is narrowed to keep it. pdf.js joined words up to 0.02 em apart and split them from 0.05;
+ * PDFium joined them at 0.1 em of overlap [measured, PR2 review]; 0.15 leaves margin above
+ * pdf.js's 0.102 em space threshold of tilted text (OBLIQUE_TC_MAX).
+ */
+export const MIN_WORD_GAP_EM = 0.15
 
 /** A PDF number: at most `digits` decimals, no trailing zeros, no "-0". */
 export function num(n: number, digits = 3): string {
@@ -174,13 +201,21 @@ export function ocrLayerContent(
     const s6 = num(sin, 6)
     const words = ws.map((w, i) => {
       const enc = fonts.encode(w.t)
+      const natural = (enc.units / 1000) * size
       const next = ws[i + 1]
-      // The gap along the baseline from this word's end to the next word's start.
-      const gap = next ? (next.x - w.x) * cos + (next.y - w.y) * sin - w.w : 0
+      // Along the baseline: from this word's start to the next one's, and the gap between them.
+      const along = next ? (next.x - w.x) * cos + (next.y - w.y) * sin : 0
+      let gap = next ? along - w.w : 0
       const spaced = next ? needsSpaceBetween(w.t, next.t) : false
       let width = w.w
       if (next && !spaced && gap > 0 && gap <= MAX_CJK_STRETCH_EM * size) width += gap
-      return { w, enc, gap, spaced, width, tz: (100 * width) / ((enc.units / 1000) * size) }
+      else if (next && spaced && gap < MIN_WORD_GAP_EM * size) {
+        // Touching or overlapping boxes: end this word early (never below the Tz floor) so the
+        // space between them is wide enough to read as one; the next word's Tm stays exact.
+        width = Math.max((TZ_MIN / 100) * natural, along - MIN_WORD_GAP_EM * size)
+        gap = along - width
+      }
+      return { w, enc, gap, spaced, width, tz: (100 * width) / natural }
     })
     return {
       size,
@@ -255,22 +290,38 @@ export function isOcrLayerStream(obj: unknown): boolean {
   return obj instanceof PDFStream && obj.dict.get(PDFName.of(OCR_LAYER_KEY)) === PDFBool.True
 }
 
-/** A font resource name on `page` that is free or already bound to `ref`: FOcr, FOcr1, FOcr2, … */
-function fontResourceName(page: PDFPage, ref: PDFRef): string {
-  const fonts = page.node.Resources()?.lookupMaybe(PDFName.of('Font'), PDFDict)
+/** A font resource name in `fonts` that is free or already bound to `ref`: FOcr, FOcr1, … */
+function fontResourceName(fonts: PDFDict | undefined, ref: PDFRef | null): string {
   for (let i = 0; ; i++) {
     const name = i === 0 ? OCR_FONT_RESOURCE : `${OCR_FONT_RESOURCE}${i}`
     const bound = fonts?.get(PDFName.of(name))
-    if (bound === undefined || bound === ref) return name
+    if (bound === undefined || (ref !== null && bound === ref)) return name
   }
+}
+
+/** The page's /Contents entries as a list of stream refs (a stream, an array, or a ref to either). */
+function contentsList(page: PDFPage): PDFObject[] {
+  const ctx = page.node.context
+  const entry = page.node.get(PDFName.of('Contents'))
+  const resolved = entry instanceof PDFRef ? ctx.lookup(entry) : entry
+  if (resolved instanceof PDFArray) return resolved.asArray()
+  if (resolved instanceof PDFStream)
+    return [entry instanceof PDFRef ? entry : ctx.register(resolved)]
+  return []
 }
 
 /**
  * Bake `ocr` into `page` as its own content stream, PREPENDED to /Contents (index 0), with
  * `/PDFxOCRLayer true` in its dictionary, and bind the OCR font as a page font resource. Returns
- * the stream's ref, or null when there is nothing to write. The caller isolates shared /Contents
- * and /Resources first (build.ts `isolateMutableContainers`) and calls `fonts.finalize(doc)` after
- * the last page.
+ * the stream's ref, or null — leaving the page untouched — when there is nothing to write. The
+ * caller calls `fonts.finalize(doc)` after the last page.
+ *
+ * Self-contained against shared containers: /Contents always becomes a fresh direct array, and
+ * /Resources and its /Font dict page-own (shallow) copies, so a /Contents array or resource dict
+ * shared with another page (or a ref to an array, which the font's CID tracking must see through)
+ * is never mutated. `normalize()` is deliberately NOT called: the layer comes first and is
+ * balanced (q … Q), so the original content needs no q/Q wrapper, and wrapping on every
+ * Replace round trip would pile up [layer, q, q, …, Q, Q].
  */
 export function appendOcrLayer(
   page: PDFPage,
@@ -278,33 +329,43 @@ export function appendOcrLayer(
   fonts: OcrFontCache,
   opts: Omit<OcrLayerOptions, 'fontName'> = {}
 ): PDFRef | null {
-  const ctx = page.doc.context
-  page.node.normalize()
-  const fontRef = fonts.ref()
-  const fontName = fontResourceName(page, fontRef)
+  const node = page.node
+  const ctx = node.context
+  const resources = node.Resources() // inherited ones included
+  const fontDict = resources?.lookupMaybe(PDFName.of('Font'), PDFDict)
+  const fontName = fontResourceName(fontDict, fonts.peekRef())
   const content = ocrLayerContent(ocr, fonts, { ...opts, fontName })
   if (!content) return null
   const ref = ctx.register(ctx.flateStream(content.bytes, { [OCR_LAYER_KEY]: true }))
   fonts.track(ref, content.cids)
-  page.node.setFontDictionary(PDFName.of(fontName), fontRef)
-  const contents = page.node.Contents()
-  if (contents instanceof PDFArray) contents.insert(0, ref)
-  else page.node.set(PDFName.of('Contents'), ctx.obj([ref]))
+  const ownFonts = fontDict ? fontDict.clone(ctx) : ctx.obj({})
+  ownFonts.set(PDFName.of(fontName), fonts.ref())
+  const ownRes = resources ? resources.clone(ctx) : ctx.obj({})
+  ownRes.set(PDFName.of('Font'), ownFonts)
+  node.set(PDFName.of('Resources'), ownRes)
+  node.set(PDFName.of('Contents'), ctx.obj([ref, ...contentsList(page)]))
   return ref
 }
 
 /**
  * Remove every PDFx OCR layer stream (dictionary `/PDFxOCRLayer true`) from `page`'s /Contents,
  * leaving every other stream byte-for-byte untouched, and unbind the page's PDFx OCR font
- * resources (BaseFont /PDFxOCR-GlyphLess) so an old ToUnicode does not ride along. Returns the
- * number of streams dropped. /Contents and the Font dict are replaced, never mutated, so a
- * container shared with another page is left alone.
+ * resources (BaseFont /PDFxOCR-GlyphLess). Returns the number of streams dropped. /Contents and
+ * the Font dict are replaced, never mutated, so a container shared with another page is left
+ * alone.
+ *
+ * Unlinking is not removal: pdf-lib's save writes every registered object. So the dropped
+ * streams, the unbound OCR fonts with their whole graph (CIDFont, FontDescriptor, FontFile2,
+ * CIDToGIDMap, ToUnicode) and the replaced indirect containers are then DELETED from the context,
+ * unless something else in the document still reaches them (`deleteUnreachable`): another
+ * page's layer that shares the font keeps it.
  */
 export function dropOcrLayers(page: PDFPage): number {
   const node = page.node
   const ctx = node.context
   const entry = node.get(PDFName.of('Contents'))
   const resolved = entry instanceof PDFRef ? ctx.lookup(entry) : entry
+  const candidates: PDFRef[] = []
   let dropped = 0
   if (isOcrLayerStream(resolved)) {
     node.set(PDFName.of('Contents'), ctx.obj([]))
@@ -312,23 +373,39 @@ export function dropOcrLayers(page: PDFPage): number {
   } else if (resolved instanceof PDFArray) {
     const keep = resolved.asArray().filter((r) => {
       const layer = isOcrLayerStream(r instanceof PDFRef ? ctx.lookup(r) : r)
-      if (layer) dropped++
+      if (layer) {
+        dropped++
+        if (r instanceof PDFRef) candidates.push(r)
+      }
       return !layer
     })
     if (dropped) node.set(PDFName.of('Contents'), ctx.obj(keep))
   }
   if (!dropped) return 0
+  // The old stream, or the old indirect /Contents array.
+  if (entry instanceof PDFRef) candidates.push(entry)
+  const resEntry = node.get(PDFName.of('Resources'))
   const resources = node.Resources()
+  const fontEntry = resources?.get(PDFName.of('Font'))
   const fontDict = resources?.lookupMaybe(PDFName.of('Font'), PDFDict)
   if (resources && fontDict) {
     const own = fontDict.clone(ctx)
+    let unbound = 0
     for (const [name, value] of fontDict.entries()) {
       const dict = value instanceof PDFRef ? ctx.lookupMaybe(value, PDFDict) : value
-      if (dict instanceof PDFDict && isOcrFontDict(dict)) own.delete(name)
+      if (dict instanceof PDFDict && isOcrFontDict(dict)) {
+        own.delete(name)
+        unbound++
+        if (value instanceof PDFRef) candidates.push(value)
+      }
     }
-    const res = resources.clone(ctx)
-    res.set(PDFName.of('Font'), own)
-    node.set(PDFName.of('Resources'), res)
+    if (unbound) {
+      const res = resources.clone(ctx)
+      res.set(PDFName.of('Font'), own)
+      node.set(PDFName.of('Resources'), res)
+      for (const e of [resEntry, fontEntry]) if (e instanceof PDFRef) candidates.push(e)
+    }
   }
+  deleteUnreachable(ctx, candidates)
   return dropped
 }

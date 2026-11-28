@@ -23,7 +23,7 @@ import {
   ocrLayerContent,
   pdfLiteral
 } from './ocr-layer'
-import { decodeStream, flowWords, handPage } from './test-utils/ocr-layer'
+import { allStreams, decodeStream, flowWords, handPage } from './test-utils/ocr-layer'
 
 async function content(page: OcrPage, opts = {}): Promise<string[]> {
   const doc = await PDFDocument.create()
@@ -50,6 +50,14 @@ describe('ocrLayerContent', () => {
     ])
     expect(ops.filter((o) => o === 'ET')).toHaveLength(2)
     expect(ops.slice(-2)).toEqual(['EMC', 'Q'])
+  })
+
+  it('tags /Lang from the page’s first language (und when there is none)', async () => {
+    const bdc = async (langs: string[]): Promise<string> =>
+      (await content(handPage([line(['a'])], { langs }))).find((o) => o.endsWith(' BDC'))!
+    expect(await bdc(['jpn', 'eng'])).toContain('/Lang (ja)')
+    expect(await bdc(['deu'])).toContain('/Lang (de)')
+    expect(await bdc([])).toContain('/Lang (und)')
   })
 
   it('emits the view-origin and intrinsic cm pair before the marked content', async () => {
@@ -95,19 +103,64 @@ describe('ocrLayerContent', () => {
   })
 
   it('keeps the natural space width across a gap wider than 3 em (columns, tables)', async () => {
-    const page = handPage([
-      {
-        y: 50,
-        size: 10,
-        words: [
-          { t: 'left', x: 0, w: 20 },
-          { t: 'right', x: 20 + 31, w: 25 } // 31 pt > 3 em
-        ]
-      }
+    const shownFor = async (gap: number): Promise<string[]> =>
+      (
+        await content(
+          handPage([
+            {
+              y: 50,
+              size: 10,
+              words: [
+                { t: 'left', x: 0, w: 20 },
+                { t: 'right', x: 20 + gap, w: 25 }
+              ]
+            }
+          ])
+        )
+      ).filter((o) => o.endsWith('Tj'))
+    // shown: [left, the space after it, right, the trailing space]
+    const wide = await shownFor(31) // 3.1 em: natural width, the next Tm does the jump
+    expect(wide).toHaveLength(4)
+    expect(wide[1]).toBe('100 Tz <0001> Tj')
+    expect(wide[2]).toMatch(/^1 0 0 1 51 50 Tm /)
+    const below = await shownFor(29) // 2.9 em: still stretched, 29 / (0.5 em × 10) = 580 %
+    expect(below[1]).toBe('580 Tz <0001> Tj')
+  })
+
+  it('keeps ≥ 0.15 em between touching or overlapping words by narrowing the first', async () => {
+    // "one" at 0, 15 pt natural (3 × 0.5 em at size 10); the next word starts at 15 + gap.
+    const shownFor = async (gap: number, angle = 0): Promise<string[]> =>
+      (
+        await content(
+          handPage([
+            {
+              y: 50,
+              size: 10,
+              angle,
+              words: [
+                { t: 'one', x: 0, w: 15 },
+                { t: 'two', x: 15 + gap, w: 15 }
+              ]
+            }
+          ])
+        )
+      ).filter((o) => o.endsWith('Tj'))
+    // gap 0: "one" ends at 13.5 (90 %), the space spans 1.5 pt (30 %), "two" stays at 15.
+    expect(await shownFor(0)).toEqual([
+      '1 0 0 1 0 50 Tm 90 Tz <000200030004> Tj',
+      '30 Tz <0001> Tj',
+      '1 0 0 1 15 50 Tm 100 Tz <000500060002> Tj',
+      '100 Tz <0001> Tj'
     ])
-    const ops = await content(page)
-    expect(ops).toContain('100 Tz <0001> Tj')
-    expect(ops.filter((o) => o.includes(' Tm '))).toHaveLength(2)
+    // Overlap by 0.2 em: "one" ends at 11.5, the space is again 1.5 pt.
+    const overlap = await shownFor(-2)
+    expect(overlap[0]).toMatch(/ 76\.667 Tz /)
+    expect(overlap[1]).toBe('30 Tz <0001> Tj')
+    expect(overlap[2]).toMatch(/^1 0 0 1 13 50 Tm /)
+    // A real gap above the minimum is left exactly as measured.
+    expect((await shownFor(2))[1]).toBe('40 Tz <0001> Tj')
+    // Quarter-turned lines measure along their baseline the same way.
+    expect((await shownFor(0, Math.PI / 2))[1]).toBe('30 Tz <0001> Tj')
   })
 
   it('writes no trailing space after a hyphen, one after anything else', async () => {
@@ -295,11 +348,11 @@ describe('appendOcrLayer / dropOcrLayers', () => {
     const before = original.map((r) => decodeStream(doc.context.lookup(r, PDFStream)))
     expect(dropOcrLayers(page)).toBe(1)
     const after = (page.node.Contents() as PDFArray).asArray()
-    // normalize() wrapped the original content in q … Q streams; the original streams are intact.
-    const kept = after.filter((r) => original.includes(r as PDFRef)) as PDFRef[]
-    expect(kept).toEqual(original)
-    expect(kept.map((r) => decodeStream(doc.context.lookup(r, PDFStream)))).toEqual(before)
-    expect(after.some((r) => isOcrLayerStream(doc.context.lookup(r)))).toBe(false)
+    // Exactly the original streams, byte-exact, and nothing added (no q … Q wrapper).
+    expect(after).toEqual(original)
+    expect(after.map((r) => decodeStream(doc.context.lookup(r as PDFRef, PDFStream)))).toEqual(
+      before
+    )
     const fontsDict = page.node.Resources()!.lookup(PDFName.of('Font'), PDFDict)
     expect(fontsDict.get(PDFName.of('FOcr'))).toBeUndefined()
     expect(fontsDict.keys().length).toBe(1) // Helvetica stays
@@ -313,5 +366,118 @@ describe('appendOcrLayer / dropOcrLayers', () => {
     page.node.set(PDFName.of('Contents'), ref)
     expect(dropOcrLayers(page)).toBe(1)
     expect((page.node.Contents() as PDFArray).size()).toBe(0)
+    expect(doc.context.lookup(ref)).toBeUndefined()
+  })
+
+  /** Everything a raw-bytes reader finds in `bytes`: inflated streams, as latin1 text. */
+  async function rawStreams(bytes: Uint8Array): Promise<string[]> {
+    return (await allStreams(bytes)).map((s) => new TextDecoder('latin1').decode(s.data))
+  }
+
+  /** Bake "Secret Name" onto the scan page, finalize, save: a PDFx output as Replace reopens it. */
+  async function bakedSecret(): Promise<{ bytes: Uint8Array; hex: string[] }> {
+    const src = await scanPage()
+    const fonts = new OcrFontCache(src)
+    const ref = appendOcrLayer(src.getPage(0), pack(handPage([line(['Secret', 'Name'])])), fonts)!
+    fonts.finalize(src)
+    const text = new TextDecoder().decode(decodeStream(src.context.lookup(ref, PDFStream)))
+    const hex = [...text.matchAll(/<([0-9A-F]{8,})> Tj/g)].map((m) => m[1])
+    return { bytes: await src.save({ useObjectStreams: false }), hex }
+  }
+
+  it('Remove: no byte of the old layer or of its font survives the save (raw-bytes oracle)', async () => {
+    const { bytes, hex } = await bakedSecret()
+    expect(hex).toHaveLength(2) // "Secret", "Name"
+    const raw = await rawStreams(bytes)
+    expect(raw.some((s) => s.includes('/PDFxOCR <<'))).toBe(true)
+    expect(raw.some((s) => s.includes('beginbfchar'))).toBe(true)
+    // Reopen (directly, and through copyPages as build.ts does), drop, save.
+    for (const copy of [false, true]) {
+      let doc = await PDFDocument.load(bytes)
+      if (copy) {
+        const out = await PDFDocument.create()
+        const [p] = await out.copyPages(doc, [0])
+        out.addPage(p)
+        doc = out
+      }
+      expect(dropOcrLayers(doc.getPage(0))).toBe(1)
+      const saved = await doc.save({ useObjectStreams: false })
+      const streams = await rawStreams(saved)
+      for (const s of streams) {
+        expect(s).not.toContain('PDFxOCR')
+        expect(s).not.toContain('beginbfchar')
+        for (const h of hex) expect(s).not.toContain(h)
+      }
+      const text = new TextDecoder('latin1').decode(saved)
+      expect(text).not.toContain('PDFxOCR-GlyphLess')
+      expect(text).not.toContain('PDFxOCRLayer')
+      // The page's own content is still there.
+      expect(streams.some((s) => s.includes('Tj') && s.includes('BT'))).toBe(true)
+    }
+  })
+
+  it('Replace round trips do not pile up objects or /Contents entries', async () => {
+    let bytes = (await bakedSecret()).bytes
+    const counts: number[] = []
+    const lengths: number[] = []
+    for (let round = 0; round < 3; round++) {
+      const doc = await PDFDocument.load(bytes)
+      const page = doc.getPage(0)
+      expect(dropOcrLayers(page)).toBe(1)
+      const fonts = new OcrFontCache(doc)
+      appendOcrLayer(page, pack(handPage([line(['Secret', 'Name'])])), fonts)
+      fonts.finalize(doc)
+      bytes = await doc.save({ useObjectStreams: false })
+      const saved = await PDFDocument.load(bytes)
+      counts.push(saved.context.enumerateIndirectObjects().length)
+      lengths.push((saved.getPage(0).node.Contents() as PDFArray).size())
+    }
+    expect(new Set(counts).size).toBe(1)
+    expect(lengths).toEqual([2, 2, 2]) // [layer, the page's own stream]
+  })
+
+  it('a dropped layer in the SAME document is deleted too (append, drop, finalize)', async () => {
+    const doc = await scanPage()
+    const fonts = new OcrFontCache(doc)
+    const ref = appendOcrLayer(doc.getPage(0), ocr, fonts)!
+    expect(dropOcrLayers(doc.getPage(0))).toBe(1)
+    fonts.finalize(doc)
+    expect(doc.context.lookup(ref)).toBeUndefined()
+    const streams = await rawStreams(await doc.save({ useObjectStreams: false }))
+    for (const s of streams) expect(s).not.toContain('PDFxOCR')
+  })
+
+  it('Remove on one page leaves a font shared with another page’s layer bound and written', async () => {
+    // Two pages with ONE indirect /Resources (and Font dict), each with its own layer, saved and
+    // reopened: Remove on page 1 only.
+    const src = await PDFDocument.create()
+    src.addPage([200, 100])
+    src.addPage([200, 100])
+    const ctx = src.context
+    const sharedFont = ctx.register(ctx.obj({}))
+    const sharedRes = ctx.register(ctx.obj({ Font: sharedFont }))
+    for (const p of src.getPages()) p.node.set(PDFName.of('Resources'), sharedRes)
+    const fonts = new OcrFontCache(src)
+    for (const p of src.getPages()) appendOcrLayer(p, ocr, fonts)
+    // Re-share the (now page-own) Font dicts, as a third-party tool that dedupes would.
+    const fontDict = src.getPage(0).node.Resources()!.lookup(PDFName.of('Font'), PDFDict)
+    ctx.assign(sharedFont, fontDict)
+    for (const p of src.getPages()) p.node.set(PDFName.of('Resources'), sharedRes)
+    fonts.finalize(src)
+    const doc = await PDFDocument.load(await src.save({ useObjectStreams: false }))
+    const [p1, p2] = doc.getPages()
+    const ocrFont = (p: typeof p1) =>
+      p.node.Resources()!.lookup(PDFName.of('Font'), PDFDict).get(PDFName.of('FOcr'))
+    const bound = ocrFont(p2)
+    expect(bound).toBeInstanceOf(PDFRef)
+    expect(ocrFont(p1)).toBe(bound)
+    expect(dropOcrLayers(p1)).toBe(1)
+    expect(ocrFont(p1)).toBeUndefined()
+    expect(ocrFont(p2)).toBe(bound) // the shared dict was not mutated
+    expect(doc.context.lookup(bound as PDFRef, PDFDict)).toBeDefined() // nor the font deleted
+    const saved = await doc.save({ useObjectStreams: false })
+    expect(new TextDecoder('latin1').decode(saved)).toContain('PDFxOCR-GlyphLess')
+    const reread = await PDFDocument.load(saved)
+    expect(ocrFont(reread.getPage(1))).toBeInstanceOf(PDFRef)
   })
 })

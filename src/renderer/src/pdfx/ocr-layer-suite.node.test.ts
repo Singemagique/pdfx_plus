@@ -7,7 +7,7 @@
 // Pinned to pdf.js 5.7.284 and @embedpdf/pdfium 2.14.x (R13): re-run on any upgrade.
 
 import { createHash } from 'node:crypto'
-import { PDFDocument, PDFName, PDFRawStream } from 'pdf-lib'
+import { degrees, PDFDocument, PDFName, PDFRawStream } from 'pdf-lib'
 import { beforeAll, describe, expect, it } from 'vitest'
 
 import { needsSpaceBetween } from '../../../shared/ocr/spacing'
@@ -21,6 +21,7 @@ import { buildPageText, toItemGeom } from '../search/extract'
 import { textMatchRects } from '../search/geometry'
 import { loadTestPdfium } from '../test-utils/pdfium'
 import type { OcrFontBBox } from './ocr-font'
+import { dropOcrLayers } from './ocr-layer'
 import {
   allStreams,
   bakeLayer,
@@ -468,6 +469,90 @@ describe('hand-made pages', () => {
     })
     expect(pdfjsCopyText((await pdfjsText(baked.bytes)).items)).toBe(expected.join('\n'))
     expect(pdfiumCopyText(pdfiumProbe(pdfium, baked.bytes))).toBe(expected.join('\n'))
+  })
+
+  describe.each([
+    ['upright', 0],
+    ['90°', Math.PI / 2],
+    ['270°', -Math.PI / 2],
+    ['2° tilt', 0.035]
+  ])('touching or overlapping word boxes (%s)', (_name, angle) => {
+    it.each([
+      [10, -0.5],
+      [10, -0.2],
+      [10, 0],
+      [10, 0.02],
+      [30, -0.2],
+      [30, 0],
+      [30, 0.02]
+    ])('size %i, gap %s em: both extractors keep the words apart', async (size, gapEm) => {
+      // Real engine boxes touch or overlap with italics, kerned pairs and tight justification;
+      // the synth pages' ~0.25 em gaps never do (MIN_WORD_GAP_EM in ocr-layer.ts).
+      const vertical = Math.abs(Math.sin(angle)) > 0.5
+      const line = {
+        y: vertical ? (angle > 0 ? 40 : 260) : 150,
+        x0: vertical ? 200 : 20,
+        size,
+        angle,
+        words: flowWords(['one', 'two', 'six'], size / 2, gapEm * size)
+      }
+      const baked = await bakeLayer(await blankPdf(), [handPage([line])])
+      expect(pdfjsCopyText((await pdfjsText(baked.bytes)).items)).toBe('one two six')
+      expect(pdfiumCopyText(pdfiumProbe(pdfium, baked.bytes))).toBe('one two six')
+    })
+  })
+
+  it('upside-down lines (angle π): pdf.js reads them; PDFium reverses the words (known limitation)', async () => {
+    // An orientation-180 scan the user did not turn upright. PDFium orders a line's text objects
+    // by display x, and each word is its own object, so it reads the words right to left in page
+    // terms; content order does not change that (reversing it only broke pdf.js: "downUpside")
+    // [measured]. See ocr-layer.ts's header.
+    const up = (y: number, words: string[]) => ({
+      y,
+      size: 20,
+      x0: 380,
+      angle: Math.PI,
+      words: flowWords(words, 10, 6)
+    })
+    const baked = await bakeLayer(await blankPdf(), [
+      handPage([up(150, ['Upside', 'down']), up(120, ['Second', 'row'])])
+    ])
+    expect(pdfjsCopyText((await pdfjsText(baked.bytes)).items)).toBe('Upside down\nSecond row')
+    expect(pdfiumCopyText(pdfiumProbe(pdfium, baked.bytes))).toBe(' down Upside\n row Second')
+    // Turned upright with /Rotate 180 (the "Rotate?" offer), the same scan reads right in both.
+    const rotated = await bakeLayer(
+      await blankPdf(400, 300, (doc) => doc.getPage(0).setRotation(degrees(180))),
+      [handPage([{ y: 150, size: 20, x0: 20, words: flowWords(['Upside', 'down'], 10, 6) }])]
+    )
+    expect(pdfjsCopyText((await pdfjsText(rotated.bytes)).items)).toBe('Upside down')
+    expect(pdfiumCopyText(pdfiumProbe(pdfium, rotated.bytes))).toBe('Upside down')
+  })
+
+  it('a line-final hyphen: no trailing space; PDFium dehyphenates to U+FFFE', async () => {
+    const baked = await bakeLayer(await blankPdf(), [
+      handPage([
+        { y: 200, size: 12, x0: 20, words: flowWords(['An', 'inter-'], 6, 4) },
+        { y: 180, size: 12, x0: 20, words: flowWords(['national', 'deal'], 6, 4) }
+      ])
+    ])
+    expect(pdfjsCopyText((await pdfjsText(baked.bytes)).items)).toBe('An inter-\nnational deal')
+    const pf = pdfiumProbe(pdfium, baked.bytes)
+    // PDFium's own text: the hyphen becomes U+FFFE and the line break goes [measured].
+    expect(pf.text).toBe('An inter￾national deal')
+    expect(pdfiumCopyText(pf)).toBe('An inter-\nnational deal')
+  })
+
+  it('the PDFium probe reads an empty page as empty text (no uninitialised buffer)', async () => {
+    const empty = pdfiumProbe(pdfium, await blankPdf())
+    expect(empty.chars).toEqual([])
+    expect(empty.text).toBe('')
+    // And after Remove on a baked page.
+    const baked = await bakeLayer(await blankPdf(), [
+      handPage([{ y: 200, size: 12, x0: 20, words: flowWords(['gone'], 6, 4) }])
+    ])
+    const doc = await PDFDocument.load(baked.bytes)
+    expect(dropOcrLayers(doc.getPage(0))).toBe(1)
+    expect(pdfiumProbe(pdfium, await doc.save()).text).toBe('')
   })
 
   it.each([0, 90, 180, 270])(

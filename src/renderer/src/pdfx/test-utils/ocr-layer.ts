@@ -337,8 +337,11 @@ export function pdfiumProbe(pdfium: ProbePdfium, bytes: Uint8Array, index = 0): 
       const buf = rt.wasmExports.malloc((n + 1) * 2)
       let text = ''
       try {
-        pdfium.FPDFText_GetText(tp, 0, n, buf)
-        text = rt.UTF16ToString(buf)
+        // Zeroed first: on a page with no chars PDFium writes nothing, not even the NUL, and the
+        // malloc'd bytes would read back as text. The result counts the NUL it wrote.
+        rt.HEAPU8.fill(0, buf, buf + (n + 1) * 2)
+        const written = n > 0 ? pdfium.FPDFText_GetText(tp, 0, n, buf) : 0
+        text = written > 1 ? rt.UTF16ToString(buf).slice(0, written - 1) : ''
       } finally {
         rt.wasmExports.free(buf)
       }
@@ -402,9 +405,15 @@ export function pdfiumProbe(pdfium: ProbePdfium, bytes: Uint8Array, index = 0): 
  * PDFium's text as a viewer copies it: FPDFText_GetText with "\r\n" → "\n" and each line's
  * trailing whitespace trimmed. Generated chars (PDFium's own inferred spaces and line breaks) are
  * part of it, exactly as in a real copy.
+ *
+ * A line ending in "-" triggers PDFium's dehyphenation: it reports U+FFFE in place of the hyphen
+ * and drops the line break ("An inter￾national deal") [measured]. That is mapped back to "-"
+ * plus a line break, so the comparison is with the text as laid out. Any PDFium-based oracle
+ * (PR3b's raw/extractor checks) must apply the same normalisation.
  */
 export function pdfiumCopyText(probe: PdfiumPageProbe): string {
   return probe.text
+    .replace(/￾(\r\n?|\n)?/g, '-\n')
     .replace(/\r\n?/g, '\n')
     .split('\n')
     .map((l) => l.replace(/\s+$/, ''))

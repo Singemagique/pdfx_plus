@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest'
 
 import { pack, type OcrPage } from '../../../shared/ocr/types'
 import {
+  GLYPHLESS_TTF_DIAGONAL,
   GLYPHLESS_TTF_FONTBBOX,
   GLYPHLESS_TTF_NO_CONTOUR,
   GLYPHLESS_TTF_ZERO_AREA
@@ -90,6 +91,7 @@ function parseCMap(cmap: string): { entries: [number, string][]; blocks: number[
 describe('glyphless TTF', () => {
   const variants = {
     'zero-area': b64(GLYPHLESS_TTF_ZERO_AREA),
+    diagonal: b64(GLYPHLESS_TTF_DIAGONAL),
     none: b64(GLYPHLESS_TTF_NO_CONTOUR),
     fontbbox: b64(GLYPHLESS_TTF_FONTBBOX)
   }
@@ -110,17 +112,24 @@ describe('glyphless TTF', () => {
     expect(commands(f.getGlyph(0))).toEqual([]) // .notdef has no contour
   })
 
-  it('zero-area: g1 / g2 are one two-point contour spanning their em box, filling nothing', () => {
+  it('zero-area: g1 / g2 are two one-point contours at their em box corners, with no edge', () => {
     const f = fontkit.create(variants['zero-area'])
     for (const [gid, w] of [
       [1, 500],
       [2, 1000]
     ]) {
       const g = f.getGlyph(gid)
-      expect(commands(g).map((c) => c.command)).toEqual(['moveTo', 'lineTo', 'closePath'])
+      // Two separate points: nothing for a fill rule or dropout control to paint (a lineTo
+      // between them was the diagonal variant's hairline).
+      expect(commands(g).map((c) => c.command)).toEqual([
+        'moveTo',
+        'closePath',
+        'moveTo',
+        'closePath'
+      ])
       expect(
         commands(g)
-          .slice(0, 2)
+          .filter((c) => c.command === 'moveTo')
           .map((c) => c.args)
       ).toEqual([
         [0, -200],
@@ -129,6 +138,18 @@ describe('glyphless TTF', () => {
       expect([g.bbox.minX, g.bbox.minY, g.bbox.maxX, g.bbox.maxY]).toEqual([0, -200, w, 800])
     }
     expect([f.bbox.minX, f.bbox.minY, f.bbox.maxX, f.bbox.maxY]).toEqual([0, -200, 1000, 800])
+  })
+
+  it('diagonal (rejected): g1 / g2 are one two-point there-and-back contour', () => {
+    const f = fontkit.create(variants.diagonal)
+    const g = f.getGlyph(2)
+    expect(commands(g).map((c) => c.command)).toEqual(['moveTo', 'lineTo', 'closePath'])
+    expect([g.bbox.minX, g.bbox.minY, g.bbox.maxX, g.bbox.maxY]).toEqual([0, -200, 1000, 800])
+  })
+
+  it.each(Object.entries(variants))('%s: hhea advanceWidthMax is the wide advance', (_n, bytes) => {
+    const hhea = (fontkit.create(bytes) as unknown as { hhea: { advanceWidthMax: number } }).hhea
+    expect(hhea.advanceWidthMax).toBe(1000)
   })
 
   it('none and fontbbox: no contours; only fontbbox keeps the em box in head', () => {
@@ -184,6 +205,10 @@ describe('OcrFontCache', () => {
     expect(fonts.encode('字').cids).toEqual([3])
     expect(() => fonts.encode('a\u0000')).toThrow(/cannot be mapped/)
     expect(() => fonts.encode('﻿')).toThrow(/cannot be mapped/)
+    expect(() => fonts.encode('￾')).toThrow(/cannot be mapped/)
+    // Lone surrogates (a caller that skipped cleanOcrText): no CID, no invalid <D800> ToUnicode.
+    expect(() => fonts.encode('a\ud800')).toThrow(/cannot be mapped/)
+    expect(() => fonts.encode('\udc00b')).toThrow(/cannot be mapped/)
   })
 
   it('writes the Type0 / CIDFontType2 / descriptor structure of §3.7.4', async () => {
@@ -205,7 +230,8 @@ describe('OcrFontCache', () => {
     expect(String(info.get(PDFName.of('Ordering')))).toBe('(Identity)')
     expect(String(info.get(PDFName.of('Supplement')))).toBe('0')
     expect(f.desc.lookup(PDFName.of('Flags'), PDFNumber).asNumber()).toBe(4)
-    expect(String(f.desc.get(PDFName.of('FontBBox')))).toBe('[ 0 -200 500 800 ]')
+    // The union of all glyph boxes (PDF 32000 §9.8.1): g2 is 1000 wide.
+    expect(String(f.desc.get(PDFName.of('FontBBox')))).toBe('[ 0 -200 1000 800 ]')
     expect(String(f.desc.get(PDFName.of('Ascent')))).toBe('800')
     expect(String(f.desc.get(PDFName.of('Descent')))).toBe('-200')
     expect(String(f.desc.get(PDFName.of('CapHeight')))).toBe('700')
@@ -232,32 +258,105 @@ describe('OcrFontCache', () => {
     fonts.finalize(doc)
     const { desc } = fontParts(doc, fonts.ref())
     expect(desc.lookup(PDFName.of('Flags'), PDFNumber).asNumber()).toBe(5)
-    expect(String(desc.get(PDFName.of('FontBBox')))).toBe('[ 0 0 500 1000 ]')
+    expect(String(desc.get(PDFName.of('FontBBox')))).toBe('[ 0 0 1000 1000 ]')
   })
 
   it('builds every table ONLY from the layer streams still on the pages (redaction rule 5)', async () => {
     const doc = await PDFDocument.create()
-    const keep = doc.addPage([300, 200])
-    const drop = doc.addPage([300, 200])
-    const removed = doc.addPage([300, 200])
+    doc.addPage([300, 200])
+    doc.addPage([300, 200])
+    doc.addPage([300, 200])
     const fonts = new OcrFontCache(doc)
-    appendOcrLayer(keep, pack(onePage(['public'])), fonts)
+    // The build pattern: pages baked through getPage(i), which POPULATES pdf-lib's page cache;
+    // pdf-lib 1.17.1's removePage does not invalidate it, so getPages() would still list page 2.
+    // Provisional CIDs in baking order: ' ' 1, 三 2 | 张 3, p u b l i c 4–9 | Ω m e g a 10–14.
+    const refs = [
+      appendOcrLayer(doc.getPage(0), pack(onePage(['三'])), fonts)!,
+      appendOcrLayer(doc.getPage(1), pack(onePage(['张', 'public'])), fonts)!,
+      appendOcrLayer(doc.getPage(2), pack(onePage(['Ωmega'])), fonts)!
+    ]
     // A page whose layer is dropped again (Replace/Remove) and a page removed from the output:
-    // the characters only they used (张 三 / Ω) must not reach any font table.
-    appendOcrLayer(drop, pack(onePage(['张三'])), fonts)
-    appendOcrLayer(removed, pack(onePage(['Ω'])), fonts)
-    expect(dropOcrLayers(drop)).toBe(1)
+    // the characters only they used (三 / Ω m e g a) must not reach any font table.
+    expect(dropOcrLayers(doc.getPage(0))).toBe(1)
     doc.removePage(2)
+    expect(doc.getPages().length).toBe(3) // the stale cache this must not trust
     fonts.finalize(doc)
     const f = fontParts(doc, fonts.ref())
-    const cps = parseCMap(f.toUnicode).entries.map(([, d]) => String.fromCodePoint(parseInt(d, 16)))
-    expect(cps.sort().join('')).toBe(' bcilpu')
-    expect(String(f.w)).toBe('[ ]') // 张 and 三 were the only wide characters
-    // Unused CIDs (including the dropped 张 三 Ω) map to GID 0; no used CID is 0.
-    const used = parseCMap(f.toUnicode).entries.map(([c]) => c)
-    expect(used).not.toContain(0)
-    for (let cid = 0; cid < f.gidMap.length / 2; cid++)
-      expect(f.gidMap[2 * cid + 1], `cid ${cid}`).toBe(used.includes(cid) ? 1 : 0)
+    const { entries } = parseCMap(f.toUnicode)
+    const cps = entries.map(([, d]) => String.fromCodePoint(parseInt(d, 16)))
+    expect(cps.join('')).toBe(' 张public')
+    // Dense CIDs 1..n in first-use order: no hole where 三 was provisionally numbered, nothing
+    // after c where Ω m e g a were.
+    expect(entries.map(([c]) => c)).toEqual([1, 2, 3, 4, 5, 6, 7, 8])
+    expect(String(f.w)).toBe('[ 2 [ 1000 ] ]') // 张 is the only wide character left
+    expect([...f.gidMap]).toEqual([0, 0, 0, 1, 0, 2, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1])
+    // The kept stream was renumbered to match (张, space, public, trailing space); the dropped
+    // and the removed page's streams are deleted from the context (save writes every registered
+    // object, linked or not).
+    const kept = new TextDecoder().decode(decodeStream(doc.context.lookup(refs[1], PDFStream)))
+    expect([...kept.matchAll(/<([0-9A-F]+)> Tj/g)].map((m) => m[1])).toEqual([
+      '0002',
+      '0001',
+      '000300040005000600070008',
+      '0001'
+    ])
+    expect(doc.context.lookup(refs[0])).toBeUndefined()
+    expect(doc.context.lookup(refs[2])).toBeUndefined()
+  })
+
+  it('counts a layer behind an indirect /Contents array (a ref to [s])', async () => {
+    const doc = await PDFDocument.create()
+    const page = doc.addPage([300, 200])
+    const ctx = doc.context
+    const s = ctx.register(ctx.flateStream('0 0 m 1 1 l S'))
+    const arrayRef = ctx.register(ctx.obj([s]))
+    page.node.set(PDFName.of('Contents'), arrayRef)
+    const fonts = new OcrFontCache(doc)
+    const ref = appendOcrLayer(page, pack(onePage(['Hello', 'world'])), fonts)!
+    // A fresh direct array: the (possibly shared) indirect one is left as it was.
+    const contents = page.node.get(PDFName.of('Contents'))
+    expect(contents).toBeInstanceOf(PDFArray)
+    expect((contents as PDFArray).asArray()).toEqual([ref, s])
+    expect(ctx.lookup(arrayRef, PDFArray).asArray()).toEqual([s])
+    expect(fonts.usedCids(doc)).toEqual([1, 2, 3, 4, 5, 6, 7, 8])
+    // And the case usedCids must see through itself: the layer inside a ref'd array.
+    const doc2 = await PDFDocument.create()
+    const page2 = doc2.addPage([300, 200])
+    const fonts2 = new OcrFontCache(doc2)
+    const ref2 = appendOcrLayer(page2, pack(onePage(['Hi'])), fonts2)!
+    page2.node.set(PDFName.of('Contents'), doc2.context.register(doc2.context.obj([ref2])))
+    expect(fonts2.usedCids(doc2)).toEqual([1, 2, 3])
+    fonts2.finalize(doc2)
+    expect(parseCMap(fontParts(doc2, fonts2.ref()).toUnicode).entries.length).toBe(3)
+  })
+
+  it('a page whose every word is filtered stays untouched, and no font is written', async () => {
+    const doc = await PDFDocument.create()
+    const page = doc.addPage([100, 100])
+    const before = doc.context.enumerateIndirectObjects().length
+    const keys = page.node.keys().map(String)
+    const fonts = new OcrFontCache(doc)
+    expect(appendOcrLayer(page, pack(onePage(['​'])), fonts)).toBeNull()
+    expect(page.node.keys().map(String)).toEqual(keys)
+    expect(fonts.peekRef()).toBeNull()
+    fonts.finalize(doc)
+    expect(doc.context.enumerateIndirectObjects().length).toBe(before)
+  })
+
+  it('writes no font, and leaves no dangling binding, when every layer was dropped', async () => {
+    const doc = await PDFDocument.create()
+    const page = doc.addPage([100, 100])
+    const fonts = new OcrFontCache(doc)
+    appendOcrLayer(page, pack(onePage(['gone'])), fonts)
+    expect(dropOcrLayers(page)).toBe(1)
+    fonts.finalize(doc)
+    expect(doc.context.lookup(fonts.ref())).toBeUndefined()
+    const fontDict = page.node.Resources()!.lookup(PDFName.of('Font'), PDFDict)
+    expect(fontDict.keys()).toEqual([])
+    const saved = await PDFDocument.load(await doc.save({ useObjectStreams: false }))
+    expect(saved.context.enumerateIndirectObjects().some(([, o]) => o instanceof PDFStream)).toBe(
+      false
+    )
   })
 
   it('is single-use: finalize once, on its own document, and no encoding afterwards', async () => {

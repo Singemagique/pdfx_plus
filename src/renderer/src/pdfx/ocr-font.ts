@@ -7,8 +7,11 @@
 //     └ CIDFontType2, CIDSystemInfo (Adobe/Identity/0), /DW 500, /W [c [1000 …] …] for wide CIDs,
 //       /CIDToGIDMap stream (used CIDs → GID 1, or GID 2 when wide), FontDescriptor → FontFile2
 //
-// One code point = one CID, allocated from 1 (CID 0 is never used) the first time a baked word
-// needs it. A code point outside the BMP still takes one CID; its ToUnicode value is the UTF-16BE
+// One code point = one CID. `encode` hands out PROVISIONAL CIDs from 1 the first time a baked word
+// needs a code point; `finalize` renumbers the CIDs still shown densely from 1 in first-use order
+// (CID 0 is never used) and rewrites the live layer streams to match, so the output's numbering
+// has no holes where dropped or removed content was (§3.7.4: CIDs are allocated over the filtered
+// set). A code point outside the BMP still takes one CID; its ToUnicode value is the UTF-16BE
 // surrogate pair. Every advance is 500 units, or 1000 for East Asian Wide/Fullwidth code points:
 // never below 500, because PDFium drops identical codes whose advance is under 0.07 em, and a
 // combining mark is a code point like any other. A wide CID maps to GID 2, the 1000-unit twin of the
@@ -16,12 +19,27 @@
 // got a box half its advance [measured, PR2].
 //
 // REDACTION RULE 5 (§3.7.3). /W, CIDToGIDMap and ToUnicode are written by `finalize(doc)` from the
-// CIDs used by the layer streams that are ACTUALLY on the document's pages at that moment, never
-// from everything this cache ever encoded. A layer built for a page that was later dropped, or a
-// stream removed again with `dropOcrLayers`, contributes nothing, so a character that only
-// occurred in a filtered-out word cannot survive in a CMap where no text extractor would report it.
+// CIDs used by the layer streams that are ACTUALLY on the document's pages at that moment (the live
+// page tree, never pdf-lib's page cache, which `removePage` leaves stale), never from everything
+// this cache ever encoded. A layer built for a page that was later removed, or a stream removed
+// again with `dropOcrLayers`, contributes nothing, and `finalize` deletes such streams from the
+// context (pdf-lib's save writes every registered object, linked or not), so a character that only
+// occurred in a filtered-out word cannot survive in the file where no text extractor reports it.
 
-import { PDFArray, PDFDict, PDFDocument, PDFName, PDFNumber, PDFRef, PDFString } from 'pdf-lib'
+import {
+  decodePDFRawStream,
+  PDFArray,
+  PDFDict,
+  PDFDocument,
+  PDFName,
+  PDFNumber,
+  PDFPageLeaf,
+  PDFRawStream,
+  PDFRef,
+  PDFStream,
+  PDFString,
+  type PDFObject
+} from 'pdf-lib'
 import { isWideCodePoint } from '../../../shared/ocr/text'
 import { GLYPHLESS_TTF_ZERO_AREA } from './ocr-glyphless-ttf'
 
@@ -39,9 +57,11 @@ const MAX_CID = 0xffff
 
 /**
  * FontDescriptor metrics. `em` (default) matches the glyph box the layer is positioned with:
- * Flags 4 (Symbolic), FontBBox [0 -200 500 800], Ascent 800, Descent -200. `tesseract` is
+ * Flags 4 (Symbolic), FontBBox [0 -200 1000 800], Ascent 800, Descent -200. `tesseract` is
  * Tesseract's known-good alternative, Flags 5 (FixedPitch + Symbolic) and FontBBox
- * [0 0 500 1000], kept as the A/B candidate for the viewer matrix (§3.7.4).
+ * [0 0 1000 1000], kept as the A/B candidate for the viewer matrix (§3.7.4). Both boxes are
+ * 1000 wide, not the design's 500: FontBBox is the union of all glyph boxes (PDF 32000 §9.8.1),
+ * and the wide glyph g2 spans 1000 units (the embedded TTF's head bbox is (0,-200)-(1000,800)).
  */
 export type OcrFontBBox = 'em' | 'tesseract'
 
@@ -157,6 +177,11 @@ export class OcrFontCache {
     return this.fontRef
   }
 
+  /** The font's ref if a layer has asked for it, without allocating one. */
+  peekRef(): PDFRef | null {
+    return this.fontRef
+  }
+
   /** Advance of a CID in font units. */
   advance(cid: number): number {
     return isWideCodePoint(this.cpOf[cid]) ? OCR_WIDE : OCR_NARROW
@@ -193,30 +218,64 @@ export class OcrFontCache {
   }
 
   /**
-   * The CIDs shown by tracked layer streams that some page of `doc` currently lists in /Contents,
-   * sorted ascending. The basis of every font table (redaction rule 5).
+   * The tracked layer streams that a page in `doc`'s page tree currently lists in /Contents. The
+   * tree is walked from the catalog: pdf-lib 1.17.1's `removePage` does not invalidate the cache
+   * behind `getPages()`, so a removed page would still count. /Contents may be a stream ref, a
+   * direct array, or a ref to an array; all three are resolved.
+   */
+  private liveStreams(doc: PDFDocument): Set<PDFRef> {
+    const ctx = doc.context
+    const live = new Set<PDFRef>()
+    doc.catalog.Pages().traverse((node) => {
+      if (!(node instanceof PDFPageLeaf)) return
+      const entry = node.get(PDFName.of('Contents'))
+      const resolved = entry instanceof PDFRef ? ctx.lookup(entry) : entry
+      const refs = resolved instanceof PDFArray ? resolved.asArray() : [entry]
+      for (const r of refs) if (r instanceof PDFRef && this.streams.has(r)) live.add(r)
+    })
+    return live
+  }
+
+  /**
+   * The (provisional) CIDs shown by tracked layer streams that some page of `doc` currently lists
+   * in /Contents, sorted ascending. The basis of every font table (redaction rule 5).
    */
   usedCids(doc: PDFDocument): number[] {
     const used = new Set<number>()
-    for (const page of doc.getPages()) {
-      const contents = page.node.get(PDFName.of('Contents'))
-      const refs: unknown[] =
-        contents instanceof PDFRef
-          ? [contents]
-          : (doc.context.lookupMaybe(contents, PDFArray)?.asArray() ?? [])
-      for (const r of refs) {
-        if (!(r instanceof PDFRef)) continue
-        const cids = this.streams.get(r)
-        if (cids) for (const c of cids) used.add(c)
-      }
-    }
+    for (const ref of this.liveStreams(doc)) for (const c of this.streams.get(ref)!) used.add(c)
     return [...used].sort((a, b) => a - b)
+  }
+
+  /** Rewrite the hex `Tj` operands of the layer stream `ref` through `dense` (old → new CID). */
+  private renumber(ref: PDFRef, dense: ReadonlyMap<number, number>): void {
+    const ctx = this.doc.context
+    const old = ctx.lookup(ref, PDFStream)
+    const bytes = old instanceof PDFRawStream ? decodePDFRawStream(old).decode() : old.getContents()
+    // Our own stream: the only `<…>` operands are the Tj hex strings (the BDC property list is a
+    // `<<…>>` dictionary, which this pattern cannot match).
+    const text = new TextDecoder().decode(bytes).replace(/<([0-9A-F]*)> Tj/g, (_, hex: string) => {
+      let out = ''
+      for (let i = 0; i < hex.length; i += 4) {
+        const cid = dense.get(parseInt(hex.slice(i, i + 4), 16))
+        if (cid === undefined) throw new Error('ocr-font: layer stream shows an untracked CID')
+        out += hex4(cid)
+      }
+      return `<${out}> Tj`
+    })
+    const dict: Record<string, PDFObject> = {}
+    for (const [k, v] of old.dict.entries()) {
+      const key = k.decodeText()
+      if (key !== 'Length' && key !== 'Filter' && key !== 'DecodeParms') dict[key] = v
+    }
+    ctx.assign(ref, ctx.flateStream(new TextEncoder().encode(text), dict))
   }
 
   /**
    * Write the font: Type0 + CIDFontType2 + FontDescriptor + FontFile2, with /W, CIDToGIDMap and
-   * ToUnicode built ONLY from `usedCids(doc)`. Does nothing if no layer stream ever asked for the
-   * font. Afterwards the cache refuses further `encode`/`track` calls.
+   * ToUnicode built ONLY from `usedCids(doc)`, renumbered densely from 1. Tracked layer streams no
+   * page lists any more (dropped, or on a removed page) are deleted from the context. Writes no
+   * font when no CID is shown (and unbinds the never-written font from the pages). Afterwards the
+   * cache refuses further `encode`/`track` calls.
    */
   finalize(doc: PDFDocument): void {
     if (doc !== this.doc) throw new Error('ocr-font: finalize on another document')
@@ -224,7 +283,19 @@ export class OcrFontCache {
     this.finalized = true
     if (!this.fontRef) return
     const ctx = doc.context
-    const used = this.usedCids(doc)
+    const live = this.liveStreams(doc)
+    for (const ref of this.streams.keys()) if (!live.has(ref)) ctx.delete(ref)
+    const shown = this.usedCids(doc)
+    if (!shown.length) {
+      this.unbindFont(doc)
+      return
+    }
+    // Dense renumbering in first-use order (provisional CIDs were allocated in reading order).
+    const dense = new Map(shown.map((cid, i) => [cid, i + 1]))
+    if (shown.some((cid, i) => cid !== i + 1)) for (const ref of live) this.renumber(ref, dense)
+    const used = shown.map((_, i) => i + 1)
+    const cpOf = (cid: number): number => this.cpOf[shown[cid - 1]]
+    const wide = (cid: number): boolean => isWideCodePoint(cpOf(cid))
 
     const ttf = ctx.flateStream(this.ttf, { Length1: this.ttf.length })
     const tess = this.bbox === 'tesseract'
@@ -232,7 +303,7 @@ export class OcrFontCache {
       Type: 'FontDescriptor',
       FontName: OCR_FONT_NAME,
       Flags: tess ? 5 : 4,
-      FontBBox: tess ? [0, 0, 500, 1000] : [0, -200, 500, 800],
+      FontBBox: tess ? [0, 0, OCR_WIDE, 1000] : [0, -200, OCR_WIDE, 800],
       ItalicAngle: 0,
       Ascent: tess ? 1000 : 800,
       Descent: tess ? -1 : -200,
@@ -241,14 +312,12 @@ export class OcrFontCache {
       FontFile2: ctx.register(ttf)
     })
 
-    const maxCid = used.length ? used[used.length - 1] : 0
-    const gidMap = new Uint8Array(2 * (maxCid + 1))
-    // Big-endian GIDs: 1 (narrow) or 2 (wide) for every used CID; unused CIDs stay GID 0.
-    for (const cid of used)
-      gidMap[2 * cid + 1] = this.advance(cid) === OCR_WIDE ? GID_WIDE : GID_NARROW
+    const gidMap = new Uint8Array(2 * (used.length + 1))
+    // Big-endian GIDs: 1 (narrow) or 2 (wide) for every used CID; only CID 0 stays GID 0.
+    for (const cid of used) gidMap[2 * cid + 1] = wide(cid) ? GID_WIDE : GID_NARROW
 
     const w = ctx.obj([])
-    for (const part of widthsArray(used, (c) => this.advance(c) === OCR_WIDE))
+    for (const part of widthsArray(used, wide))
       w.push(typeof part === 'number' ? PDFNumber.of(part) : ctx.obj(part))
 
     const cidFont = ctx.obj({
@@ -266,7 +335,7 @@ export class OcrFontCache {
       CIDToGIDMap: ctx.register(ctx.flateStream(gidMap))
     })
 
-    const cmap = toUnicodeCMap(used.map((cid) => [cid, this.cpOf[cid]] as const))
+    const cmap = toUnicodeCMap(used.map((cid) => [cid, cpOf(cid)] as const))
     const type0 = ctx.obj({
       Type: 'Font',
       Subtype: 'Type0',
@@ -276,6 +345,17 @@ export class OcrFontCache {
       ToUnicode: ctx.register(ctx.flateStream(cmap))
     })
     ctx.assign(this.fontRef, type0)
+  }
+
+  /** Remove every page font binding to the (never written) font, so no ref dangles. */
+  private unbindFont(doc: PDFDocument): void {
+    const ref = this.fontRef
+    doc.catalog.Pages().traverse((node) => {
+      if (!(node instanceof PDFPageLeaf)) return
+      const fonts = node.Resources()?.lookupMaybe(PDFName.of('Font'), PDFDict)
+      // No page shows the font, so even a Font dict shared by several pages can lose the entry.
+      if (fonts) for (const [name, value] of fonts.entries()) if (value === ref) fonts.delete(name)
+    })
   }
 }
 

@@ -9,14 +9,20 @@ PR2 adds g2, the wide counterpart of g1 (advance 1000), for CIDs whose /W is 100
 Wide/Fullwidth). PDFium's FPDFText_GetCharBox is the glyph's own bbox, so with g1 alone a CJK
 character's box covered only the left half of its advance [measured, PR2 layer suite].
 
-Three variants are generated so PR2 can measure how each tool computes glyph and text bounds
-(DESIGN.md section 3.7.3 rule 4):
+Four variants are generated so PR2 can measure how each tool computes glyph and text bounds
+(DESIGN.md section 3.7.3 rule 4) and whether a rasteriser paints them:
 
-  zero-area  g1 (g2) is a single zero-area contour of two on-curve points, (0, -200) and
-             (500 (1000), 800), so its glyf bbox, and the head bbox, span the full em box while
-             it fills nothing. The default.
+  zero-area  g1 (g2) is TWO one-point contours, (0, -200) and (500 (1000), 800): its glyf bbox,
+             and the head bbox, span the full em box, yet the outline has no edge at all, so no
+             fill rule and no dropout control can paint a pixel. The default.
+  diagonal   g1 (g2) is one zero-area contour of two on-curve points, (0, -200) -> (500 (1000),
+             800) and back. Same bbox, but the there-and-back diagonal is an edge pair: the
+             monochrome (non-anti-aliased) rasterisers of PDFium (FPDF_RENDER_NO_SMOOTHTEXT) and
+             FreeType turn it into a 1-px line through dropout control [measured, PR2 review].
+             Kept only as the measured reason the default changed.
   none       g1 and g2 have no contour (empty glyphs); the head bbox is all zeros.
-  fontbbox   no contours, but the head bbox is forced to the em box (0, -200, 1000, 800).
+  fontbbox   no contours, but the head bbox is forced to the em box (0, -200, 1000, 800), and
+             hhea.advanceWidthMax is set by hand (recalcBBoxes=False also stops its recalculation).
 
 .notdef has no contour in every variant. Everything is deterministic: fixed timestamps, no
 glyph names (post format 3), a two-entry cmap (U+0020 -> g1, U+3000 -> g2; the PDF font maps
@@ -38,6 +44,7 @@ import sys
 from fontTools import version as fonttools_version
 from fontTools.fontBuilder import FontBuilder
 from fontTools.pens.ttGlyphPen import TTGlyphPen
+from fontTools.ttLib.tables._g_l_y_f import Glyph, GlyphCoordinates
 
 UPM = 1000
 ADVANCE = 500
@@ -65,7 +72,7 @@ def empty_glyph():
     return TTGlyphPen(None).glyph()
 
 
-def spanning_glyph(advance):
+def diagonal_glyph(advance):
     pen = TTGlyphPen(None)
     pen.moveTo((0, DESCENT))
     pen.lineTo((advance, ASCENT))
@@ -73,17 +80,35 @@ def spanning_glyph(advance):
     return pen.glyph()
 
 
+def corner_points_glyph(advance):
+    # Built by hand: TTGlyphPen drops one-point contours (it treats them as anchors).
+    g = Glyph()
+    g.numberOfContours = 2
+    g.coordinates = GlyphCoordinates([(0, DESCENT), (advance, ASCENT)])
+    g.endPtsOfContours = [0, 1]
+    g.flags = bytearray([1, 1])  # both on-curve
+    g.program = TTGlyphPen(None).glyph().program  # empty instructions
+    return g
+
+
+def glyph_for(variant, advance):
+    if variant == 'zero-area':
+        return corner_points_glyph(advance)
+    if variant == 'diagonal':
+        return diagonal_glyph(advance)
+    return empty_glyph()
+
+
 def build(variant):
     fb = FontBuilder(UPM, isTTF=True)
     order = ['.notdef', 'g1', 'g2']
     fb.setupGlyphOrder(order)
     fb.setupCharacterMap({0x20: 'g1', 0x3000: 'g2'})
-    spans = variant == 'zero-area'
     fb.setupGlyf(
         {
             '.notdef': empty_glyph(),
-            'g1': spanning_glyph(ADVANCE) if spans else empty_glyph(),
-            'g2': spanning_glyph(WIDE) if spans else empty_glyph(),
+            'g1': glyph_for(variant, ADVANCE),
+            'g2': glyph_for(variant, WIDE),
         }
     )
     fb.setupHorizontalMetrics({'.notdef': (ADVANCE, 0), 'g1': (ADVANCE, 0), 'g2': (WIDE, 0)})
@@ -121,13 +146,20 @@ def build(variant):
         font.recalcBBoxes = False
         head = font['head']
         head.xMin, head.yMin, head.xMax, head.yMax = 0, DESCENT, WIDE, ASCENT
+        # ... which also stops hhea's recalculation from hmtx, so set what it would compute.
+        hhea = font['hhea']
+        hhea.advanceWidthMax = WIDE
+        hhea.minLeftSideBearing = 0
+        hhea.minRightSideBearing = 0
+        hhea.xMaxExtent = 0
     buf = io.BytesIO()
     font.save(buf)
     return buf.getvalue()
 
 
 VARIANTS = [
-    ('GLYPHLESS_TTF_ZERO_AREA', 'zero-area', 'g1/g2 = one zero-area contour (0,-200)-(500|1000,800); the default'),
+    ('GLYPHLESS_TTF_ZERO_AREA', 'zero-area', 'g1/g2 = two one-point contours (0,-200) and (500|1000,800), no edges; the default'),
+    ('GLYPHLESS_TTF_DIAGONAL', 'diagonal', 'g1/g2 = one two-point contour (0,-200)-(500|1000,800); paints in monochrome rasterisers, not used'),
     ('GLYPHLESS_TTF_NO_CONTOUR', 'none', 'g1/g2 have no contour; head bbox all zeros'),
     ('GLYPHLESS_TTF_FONTBBOX', 'fontbbox', 'g1/g2 have no contour; head bbox forced to the em box'),
 ]
@@ -147,7 +179,7 @@ def main():
         '// The glyphless TrueType programs for the invisible OCR text layer (DESIGN.md §3.7.4): unitsPerEm',
         '// 1000, glyphs .notdef, g1 (advance 500) and g2 (advance 1000, for wide CIDs), OS/2 + hhea',
         "// 800/-200. Written from scratch with fontTools' FontBuilder; Tesseract's pdf_ttf.h is not",
-        '// copied. Only the default is imported by ocr-font.ts, so the other two variants (kept for the',
+        '// copied. Only the default is imported by ocr-font.ts, so the other three variants (kept for the',
         '// PR2 glyph-bounds measurements and their pinned tests) are tree-shaken out of the app bundle.',
         '',
     ]
