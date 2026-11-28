@@ -13,6 +13,7 @@ import {
   removeOverlayInHistory,
   replaceOverlayInHistory,
   rotateInHistory,
+  selectOcrInHistory,
   setCropInHistory,
   setFormValueInHistory,
   type EditState
@@ -86,6 +87,13 @@ export interface EditStore {
   crops: Map<string, CropBox>
   /** Set (or clear, with null) the crop rectangle for a page. */
   setCrop: (pageKey: string, box: CropBox | null) => void
+  /**
+   * The Replace / Remove Recognized Text choices by page key (edit-history.ts `ocrSelect`): a
+   * result's `configHash`, or null for Remove. Also on `editLayer`, for the export snapshot.
+   */
+  ocrSelect: Map<string, string | null>
+  /** Record a Replace (`configHash`) or Remove (null) for a page: one undoable step. */
+  selectOcr: (pageKey: string, configHash: string | null) => void
   /** Upsert a form field's value as a formValue overlay (empty string / false clears it). For
    *  radios, `geom` is the chosen option's rect and `control` is 'radio'. */
   setFormValue: (
@@ -161,6 +169,11 @@ export function useEditStore(): EditStore {
     setHistory((h) => setCropInHistory(h, pageKey, box))
   }, [])
 
+  // Replace / Remove Recognized Text: only the choice goes into history, never words (§3.5.2).
+  const selectOcr = useCallback((pageKey: string, configHash: string | null) => {
+    setHistory((h) => selectOcrInHistory(h, pageKey, configHash))
+  }, [])
+
   const setFormValue = useCallback(
     (pageKey: string, field: string, value: string | boolean, geom: Geom, control?: 'radio') => {
       setHistory((h) => setFormValueInHistory(h, pageKey, field, value, geom, control))
@@ -195,6 +208,7 @@ export function useEditStore(): EditStore {
   // memo) don't recompute on unrelated overlay edits.
   const rotations = useMemo(() => new Map(Object.entries(present.rotations)), [present.rotations])
   const crops = useMemo(() => new Map(Object.entries(present.crops)), [present.crops])
+  const ocrSelect = useMemo(() => new Map(Object.entries(present.ocrSelect)), [present.ocrSelect])
 
   // Selection is only meaningful in Browse; switching to a drawing tool clears it.
   const setTool = useCallback((t: ToolKind) => {
@@ -218,9 +232,11 @@ export function useEditStore(): EditStore {
   const doUndo = useCallback(() => setHistory((h) => undo(h)), [])
   const doRedo = useCallback(() => setHistory((h) => redo(h)), [])
 
+  // The OCR choices ride on the layer (the export snapshot applies them, export-source.ts); the
+  // recognised words never do (withOcrLayer adds them to a copy at export time).
   const editLayer = useMemo<EditLayer>(
-    () => ({ overlays: groupByPage(overlays), attachments, rotations, crops }),
-    [overlays, attachments, rotations, crops]
+    () => ({ overlays: groupByPage(overlays), attachments, rotations, crops, ocrSelect }),
+    [overlays, attachments, rotations, crops, ocrSelect]
   )
 
   const undoable = canUndo(history)
@@ -269,6 +285,8 @@ export function useEditStore(): EditStore {
       rotatePage,
       crops,
       setCrop,
+      ocrSelect,
+      selectOcr,
       setFormValue,
       savedSignature,
       setSavedSignature,
@@ -308,6 +326,8 @@ export function useEditStore(): EditStore {
       rotatePage,
       crops,
       setCrop,
+      ocrSelect,
+      selectOcr,
       setFormValue,
       savedSignature,
       setSavedSignature,

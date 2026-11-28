@@ -8,6 +8,7 @@ import {
   removeOverlayInHistory,
   replaceOverlayInHistory,
   rotateInHistory,
+  selectOcrInHistory,
   setCropInHistory,
   setFormValueInHistory,
   type EditState
@@ -15,6 +16,39 @@ import {
 import type { CropBox, Geom, Overlay } from './model'
 
 const start = () => initHistory<EditState>(emptyEditState())
+
+describe('selectOcrInHistory (the ocrSelect op: Replace / Remove Recognized Text)', () => {
+  it('records each choice as one step; undo restores the previous choice, redo replays it', () => {
+    let h = selectOcrInHistory(start(), 'p1', 'cfg-a') // Replace
+    h = selectOcrInHistory(h, 'p1', null) // Remove
+    h = rotateInHistory(h, 'p1', 90) // interleaved with other edits on one timeline
+    expect(h.present.ocrSelect).toEqual({ p1: null })
+    expect(h.past).toHaveLength(3)
+    h = undo(h)
+    expect(h.present.ocrSelect).toEqual({ p1: null })
+    h = undo(h)
+    expect(h.present.ocrSelect).toEqual({ p1: 'cfg-a' })
+    h = undo(h)
+    expect(h.present.ocrSelect).toEqual({})
+    h = redo(redo(h))
+    expect(h.present.ocrSelect).toEqual({ p1: null })
+  })
+
+  it('holds choices only (strings or null), and a repeated choice is no step', () => {
+    const h = selectOcrInHistory(start(), 'p1', 'cfg-a')
+    expect(selectOcrInHistory(h, 'p1', 'cfg-a')).toBe(h)
+    expect(JSON.stringify(h.present.ocrSelect)).toBe('{"p1":"cfg-a"}')
+  })
+
+  it('survives loading a .pdfx (which stores no choices) and stays undoable', () => {
+    let h = selectOcrInHistory(start(), 'p1', null)
+    h = loadIntoHistory(h, { overlays: [], rotations: [['q1', 90]], crops: [] })
+    expect(h.present.ocrSelect).toEqual({ p1: null })
+    h = undo(h)
+    expect(h.present.ocrSelect).toEqual({})
+    expect(h.present.rotations).toEqual({ q1: 90 })
+  })
+})
 
 const highlight = (id: string, pageKey = 'p'): Overlay => ({
   id,

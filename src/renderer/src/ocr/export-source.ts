@@ -18,8 +18,10 @@ export interface OcrExportSource {
   flushOrConfirm(docs: DocEntry[]): Promise<boolean>
   /**
    * The recognised pages of `docs` by page key, with the edit history's Replace/Remove choices
-   * (`ocrSelect`) in `editLayer` applied; undefined when there are none. Called after the save
-   * path is chosen; the result goes through `withOcrLayer` (ocr-export.ts) before any build.
+   * (`editLayer.ocrSelect`) applied by `applyOcrSelections` (ocr-select.ts); undefined when there
+   * are none. Called after the save path is chosen; the result goes through `withOcrLayer`
+   * (ocr-export.ts) before any build. The choices themselves stay on the layer: the bake drops a
+   * reopened page's own PDFx OCR layer wherever one is recorded (build.ts `dropsSourceOcr`).
    */
   snapshotFor(docs: DocEntry[], editLayer: EditLayer): Map<string, PackedOcrPage> | undefined
   /** The persistent "Include Recognized Text When Exporting" setting (`ocr.includeInExports`, D7). */

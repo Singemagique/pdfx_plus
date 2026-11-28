@@ -33,9 +33,20 @@ import {
   appendOcrLayer,
   dropOcrLayers,
   existingOcrLayer,
+  hasMergedOcrText,
   ocrLayerEngines,
+  pageContentStreams,
+  unbindOcrFonts,
   type OcrPageSpace
 } from './ocr-layer'
+import {
+  placeProvenance,
+  provenanceOf,
+  sourceProvenance,
+  type OcrProvenance
+} from './ocr-provenance'
+import { getPdfium } from './pdfium'
+import { stripOcrText, type PdfiumModule } from './redact'
 import {
   catalogLang,
   dropWordsOutside,
@@ -76,6 +87,35 @@ export interface EditLayer {
    * `keep`, which is also what a page that gets no new layer had before OCR existed.
    */
   ocrPassthrough?: OcrPassthrough
+  /**
+   * The Replace / Remove Recognized Text choices by page key (edit history's `ocrSelect`,
+   * DESIGN.md §3.5.2): a `configHash` or null. EditProvider sets it; the export snapshot applies it
+   * to pick `ocr` (export-source.ts). The bake reads only WHETHER a page has a choice: a page with
+   * one no longer carries the PDFx OCR layer its source page has (§3.7.6), whether a new layer
+   * replaces it (Replace) or none does (Remove).
+   */
+  ocrSelect?: ReadonlyMap<string, string | null>
+}
+
+/** Options shared by `buildPdf` and `buildPdfx`. */
+export interface BuildOptions {
+  /**
+   * The PDFium module for the merged-layer fallback (`stripMergedOcr`), or a loader for it; only
+   * called when a page needs it. Default: the app's shared instance (pdfium.ts).
+   */
+  pdfium?: PdfiumModule | (() => Promise<PdfiumModule>)
+}
+
+/**
+ * Must the PDFx OCR layer a SOURCE page already carries (a reopened PDFx export, `ocr-ours`) go from
+ * the page with key `key`? When recognised text is excluded (`ocrPassthrough: 'drop'`), when the
+ * user chose Replace or Remove for it (`ocrSelect`), and whenever a new recognition result is baked
+ * there: one page never carries two layers (§3.7.6). The new result counts before the crop rule,
+ * so a result whose words all lie outside the edit crop still supersedes the old layer.
+ */
+function dropsSourceOcr(edits: EditLayer | undefined, key: string): boolean {
+  if (!edits) return false
+  return edits.ocrPassthrough === 'drop' || !!edits.ocrSelect?.has(key) || !!ocrPageFor(edits, key)
 }
 
 /**
@@ -104,26 +144,33 @@ const newOcrBake = (doc: PDFDocument): OcrBake => ({
 const UNKNOWN_OCR_ENGINE = 'unknown'
 
 /**
- * Apply the passthrough policy to a PDFx OCR layer `page` already carries (a reopened PDFx
- * export): its tagged streams and their font go when the policy is `drop` or when a NEW layer
- * replaces it (§3.7.6), and whatever remains is recorded, so the output is marked machine-generated
- * exactly when it carries machine text (§3.7.1, §3.7.7). A layer whose streams a later rewrite
- * merged (no tag, the font still bound) cannot be separated from the page content here and is
- * kept (and marked) whatever the policy; removing it by its marked content is PR3c's fallback.
+ * Keep or drop the PDFx OCR layer `page` already carries (a reopened PDFx export), and record what
+ * remains, so the output is marked machine-generated exactly when it carries machine text (§3.7.1,
+ * §3.7.7). `drop` (see `dropsSourceOcr`): the tagged streams go through pdf-lib, every other stream
+ * byte-for-byte untouched (`dropOcrLayers`). A layer with no tag (its streams merged into the page
+ * content by a later rewrite, or wrapped into a Form XObject with the page) was already removed by
+ * PDFium in copyExportPages (`stripMergedOcr`), so if machine text is still found outside a tagged
+ * stream here (on the page or in a form it draws), the export fails rather than carry a layer the
+ * user removed (or two layers on one page). That check runs on EVERY dropping page, whatever the
+ * page seems to carry. Returns the engines of a layer that remains (empty when none does).
  */
-function passExistingOcr(
-  page: PDFPage,
-  policy: OcrPassthrough,
-  replaced: boolean,
-  bake: OcrBake
-): void {
-  const before = existingOcrLayer(page)
-  if (!before.streams.length && !before.font) return
-  if (policy === 'drop' || replaced) dropOcrLayers(page)
+function passExistingOcr(page: PDFPage, drop: boolean, bake: OcrBake): string[] {
+  if (drop) {
+    dropOcrLayers(page)
+    if (hasMergedOcrText(page))
+      throw new Error('could not remove the recognized text this page already carries')
+    // The font of a layer the fallback removed may still be bound, used by nothing: unbind it.
+    if (existingOcrLayer(page).font) unbindOcrFonts(page)
+  }
   const after = existingOcrLayer(page)
-  if (!after.streams.length && !after.font) return
-  const engines = ocrLayerEngines(after.streams)
-  for (const e of engines.length ? engines : [UNKNOWN_OCR_ENGINE]) bake.engines.add(e)
+  if (!after.streams.length && !after.font && !after.forms.length) return []
+  const tagged = ocrLayerEngines(after.streams)
+  const engines = tagged.length
+    ? tagged
+    : ocrLayerEngines([...pageContentStreams(page), ...after.forms])
+  const list = engines.length ? [...new Set(engines)] : [UNKNOWN_OCR_ENGINE]
+  for (const e of list) bake.engines.add(e)
+  return list
 }
 
 /**
@@ -403,7 +450,7 @@ async function bakePage(
   res: FlattenResources | undefined,
   ocr: { bake: OcrBake; ordinal: number }
 ): Promise<void> {
-  if (!edits) return passExistingOcr(page, 'keep', false, ocr.bake)
+  if (!edits) return void passExistingOcr(page, false, ocr.bake)
   const key = makePageKey(exportPage.sourceKey, exportPage.pageIndex)
   // The source page's intrinsic /Rotate and its original (pre-crop) unrotated view box. Both are
   // captured up front because the editor's overlay/crop coordinates live in pdf.js's
@@ -448,10 +495,11 @@ async function bakePage(
     ocrPage = dropWordsOutside(ocrPage, visibleBox(visual, crop)) ?? undefined
   }
   const layer = ocrPage ? { ...ocr, page: ocrPage } : undefined
-  // A layer the source page already carries is kept or dropped by the export's policy, and always
-  // replaced by a new one. (Its words are not re-filtered by the edit crop: like the page's other
-  // native text and the scan pixels outside the CropBox, it is source content the export keeps.)
-  passExistingOcr(page, edits.ocrPassthrough ?? 'keep', !!layer, ocr.bake)
+  // A layer the source page already carries is kept, or dropped by the export's policy, a Replace /
+  // Remove choice or a new result (`dropsSourceOcr`). (A kept one's words are not re-filtered by
+  // the edit crop: like the page's other native text and the scan pixels outside the CropBox, it
+  // is source content the export keeps.)
+  passExistingOcr(page, dropsSourceOcr(edits, key), ocr.bake)
   await withPageSpace(
     page,
     intrinsic,
@@ -503,23 +551,27 @@ function pageError(ordinal: number, page: ExportPage, e: unknown): Error {
  */
 async function copyExportPages(
   output: PDFDocument,
-  pages: ExportPage[]
-): Promise<{ copied: PDFPage[]; sources: PDFDocument[] }> {
+  pages: ExportPage[],
+  strip?: MergedOcrStrip
+): Promise<{ copied: PDFPage[]; sources: Map<string, PDFDocument> }> {
   const sources = new Map<string, PDFDocument>()
+  for (let slot = 0; slot < pages.length; slot++) {
+    const page = pages[slot]
+    if (sources.has(page.sourceKey)) continue
+    try {
+      sources.set(page.sourceKey, await PDFDocument.load(page.bytes, { ignoreEncryption: true }))
+    } catch (e) {
+      throw pageError(slot + 1, page, e)
+    }
+  }
+  if (strip) await stripMergedOcr(pages, sources, strip)
+
   const occurrences = new Map<string, number>()
   // Insertion-ordered: batch key (source + repeat round) -> the output slots it fills.
   const batches = new Map<string, { source: PDFDocument; slots: number[] }>()
   for (let slot = 0; slot < pages.length; slot++) {
     const page = pages[slot]
-    let source = sources.get(page.sourceKey)
-    if (!source) {
-      try {
-        source = await PDFDocument.load(page.bytes, { ignoreEncryption: true })
-      } catch (e) {
-        throw pageError(slot + 1, page, e)
-      }
-      sources.set(page.sourceKey, source)
-    }
+    const source = sources.get(page.sourceKey)!
     const pageKey = makePageKey(page.sourceKey, page.pageIndex)
     const round = occurrences.get(pageKey) ?? 0
     occurrences.set(pageKey, round + 1)
@@ -552,7 +604,62 @@ async function copyExportPages(
     }
     slots.forEach((s, i) => (copied[s] = result[i]))
   }
-  return { copied, sources: [...sources.values()] }
+  return { copied, sources }
+}
+
+/** Which export pages lose their source OCR layer, and where PDFium comes from (BuildOptions). */
+interface MergedOcrStrip {
+  drops: (page: ExportPage) => boolean
+  pdfium: NonNullable<BuildOptions['pdfium']>
+}
+
+/** `strip` for an export of `edits`, or undefined when no page can lose a source layer. */
+function mergedOcrStrip(
+  edits: EditLayer | undefined,
+  opts?: BuildOptions
+): MergedOcrStrip | undefined {
+  if (!edits) return undefined
+  return {
+    drops: (p) => dropsSourceOcr(edits, makePageKey(p.sourceKey, p.pageIndex)),
+    pdfium: opts?.pdfium ?? getPdfium
+  }
+}
+
+/**
+ * The merged-stream fallback of Replace / Remove (§3.7.6): a source page that must lose its PDFx OCR
+ * layer (`strip.drops`) but carries that text outside a tagged stream (`hasMergedOcrText`: a later
+ * rewrite merged the streams, or wrapped the page into a Form XObject) gets it removed by PDFium
+ * (redact.ts `stripOcrText`) BEFORE the pages are copied, and the source is reloaded from the
+ * rewritten bytes. Only those pages are regenerated; a page whose layer is still tagged keeps the
+ * lossless pdf-lib drop. Like the redaction pass, the rewrite replaces the whole source for every
+ * page copied from it. PDFium is loaded only when such a page exists.
+ */
+async function stripMergedOcr(
+  pages: ExportPage[],
+  sources: Map<string, PDFDocument>,
+  strip: MergedOcrStrip
+): Promise<void> {
+  /** sourceKey → the page indices that must lose their layer, and the first slot (for errors). */
+  const wanted = new Map<string, { indices: Set<number>; slot: number }>()
+  pages.forEach((p, slot) => {
+    if (!strip.drops(p)) return
+    let w = wanted.get(p.sourceKey)
+    if (!w) wanted.set(p.sourceKey, (w = { indices: new Set(), slot }))
+    w.indices.add(p.pageIndex)
+  })
+  for (const [sourceKey, { indices, slot }] of wanted) {
+    const source = sources.get(sourceKey)!
+    const count = source.getPageCount()
+    const merged = [...indices].filter((i) => i < count && hasMergedOcrText(source.getPage(i)))
+    if (!merged.length) continue
+    try {
+      const pdfium = typeof strip.pdfium === 'function' ? await strip.pdfium() : strip.pdfium
+      const { bytes } = stripOcrText(pdfium, pages[slot].bytes, merged)
+      sources.set(sourceKey, await PDFDocument.load(bytes, { ignoreEncryption: true }))
+    } catch (e) {
+      throw pageError(slot + 1, pages[slot], e)
+    }
+  }
 }
 
 /**
@@ -586,14 +693,14 @@ function isolateMutableContainers(page: PDFPage): void {
 export async function buildPdf(
   pages: ExportPage[],
   edits?: EditLayer,
-  opts?: { stripSignatureFields?: boolean }
+  opts?: { stripSignatureFields?: boolean } & BuildOptions
 ): Promise<Uint8Array> {
   const output = await PDFDocument.create()
   const res = edits ? createFlattenResources(output, edits.attachments) : undefined
   // One OCR font per baked page of THIS output document (a zip builds one document per entry): its
   // tables come only from the words baked onto that page (redaction rule 5).
   const bake = newOcrBake(output)
-  const { copied, sources } = await copyExportPages(output, pages)
+  const { copied, sources } = await copyExportPages(output, pages, mergedOcrStrip(edits, opts))
   for (let i = 0; i < pages.length; i++) {
     const page = copied[i]
     // Tag any failure with which page failed, so a single bad source (e.g. one odd scan) is
@@ -609,7 +716,7 @@ export async function buildPdf(
       throw pageError(i + 1, pages[i], e)
     }
   }
-  finishOcr(output, bake, pages.length, sources, `PDFX ${PDFX_VERSION}`)
+  finishOcr(output, bake, pages.length, sources.values(), `PDFX ${PDFX_VERSION}`)
   pruneDetached(output)
   try {
     return await output.save()
@@ -623,7 +730,8 @@ export async function buildPdf(
 export async function buildPdfx(
   documents: ExportDocument[],
   title: string,
-  edits?: EditLayer
+  edits?: EditLayer,
+  opts?: BuildOptions
 ): Promise<Uint8Array> {
   const output = await PDFDocument.create()
   const manifest: PdfxManifest = { pdfx: PDFX_VERSION, title, documents: [] }
@@ -634,33 +742,51 @@ export async function buildPdfx(
   // an image shared between documents of the same source is also stored once; failures name the
   // page by its ordinal across documents, as buildPdf does.
   const ordered = documents.flatMap((doc) => doc.pages)
-  const { copied, sources } = await copyExportPages(output, ordered)
+  const { copied, sources } = await copyExportPages(output, ordered, mergedOcrStrip(edits, opts))
   for (const page of copied) output.addPage(page)
 
   // The one exception to clean pages: the OCR text layer is BAKED (DESIGN.md §3.7.2), so a
   // reopened .pdfx is searchable without re-recognition, and it is baked BEFORE computeIntegrity
-  // so the pdfx-canon/1 tamper hash covers it. Only those pages get private containers (a dropped
-  // source layer is unlinked by replacing containers, never mutating them). Rotation and crop stay
+  // so the pdfx-canon/1 tamper hash covers its content stream (not its font's ToUnicode, which no
+  // pdfx-canon/1 hash covers: see ocr-provenance.ts). Only those pages get private containers (a
+  // dropped source layer is unlinked by replacing containers, never mutating them). Rotation and crop stay
   // live mirror edits: words keep the source visual frame (intrinsic + view-origin matrices only),
-  // and every word is kept (no crop drop). A layer a source page already carries follows the
-  // export's passthrough policy, as in buildPdf.
+  // and every word is kept (no crop drop). A layer a source page already carries is kept or
+  // dropped as in buildPdf (`dropsSourceOcr`). Each page that ends up with a layer gets a
+  // provenance record (engine, data hashes, languages, pipeline; never words): from the result
+  // baked now, or, for a kept layer, from the source .pdfx's own manifest while it still describes
+  // that layer (`sourceProvenance`, and the engine check below).
   const bake = newOcrBake(output)
+  const provenance: (OcrProvenance | undefined)[] = []
+  const sourceRecords = new Map<string, Map<number, OcrProvenance>>()
   for (let i = 0; i < ordered.length; i++) {
-    const ocrPage = ocrPageFor(edits, makePageKey(ordered[i].sourceKey, ordered[i].pageIndex))
+    const key = makePageKey(ordered[i].sourceKey, ordered[i].pageIndex)
+    const ocrPage = ocrPageFor(edits, key)
     const page = copied[i]
     try {
       if (ocrPage) isolateMutableContainers(page)
-      passExistingOcr(page, edits?.ocrPassthrough ?? 'keep', !!ocrPage, bake)
+      const kept = passExistingOcr(page, dropsSourceOcr(edits, key), bake)
+      if (kept.length) {
+        const { sourceKey, pageIndex, bytes } = ordered[i]
+        let records = sourceRecords.get(sourceKey)
+        if (!records) sourceRecords.set(sourceKey, (records = await sourceProvenance(sources.get(sourceKey)!, bytes))) // prettier-ignore
+        // The source's record only while it names an engine of the layer that is actually there
+        // (its /Engine property lists); otherwise only that engine is known.
+        const record = records.get(pageIndex)
+        provenance[i] = record && kept.includes(record.engineId) ? record : { engineId: kept[0] }
+      }
       if (!ocrPage) continue
       const intrinsic = ((page.getRotation().angle % 360) + 360) % 360
       const view0 = viewBox(page.getCropBox(), page.getMediaBox())
+      let baked = false
       await withPageSpace(
         page,
         intrinsic,
         view0,
-        { prepend: (space) => void bakeOcrLayer(page, ocrPage, bake, i, space) },
+        { prepend: (space) => void (baked = bakeOcrLayer(page, ocrPage, bake, i, space)) },
         pageUserUnit(page)
       )
+      if (baked) provenance[i] = provenanceOf(ocrPage)
     } catch (e) {
       throw pageError(i + 1, ordered[i], e)
     }
@@ -670,6 +796,12 @@ export async function buildPdfx(
     if (doc.pages.length === 0) continue
     manifest.documents.push({ name: doc.name, pages: doc.pages.length })
   }
+  const docPages = manifest.documents.map((d) => d.pages)
+  const ocrRecords = provenance.flatMap((p, i) => {
+    const placed = p ? placeProvenance(p, i, docPages) : null
+    return placed ? [placed] : []
+  })
+  if (ocrRecords.length) manifest.ocr = { v: 1, pages: ocrRecords }
 
   if (edits) {
     const mirror = serializeMirror(documents, edits)
@@ -681,7 +813,7 @@ export async function buildPdfx(
   }
   // Font tables, Producer + XMP marking and the catalog /Lang, before computeIntegrity and save;
   // after the mirror, because the Producer names the manifest version, which it can raise to 1.1.
-  finishOcr(output, bake, ordered.length, sources, `PDFX ${manifest.pdfx}`)
+  finishOcr(output, bake, ordered.length, sources.values(), `PDFX ${manifest.pdfx}`)
   // What copyPages dragged in through links to pages the output does not have (see reachable.ts).
   pruneDetached(output)
 
