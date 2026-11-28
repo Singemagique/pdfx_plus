@@ -47,7 +47,7 @@ env:
 jobs:
   sweep:
     name: Sweep and calibration
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ocr')
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ocr') || github.head_ref == 'ocr/pr11-ci-release'
     runs-on: ubuntu-latest
     timeout-minutes: 300
     steps:
@@ -102,7 +102,7 @@ jobs:
 
   timing:
     name: Timing (${{ matrix.os }})
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ocr')
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ocr') || github.head_ref == 'ocr/pr11-ci-release'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
@@ -137,7 +137,7 @@ jobs:
 
   scale:
     name: Scale (1,000 pages, 1.5 GiB source)
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ocr')
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ocr') || github.head_ref == 'ocr/pr11-ci-release'
     runs-on: ubuntu-latest
     timeout-minutes: 300
     steps:
@@ -172,7 +172,7 @@ jobs:
   summary:
     name: Summary
     needs: [sweep, timing, scale]
-    if: ${{ !cancelled() && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ocr')) }}
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ocr') || github.head_ref == 'ocr/pr11-ci-release') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
