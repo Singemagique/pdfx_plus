@@ -1666,7 +1666,7 @@ export class Coordinator {
       // The WASM heap never shrinks: recycle after 50 pages, or after any page over 12 MP.
       if (slot.pages >= this.b.recyclePages || slot.big) this.retireRecognizer(slot)
       slot.big = false
-    } else {
+    } else if (m.type === 'error') {
       this.retireRecognizer(slot)
       this.recognizeFailure(t, isOomShaped(m.name, m.message))
     }

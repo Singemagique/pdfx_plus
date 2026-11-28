@@ -13,6 +13,7 @@ import type { Orientation } from '../../../shared/ocr/preprocess/orientation'
 import type { PageReason } from '../../../shared/ocr/protocol'
 import type { TriagePage } from '../../../shared/ocr/triage'
 import type { RecognizeOutcome, ReuseHint } from './recognize-core'
+import type { TessParams } from '../../../shared/ocr/engine/tess-core'
 
 export interface RasterLimits {
   /** The PDFium WASM memory cap (the module declares 32,768 pages = 2 GiB; PR0). */
@@ -117,6 +118,8 @@ export type ToRecognize =
       reuse?: ReuseHint
       /** Ask for the adaptive pass (default true). */
       adaptive?: boolean
+      /** PROTOTYPE, tests only: never split a pass (the 1.1.4 path, for an A/B). */
+      noUnits?: boolean
       /**
        * The page's edit rotation (§3.4.5 priors: tried first). Absent = 0: the 90° test decides.
        */
@@ -128,12 +131,26 @@ export type ToRecognize =
       calibration?: CalibrationTable
       /** Tests only: pass 1 on the bitmap as given, no preprocessing (the PR5 replay cache). */
       rawPass1?: boolean
+      /** PROTOTYPE: hand a split pass's units to the parent ('units' / 'units-done'). */
+      delegateUnits?: boolean
       /**
        * Tests only (the tier-1 harness records the replay cache): also return each pass's raw hOCR.
        * The coordinator never sets it; hOCR is page content and never leaves the process.
        */
       returnHocr?: boolean
     }
+  /** PROTOTYPE: recognise one unit as given (helper side). */
+  | {
+      type: 'unit'
+      taskId: number
+      width: number
+      height: number
+      data: ArrayBuffer
+      langs: string[]
+      params: TessParams
+    }
+  /** PROTOTYPE: every unit of the page task's split pass, in order. */
+  | { type: 'units-done'; taskId: number; hocr: string[] }
 
 export type FromRecognize =
   | { type: 'ready'; tripwire: number; selfCheckFailed: string[] }
@@ -148,3 +165,11 @@ export type FromRecognize =
       tripwire: number
     }
   | { type: 'error'; taskId: number; name: string; message: string; tripwire: number }
+  /** PROTOTYPE: a split pass's units, for the parent to place on threads. */
+  | {
+      type: 'units'
+      taskId: number
+      jobs: { width: number; height: number; data: ArrayBuffer; params: TessParams }[]
+      tripwire: number
+    }
+  | { type: 'unit-result'; taskId: number; hocr: string; tripwire: number }

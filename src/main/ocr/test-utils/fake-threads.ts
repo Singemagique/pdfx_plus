@@ -190,6 +190,7 @@ export class FakeRecognizer extends FakeWorker<ToRecognize, FromRecognize> {
       this.addedData.push(Object.keys(msg.data))
       return
     }
+    if (msg.type !== 'recognize') return
     this.jobs.push(msg)
     const out = this.script(msg, this)
     if (out === 'crash') this.crash(new Error('recognize thread died'))

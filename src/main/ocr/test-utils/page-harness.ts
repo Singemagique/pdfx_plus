@@ -32,6 +32,8 @@ export interface PageRunOptions {
   noSmooth1Bit?: boolean
   /** Ask for the adaptive pass (default true). */
   adaptive?: boolean
+  /** PROTOTYPE: never split a pass (the 1.1.4 path, for the bench's A/B). */
+  noUnits?: boolean
   /** Return every recognition's hOCR and input record (the replay recorder). */
   record?: boolean
   /** The page's edit rotation (the request's `editRotation`; tried first). */
@@ -117,6 +119,7 @@ export async function pageHarness(thread: Recognizer): Promise<PageHarness> {
         const t1 = performance.now()
         const first = await thread.recognize(r1, r1.dpi, o.langs, o.record === true, {
           adaptive: o.adaptive,
+          ...(o.noUnits ? { noUnits: true } : {}),
           ...(o.editRotation ? { editRotation: o.editRotation } : {}),
           ...(o.calibration ? { calibration: o.calibration } : {})
         })
@@ -140,6 +143,7 @@ export async function pageHarness(thread: Recognizer): Promise<PageHarness> {
           const t2 = performance.now()
           second = await thread.recognize(r2, r2.dpi, o.langs, o.record === true, {
             reuse: { plan: first.outcome.plan, recipe: first.outcome.recipe },
+            ...(o.noUnits ? { noUnits: true } : {}),
             ...(o.calibration ? { calibration: o.calibration } : {})
           })
           recMs += performance.now() - t2
