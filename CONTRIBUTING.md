@@ -111,21 +111,27 @@ must be green before merging. Each PR therefore lands as exactly one commit on
 
 Every push to `main` and every PR runs `.github/workflows/ci.yml`:
 
-1. **Lint, typecheck, test** on Ubuntu — `yarn typecheck`, `yarn format:check`,
-   `yarn test:run`, then `yarn test:ocr` with `PDFX_OCR_CACHE_STRICT=1`.
+1. **Lint, typecheck, test** on Ubuntu — `yarn typecheck`, `yarn format:check`, the node and
+   jsdom projects (`yarn test:run --project node --project jsdom`), then the ocr project
+   (`yarn test:ocr`), both with `PDFX_OCR_CACHE_STRICT=1`. Locally, `yarn test:run` runs all
+   three projects.
 2. **Build** matrix on macOS, Windows, and Ubuntu — packages the app with
    code-signing disabled so forks build without secrets, then:
    - runs the packaged app's OCR self-test (`pdfx --ocr-selftest out.json`, via
      `scripts/ocr-selftest-run.mjs`): a scanned page recognized exactly as recorded, every
      network tripwire at 0, nothing printed by the engine, a crashed OCR process detected and
-     restarted, and the Recognize Text shortcut sent to a hidden app window, which must reach
-     the renderer exactly once (Cmd+Shift+R on macOS, Ctrl+Shift+R on Windows and Linux; required
-     on all three, never skipped). On Ubuntu it runs twice, the second time with no network at all
-     (`unshare --net`);
+     restarted, and the Recognize Text shortcut pressed on a hidden app window, which must make
+     the main process send the Recognize Text action to the renderer exactly once (Cmd+Shift+R on
+     macOS, Ctrl+Shift+R on Windows and Linux; required on all three, never skipped; the send is
+     counted, not delivered, so nothing starts recognizing), with the Document menu's **Recognize
+     Text…** item showing that shortcut. On Ubuntu it runs twice, the second time with no network
+     at all (`unshare --net`);
    - on Windows, checks the installer grew by at most 15 MB over v1.1.3 (`scripts/ocr-nsis-size.mjs`);
    - runs the `ocr` project again and uploads what it recognized.
 3. **OCR cross-OS diff** — compares the three OSes' recognized text, word boxes, engine output and
-   input pixels, and fails on any difference (`scripts/ocr-xos-diff.mjs`).
+   input pixels, and fails on any difference, or if an OS produced fewer records than
+   `--min-cases` in `ci.yml` (`scripts/ocr-xos-diff.mjs`). Lower that number only in a change
+   that removes tier-1 cases.
 
 The build job depends on the check job, so lint/typecheck/test failures stop the
 matrix early.
@@ -139,4 +145,6 @@ failed, because GitHub counts a skipped required check as passing.)
 
 `.github/workflows/ocr-bench.yml` runs the slower OCR bench nightly, on demand, and on pull
 requests labelled `ocr`: the seeds × presets × fonts sweep, the calibration check, per-page timing
-on all three OSes, and the 1,000-page and 1.5 GiB scale tests. It never blocks a merge.
+on all three OSes (on Windows it fails if a full Letter page of 10 pt text takes more than 6 s, or
+one filled with 6 pt text more than 16 s), and the 1,000-page and 1.5 GiB scale tests. It never
+blocks a merge. Scheduled runs start only from the default branch.

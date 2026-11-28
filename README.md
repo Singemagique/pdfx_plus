@@ -66,21 +66,29 @@ PDFx can recognize the text in scanned pages and photos, so you can find words i
   Text dialog. To start it: **Document ▸ Recognize Text…** (Ctrl/Cmd+Shift+R), **Document ▸
   Recognize Text on All Scanned Pages**, the **Recognize Text** toolbar button (shown while scanned
   pages are waiting), the **Scanned · Recognize text** chip on a document, the **Recognize text**
-  prompt in Find, or the banner in the full-page view. Pages that already have searchable text, including text another OCR tool added,
-  are skipped and say so.
+  prompt in Find, or the banner in the full-page view. Pages that already have searchable text,
+  including text another OCR tool added, are skipped and say so.
 - **Checking the result.** **Document ▸ Show Recognized Text** draws the recognized words over the
   page in the full-page view, with a dotted underline under low-confidence words; press `]` and `[`
-  to step through them. **Document ▸ Copy Page Text** copies a page's recognized text. **Replace
+  to step through them. **Document ▸ Copy Page Text** copies a page's searchable text, the same
+  text Find searches: its own text and/or the recognized words, without words under a redaction.
+  **Replace
   Recognized Text…** recognizes pages again (for example with other languages) and **Remove
   Recognized Text** takes the text off; both work on text PDFx recognized, including a layer PDFx
   saved in a file you reopen, and both can be undone.
 - **Keeping it.** Recognition is kept while the file is open. Export or save as .pdfx to keep it.
   Word confidence is kept only while the file is open: after reopening, the saved words show
   without underlines.
-- **Redaction.** Redacting removes the covered pixels and any recognized words under them: the
-  scan image is rewritten (losslessly) with the covered pixels blanked. Where a scan image cannot be
-  cut in place (an unusual image format or placement), the whole image and its recognized text are
-  removed instead, and the note next to the Redact tool says so. Redacting a page of a PDF that
+- **Redaction.** Redacting part of a scan always removes the recognized words under the box; how
+  much of the image goes depends on how the image is stored. Black-and-white scans (fax/CCITT,
+  JBIG2) and losslessly compressed grey or colour scans usually keep everything but the covered
+  pixels, which are blanked in a lossless copy of the image. Colour and greyscale JPEG scans and
+  photos, including photos imported into PDFx, usually lose the whole image and its recognized
+  text instead, because a lossless copy of a JPEG is more than twice its size. Images in CMYK or
+  with a colour profile, transparency or JPEG 2000 compression, images drawn tilted on the page,
+  very large images and images in encrypted PDFs are always removed whole. Either way nothing under
+  the box survives, and the note next to the Redact tool says so when the whole image goes.
+  Redacting a page of a PDF that
   PDFx already made searchable removes that page's recognized text; run Recognize Text again to
   restore it.
 - **Languages.** English, German, French and Spanish are included. 31 more can be added from the
@@ -98,8 +106,9 @@ PDFx can recognize the text in scanned pages and photos, so you can find words i
   files in the app's `resources/ocr/tessdata/` folder; they are checked the same way.
 - **Licences.** The engine, the libraries linked into it and the language data have their own
   licences. Their texts ship with the app in `resources/licenses/` (Windows:
-  `<install folder>\resources\licenses\`; macOS: `PDFx.app/Contents/Resources/licenses/`; Linux:
-  `/opt/PDFx/resources/licenses/`), with
+  `<install folder>\resources\licenses\`; macOS: `PDFx.app/Contents/Resources/licenses/`; Linux
+  .deb and .rpm: `/opt/PDFx/resources/licenses/`; the AppImage carries the same folder inside its
+  image), with
   [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) listing each component.
 
 ## How to run
