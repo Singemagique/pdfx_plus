@@ -53,6 +53,19 @@ Tests use [Vitest](https://vitest.dev). The suite is split into three projects i
   (`src/shared/ocr/test-utils/ocr-cache/`); `PDFX_OCR_CACHE_STRICT=1` (what CI sets) fails on any
   mismatch, and `yarn ocr:record` re-records after a deliberate engine or pipeline change.
 
+OCR maintenance scripts (none of them runs in the app):
+
+- `yarn ocr:record` rewrites the replay cache and the packaged self-test's expected result.
+- `yarn ocr:calibrate` refits the confidence calibration
+  (`src/shared/ocr/calibration/tess-core7-simd.json`) from the synthetic sweep.
+- `yarn ocr:lang-catalogue` regenerates `src/main/ocr/lang-manifest.json`, the compiled catalogue
+  of downloadable languages: for each one it checks the npm tarball of `@tesseract.js-data/<code>`
+  against the registry's integrity hash, records the size and SHA-256 of the `.traineddata.gz`
+  and of the unpacked `.traineddata`, and checks that cdn.jsdelivr.net serves the same bytes.
+  `--check` fails if the committed file differs. The app never fetches the catalogue; every hash
+  it trusts for a downloaded or installed language file comes from this reviewed, committed file.
+  Right-to-left languages are left out on purpose until the text layer supports them.
+
 Place a test next to the code it covers (e.g. `src/renderer/src/pdfx/build.node.test.ts`).
 The `@renderer` alias resolves the same way it does in the app, so you can import
 renderer modules with either a relative path or `@renderer/...`.
@@ -105,8 +118,10 @@ Every push to `main` and every PR runs `.github/workflows/ci.yml`:
    - runs the packaged app's OCR self-test (`pdfx --ocr-selftest out.json`, via
      `scripts/ocr-selftest-run.mjs`): a scanned page recognized exactly as recorded, every
      network tripwire at 0, nothing printed by the engine, a crashed OCR process detected and
-     restarted, and the Ctrl/Cmd+Shift+R shortcut on a hidden window. On Ubuntu it runs twice,
-     the second time with no network at all (`unshare --net`);
+     restarted, and the Recognize Text shortcut sent to a hidden app window, which must reach
+     the renderer exactly once (Cmd+Shift+R on macOS, Ctrl+Shift+R on Windows and Linux; required
+     on all three, never skipped). On Ubuntu it runs twice, the second time with no network at all
+     (`unshare --net`);
    - on Windows, checks the installer grew by at most 15 MB over v1.1.3 (`scripts/ocr-nsis-size.mjs`);
    - runs the `ocr` project again and uploads what it recognized.
 3. **OCR cross-OS diff** — compares the three OSes' recognized text, word boxes, engine output and
