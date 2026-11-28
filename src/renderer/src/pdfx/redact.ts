@@ -25,10 +25,18 @@
 //   layer (fail-safe).
 // - The INVISIBLE-TEXT PAD (rule 4, defence in depth). A text object in render mode 3 (invisible)
 //   or shown in a known glyphless OCR font (Tesseract's GlyphLessFont, Occulta, ours) has its
-//   bounds grown by its em (font size × the text matrix's vertical axis), on both sides of the
-//   baseline and along that axis, before the overlap test. Another producer's glyphless layer may
-//   report degenerate (baseline-thin) bounds, and a box over the x-height band would then miss the
-//   word. The pad can over-remove invisible text, never leak it.
+//   bounds grown to its EM BOX before the overlap test: the baseline extent of its bounds, from
+//   `PAD_DESCENT` em below the baseline to 1 em above it, along the text matrix's vertical axis
+//   (font size × (c, d)) and anchored at the text origin. Another producer's glyphless layer may
+//   report degenerate (baseline-thin) bounds, and a box over the x-height or the descender band
+//   would then miss the word. Anchoring at the baseline keeps the pad off the lines above and
+//   below (at 1.2 em line pitch the em boxes of adjacent lines only touch). The pad can over-remove
+//   invisible text, never leak it.
+//
+// Removing an annotation also removes the annotations tied to it (`linkedAnnots`): its /Popup, and
+// every annotation whose /Parent or /IRT names a removed one (a popup's /Parent, a reply). They
+// would otherwise stay on the page holding a reference to the removed dict, and copyPages carries
+// that dict, with its /Contents, into the export (pdf.js even shows it as the popup's text).
 
 /** FPDF_SaveAsCopy flag: complete rewrite rather than incremental append (no retained revision). */
 const FPDF_NO_INCREMENTAL = 2
@@ -51,7 +59,11 @@ export interface PdfiumModule {
   FPDFPage_GetAnnot(page: number, index: number): number
   FPDFPage_CloseAnnot(annot: number): void
   FPDFPage_RemoveAnnot(page: number, index: number): boolean
+  /** The page's index of `annot`'s dictionary, -1 when the page does not list it. */
+  FPDFPage_GetAnnotIndex(page: number, annot: number): number
   FPDFAnnot_GetRect(annot: number, rectPtr: number): boolean
+  /** The annotation `key` (Popup, Parent, IRT) of `annot` names, or 0 (close it after use). */
+  FPDFAnnot_GetLinkedAnnot(annot: number, key: string): number
   FPDFPageObj_GetBounds(obj: number, l: number, b: number, r: number, t: number): boolean
   FPDFPageObj_Destroy(obj: number): void
   FPDFPageObj_CreateNewRect(x: number, y: number, w: number, h: number): number
@@ -133,8 +145,9 @@ export interface RemovedObject {
   /** FPDF_PAGEOBJ_* (1 text, 2 path, 3 image, 4 shading, 5 Form XObject), or 'annot'. */
   type: number | 'annot'
   /**
-   * The bounds the overlap test used (padded for invisible text), in unrotated user space; null
-   * when the extent is unknown (the caller must then treat the whole page as removed).
+   * The object's bounds (for invisible text its own, not the pad the overlap test used), in
+   * unrotated user space; null when the extent is unknown (the caller must then treat the whole
+   * page as removed).
    */
   box: PdfBox | null
 }
@@ -167,10 +180,17 @@ function isOcrText(pdfium: PdfiumModule, obj: number): boolean {
   return namedAs(baseFontName(pdfium, obj), [OCR_FONT_BASE_NAME])
 }
 
+/** How far below the baseline the invisible-text pad reaches, in em (descenders: ~0.2–0.25 em). */
+export const PAD_DESCENT = 0.25
+
+const UNKNOWN_BOX: PdfBox = Object.freeze({ l: NaN, b: NaN, r: NaN, t: NaN })
+
 /**
  * The bounds of a text object grown for the overlap test when the text is invisible (render
- * mode 3) or in a glyphless OCR font: by ± its em along the text's vertical axis. `fb` is scratch
- * memory of at least 32 bytes. Other objects (and text that is neither) keep `box`.
+ * mode 3) or in a glyphless OCR font: the union of `box` with the object's em box (see the header:
+ * the baseline extent of `box`, from PAD_DESCENT em below the baseline to 1 em above it, along the
+ * em vector size × (c, d) from the text origin (e, f)). `fb` is scratch memory of at least 32
+ * bytes. Other objects (and text that is neither) keep `box`.
  */
 function invisibleTextPad(pdfium: PdfiumModule, obj: number, box: PdfBox, fb: number): PdfBox {
   if (pdfium.FPDFPageObj_GetType(obj) !== FPDF_PAGEOBJ_TEXT) return box
@@ -180,16 +200,80 @@ function invisibleTextPad(pdfium: PdfiumModule, obj: number, box: PdfBox, fb: nu
   if (!invisible) return box
   const rt = pdfium.pdfium
   // Size × the text matrix's y axis (c, d): the em vector in user space [measured: the matrix
-  // carries Tz and the CTM, the size is the bare Tf operand]. A matrix or size PDFium cannot give
-  // makes the extent unknown, which the caller turns into a whole-page removal.
-  if (!pdfium.FPDFTextObj_GetFontSize(obj, fb)) return { l: NaN, b: NaN, r: NaN, t: NaN }
+  // carries Tz and the CTM, the size is the bare Tf operand; (e, f) is the text origin on the
+  // baseline]. A matrix or size PDFium cannot give makes the extent unknown, which the caller
+  // turns into a whole-page removal.
+  if (!pdfium.FPDFTextObj_GetFontSize(obj, fb)) return UNKNOWN_BOX
   const size = Math.abs(rt.getValue(fb, 'float'))
-  if (!pdfium.FPDFPageObj_GetMatrix(obj, fb + 8)) return { l: NaN, b: NaN, r: NaN, t: NaN }
-  const c = rt.getValue(fb + 16, 'float')
-  const d = rt.getValue(fb + 20, 'float')
-  const px = Math.abs(size * c)
-  const py = Math.abs(size * d)
-  return { l: box.l - px, b: box.b - py, r: box.r + px, t: box.t + py }
+  if (!pdfium.FPDFPageObj_GetMatrix(obj, fb + 8)) return UNKNOWN_BOX
+  const [a, b, c, d, e, f] = [0, 4, 8, 12, 16, 20].map((o) => rt.getValue(fb + 8 + o, 'float'))
+  const n = Math.hypot(a, b)
+  if (!(n > 0) || !Number.isFinite(size)) return UNKNOWN_BOX
+  // The baseline direction, and the extent of `box` along it measured from the origin.
+  const ux = a / n
+  const uy = b / n
+  const along = [
+    [box.l, box.b],
+    [box.r, box.b],
+    [box.r, box.t],
+    [box.l, box.t]
+  ].map(([x, y]) => (x - e) * ux + (y - f) * uy)
+  const s0 = Math.min(...along)
+  const s1 = Math.max(...along)
+  // A mirrored or flipped text matrix still has its em box on the side (c, d) points to.
+  const vx = size * c
+  const vy = size * d
+  const xs: number[] = [box.l, box.r]
+  const ys: number[] = [box.b, box.t]
+  for (const s of [s0, s1])
+    for (const t of [-PAD_DESCENT, 1]) {
+      xs.push(e + s * ux + t * vx)
+      ys.push(f + s * uy + t * vy)
+    }
+  return { l: Math.min(...xs), b: Math.min(...ys), r: Math.max(...xs), t: Math.max(...ys) }
+}
+
+/**
+ * `hits` (annotation indices of `page`) plus every annotation tied to one of them, to a fixpoint:
+ * the /Popup of a removed annotation, and each annotation whose /Parent or /IRT is a removed one.
+ */
+function linkedAnnots(
+  pdfium: PdfiumModule,
+  page: number,
+  count: number,
+  hits: ReadonlySet<number>
+): Set<number> {
+  const gone = new Set(hits)
+  if (!gone.size) return gone
+  /** The page index of the annotation `key` of annotation `i` names (-1: none, or off the page). */
+  const linked = (i: number, key: string): number => {
+    const annot = pdfium.FPDFPage_GetAnnot(page, i)
+    if (!annot) return -1
+    try {
+      const other = pdfium.FPDFAnnot_GetLinkedAnnot(annot, key)
+      if (!other) return -1
+      try {
+        return pdfium.FPDFPage_GetAnnotIndex(page, other)
+      } finally {
+        pdfium.FPDFPage_CloseAnnot(other)
+      }
+    } finally {
+      pdfium.FPDFPage_CloseAnnot(annot)
+    }
+  }
+  for (let grew = true; grew; ) {
+    grew = false
+    for (let i = 0; i < count; i++) {
+      const add = (j: number): void => {
+        if (j < 0 || j >= count || gone.has(j)) return
+        gone.add(j)
+        grew = true
+      }
+      if (gone.has(i)) add(linked(i, 'Popup'))
+      else if (['Parent', 'IRT'].some((k) => gone.has(linked(i, k)))) add(i)
+    }
+  }
+  return gone
 }
 
 const finiteBox = (b: PdfBox): boolean =>
@@ -230,14 +314,17 @@ function redactPage(
         t: rt.getValue(fb + 12, 'float')
       }
       const box = invisibleTextPad(pdfium, obj, raw, fb + 16)
-      const known = finiteBox(box)
+      const known = finiteBox(box) && finiteBox(raw)
       // Unknown extent (non-finite bounds, or an invisible text object whose pad PDFium cannot
       // give): removed, and reported as unknown. `overlaps` already said yes to NaN bounds before
       // the report existed, and for invisible text the removal changes no pixel.
       const hit = !known || rects.some((rc) => overlaps(box.l, box.b, box.r, box.t, rc))
       if (hit) {
         doomed.push(obj)
-        removed.push({ type: pdfium.FPDFPageObj_GetType(obj), box: known ? box : null })
+        // The object's OWN bounds, not the pad: the pad only decides removal. A padded object is
+        // invisible text, which paints no pixel an OCR word could describe, and the em box would
+        // reach the footprints of the words on the lines above and below (rule 2 would drop them).
+        removed.push({ type: pdfium.FPDFPageObj_GetType(obj), box: known ? raw : null })
       } else if (sweep) doomed.push(obj)
     }
     for (const obj of doomed) {
@@ -247,9 +334,13 @@ function redactPage(
       pdfium.FPDFPageObj_Destroy(obj)
     }
 
-    // 2) Remove ANNOTATIONS / widgets overlapping any rect (descending so indices stay valid).
-    //    FS_RECTF layout: { left@0, top@4, right@8, bottom@12 }.
-    for (let i = pdfium.FPDFPage_GetAnnotCount(page) - 1; i >= 0; i--) {
+    // 2) Remove ANNOTATIONS / widgets overlapping any rect, and the annotations tied to them
+    //    (`linkedAnnots`), descending so indices stay valid. FS_RECTF layout:
+    //    { left@0, top@4, right@8, bottom@12 }.
+    const annotCount = pdfium.FPDFPage_GetAnnotCount(page)
+    const boxes = new Map<number, PdfBox | null>()
+    const hits = new Set<number>()
+    for (let i = 0; i < annotCount; i++) {
       const annot = pdfium.FPDFPage_GetAnnot(page, i)
       if (!annot) continue
       const ok = pdfium.FPDFAnnot_GetRect(annot, fb)
@@ -258,14 +349,18 @@ function redactPage(
       const r = rt.getValue(fb + 8, 'float')
       const b = rt.getValue(fb + 12, 'float')
       pdfium.FPDFPage_CloseAnnot(annot)
-      if (ok && rects.some((rc) => overlaps(l, b, r, t, rc))) {
-        if (!pdfium.FPDFPage_RemoveAnnot(page, i)) {
-          throw new Error('redact: FPDFPage_RemoveAnnot failed')
-        }
-        // A rect may be stored with its corners swapped: report it normalised.
-        const box = { l: Math.min(l, r), b: Math.min(b, t), r: Math.max(l, r), t: Math.max(b, t) }
-        removed.push({ type: 'annot', box: finiteBox(box) ? box : null })
+      // A rect may be stored with its corners swapped: report it normalised.
+      const box = { l: Math.min(l, r), b: Math.min(b, t), r: Math.max(l, r), t: Math.max(b, t) }
+      boxes.set(i, ok && finiteBox(box) ? box : null)
+      if (ok && rects.some((rc) => overlaps(l, b, r, t, rc))) hits.add(i)
+    }
+    const gone = linkedAnnots(pdfium, page, annotCount, hits)
+    for (const i of [...gone].sort((x, y) => y - x)) {
+      if (!pdfium.FPDFPage_RemoveAnnot(page, i)) {
+        throw new Error('redact: FPDFPage_RemoveAnnot failed')
       }
+      // A tied annotation is reported too: what it painted (a reply's icon) goes with it.
+      removed.push({ type: 'annot', box: boxes.get(i) ?? null })
     }
   } finally {
     free(fb)

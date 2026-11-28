@@ -501,7 +501,6 @@ describe('.pdfx round trip', () => {
 })
 
 // ---------------------------------------------------------------------------------------------
-// ---------------------------------------------------------------------------------------------
 // Redaction safety (PR3b): the boxed word goes, the rest of the page keeps its layer. The full
 // leak suite is ocr-redaction.node.test.ts; these pin the PR3a wiring cases under the new rule.
 

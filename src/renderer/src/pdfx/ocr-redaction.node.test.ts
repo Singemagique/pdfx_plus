@@ -16,19 +16,29 @@ import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import type { PDFDocumentProxy } from 'pdfjs-dist'
 import { getDocument } from 'pdfjs-dist/legacy/build/pdf.mjs'
+import fontkit from '@pdf-lib/fontkit'
 import {
   concatTransformationMatrix,
+  decodePDFRawStream,
   degrees,
   drawObject,
+  PDFArray,
   PDFDict,
   PDFDocument,
   PDFName,
+  PDFNumber,
+  PDFPageLeaf,
+  PDFRawStream,
+  PDFRef,
+  PDFStream,
+  PDFString,
   popGraphicsState,
   pushGraphicsState,
   rgb,
+  StandardFonts,
   type PDFPage
 } from 'pdf-lib'
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 
 import { loadNodeSynthDeps } from '../../../shared/ocr/test-utils/node-deps'
 import {
@@ -44,6 +54,7 @@ import {
   type PackedOcrPage
 } from '../../../shared/ocr/types'
 import { makePageKey, type Geom, type Overlay } from '../edit/model'
+import { stubUnicodeFontFetch } from '../test-utils/fonts'
 import { loadTestPdfium } from '../test-utils/pdfium'
 import type { DocEntry, PageEntry } from '../types'
 import { buildPdf, buildPdfx, unrotateCrop, type EditLayer } from './build'
@@ -52,11 +63,18 @@ import { GLYPHLESS_TTF_NO_CONTOUR } from './ocr-glyphless-ttf'
 import { redactOcrPage, withOcrLayer, type FrameBox } from './ocr-export'
 import { existingOcrLayer, isOcrLayerStream } from './ocr-layer'
 import { redactPdf, redactPdfReport, type PdfiumModule } from './redact'
-import { applyRedactedBytes, buildRedactedSources, type RedactedSources } from './redact-export'
+import {
+  applyRedactedBytes,
+  buildRedactedSources,
+  pdfBoxToFrame,
+  sanitizeRedacted,
+  type RedactedSources
+} from './redact-export'
 import { redactPdf as redactPdf113 } from './test-utils/legacy/redact-1.1.3'
 import {
   extractorLeaks,
   hasManifest,
+  parseToUnicode,
   rawLeaks,
   uniqueCodePoints,
   type Secret
@@ -69,6 +87,7 @@ import {
   pdfiumProbe,
   pdfjsCopyText,
   pdfjsText,
+  toOverlay,
   type ProbePdfium
 } from './test-utils/ocr-layer'
 
@@ -594,6 +613,87 @@ describe('a baseline-miss box (the x-height band, not the baseline)', () => {
   )
 })
 
+describe('the invisible-text pad: its em box, below the baseline, turned, and not the next line', () => {
+  const noContour = (): Uint8Array =>
+    Uint8Array.from(atob(GLYPHLESS_TTF_NO_CONTOUR), (c) => c.charCodeAt(0))
+  const secret: Secret = { words: [SECRET_WORD], uniqueCps: uniqueCodePoints([SECRET_WORD], ['Public', 'words']) } // prettier-ignore
+  const pdfiumOf = (): PdfiumModule => pdfium as unknown as PdfiumModule
+
+  it('a box in the descender band, just under the baseline, still takes the word', async () => {
+    const page = handPage([{ y: 200, size: 20, x0: 20, words: flowWords(['Public', SECRET_WORD, 'words'], 10, 6) }]) // prettier-ignore
+    const w = page.lines[0].words[1]
+    const box = { x: w.x + 2, y: 196, w: w.w - 4, h: 3 }
+    const baked = await bakeLayer(await blankPdf(), [page], { ttf: noContour() })
+    const out = redactPdf(pdfiumOf(), baked.bytes, [{ pageIndex: 0, rects: [box] }])
+    expect(await extractorLeaks(pdfium, out, secret)).toEqual([])
+    expect(await wordsOn(out)).toEqual(['Public', 'words'])
+  })
+
+  it('a quarter-turned contour-less line: the band beside the baseline takes the word', async () => {
+    // Up the page from (200, 20): the em lies to the LEFT of the baseline (x < 200).
+    const page = handPage([{ y: 20, size: 20, x0: 200, angle: Math.PI / 2, words: flowWords(['Public', SECRET_WORD, 'words'], 10, 6) }]) // prettier-ignore
+    const w = page.lines[0].words[1]
+    const baked = await bakeLayer(await blankPdf(), [page], { ttf: noContour() })
+    // PDFium reports zero-width bounds on the baseline itself.
+    for (const o of pdfiumProbe(pdfium, baked.bytes).textObjects)
+      expect(o.bounds.r - o.bounds.l).toBeLessThan(1)
+    const box = { x: 191, y: w.y + 2, w: 7, h: w.w - 4 }
+    const out = redactPdf(pdfiumOf(), baked.bytes, [{ pageIndex: 0, rects: [box] }])
+    expect(await extractorLeaks(pdfium, out, secret)).toEqual([])
+    expect(await wordsOn(out)).toEqual(['Public', 'words'])
+    // Control: the frozen 1.1.3 engine misses it.
+    const old = redactPdf113(pdfiumOf(), baked.bytes, [{ pageIndex: 0, rects: [box] }])
+    expect(await wordsOn(old)).toEqual(['Public', SECRET_WORD, 'words'])
+  })
+
+  it('a skewed (30°) contour-less line: a box above the end of the word takes it', async () => {
+    const a = Math.PI / 6
+    const page = handPage([{ y: 100, size: 20, x0: 100, angle: a, words: flowWords(['Public', SECRET_WORD, 'words'], 10, 6) }]) // prettier-ignore
+    const w = page.lines[0].words[1]
+    const baked = await bakeLayer(await blankPdf(), [page], { ttf: noContour() })
+    // 0.5 em up from the baseline at the word's end: outside the bounds of its (slanted)
+    // baseline segment, inside its em box; both pad axes are non-zero at 30°.
+    const s = w.w - 3
+    const px = w.x + s * Math.cos(a) - 10 * Math.sin(a)
+    const py = w.y + s * Math.sin(a) + 10 * Math.cos(a)
+    const box = { x: px - 1, y: py - 1, w: 2, h: 2 }
+    // The box meets no object's own bounds: only the pad can catch the word.
+    for (const { bounds: o } of pdfiumProbe(pdfium, baked.bytes).textObjects)
+      expect(o.r <= box.x || o.l >= box.x + 2 || o.t <= box.y || o.b >= box.y + 2).toBe(true)
+    const out = redactPdf(pdfiumOf(), baked.bytes, [{ pageIndex: 0, rects: [box] }])
+    expect(await extractorLeaks(pdfium, out, secret)).toEqual([])
+    expect(await wordsOn(out)).not.toContain(SECRET_WORD)
+  })
+
+  it.each([1.2, 1.5])(
+    'at %f em line pitch only the boxed object goes, and rule 2 keeps the lines around it',
+    async (pitch) => {
+      const rows = [
+        ['Alpha', 'Bravo', 'Charl'],
+        ['Delta', 'QVWJK', 'Foxtr'],
+        ['Golfy', 'Hotel', 'India']
+      ]
+      const page = handPage(rows.map((words, k) => ({ y: 200 + (1 - k) * pitch * 20, size: 20, x0: 20, words: flowWords(words, 10, 6) }))) // prettier-ignore
+      const sw = page.lines[1].words[1]
+      const box = { x: sw.x + 2, y: sw.y + 2, w: sw.w - 4, h: 10 }
+      // Our own glyph: its bounds are already a full em tall, so the pad must not grow them.
+      const baked = await bakeLayer(await blankPdf(), [page])
+      const before = pdfiumProbe(pdfium, baked.bytes).textObjects.length
+      const { bytes, removed } = redactPdfReport(pdfiumOf(), baked.bytes, [{ pageIndex: 0, rects: [box] }]) // prettier-ignore
+      expect(before - pdfiumProbe(pdfium, bytes).textObjects.length).toBe(1)
+      expect(removed.get(0)).toHaveLength(1)
+      const kept = rows.flat().filter((t) => t !== 'QVWJK')
+      expect(await wordsOn(bytes)).toEqual(kept)
+      // The report holds the object's own bounds: the OCR words of the lines around it stay.
+      const key = makePageKey('pitch', 0)
+      const gone = new Map([[key, removed.get(0)!.map((o) => pdfBoxToFrame(o.box, [0, 0, 400, 400], 0))]]) // prettier-ignore
+      const layer = edits({ overlays: new Map([[key, [redaction(key, box)]]]) })
+      const left = redactOcrPage(pack(page), layer, key, gone)
+      expect(left ? unpack(left).lines.flatMap((l) => l.words.map((x) => x.t)) : []).toEqual(kept)
+    }
+  )
+})
+
 // ---------------------------------------------------------------------------------------------
 // .pdfx: manifest, attachments, and the round trip
 
@@ -689,7 +789,7 @@ describe("re-redacting a reopened OCR'd PDF", () => {
     const before = pdfiumProbe(pdfium, first).textObjects
     const { bytes, removed } = redactPdfReport(pdfium, first, [{ pageIndex: 0, rects: [box] }])
     const after = pdfiumProbe(pdfium, bytes).textObjects
-    // Exactly one object (the word's Tj) went, and the report names it with its em box.
+    // Exactly one object (the word's Tj) went, and the report names it with its bounds.
     expect(removed.get(0)).toHaveLength(1)
     expect(removed.get(0)![0].type).toBe(1)
     expect(before.length - after.length).toBe(1)
@@ -714,6 +814,32 @@ describe("re-redacting a reopened OCR'd PDF", () => {
     const found = await rawLeaks(out, secret)
     expect(found.length).toBeGreaterThan(0)
     for (const f of found) expect(f).toMatch(/ToUnicode|describes unshown CIDs/)
+    // Positive control of the oracle's ToUnicode text check (not only of rule 5's CID check).
+    expect(found.some((f) => /^ToUnicode of /.test(f))).toBe(true)
+  })
+
+  it('the sweep reports exactly the overlapping OCR object, with bounds over the boxed word', async () => {
+    const before = pdfiumProbe(pdfium, first).textObjects.length
+    const { bytes, removed } = redactPdfReport(pdfium, first, [{ pageIndex: 0, rects: [box] }], { dropOcrText: true }) // prettier-ignore
+    // Every OCR object went; only the one under the box is reported.
+    expect(pdfiumProbe(pdfium, bytes).textObjects).toHaveLength(0)
+    expect(before).toBeGreaterThan(1)
+    const got = removed.get(0)!
+    expect(got).toHaveLength(1)
+    expect(got[0].type).toBe(1)
+    const b = got[0].box!
+    expect(b.l).toBeLessThanOrEqual(sw.x + 0.5)
+    expect(b.r).toBeGreaterThanOrEqual(sw.x + sw.w - 0.5)
+    expect(b.b).toBeLessThanOrEqual(box.y)
+    expect(b.t).toBeGreaterThanOrEqual(box.y + box.h)
+    // The same through the export's report, in the overlay frame.
+    const doc = await openDoc('re-report', first)
+    const key = makePageKey('re-report', 0)
+    const redacted = await buildRedactedSources(edits({ overlays: new Map([[key, [redaction(key, box)]]]) }), [doc], { pdfium, report: true }) // prettier-ignore
+    const rects = redacted.removed!.get(key)!
+    expect(rects).toHaveLength(1)
+    expect(rects[0].x).toBeCloseTo(b.l, 3)
+    expect(rects[0].w).toBeCloseTo(b.r - b.l, 3)
   })
 
   it.each(['pdf', 'pdfx', 'zip', 'sign'] as Kind[])(
@@ -832,6 +958,24 @@ describe('redactOcrPage', () => {
     expect(words(redactOcrPage(page, layer, key, new Map([[key, []]])))).toEqual(['beta', 'gamma'])
   })
 
+  it.each([
+    ['above', 'alpha', { x: 30, y: 316.5, w: 5, h: 1 }, { x: 30, y: 319.5, w: 5, h: 1 }],
+    ['below', 'alpha', { x: 30, y: 294, w: 5, h: 1 }, { x: 30, y: 291.5, w: 5, h: 1 }],
+    ['left of', 'alpha', { x: 17.5, y: 305, w: 1, h: 1 }, { x: 15.5, y: 305, w: 1, h: 1 }],
+    ['right of', 'beta', { x: 116.5, y: 305, w: 1, h: 1 }, { x: 119.5, y: 305, w: 1, h: 1 }]
+  ])(
+    'rule 1 uses the padded footprint (§3.5.1): a box %s the quad, only in the 3 pt pad, drops %s',
+    (_, word, inPad, outside) => {
+      // Size 20: "alpha" quad x 20…70, "beta" x 76…116, both y 296…316 (descent 0.2, ascent
+      // 0.8 em); pad max(1, 0.15 × 20) = 3 pt. Just outside the pad, nothing goes.
+      const report = new Map([[key, []]])
+      const at = (g: FrameBox): string[] =>
+        words(redactOcrPage(page, edits({ overlays: new Map([[key, [redaction(key, g)]]]) }), key, report)) // prettier-ignore
+      expect(at(inPad)).toEqual(['alpha', 'beta', 'gamma'].filter((w) => w !== word))
+      expect(at(outside)).toEqual(['alpha', 'beta', 'gamma'])
+    }
+  )
+
   it('a rotated redaction covers its rotated footprint (mirror.ts footprint)', () => {
     // A thin box at the left, rotated −90° about its origin: it then reaches down to "gamma".
     const r = redaction(key, { x: 5, y: 150, w: 100, h: 2 })
@@ -909,5 +1053,360 @@ describe('the layer stream on a page keeps its tag after filtering', () => {
     const streams = existingOcrLayer(out.getPage(0)).streams
     expect(streams).toHaveLength(1)
     expect(isOcrLayerStream(streams[0])).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------------------------
+// Native residue of the redaction pass (pre-existing since 1.1.3, closed in PR3b's review): what
+// PDFium leaves of a redacted page that copyPages still carries into every export kind
+
+/** A visible secret in Helvetica (a WinAnsi literal string in the content stream). */
+const NATIVE = 'TOPSECRETZQ'
+const NATIVE_BOX: FrameBox = { x: 45, y: 293, w: 200, h: 30 }
+
+/** Every page object of `bytes` is in its page tree (no orphan copy of a page). */
+async function expectNoOrphanPages(bytes: Uint8Array): Promise<void> {
+  const doc = await PDFDocument.load(bytes, { updateMetadata: false })
+  const leaves = doc.context.enumerateIndirectObjects().filter(([, o]) => o instanceof PDFPageLeaf)
+  expect(leaves).toHaveLength(doc.getPageCount())
+}
+
+/** The pages of `doc` (opened over `bytes` as source `id`) at `indices` only. */
+async function someOf(id: string, bytes: Uint8Array, indices: number[]): Promise<DocEntry> {
+  const doc = await openDoc(id, bytes)
+  return { ...doc, pages: doc.pages.filter((p) => indices.includes(p.pageIndex)) }
+}
+
+describe('a page reached only by a reference is not copied (orphan pages)', () => {
+  /**
+   * Page 0 holds the secret; page 1 reaches page 0 through a Link /Dest, a GoTo /A, and a widget
+   * whose field's /Kids lists page 0's widget (/P page 0).
+   */
+  async function linkedPdf(): Promise<Uint8Array> {
+    const doc = await PDFDocument.create()
+    const font = await doc.embedFont(StandardFonts.Helvetica)
+    const p0 = doc.addPage([400, 400])
+    p0.drawText(NATIVE, { x: 50, y: 300, size: 20, font })
+    p0.drawText('alpha notes', { x: 50, y: 100, size: 20, font })
+    const p1 = doc.addPage([400, 400])
+    p1.drawText('public words', { x: 50, y: 300, size: 20, font })
+    const ctx = doc.context
+    const link = ctx.register(ctx.obj({ Type: 'Annot', Subtype: 'Link', Rect: [50, 290, 200, 320], Border: [0, 0, 0], Dest: [p0.ref, 'XYZ', null, null, null] })) // prettier-ignore
+    const goTo = ctx.register(ctx.obj({ Type: 'Annot', Subtype: 'Link', Rect: [50, 250, 200, 280], A: { S: 'GoTo', D: [p0.ref, 'Fit'] } })) // prettier-ignore
+    const field = ctx.nextRef()
+    const w0 = ctx.register(ctx.obj({ Type: 'Annot', Subtype: 'Widget', Rect: [300, 50, 380, 70], P: p0.ref, Parent: field })) // prettier-ignore
+    const w1 = ctx.register(ctx.obj({ Type: 'Annot', Subtype: 'Widget', Rect: [300, 50, 380, 70], P: p1.ref, Parent: field })) // prettier-ignore
+    ctx.assign(field, ctx.obj({ FT: 'Tx', T: PDFString.of('field'), Kids: [w0, w1] }))
+    p0.node.set(PDFName.of('Annots'), ctx.obj([w0]))
+    p1.node.set(PDFName.of('Annots'), ctx.obj([link, goTo, w1]))
+    return doc.save({ useObjectStreams: false })
+  }
+  const secret: Secret = { words: [NATIVE], uniqueCps: [] }
+
+  it('control: the raw copy carries the unredacted page 0 along with page 1', async () => {
+    const bytes = await linkedPdf()
+    const out = await PDFDocument.create()
+    const src = await PDFDocument.load(bytes)
+    out.addPage((await out.copyPages(src, [1]))[0])
+    expect((await rawLeaks(await out.save(), secret)).length).toBeGreaterThan(0)
+  })
+
+  it.each(ALL_KINDS)(
+    '%s: a redacted page and another copy of the same file (a duplicate) linking to it',
+    async (kind) => {
+      const bytes = await linkedPdf()
+      const a = await someOf(`dup-a-${kind}`, bytes, [0])
+      const b = await someOf(`dup-b-${kind}`, bytes, [1])
+      const key = makePageKey(`dup-a-${kind}`, 0)
+      const layer = edits({ overlays: new Map([[key, [redaction(key, NATIVE_BOX)]]]) })
+      const { files } = await exportAs(kind, [a, b], layer, undefined)
+      for (const f of files) await expectNoOrphanPages(f)
+      await expectNoLeak(files, secret)
+      const last = files[files.length - 1]
+      const out = await PDFDocument.load(last)
+      expect(await wordsOn(last, out.getPageCount() - 1)).toEqual(['public', 'words'])
+      // The links lost their destination; the widget left its field's /Kids (and the field).
+      const annots = out
+        .getPage(out.getPageCount() - 1)
+        .node.Annots()!
+        .asArray()
+      const dicts = annots.map((r) => out.context.lookup(r, PDFDict))
+      expect(dicts[0].get(PDFName.of('Dest'))).toBeUndefined()
+      expect(dicts[1].get(PDFName.of('A'))).toBeUndefined()
+      const kids = dicts[2].lookup(PDFName.of('Parent'), PDFDict).lookup(PDFName.of('Kids'), PDFArray) // prettier-ignore
+      expect(kids.size()).toBe(1)
+    }
+  )
+
+  it.each(['pdf', 'pdfx'] as Kind[])(
+    '%s: the redacted page itself was deleted from the collection',
+    async (kind) => {
+      const bytes = await linkedPdf()
+      const doc = await someOf(`del-${kind}`, bytes, [1])
+      const key = makePageKey(`del-${kind}`, 0)
+      const layer = edits({ overlays: new Map([[key, [redaction(key, NATIVE_BOX)]]]) })
+      const { files } = await exportAs(kind, [doc], layer, undefined)
+      await expectNoOrphanPages(files[0])
+      await expectNoLeak(files, secret)
+      expect(await wordsOn(files[0])).toEqual(['public', 'words'])
+    }
+  )
+
+  it('a link between two exported pages of one source keeps its destination', async () => {
+    const bytes = await linkedPdf()
+    const doc = await openDoc('keep-links', bytes)
+    const { files } = await exportAs('pdf', [doc], edits(), undefined)
+    const out = await PDFDocument.load(files[0])
+    const link = out.context.lookup(out.getPage(1).node.Annots()!.get(0), PDFDict)
+    const dest = link.lookup(PDFName.of('Dest'), PDFArray)
+    expect(dest.get(0)).toBe(out.getPage(0).ref)
+    await expectNoOrphanPages(files[0])
+  })
+})
+
+describe('annotations tied to a removed one go with it (popup, reply)', () => {
+  /** A note under the box, its popup in the margin, and a reply to it elsewhere. */
+  async function notedPdf(listNote = true): Promise<Uint8Array> {
+    const doc = await PDFDocument.create()
+    const p = doc.addPage([400, 400])
+    const ctx = doc.context
+    const note = ctx.nextRef()
+    const popup = ctx.register(ctx.obj({ Type: 'Annot', Subtype: 'Popup', Rect: [300, 300, 395, 395], Parent: note })) // prettier-ignore
+    ctx.assign(note, ctx.obj({ Type: 'Annot', Subtype: 'Text', Rect: [50, 300, 70, 320], Contents: PDFString.of('MEMOXQJ'), Popup: popup })) // prettier-ignore
+    const reply = ctx.register(ctx.obj({ Type: 'Annot', Subtype: 'Text', Rect: [300, 50, 320, 70], Contents: PDFString.of('REPLYKQ'), IRT: note })) // prettier-ignore
+    p.node.set(PDFName.of('Annots'), ctx.obj(listNote ? [note, popup, reply] : [popup, reply]))
+    return doc.save({ useObjectStreams: false })
+  }
+  const secret: Secret = { words: ['MEMOXQJ', 'REPLYKQ'], uniqueCps: [] }
+
+  it.each(['pdf', 'pdfx'] as Kind[])('%s', async (kind) => {
+    const doc = await openDoc(`note-${kind}`, await notedPdf())
+    const key = makePageKey(`note-${kind}`, 0)
+    const layer = edits({ overlays: new Map([[key, [redaction(key, { x: 40, y: 290, w: 210, h: 40 })]]]) }) // prettier-ignore
+    const { files, redacted } = await exportAs(kind, [doc], layer, undefined)
+    // All three are reported removed (the tied two are not under the box).
+    expect(redacted.removed!.get(key)).toHaveLength(3)
+    await expectNoLeak(files, secret)
+    const pdf = await getDocument({ data: files[0].slice(), verbosity: 0 }).promise
+    try {
+      expect(await (await pdf.getPage(1)).getAnnotations()).toEqual([])
+    } finally {
+      await pdf.destroy()
+    }
+  })
+
+  it('the pdf-lib pass drops a popup or reply whose annotation the page no longer lists', async () => {
+    const out = await sanitizeRedacted(await notedPdf(false), [0])
+    expect((await PDFDocument.load(out)).getPage(0).node.Annots()?.size() ?? 0).toBe(0)
+    expect(await rawLeaks(out, secret)).toEqual([])
+  })
+})
+
+describe("a redacted page's side copies of its content (PieceInfo, Thumb, Metadata)", () => {
+  async function sidePdf(): Promise<Uint8Array> {
+    const doc = await PDFDocument.create()
+    const font = await doc.embedFont(StandardFonts.Helvetica)
+    const p = doc.addPage([400, 400])
+    p.drawText(NATIVE, { x: 50, y: 300, size: 20, font })
+    p.drawText('alpha notes', { x: 50, y: 100, size: 20, font })
+    const ctx = doc.context
+    const priv = ctx.register(ctx.flateStream(`%AI private (${NATIVE}) Tx`))
+    p.node.set(PDFName.of('PieceInfo'), ctx.obj({ Illustrator: { LastModified: PDFString.of('D:20261128'), Private: { AIPrivateData1: priv } } })) // prettier-ignore
+    p.node.set(PDFName.of('Thumb'), ctx.register(ctx.flateStream(new Uint8Array([10, 20, 30, 40]), { Type: 'XObject', Subtype: 'Image', Width: 2, Height: 2, ColorSpace: 'DeviceGray', BitsPerComponent: 8 }))) // prettier-ignore
+    p.node.set(PDFName.of('Metadata'), ctx.register(ctx.stream(`<x:xmpmeta>${NATIVE}</x:xmpmeta>`, { Type: 'Metadata', Subtype: 'XML' }))) // prettier-ignore
+    p.node.set(PDFName.of('SeparationInfo'), ctx.obj({ Pages: [p.ref], DeviceColorant: 'Cyan' }))
+    return doc.save({ useObjectStreams: false })
+  }
+
+  it.each(ALL_KINDS)('%s', async (kind) => {
+    const bytes = await sidePdf()
+    expect((await rawLeaks(bytes, { words: [NATIVE], uniqueCps: [] })).length).toBeGreaterThan(2) // control
+    const doc = await openDoc(`side-${kind}`, bytes)
+    const key = makePageKey(`side-${kind}`, 0)
+    const layer = edits({ overlays: new Map([[key, [redaction(key, NATIVE_BOX)]]]) })
+    const { files } = await exportAs(kind, [doc], layer, undefined)
+    for (const f of files) {
+      const node = (await PDFDocument.load(f)).getPage(0).node
+      for (const k of ['PieceInfo', 'Thumb', 'Metadata', 'SeparationInfo'])
+        expect(node.get(PDFName.of(k)), k).toBeUndefined()
+      expect(await wordsOn(f)).toEqual(['alpha', 'notes'])
+    }
+    await expectNoLeak(files, { words: [NATIVE], uniqueCps: [] })
+  })
+})
+
+// Native Type0 text: a pdf-lib subset font numbers its glyphs in first-use order.
+
+const DEJAVU = new Uint8Array(
+  readFileSync(fileURLToPath(new URL('../../../../node_modules/dejavu-fonts-ttf/ttf/DejaVuSans.ttf', import.meta.url))) // prettier-ignore
+)
+const NATIVE_KEPT = 'public notes café'
+const NATIVE_SECRET: Secret = { words: [SECRET_WORD], uniqueCps: uniqueCodePoints([SECRET_WORD], [NATIVE_KEPT]) } // prettier-ignore
+
+/** The secret, then the kept line, both in a DejaVu Sans subset (Type0, Identity-H). */
+async function dejavuPdf(gidStream = false): Promise<Uint8Array> {
+  const doc = await PDFDocument.create()
+  doc.registerFontkit(fontkit)
+  const font = await doc.embedFont(DEJAVU, { subset: true })
+  const p = doc.addPage([400, 400])
+  p.drawText(SECRET_WORD, { x: 50, y: 300, size: 20, font })
+  p.drawText(NATIVE_KEPT, { x: 50, y: 100, size: 20, font })
+  const saved = await doc.save({ useObjectStreams: false })
+  if (!gidStream) return saved
+  // A CID font with an explicit CIDToGIDMap stream (identity, as a table) instead of /Identity.
+  const again = await PDFDocument.load(saved)
+  for (const [, o] of again.context.enumerateIndirectObjects())
+    if (o instanceof PDFDict && o.get(PDFName.of('Subtype')) === PDFName.of('CIDFontType2')) {
+      const map = new Uint8Array(512)
+      for (let c = 0; c < 256; c++) map[2 * c + 1] = c
+      o.set(PDFName.of('CIDToGIDMap'), again.context.register(again.context.flateStream(map)))
+    }
+  return again.save({ useObjectStreams: false })
+}
+
+const decoded = (s: PDFStream): Uint8Array =>
+  s instanceof PDFRawStream ? decodePDFRawStream(s).decode() : s.getContents()
+
+/** The DejaVu font of `bytes`: CID → text, CID → GID, and the GIDs with any outline data. */
+async function dejavuTables(
+  bytes: Uint8Array
+): Promise<{ text: Map<number, string>; gid: (c: number) => number; outlined: Set<number> }> {
+  // prettier-ignore
+  const doc = await PDFDocument.load(bytes, { updateMetadata: false })
+  for (const [, o] of doc.context.enumerateIndirectObjects()) {
+    if (!(o instanceof PDFDict) || !o.lookupMaybe(PDFName.of('BaseFont'), PDFName)?.decodeText().includes('DejaVu')) continue // prettier-ignore
+    if (o.get(PDFName.of('Subtype')) !== PDFName.of('Type0')) continue
+    const text = parseToUnicode(new TextDecoder('latin1').decode(decoded(o.lookup(PDFName.of('ToUnicode'), PDFStream)))) // prettier-ignore
+    const cid = doc.context.lookup(
+      o.lookup(PDFName.of('DescendantFonts'), PDFArray).get(0),
+      PDFDict
+    )
+    const m = cid.get(PDFName.of('CIDToGIDMap'))
+    const table = m instanceof PDFRef ? decoded(doc.context.lookup(m, PDFStream)) : null
+    const gid = (c: number): number => (table ? (table[2 * c] << 8) | table[2 * c + 1] : c)
+    const desc = cid.lookup(PDFName.of('FontDescriptor'), PDFDict)
+    const ttf = decoded(desc.lookup(PDFName.of('FontFile2'), PDFStream))
+    const dv = new DataView(ttf.buffer, ttf.byteOffset, ttf.byteLength)
+    const tables = new Map<string, number>()
+    for (let t = 0; t < dv.getUint16(4); t++)
+      tables.set(String.fromCharCode(...ttf.subarray(12 + 16 * t, 16 + 16 * t)), dv.getUint32(12 + 16 * t + 8)) // prettier-ignore
+    const long = dv.getInt16(tables.get('head')! + 50) === 1
+    const n = dv.getUint16(tables.get('maxp')! + 4)
+    const loca = tables.get('loca')!
+    const at = (g: number): number => (long ? dv.getUint32(loca + 4 * g) : 2 * dv.getUint16(loca + 2 * g)) // prettier-ignore
+    const outlined = new Set<number>()
+    for (let g = 0; g < n; g++)
+      if (ttf.subarray(tables.get('glyf')! + at(g), tables.get('glyf')! + at(g + 1)).some((v) => v !== 0)) outlined.add(g) // prettier-ignore
+    return { text, gid, outlined }
+  }
+  throw new Error('no DejaVu font')
+}
+
+describe('native Type0 text in a subset font: its tables and outlines keep only what is shown', () => {
+  it.each([
+    ['/Identity', false],
+    ['a CIDToGIDMap stream', true]
+  ] as const)('%s', async (_, gidStream) => {
+    const bytes = await dejavuPdf(gidStream)
+    const before = await dejavuTables(bytes)
+    // Control: the subset's ToUnicode spells the secret out in order, and draws it.
+    const order = [...before.text]
+      .sort((x, y) => x[0] - y[0])
+      .map(([, t]) => t)
+      .join('')
+    expect(order.startsWith(SECRET_WORD)).toBe(true)
+    const secretCids = [...before.text].filter(([, t]) => SECRET_WORD.includes(t)).map(([c]) => c)
+    expect(secretCids).toHaveLength(SECRET_WORD.length)
+    for (const c of secretCids) expect(before.outlined.has(before.gid(c))).toBe(true)
+    expect((await rawLeaks(bytes, NATIVE_SECRET)).length).toBeGreaterThan(0)
+
+    for (const kind of ['pdf', 'pdfx', 'zip'] as Kind[]) {
+      const id = `dv-${gidStream ? 'map' : 'id'}-${kind}`
+      const doc = await openDoc(id, bytes)
+      const key = makePageKey(id, 0)
+      const layer = edits({ overlays: new Map([[key, [redaction(key, NATIVE_BOX)]]]) })
+      const { files } = await exportAs(kind, [doc], layer, undefined)
+      for (const f of files) {
+        expect(await wordsOn(f)).toEqual(NATIVE_KEPT.split(' '))
+        const after = await dejavuTables(f)
+        for (const c of secretCids) {
+          expect(after.text.has(c)).toBe(false)
+          expect(after.outlined.has(before.gid(c))).toBe(false)
+        }
+        // What is shown keeps its outline.
+        for (const [c, t] of after.text) if (t !== ' ') expect(after.outlined.has(after.gid(c)), t).toBe(true) // prettier-ignore
+      }
+      await expectNoLeak(files, NATIVE_SECRET)
+    }
+  })
+
+  it('trimming changes no pixel of the redacted page', async () => {
+    const bytes = await dejavuPdf()
+    const user = { x: NATIVE_BOX.x, y: NATIVE_BOX.y, w: NATIVE_BOX.w, h: NATIVE_BOX.h }
+    const redacted = redactPdf(pdfium as unknown as PdfiumModule, bytes, [{ pageIndex: 0, rects: [user] }]) // prettier-ignore
+    const clean = await sanitizeRedacted(redacted, [0])
+    expect(raster(clean, 144).data).toEqual(raster(redacted, 144).data)
+    // ...nor of a page sharing the font that was not redacted at all.
+    expect(raster(await sanitizeRedacted(bytes, []), 144).data).toEqual(raster(bytes, 144).data)
+  })
+})
+
+describe('a Unicode text overlay next to an OCR layer (both pdf-lib Type0 subsets)', () => {
+  it.each(['pdf', 'pdfx'] as Kind[])('%s', async (kind) => {
+    stubUnicodeFontFetch()
+    try {
+      const page = handPage([{ y: 200, size: 20, x0: 20, words: flowWords(['Public', SECRET_WORD, 'words'], 10, 6) }]) // prettier-ignore
+      const sw = page.lines[0].words[1]
+      const doc = await openDoc(`uni-${kind}`, await blankPdf())
+      const key = makePageKey(`uni-${kind}`, 0)
+      const text: Overlay = { id: 'uni', pageKey: key, z: 0, createdAt: 0, type: 'text', text: 'Ωmega café', fontSize: 14, color: { r: 0, g: 0, b: 0 }, font: 'Helvetica', align: 'left', geom: { x: 20, y: 300, w: 200, h: 20, rotation: 0, opacity: 1 } } // prettier-ignore
+      const box = { x: sw.x + 2, y: 202, w: sw.w - 4, h: 10 }
+      const layer = edits({ overlays: new Map([[key, [text, { ...redaction(key, box), z: 1, createdAt: 1 }]]]) }) // prettier-ignore
+      const { files } = await exportAs(kind, [doc], layer, new Map([[key, pack(page)]]))
+      const secret: Secret = { words: [SECRET_WORD], uniqueCps: uniqueCodePoints([SECRET_WORD], ['Public', 'words', 'Ωmega café']) } // prettier-ignore
+      await expectNoLeak(files, secret)
+      const all = pdfjsCopyText((await pdfjsText(files[0])).items)
+      expect(all).toContain('Public')
+      if (kind === 'pdf') expect(all).toContain('Ωmega')
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+})
+
+describe('a page with /UserUnit 2: the frame is twice the user space', () => {
+  async function unitPdf(): Promise<Uint8Array> {
+    const doc = await PDFDocument.create()
+    const font = await doc.embedFont(StandardFonts.Helvetica)
+    const p = doc.addPage([400, 400])
+    p.node.set(PDFName.of('UserUnit'), PDFNumber.of(2))
+    p.drawText(NATIVE, { x: 50, y: 300, size: 20, font })
+    p.drawText('alpha', { x: 50, y: 100, size: 20, font })
+    return doc.save({ useObjectStreams: false })
+  }
+
+  it.each(['pdf', 'pdfx'] as Kind[])('%s', async (kind) => {
+    const doc = await openDoc(`uu-${kind}`, await unitPdf())
+    expect([doc.pages[0].width, doc.pages[0].height]).toEqual([800, 800])
+    const key = makePageKey(`uu-${kind}`, 0)
+    // In the frame the secret's baseline is at (100, 600).
+    const box = { x: 95, y: 590, w: 310, h: 50 }
+    const ocr = handPage([{ y: 400, size: 24, x0: 100, words: flowWords(['Harbor'], 20, 0) }])
+    const layer = edits({ overlays: new Map([[key, [redaction(key, box)]]]) })
+    const { files, redacted } = await exportAs(kind, [doc], layer, new Map([[key, pack(ocr)]]))
+    expect(await extractorLeaks(pdfium, files[0], { words: [NATIVE], uniqueCps: [] })).toEqual([])
+    // The report is in the frame too: the removed text object lies inside the box.
+    const gone = redacted.removed!.get(key)!
+    expect(gone).toHaveLength(1)
+    expect(gone[0].x).toBeGreaterThanOrEqual(box.x)
+    expect(gone[0].x + gone[0].w).toBeLessThanOrEqual(box.x + box.w)
+    expect(gone[0].y).toBeGreaterThanOrEqual(box.y)
+    // The OCR word lands where the frame put it.
+    const t = await pdfjsText(files[0])
+    const item = t.items.find((i) => i.str === 'Harbor')!
+    const [x, y] = toOverlay(t, item.transform[4], item.transform[5])
+    expect(x).toBeCloseTo(100, 0)
+    expect(y).toBeCloseTo(400, 0)
+    expect(await wordsOn(files[0])).toEqual(['Harbor', 'alpha'])
   })
 })

@@ -167,9 +167,11 @@ function type0Fonts(doc: PDFDocument): FontInfo[] {
     const desc = obj.lookupMaybe(PDFName.of('DescendantFonts'), PDFArray)
     const cid = desc ? doc.context.lookupMaybe(desc.get(0), PDFDict) : undefined
     const wCids = widthCids(cid?.lookupMaybe(PDFName.of('W'), PDFArray), doc)
-    const gidStream = cid?.lookupMaybe(PDFName.of('CIDToGIDMap'), PDFStream)
+    // A stream maps CID → GID; the name /Identity (what pdf-lib writes) means GID = CID.
+    const gidMap = cid?.get(PDFName.of('CIDToGIDMap'))
+    const gidStream = gidMap instanceof PDFRef ? doc.context.lookup(gidMap) : gidMap
     const gidCids: number[] = []
-    if (gidStream) {
+    if (gidStream instanceof PDFStream) {
       const g = streamData(gidStream)
       for (let c = 0; 2 * c + 1 < g.length; c++) if (g[2 * c] || g[2 * c + 1]) gidCids.push(c)
     }
