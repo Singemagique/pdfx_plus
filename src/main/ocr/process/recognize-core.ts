@@ -382,6 +382,8 @@ export interface RecognizePageOptions {
   calibration?: CalibrationTable
   /** Ask for the adaptive pass at all (default true; never on a `reuse` call). */
   adaptive?: boolean
+  /** PROTOTYPE, tests only: never lay out or split a pass (the 1.1.4 path, for an A/B). */
+  noUnits?: boolean
   /**
    * The page's edit rotation (§3.4.5 priors): pass 1 reads the copy turned this way first when it
    * lies on the 90° test's axis (it then picks 180 over 0, or 270 over 90); the band tests still
@@ -463,7 +465,8 @@ function* pageSteps(
       params.tessedit_pageseg_mode !== 3 ||
       !engine.layout ||
       !engine.recognizeLaidOut ||
-      pageInk < UNIT_TUNING.minInk
+      pageInk < UNIT_TUNING.minInk ||
+      opts.noUnits === true
     )
       return recogOne(id, image, params)
     const plan = planUnits(engine.layout(image, params), image)

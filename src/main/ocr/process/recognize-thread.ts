@@ -122,6 +122,7 @@ async function handle(msg: ToRecognize): Promise<void> {
             returnHocr: msg.returnHocr === true,
             reuse: msg.reuse,
             adaptive: msg.adaptive,
+            noUnits: msg.noUnits,
             prior: msg.editRotation,
             calibration: msg.calibration,
             units: (jobs) =>
@@ -146,6 +147,7 @@ async function handle(msg: ToRecognize): Promise<void> {
             returnHocr: msg.returnHocr === true,
             reuse: msg.reuse,
             adaptive: msg.adaptive,
+            noUnits: msg.noUnits,
             prior: msg.editRotation,
             calibration: msg.calibration
           })

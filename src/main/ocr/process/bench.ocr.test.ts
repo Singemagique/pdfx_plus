@@ -337,10 +337,18 @@ describe.runIf(on('sweep') || on('timing'))('tier 2: sweep and timing', () => {
     'times the §3.9.4 page end to end at n = 1 and n = 2',
     async () => {
       const out: Record<string, unknown> = { platform: process.platform, reps: REPS }
-      for (const preset of ['letter10pt', 'smallprint6pt-letter', 'smallprint6pt']) {
+      // PROTOTYPE: smallprint6pt-letter also on the 1.1.4 path (no units), for a same-VM A/B.
+      for (const key of [
+        'letter10pt',
+        'smallprint6pt-letter',
+        'smallprint6pt-letter:no-units',
+        'smallprint6pt'
+      ]) {
+        const preset = key.split(':')[0]
+        const noUnits = key.endsWith(':no-units')
         const r = await synthesize({ preset, seed: 1 }, deps)
         const runOnce = (h: PageHarness): Promise<PageRun> =>
-          h.run(r.pdfBytes, r.gt.page, { langs: ['eng'] })
+          h.run(r.pdfBytes, r.gt.page, { langs: ['eng'], ...(noUnits ? { noUnits } : {}) })
         await runOnce(harnesses[0]) // warm-up (engine init, first-use costs)
         const byN: Record<string, unknown> = {}
         for (const n of [1, 2]) {
@@ -359,7 +367,12 @@ describe.runIf(on('sweep') || on('timing'))('tier 2: sweep and timing', () => {
             recognizeMedian: Math.round(quantile(rec, 0.5)!)
           }
         }
-        out[preset] = { pixels: r.raster.width * r.raster.height, words: r.gt.words.length, ...byN }
+        out[key] = {
+          pixels: r.raster.width * r.raster.height,
+          words: r.gt.words.length,
+          threads: threads.length,
+          ...byN
+        }
       }
       write(`timing-${process.platform}`, out)
       const median = (preset: string, n: string): number =>

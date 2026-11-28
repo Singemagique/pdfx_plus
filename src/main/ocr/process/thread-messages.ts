@@ -118,6 +118,8 @@ export type ToRecognize =
       reuse?: ReuseHint
       /** Ask for the adaptive pass (default true). */
       adaptive?: boolean
+      /** PROTOTYPE, tests only: never split a pass (the 1.1.4 path, for an A/B). */
+      noUnits?: boolean
       /**
        * The page's edit rotation (§3.4.5 priors: tried first). Absent = 0: the 90° test decides.
        */

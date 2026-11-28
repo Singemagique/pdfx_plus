@@ -42,7 +42,7 @@ export interface RecognizeReply {
 /** The recognize message's optional fields a test sets (thread-messages.ts). */
 export type RecognizeExtra = Pick<
   Extract<ToRecognize, { type: 'recognize' }>,
-  'reuse' | 'adaptive' | 'rawPass1' | 'editRotation' | 'calibration'
+  'reuse' | 'adaptive' | 'rawPass1' | 'editRotation' | 'calibration' | 'noUnits'
 >
 
 /** PROTOTYPE: threads that may run each other's units when idle (shared by harnesses). */
