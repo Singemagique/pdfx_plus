@@ -5,7 +5,7 @@
 // mapped into the overlay frame. The decisions are page-plan.ts's, the same functions the
 // coordinator calls, so this harness and the app cannot drift apart.
 
-import { TESS_CORE7 } from '../../../shared/ocr/calibration'
+import { TESS_CALIBRATION } from '../../../shared/ocr/calibration'
 import { ENGINE_ID, PIPELINE_VERSION } from '../../../shared/ocr/engine/tess-core'
 import type { CalibrationTable, GrayImage } from '../../../shared/ocr/engine/types'
 import { mapRawOcrPage, type MapContext, type SizeFactors } from '../../../shared/ocr/map'
@@ -160,7 +160,7 @@ export async function pageHarness(thread: Recognizer): Promise<PageHarness> {
           langs: o.langs,
           pipelineVersion: PIPELINE_VERSION,
           pageClass: triage.pageClass ?? 'scanned',
-          calibration: TESS_CORE7,
+          calibration: TESS_CALIBRATION,
           orientation: outcome.orientation,
           skewDeg: outcome.plan.skewDeg,
           toOverlay: overlayAffine(outcome, frame, keptRaster),

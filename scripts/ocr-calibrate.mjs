@@ -4,7 +4,7 @@
 // Runs src/main/ocr/process/calibrate.ocr.test.ts (the `ocr` vitest project, skipped unless
 // PDFX_OCR_CALIBRATE=1): the synthetic sweep of seeds × presets × fonts through the real engine
 // and the whole PR6 pipeline, an isotonic fit of P(word correct | raw conf), written as 21 points
-// to src/shared/ocr/calibration/tess-core7-simd.json with the fit's counts, its expected
+// to src/shared/ocr/calibration/tess-simd.json with the fit's counts, its expected
 // calibration error, the UI thresholds read off the curve and the font-size factor sweep.
 //
 // The maintainers' real corpus (§3.9.1) is picked up from bench/ocr-real/manifest.json when it
@@ -30,10 +30,10 @@ const opt = (name) => {
   const i = args.indexOf(`--${name}`)
   return i >= 0 ? args[i + 1] : undefined
 }
-const TABLE = 'src/shared/ocr/calibration/tess-core7-simd.json'
+const TABLE = 'src/shared/ocr/calibration/tess-simd.json'
 const check = args.includes('--check')
 const tmp = check ? mkdtempSync(join(tmpdir(), 'pdfx-ocr-cal-')) : null
-const out = tmp ? join(tmp, 'tess-core7-simd.json') : TABLE
+const out = tmp ? join(tmp, 'tess-simd.json') : TABLE
 const env = { ...process.env, PDFX_OCR_CALIBRATE: '1' }
 if (tmp) env.PDFX_OCR_CAL_OUT = out
 for (const [flag, name] of [

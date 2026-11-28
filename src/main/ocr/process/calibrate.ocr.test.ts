@@ -3,7 +3,7 @@
 // × fonts through the whole pipeline (page-harness.ts, several real recognize threads at once),
 // labels every recognised word correct or not against the ground truth (matched one-to-one by box,
 // correct = exactly the GT text), fits the isotonic P(word correct | raw conf) and writes the
-// 21-point table to src/shared/ocr/calibration/tess-core7-simd.json. It also sweeps the font-size
+// 21-point table to src/shared/ocr/calibration/tess-simd.json. It also sweeps the font-size
 // factor (§3.4.6: x-height → em) over the same pages and reports the median word-box IoU of each.
 // The pipeline's own gate (Retry A) reads a fixed table during the sweep (DECISION_TABLE), never
 // the committed one, so the fit is a deterministic function of the code and the seeds:
@@ -20,7 +20,11 @@ import { join } from 'node:path'
 import { availableParallelism } from 'node:os'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
-import { calibrate, TESS_CORE7_PLACEHOLDER, thresholdsFor } from '../../../shared/ocr/calibration'
+import {
+  calibrate,
+  TESS_CALIBRATION_PLACEHOLDER,
+  thresholdsFor
+} from '../../../shared/ocr/calibration'
 import {
   expectedCalibrationError,
   fitCalibration,
@@ -50,7 +54,7 @@ import { pageHarness, type PageHarness } from '../test-utils/page-harness'
 const RUN = process.env.PDFX_OCR_CALIBRATE === '1'
 /** Where the table goes (the script's --check writes elsewhere and compares). */
 const OUT =
-  process.env.PDFX_OCR_CAL_OUT ?? join(REPO_ROOT, 'src/shared/ocr/calibration/tess-core7-simd.json')
+  process.env.PDFX_OCR_CAL_OUT ?? join(REPO_ROOT, 'src/shared/ocr/calibration/tess-simd.json')
 
 /**
  * The table the pipeline's own gate (Retry A, `thresholdsFor(table).retry`) reads during the
@@ -60,7 +64,7 @@ const OUT =
  * placeholder's retry gate (p = raw/100 below 0.70) is the design's "≈ raw 70" itself; the app keeps
  * reading the shipped table, whose retry threshold is read off the curve at that same raw 70.
  */
-const DECISION_TABLE = TESS_CORE7_PLACEHOLDER
+const DECISION_TABLE = TESS_CALIBRATION_PLACEHOLDER
 const REAL = join(REPO_ROOT, 'bench/ocr-real/manifest.json')
 
 const list = (v: string | undefined, d: string[]): string[] =>
@@ -241,7 +245,10 @@ describe.runIf(RUN)('calibration run (tier 2)', () => {
     const best = factorIou.reduce((a, b) => (b.medianIou > a.medianIou ? b : a))
     const correct = samples.filter((s) => s.correct).length
     const ece = {
-      placeholder: expectedCalibrationError(samples, (r) => calibrate(TESS_CORE7_PLACEHOLDER, r)!),
+      placeholder: expectedCalibrationError(
+        samples,
+        (r) => calibrate(TESS_CALIBRATION_PLACEHOLDER, r)!
+      ),
       fitted: expectedCalibrationError(samples, (r) => calibrate(table, r)!)
     }
     const fit = {

@@ -53,11 +53,17 @@ Tests use [Vitest](https://vitest.dev). The suite is split into three projects i
   (`src/shared/ocr/test-utils/ocr-cache/`); `PDFX_OCR_CACHE_STRICT=1` (what CI sets) fails on any
   mismatch, and `yarn ocr:record` re-records after a deliberate engine or pipeline change.
 
+The OCR engine itself (Tesseract and Leptonica compiled to WebAssembly) is built by PDFx from
+pinned upstream sources: see [`build/ocr-core/README.md`](build/ocr-core/README.md) for how to
+rebuild it reproducibly, what is pinned, and how to bump it for a Tesseract security release. CI's
+`OCR core build` workflow fails unless the vendored `vendor/tesseract-core/` files are exactly
+what those sources build.
+
 OCR maintenance scripts (none of them runs in the app):
 
 - `yarn ocr:record` rewrites the replay cache and the packaged self-test's expected result.
 - `yarn ocr:calibrate` refits the confidence calibration
-  (`src/shared/ocr/calibration/tess-core7-simd.json`) from the synthetic sweep.
+  (`src/shared/ocr/calibration/tess-simd.json`) from the synthetic sweep.
 - `yarn ocr:lang-catalogue` regenerates `src/main/ocr/lang-manifest.json`, the compiled catalogue
   of downloadable languages: for each one it checks the npm tarball of `@tesseract.js-data/<code>`
   against the registry's integrity hash, records the size and SHA-256 of the `.traineddata.gz`

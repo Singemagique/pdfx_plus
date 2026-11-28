@@ -74,12 +74,8 @@
     "prettier": "3.8.4",
     "react": "19.2.7",
     "react-dom": "19.2.7",
-    "tesseract.js-core": "7.0.0",
     "typescript": "5.9.3",
     "vite": "7.3.5",
     "vitest": "4.1.9"
-  },
-  "resolutions": {
-    "tesseract.js-core": "7.0.0"
   }
 }

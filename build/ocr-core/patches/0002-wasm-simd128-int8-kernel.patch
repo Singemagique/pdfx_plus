@@ -1,0 +1,98 @@
+--- a/src/arch/intsimdmatrixsse.cpp
++++ b/src/arch/intsimdmatrixsse.cpp
+@@ -29,6 +29,86 @@
+ 
+ namespace tesseract {
+ 
++#  if defined(__wasm_simd128__)
++// PDFx: native WebAssembly SIMD128 kernel for the Emscripten build (the SSE4.1 one below runs
++// through Emscripten's SSE emulation, where _mm_hadd_epi32 and 64-bit loads are slow). Four outputs
++// at a time share each 16-byte input load and its widening; i32x4.dot_i16x8_s does the
++// multiply-adds. Integer sums are exact, so every output equals the SSE kernel's bit for bit.
++}  // namespace tesseract
++#    include <wasm_simd128.h>
++namespace tesseract {
++
++static inline int32_t HorizontalSum(v128_t s) {
++  s = wasm_i32x4_add(s, wasm_i32x4_shuffle(s, s, 2, 3, 0, 1));
++  s = wasm_i32x4_add(s, wasm_i32x4_shuffle(s, s, 1, 0, 3, 2));
++  return wasm_i32x4_extract_lane(s, 0);
++}
++
++static inline v128_t DotAdd16(v128_t sum, v128_t ulo, v128_t uhi, const int8_t *w) {
++  const v128_t ww = wasm_v128_load(w);
++  sum = wasm_i32x4_add(sum, wasm_i32x4_dot_i16x8(ulo, wasm_i16x8_extend_low_i8x16(ww)));
++  return wasm_i32x4_add(sum, wasm_i32x4_dot_i16x8(uhi, wasm_i16x8_extend_high_i8x16(ww)));
++}
++
++static void matrixDotVector(int dim1, int dim2, const int8_t *wi, const TFloat *scales,
++                            const int8_t *u, TFloat *v) {
++  const int num_out = dim1;
++  const int num_in = dim2 - 1;
++  const int n16 = num_in & ~15;
++  int output = 0;
++  for (; output + 4 <= num_out; output += 4) {
++    const int8_t *w0 = wi, *w1 = wi + dim2, *w2 = wi + 2 * dim2, *w3 = wi + 3 * dim2;
++    v128_t s0 = wasm_i32x4_splat(0), s1 = s0, s2 = s0, s3 = s0;
++    for (int j = 0; j < n16; j += 16) {
++      const v128_t uu = wasm_v128_load(u + j);
++      const v128_t ulo = wasm_i16x8_extend_low_i8x16(uu);
++      const v128_t uhi = wasm_i16x8_extend_high_i8x16(uu);
++      s0 = DotAdd16(s0, ulo, uhi, w0 + j);
++      s1 = DotAdd16(s1, ulo, uhi, w1 + j);
++      s2 = DotAdd16(s2, ulo, uhi, w2 + j);
++      s3 = DotAdd16(s3, ulo, uhi, w3 + j);
++    }
++    int32_t t0 = HorizontalSum(s0), t1 = HorizontalSum(s1);
++    int32_t t2 = HorizontalSum(s2), t3 = HorizontalSum(s3);
++    for (int j = n16; j < num_in; ++j) {
++      t0 += u[j] * w0[j];
++      t1 += u[j] * w1[j];
++      t2 += u[j] * w2[j];
++      t3 += u[j] * w3[j];
++    }
++    // The same float expression as PartialMatrixDotVector1 below.
++    TFloat total = t0;
++    v[0] = (total + w0[num_in] * INT8_MAX) * scales[0];
++    total = t1;
++    v[1] = (total + w1[num_in] * INT8_MAX) * scales[1];
++    total = t2;
++    v[2] = (total + w2[num_in] * INT8_MAX) * scales[2];
++    total = t3;
++    v[3] = (total + w3[num_in] * INT8_MAX) * scales[3];
++    wi += 4 * dim2;
++    scales += 4;
++    v += 4;
++  }
++  for (; output < num_out; output++) {
++    v128_t s = wasm_i32x4_splat(0);
++    for (int j = 0; j < n16; j += 16) {
++      const v128_t uu = wasm_v128_load(u + j);
++      s = DotAdd16(s, wasm_i16x8_extend_low_i8x16(uu), wasm_i16x8_extend_high_i8x16(uu), wi + j);
++    }
++    int32_t t = HorizontalSum(s);
++    for (int j = n16; j < num_in; ++j) {
++      t += u[j] * wi[j];
++    }
++    TFloat total = t;
++    *v = (total + wi[num_in] * INT8_MAX) * *scales;
++    wi += dim2;
++    scales++;
++    v++;
++  }
++}
++
++#  else
++
+ // Computes and returns the dot product of the n-vectors u and v.
+ // Uses Intel SSE intrinsics to access the SIMD instruction set.
+ static int32_t IntDotProductSSE(const int8_t *u, const int8_t *v, int n) {
+@@ -90,6 +170,8 @@
+   }
+ }
+ 
++#  endif // __wasm_simd128__
++
+ const IntSimdMatrix IntSimdMatrix::intSimdMatrixSSE = {
+     matrixDotVector,
+     // Number of 32 bit outputs held in each register.

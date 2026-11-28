@@ -22,7 +22,7 @@
 //     coordinator re-renders at `adaptive.dpi` and calls again with `reuse`, which skips the
 //     geometry tests and runs the chosen recipe once (page-plan.ts decides which result wins).
 
-import { calibrate, TESS_CORE7, thresholdsFor } from '../../../shared/ocr/calibration'
+import { calibrate, TESS_CALIBRATION, thresholdsFor } from '../../../shared/ocr/calibration'
 import type { CalibrationTable, GrayImage, RawOcr } from '../../../shared/ocr/engine/types'
 import { TessError, fullPageParams, type TessParams } from '../../../shared/ocr/engine/tess-core'
 import { hocrToRaw, parseHocr } from '../../../shared/ocr/hocr'
@@ -372,7 +372,7 @@ export interface RecognizePageOptions {
   /** The adaptive second call: reuse the first call's geometry and recipe. */
   reuse?: ReuseHint
   /**
-   * The table Retry A's gate reads (default TESS_CORE7). The calibration run passes a fixed one,
+   * The table Retry A's gate reads (default TESS_CALIBRATION). The calibration run passes a fixed one,
    * so the fit does not depend on the table it replaces (calibrate.ocr.test.ts).
    */
   calibration?: CalibrationTable
@@ -394,7 +394,7 @@ export function recognizePage(
   opts: RecognizePageOptions = {}
 ): RecognizeOutcome {
   const now = opts.now ?? (() => performance.now())
-  const table = opts.calibration ?? TESS_CORE7
+  const table = opts.calibration ?? TESS_CALIBRATION
   const hocrs: string[] = []
   const records: RecognitionRecord[] = []
   const passes: PassSummary[] = []

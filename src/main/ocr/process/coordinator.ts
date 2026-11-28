@@ -80,7 +80,7 @@ import {
   type Budgets,
   type SystemInfo
 } from './budget'
-import { TESS_CORE7 } from '../../../shared/ocr/calibration'
+import { TESS_CALIBRATION } from '../../../shared/ocr/calibration'
 import { ENGINE_ID, PIPELINE_VERSION } from '../../../shared/ocr/engine/tess-core'
 import { mapRawOcr } from '../../../shared/ocr/map'
 import { rotationDelta } from '../../../shared/ocr/preprocess/orientation'
@@ -1756,7 +1756,7 @@ export class Coordinator {
       // The class triage gave the page (§3.4.1). A page recognised without triage, or one triage
       // could not classify, is treated as a scan.
       pageClass: v?.pageClass ?? 'scanned',
-      calibration: TESS_CORE7,
+      calibration: TESS_CALIBRATION,
       orientation: outcome.orientation,
       skewDeg: outcome.plan.skewDeg,
       toOverlay: overlayAffine(outcome, frame, raster),

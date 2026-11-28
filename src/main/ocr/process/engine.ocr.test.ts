@@ -13,7 +13,7 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
-import { TESS_CORE7 } from '../../../shared/ocr/calibration'
+import { TESS_CALIBRATION } from '../../../shared/ocr/calibration'
 import { ENGINE_ID, PIPELINE_VERSION } from '../../../shared/ocr/engine/tess-core'
 import type { GrayImage } from '../../../shared/ocr/engine/types'
 import { mapRawOcrPage } from '../../../shared/ocr/map'
@@ -161,7 +161,7 @@ describe('tier 1: the real engine on the synth presets', () => {
         langs: spec.langs,
         pipelineVersion: PIPELINE_VERSION,
         pageClass: 'scanned',
-        calibration: TESS_CORE7
+        calibration: TESS_CALIBRATION
       })
       const { conf, ...parts } = pageParts(page)
       xosDump('engine', spec.id, {

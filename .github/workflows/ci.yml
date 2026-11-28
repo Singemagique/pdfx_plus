@@ -31,8 +31,9 @@ jobs:
       # skips lifecycle scripts: no Electron binary download and no native build
       # (the mac-only glass addon, which self-skips off macOS anyway). Faster and
       # more robust than a full install. The build matrix below does a full install.
-      # The OCR engine and its bundled languages are plain npm packages (tesseract.js-core,
-      # @tesseract.js-data/*) with no install scripts, so tier 1 runs on this install too.
+      # The OCR core is vendored (vendor/tesseract-core, built by build/ocr-core) and the bundled
+      # languages are plain npm packages (@tesseract.js-data/*) with no install scripts, so tier 1
+      # runs on this install too.
       - name: Install dependencies
         run: yarn install --frozen-lockfile --ignore-scripts
 

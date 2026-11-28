@@ -6,8 +6,8 @@
 import { describe, expect, it } from 'vitest'
 
 import {
-  TESS_CORE7,
-  TESS_CORE7_PLACEHOLDER,
+  TESS_CALIBRATION,
+  TESS_CALIBRATION_PLACEHOLDER,
   calibrate,
   thresholdsFor
 } from '../../../shared/ocr/calibration'
@@ -133,7 +133,7 @@ describe('recognizePage: pass plan', () => {
     const { engine, calls } = scripted((p) =>
       p.tessedit_pageseg_mode === 6 ? low : p.thresholding_method === 2 ? GOOD : low
     )
-    const out = recognizePage(engine, blank(), 300, { calibration: TESS_CORE7_PLACEHOLDER })
+    const out = recognizePage(engine, blank(), 300, { calibration: TESS_CALIBRATION_PLACEHOLDER })
     // Neither band read reads well, so the quarter band test runs too (and does not turn).
     expect(out.passes.map((p) => p.id)).toEqual([
       'pass1',
@@ -169,7 +169,7 @@ describe('recognizePage: pass plan', () => {
     const low = hocr([words(8, 50), words(8, 50)])
     const worse = hocr([words(4, 50)])
     const { engine } = scripted((p) => (p.thresholding_method === 2 ? worse : low))
-    const out = recognizePage(engine, blank(), 300, { calibration: TESS_CORE7_PLACEHOLDER })
+    const out = recognizePage(engine, blank(), 300, { calibration: TESS_CALIBRATION_PLACEHOLDER })
     expect(out.passes.map((p) => p.id)).toContain('sauvola')
     expect(out.chosen).toBe('pass1')
     expect(out.recipe).toEqual({ psm: 3, thresholding: 0 })
@@ -204,10 +204,10 @@ describe('recognizePage: pass plan', () => {
   })
 
   it('Retry A fires just under the shipped retry threshold, not at it', () => {
-    const retry = thresholdsFor(TESS_CORE7).retry
+    const retry = thresholdsFor(TESS_CALIBRATION).retry
     // The highest whole raw confidence whose calibrated value is under the threshold.
     let r = 0
-    while (calibrate(TESS_CORE7, r + 1)! < retry) r++
+    while (calibrate(TESS_CALIBRATION, r + 1)! < retry) r++
     for (const [conf, retried] of [
       [r, true],
       [r + 1, false]
@@ -239,7 +239,7 @@ describe('recognizePage: pass plan', () => {
       meanConf: 50,
       confSource: 'word' as const
     }
-    expect(calibratedMean(raw, TESS_CORE7_PLACEHOLDER)).toBeCloseTo(0.9, 12)
+    expect(calibratedMean(raw, TESS_CALIBRATION_PLACEHOLDER)).toBeCloseTo(0.9, 12)
   })
 
   it('never runs more than MAX_PASSES full-page recognitions (band reads aside)', () => {
@@ -256,7 +256,7 @@ describe('recognizePage: pass plan', () => {
       if (p.tessedit_pageseg_mode === 6) return i === 1 ? garbage : GOOD
       return hocr([words(2, 40)])
     })
-    const out = recognizePage(engine, img, 300, { calibration: TESS_CORE7_PLACEHOLDER })
+    const out = recognizePage(engine, img, 300, { calibration: TESS_CALIBRATION_PLACEHOLDER })
     const full = out.passes.filter((p) => !p.id.startsWith('band'))
     expect(full.map((p) => p.id)).toEqual(['pass1', 'pass1-flipped', 'sauvola'])
     expect(full.length).toBe(MAX_PASSES)

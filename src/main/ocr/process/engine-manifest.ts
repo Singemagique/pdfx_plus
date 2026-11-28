@@ -4,15 +4,17 @@
 // electron-builder `extraResources` source still has these bytes, so a renamed or updated package
 // fails CI rather than users. In 1.1.4 the engine never parses a model file not hashed here.
 //
-// Values [measured, PR0 `inventory.mjs`, re-measured for PR5 with node:crypto over node_modules]:
-// tesseract.js-core 7.0.0 and @tesseract.js-data/{eng,deu,fra,spa} 1.0.0, `4.0.0_best_int` only.
+// Values [measured with node:crypto]: the core PDFx builds from upstream Tesseract 5.5.5
+// (build/ocr-core, vendored in vendor/tesseract-core/5.5.5; build/ocr-core/EXPECTED.sha256 and the
+// ocr-core-build workflow pin the same bytes) and @tesseract.js-data/{eng,deu,fra,spa} 1.0.0,
+// `4.0.0_best_int` only.
 
 import catalogue from '../lang-manifest.json'
 
 export interface ManifestFile {
   /** Base name under resources/ocr (core) or resources/ocr/tessdata (data). */
   file: string
-  /** The npm source electron-builder copies from (repo-relative). */
+  /** The repo file electron-builder copies from (vendor/ or node_modules/, repo-relative). */
   source: string
   bytes: number
   sha256: string
@@ -27,15 +29,15 @@ export interface ManifestData extends ManifestFile {
 export const ENGINE_CORE = {
   js: {
     file: 'tesseract-core-simd-lstm.js',
-    source: 'node_modules/tesseract.js-core/tesseract-core-simd-lstm.js',
-    bytes: 89_271,
-    sha256: 'e48e2f02ddae3716c8dd24bf41cd290d4efa96892d689cdc4013c2545d63f469'
+    source: 'vendor/tesseract-core/5.5.5/tesseract-core-simd-lstm.js',
+    bytes: 35_606,
+    sha256: 'afb73b41ad0c20677004dbc576543dbd1c02ded553266163a7d7bce794ef82fd'
   },
   wasm: {
     file: 'tesseract-core-simd-lstm.wasm',
-    source: 'node_modules/tesseract.js-core/tesseract-core-simd-lstm.wasm',
-    bytes: 2_857_601,
-    sha256: '34e8d50cac216427d86bf397d610fdd9f49492539bbcdfbfccc4eda20c810bea'
+    source: 'vendor/tesseract-core/5.5.5/tesseract-core-simd-lstm.wasm',
+    bytes: 1_686_208,
+    sha256: '018024fe00456ae346f15479252103813beae659e326922f7f4bee2387a7aa48'
   }
 } as const satisfies Record<'js' | 'wasm', ManifestFile>
 

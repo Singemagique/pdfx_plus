@@ -1,19 +1,24 @@
-// Our own loader for the tesseract.js-core 7.0.0 simd-lstm build (DESIGN.md §3.2.2). Host-agnostic
+// Our own loader for PDFx's Tesseract core (DESIGN.md §3.2.2): upstream Tesseract 5.5.5 and
+// Leptonica 1.87.0 built to WebAssembly by build/ocr-core (the configuration of tesseract.js-core
+// 7.0.0's simd-lstm core, without image codecs, with our own WebIDL bindings). Host-agnostic
 // (DOM-free, Electron-free, no node: imports): the caller hands in the Emscripten glue's factory,
 // the WebAssembly.Module it compiled ONCE from the SHA-checked .wasm, and the gunzipped, SHA-checked
 // traineddata. Nothing here builds a URL, reads a file or touches the network.
 //
-// What PR0/PR0b measured and this file relies on:
+// What PR0/PR0b measured (on the 7.0.0 core; the 5.5.5 core keeps it) and this file relies on:
 // - The glue honours `instantiateWasm` on the main thread and in worker_threads (also in the packaged
 //   utility process); on that path it never calls `locateFile`, so the stub below is a tripwire for
 //   the fetch/wasmBinary path only.
-// - P5 PGM input gives byte-identical hOCR to PNG; Leptonica's other readers never see a byte.
+// - Input is a binary P5 PGM read by Leptonica's PNM reader; the core links no other image codec.
+//   `SetImageFile(1, 0)` returns false when no 8-bit image was set (unreadable or refused /input):
+//   that is TessError('params'), never the OOM path below.
 // - `debug_file=/dev/null` after Init alone silences tprintf; it is set before AND after Init (the
 //   sequence PR0 measured silent). `print` is dropped; `printErr` only sees runtime text (abort
 //   lines, Leptonica allocation errors), which goes to a bounded ring and is used to classify
 //   failures, never logged.
-// - The glue's exit path sets `process.exitCode` (and throws ExitStatus, a plain object): after any
-//   glue call that quits, the exit code is reset so the thread does not exit with it.
+// - An Emscripten exit path sets `process.exitCode` (and throws ExitStatus, a plain object): after
+//   any glue call that quits, the exit code is reset so the thread does not exit with it. (The
+//   5.5.5 glue has no such write [measured, grep]; the reset stays as defence.)
 // - A WASM OOM is not an abort: `Recognize` returns −1 and hOCR is empty, with Leptonica
 //   "…malloc fail…" lines on printErr. That is an OOM-shaped failure (respawn, re-queue, halve n).
 //   So is an abort whose message or printErr lines name an allocation failure, and a failed
@@ -23,8 +28,13 @@
 
 import type { GrayImage } from './types'
 
-/** Written into every OcrPage, the .pdfx provenance and the replay CACHE_INFO.json (§3.2.1). */
-export const ENGINE_ID = 'tess-lstm/core-7.0.0/simd/fork-2a9c1c4'
+/**
+ * Written into every OcrPage, the .pdfx provenance and the replay CACHE_INFO.json (§3.2.1):
+ * `tess-lstm/<TESSERACT_TAG>-pdfx.<PDFX_CORE_REVISION>/simd` from build/ocr-core/versions.env
+ * (engine-manifest.node.test.ts checks), so a rebuild with other patches or flags under the same
+ * Tesseract tag is a different engine in saved files and caches.
+ */
+export const ENGINE_ID = 'tess-lstm/5.5.5-pdfx.1/simd'
 
 /**
  * The recognition pipeline's version: bump it whenever preprocessing, the pass plan, the hOCR
@@ -88,7 +98,7 @@ export function configHashInput(opts: {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The glue's surface (WebIDL-bound in this build; the names tesseract.js's own worker uses).
+// The glue's surface (build/ocr-core/glue/pdfx.idl; the names tesseract.js's own worker uses).
 
 export interface EmscriptenOpts {
   instantiateWasm(
@@ -105,7 +115,8 @@ export interface EmscriptenOpts {
 export interface TessApi {
   SetVariable(name: string, value: string): boolean
   Init(datapath: string, langs: string, oem: number): number
-  SetImageFile(exifOrientation: number, angle: number): void
+  /** Reads /input (a P5 PGM); false: no 8-bit image was set. */
+  SetImageFile(exifOrientation: number, angle: number): boolean
   Recognize(monitor: null): number
   GetHOCRText(page: number): string
   End(): void
@@ -248,7 +259,7 @@ export async function createTess(deps: TessCoreDeps, langs: readonly string[]): 
   let broken = false
   let ended = false
 
-  // The 7.0.0 glue wraps instantiateWasm in a promise with no reject path, so a failed instantiate
+  // The glue (7.0.0's and ours) wraps instantiateWasm in a promise with no reject path, so a failed instantiate
   // (a LinkError, or V8's RangeError "Out of memory: Cannot allocate Wasm memory" under memory
   // pressure) would leave the factory pending forever and the thread hung until the watchdog. The
   // failure is raced against the factory instead: OOM-shaped when it is an allocation failure.
@@ -368,7 +379,7 @@ export async function createTess(deps: TessCoreDeps, langs: readonly string[]): 
         for (const [k, v] of Object.entries(params))
           if (!api.SetVariable(k, String(v))) throw new TessError('params', `${k} rejected`)
         m.FS.writeFile('/input', pgm)
-        api.SetImageFile(1, 0)
+        if (!api.SetImageFile(1, 0)) throw new TessError('params', 'input image rejected')
         const r = api.Recognize(null)
         const out = r === 0 ? api.GetHOCRText(0) : ''
         try {

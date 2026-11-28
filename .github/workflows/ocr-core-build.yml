@@ -1,0 +1,66 @@
+name: OCR core build
+
+# Rebuilds the vendored Tesseract WebAssembly core (vendor/tesseract-core/5.5.5) from the pinned
+# sources in build/ocr-core/ inside the digest-pinned emscripten/emsdk image, and fails unless the
+# output is byte-identical to the committed files (build/ocr-core/EXPECTED.sha256). Nothing here
+# publishes anything; the rebuilt files are uploaded only when they differ, for a maintainer to see.
+#
+# It runs on EVERY pull request and push to main (no `paths:` filter) so that it can be a required
+# check: GitHub leaves a path-filtered required workflow pending forever on PRs it skips. The first
+# step decides whether the core's inputs changed and, if not, the job passes in seconds without
+# building. workflow_dispatch always rebuilds.
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ocr-core-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  reproduce:
+    name: Rebuild and compare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Did the core's inputs change?
+        id: changes
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          paths=(build/ocr-core vendor/tesseract-core .github/workflows/ocr-core-build.yml)
+          case "$EVENT" in
+            pull_request) range="$BASE...HEAD" ;;
+            push) range="$BEFORE..HEAD" ;;
+            *) range="" ;;
+          esac
+          if [ -z "$range" ] || ! git cat-file -e "${range%%.*}^{commit}" 2>/dev/null; then
+            echo "build=true" >> "$GITHUB_OUTPUT"; echo "no comparable base: rebuilding"; exit 0
+          fi
+          if git diff --quiet "$range" -- "${paths[@]}"; then
+            echo "build=false" >> "$GITHUB_OUTPUT"; echo "core inputs unchanged in $range: nothing to rebuild"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"; git diff --stat "$range" -- "${paths[@]}"
+          fi
+
+      - name: Rebuild in the pinned image (no network inside the container)
+        if: steps.changes.outputs.build == 'true'
+        run: bash build/ocr-core/build.sh --out "$RUNNER_TEMP/core" --verify vendor/tesseract-core/5.5.5
+
+      - name: Upload the differing build
+        if: failure() && steps.changes.outputs.build == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ocr-core-rebuilt
+          path: ${{ runner.temp }}/core

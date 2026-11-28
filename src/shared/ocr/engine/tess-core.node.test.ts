@@ -36,6 +36,8 @@ interface FakeScript {
   abortMessage?: string
   /** Recognize throws this instead (e.g. a RangeError from the glue). */
   throwInRecognize?: Error
+  /** SetImageFile reports that no 8-bit image was set. */
+  imageRejected?: boolean
 }
 
 function fake(script: FakeScript = {}) {
@@ -65,8 +67,9 @@ function fake(script: FakeScript = {}) {
         if (script.quitIn === 'Init') quit(3)
         return script.initRc ?? 0
       }
-      SetImageFile(): void {
+      SetImageFile(): boolean {
         calls.push('setImageFile')
+        return script.imageRejected !== true
       }
       Recognize(): number {
         calls.push('recognize')
@@ -264,6 +267,20 @@ describe('createTess', () => {
     expect(tess.broken).toBe(true)
   })
 
+  it('a refused input image is a params error, never OOM-shaped, and Recognize never runs', async () => {
+    const f = fake({ imageRejected: true })
+    const tess = await createTess(
+      { factory: f.factory, wasmModule: EMPTY_WASM, traineddata: DATA },
+      ['eng']
+    )
+    expect(() => tess.recognize(IMG, fullPageParams(300))).toThrow(
+      expect.objectContaining({ kind: 'params', name: 'TessError' })
+    )
+    expect(f.calls).toContain('setImageFile')
+    expect(f.calls).not.toContain('recognize')
+    expect(tess.broken).toBe(true)
+  })
+
   const thrown = async (script: FakeScript): Promise<TessError> => {
     const f = fake(script)
     const tess = await createTess(
@@ -328,7 +345,7 @@ describe('createTess', () => {
   })
 
   it('a failed instantiate of the posted Module rejects createTess instead of hanging', async () => {
-    // The fake factory, like the real 7.0.0 glue, only ever resolves through instantiateWasm's
+    // The fake factory, like the real glue (7.0.0's and ours), only ever resolves through instantiateWasm's
     // success callback: before the race, this promise never settled (PR5 review).
     // A module importing a function the imports object does not provide: instantiate rejects.
     const importing = new WebAssembly.Module(
