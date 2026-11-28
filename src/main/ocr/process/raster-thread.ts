@@ -7,7 +7,7 @@ import { tripwireCount, tripwireSelfCheck } from './no-network'
 import { parentPort } from 'node:worker_threads'
 import { init } from '@embedpdf/pdfium'
 import { RasterEngine, makePrintErr, type PdfiumRaster } from './raster-core'
-import type { PdfiumTriage } from './triage-pdfium'
+import type { PdfiumMask } from './triage-pdfium'
 import type { FromRaster, ToRaster } from './thread-messages'
 
 const port = parentPort
@@ -45,7 +45,7 @@ async function start(msg: Extract<ToRaster, { type: 'init' }>): Promise<void> {
     // Captured, never silenced: "Cannot enlarge memory" during a render is the silent-blank signal.
     printErr: makePrintErr(() => pending, lines)
   } as unknown as Parameters<typeof init>[0])) as unknown as PdfiumRaster &
-    PdfiumTriage & {
+    PdfiumMask & {
       PDFiumExt_Init(): void
     }
   mod.PDFiumExt_Init()

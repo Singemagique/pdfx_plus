@@ -7,6 +7,10 @@
 //   (heap growth replaces the view).
 // - Render: FPDFBitmap_Gray, FillRect white, FPDF_RenderPageBitmap(rotate 0, flags 0). FPDF_ANNOT is
 //   left out on purpose, so widget values, stamps and signature appearances never become page text.
+//   The only flag a request may add is FPDF_RENDER_NO_SMOOTHIMAGE (page-plan.ts decides; PR6's A/B
+//   keeps smoothing on). A near-scanned page renders with maskText: its visible top-level text
+//   objects are taken off the in-memory page first (never saved; destroyed after the render) and
+//   the visible chars left inside Form XObjects are painted white over the bitmap (§3.4.1).
 // - The frame (intrinsic /Rotate applied, view box = CropBox ∩ MediaBox) must equal the pdf.js
 //   PageEntry frame the renderer sent; a mismatch fails the page instead of misplacing text.
 // - PDFium keeps the stored bytes of every stream it touched until the document closes, so a
@@ -25,7 +29,13 @@
 import type { PageReason } from '../../../shared/ocr/protocol'
 import { fitRaster, type TriagePage } from '../../../shared/ocr/triage'
 import type { RasterLimits } from './thread-messages'
-import { jpxRefusalOf, triagePages, type PdfiumTriage, type TriageContext } from './triage-pdfium'
+import {
+  jpxRefusalOf,
+  maskVisibleText,
+  triagePages,
+  type PdfiumMask,
+  type TriageContext
+} from './triage-pdfium'
 
 /** The PDFium calls this module needs (a structural subset of `@embedpdf/pdfium`'s wrapper). */
 export interface PdfiumRaster {
@@ -64,6 +74,12 @@ export interface PdfiumRaster {
 export const FPDFBitmap_Gray = 1
 /** Render flags: 0. Not FPDF_ANNOT (0x01); and 0x10 is FPDF_REVERSE_BYTE_ORDER, not printing (PR0). */
 export const RENDER_FLAGS = 0
+/**
+ * FPDF_RENDER_NO_SMOOTHIMAGE (fpdfview.h: 0x2000; the @embedpdf/pdfium typings list no flag
+ * constants). PR6's A/B decides when it is passed (page-plan.ts 
+enderFlagsFor).
+ */
+export const FPDF_RENDER_NO_SMOOTHIMAGE = 0x2000
 
 export const DEFAULT_RASTER_LIMITS: RasterLimits = {
   heapCap: 2 * 2 ** 30,
@@ -82,6 +98,13 @@ export interface RenderRequest {
   dpi: number
   userUnit: number
   frame: { width: number; height: number }
+  /** Render flags (default RENDER_FLAGS); only FPDF_RENDER_NO_SMOOTHIMAGE may be added. */
+  flags?: number
+  /**
+   * A near-scanned page (§3.4.1): its visible top-level text objects are removed from the in-memory
+   * page before the render and the visible chars left inside Form XObjects painted white after it.
+   */
+  maskText?: boolean
 }
 
 export type RenderOutcome =
@@ -127,6 +150,29 @@ export function makePrintErr(
   }
 }
 
+/**
+ * Paint overlay-frame boxes (pt, bottom-left origin) white on a `w × h` raster of a `pw × ph` pt
+ * page, each grown by one pixel (anti-aliased glyph edges reach past the char box).
+ */
+export function paintBoxesWhite(
+  data: Uint8Array,
+  w: number,
+  h: number,
+  boxes: readonly { x0: number; y0: number; x1: number; y1: number }[],
+  pw: number,
+  ph: number
+): void {
+  const sx = w / pw
+  const sy = h / ph
+  for (const b of boxes) {
+    const x0 = Math.max(0, Math.floor(b.x0 * sx) - 1)
+    const x1 = Math.min(w, Math.ceil(b.x1 * sx) + 1)
+    const y0 = Math.max(0, Math.floor((ph - b.y1) * sy) - 1)
+    const y1 = Math.min(h, Math.ceil((ph - b.y0) * sy) + 1)
+    for (let y = y0; y < y1; y++) if (x1 > x0) data.fill(255, y * w + x0, y * w + x1)
+  }
+}
+
 export class RasterEngine {
   private readonly sources = new Map<string, Source>()
   private rendering = false
@@ -135,7 +181,7 @@ export class RasterEngine {
   readonly stderrTail: string[] = []
 
   constructor(
-    private readonly mod: PdfiumRaster & PdfiumTriage,
+    private readonly mod: PdfiumRaster & PdfiumMask,
     private readonly limits: RasterLimits = DEFAULT_RASTER_LIMITS
   ) {}
 
@@ -219,6 +265,7 @@ export class RasterEngine {
     this.enlargeDuringRender = false
     let page = 0
     let bmp = 0
+    let removed: number[] = []
     try {
       page = m.FPDF_LoadPage(doc, req.index)
       if (!page) return { kind: 'failed', status: 'failed', reason: 'render' }
@@ -239,10 +286,14 @@ export class RasterEngine {
       // The probe's own failure prints "Cannot enlarge memory" too; only lines from here on count.
       this.enlargeDuringRender = false
 
+      const mask = req.maskText ? maskVisibleText(m, page) : null
+      if (mask) removed = mask.removed
+      const flags = RENDER_FLAGS | ((req.flags ?? 0) & FPDF_RENDER_NO_SMOOTHIMAGE)
+
       bmp = m.FPDFBitmap_CreateEx(fit.width, fit.height, FPDFBitmap_Gray, 0, 0)
       if (!bmp) return { kind: 'heap-exhausted' }
       m.FPDFBitmap_FillRect(bmp, 0, 0, fit.width, fit.height, 0xffffffff)
-      m.FPDF_RenderPageBitmap(bmp, page, 0, 0, fit.width, fit.height, 0, RENDER_FLAGS)
+      m.FPDF_RenderPageBitmap(bmp, page, 0, 0, fit.width, fit.height, 0, flags)
       if (this.enlargeDuringRender) return { kind: 'heap-exhausted' }
 
       const stride = m.FPDFBitmap_GetStride(bmp)
@@ -254,10 +305,13 @@ export class RasterEngine {
         for (let y = 0; y < fit.height; y++)
           data.set(heap.subarray(buf + y * stride, buf + y * stride + fit.width), y * fit.width)
       if (this.enlargeDuringRender) return { kind: 'heap-exhausted' }
+      if (mask) paintBoxesWhite(data, fit.width, fit.height, mask.boxes, pw, ph)
       return { kind: 'ok', width: fit.width, height: fit.height, dpi: fit.dpi, data }
     } finally {
       this.rendering = false
       if (bmp) m.FPDFBitmap_Destroy(bmp)
+      // Removed objects belong to us now; the page itself is never saved.
+      for (const o of removed) m.FPDFPageObj_Destroy(o)
       if (page) m.FPDF_ClosePage(page)
     }
   }

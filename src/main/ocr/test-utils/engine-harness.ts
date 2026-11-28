@@ -13,7 +13,7 @@ import { threadOptions } from '../process/budget'
 import { ENGINE_CORE, ENGINE_DATA } from '../process/engine-manifest'
 import { loadEngine } from '../process/engine-node'
 import type { LoadedEngine } from '../process/coordinator'
-import type { RecognizeOutcome } from '../process/recognize-core'
+import type { RecognizeOutcome, ReuseHint } from '../process/recognize-core'
 import type { FromRecognize, ToRecognize } from '../process/thread-messages'
 import { bundleEntry, type Bundled } from './bundle'
 import { PDFIUM_WASM_PATH } from './pdfium-node'
@@ -44,7 +44,8 @@ export interface EngineThread {
     img: GrayImage,
     dpi: number,
     langs: string[],
-    returnHocr?: boolean
+    returnHocr?: boolean,
+    extra?: { reuse?: ReuseHint; adaptive?: boolean; rawPass1?: boolean }
   ): Promise<RecognizeReply>
   /** The thread's tripwire counter as of its last message. */
   readonly tripwire: number
@@ -117,7 +118,7 @@ export async function startEngineThread(engine?: LoadedEngine): Promise<EngineTh
     get tripwire() {
       return tripwire
     },
-    recognize(img, dpi, langs, returnHocr = false) {
+    recognize(img, dpi, langs, returnHocr = false, extra = {}) {
       if (failed) return Promise.reject(failed)
       const taskId = ++seq
       const copy = new Uint8Array(img.width * img.height)
@@ -132,7 +133,8 @@ export async function startEngineThread(engine?: LoadedEngine): Promise<EngineTh
           dpi,
           data: copy.buffer,
           langs,
-          returnHocr
+          returnHocr,
+          ...extra
         }
         worker.postMessage(msg, [copy.buffer])
       })

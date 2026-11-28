@@ -30,16 +30,18 @@
 //   the line's ink height and at most twice it, using the median word height when the line box is
 //   more than 1.5× that (a tilted or ragged line).
 
-import { calibrate, RAW_THRESHOLDS } from './calibration'
+import { calibrate, thresholdsFor } from './calibration'
 import type { CalibrationTable, PxBox, RawLine, RawOcr, RawWord } from './engine/types'
 import { cleanOcrText } from './text'
 import {
   pack,
   type OcrLine,
   type OcrPage,
+  type OcrRect,
   type OcrWord,
   type PackedOcrPage,
-  type PageClass
+  type PageClass,
+  wordQuad
 } from './types'
 
 /** PDF `cm` order: x' = a·x + c·y + e, y' = b·x + d·y + f. */
@@ -64,6 +66,13 @@ export interface MapContext {
   skewDeg?: number
   /** Pixel → overlay affine; defaults to `pixelToOverlay(page, raster)`. */
   toOverlay?: Affine
+  /**
+   * A near-scanned page's visible native words (overlay frame, pt; §3.4.6): an OCR word whose em
+   * box lies more than half inside them is the native text read again, and is dropped.
+   */
+  native?: readonly OcrRect[]
+  /** The font-size factors (default XHEIGHT_EM, CJK_CHAR_EM); the calibration run's refit sweeps them. */
+  sizeFactors?: SizeFactors
 }
 
 /** The plain scale-and-flip from raster px (top-left, y down) to the overlay frame (pt, y up). */
@@ -90,8 +99,18 @@ const len = (v: readonly [number, number]): number => Math.sqrt(v[0] * v[0] + v[
 /** tan(1°): a baseline flatter than this snaps to angle 0 (no trigonometry needed to decide). */
 const TAN_1DEG = 0.017455064928217585
 
-/** The x-height → em factor for Latin-like scripts (PR0; PR6 refits). */
-export const XHEIGHT_EM = 0.5
+/**
+ * The x-height → em factor for Latin-like scripts. PR0 used 0.5, which overestimates Helvetica by
+ * 4–12%. PR6 refit it on the calibration sweep (5 seeds × 15 presets × Helvetica, Times, Courier,
+ * DejaVu Serif; 41,849 words): median word-box IoU 0.854 at 0.50, 0.882 at 0.56, a flat maximum
+ * of 0.892 at 0.59–0.61 [measured, scripts/ocr-calibrate.mjs]. 0.56 is taken rather than the
+ * maximum: it keeps a larger em box (the redaction footprint relies on the box covering the ink;
+ * a bigger factor shrinks it), it makes the box match Helvetica's own ascent..descent (0.523 em
+ * x-height plus the ~1 px anti-aliasing PR0 measured), and it already has ~75% of the IoU gain.
+ */
+export const XHEIGHT_EM = 0.56
+/** The clamp's upper bound: the em box is at most this inverse share of the line's ink height. */
+const XHEIGHT_CLAMP = 0.5
 /** Char-box height → em for scripts without an x-height (PR6 refits on the CJK replays). */
 export const CJK_CHAR_EM = 0.88
 
@@ -182,7 +201,17 @@ export function dropReason(
  * Em height (px) of a line, by script (see the header). On a vertical line (`vertical`) every
  * "height" is the extent across the reading direction: the box widths.
  */
-export function lineSizePx(line: RawLine, keptText: string, vertical = false): number {
+export interface SizeFactors {
+  xHeightEm: number
+  cjkCharEm: number
+}
+
+export function lineSizePx(
+  line: RawLine,
+  keptText: string,
+  vertical = false,
+  f: SizeFactors = { xHeightEm: XHEIGHT_EM, cjkCharEm: CJK_CHAR_EM }
+): number {
   const across = vertical ? width : height
   const wordHeights = line.words.map((w) => across(w.bbox)).filter((h) => h > 0)
   const medWord = median(wordHeights)
@@ -193,9 +222,9 @@ export function lineSizePx(line: RawLine, keptText: string, vertical = false): n
     const charHeights: number[] = []
     for (const w of line.words)
       for (const c of w.chars ?? []) if (across(c) > 0) charHeights.push(across(c))
-    size = CJK_CHAR_EM * (charHeights.length > 0 ? median(charHeights) : medWord)
-  } else size = line.xHeight > 0 ? line.xHeight / XHEIGHT_EM : ref
-  if (ref > 0) size = Math.min(Math.max(size, ref), ref / XHEIGHT_EM)
+    size = f.cjkCharEm * (charHeights.length > 0 ? median(charHeights) : medWord)
+  } else size = line.xHeight > 0 ? line.xHeight / f.xHeightEm : ref
+  if (ref > 0) size = Math.min(Math.max(size, ref), ref / XHEIGHT_CLAMP)
   return size
 }
 
@@ -239,9 +268,10 @@ export function mapRawOcrPage(raw: RawOcr, ctx: MapContext): OcrPage {
   let weight = 0
   let anyConf = false
 
-  for (const rl of raw.lines) {
-    const o = lineOrientation(rl)
+  for (const line0 of raw.lines) {
+    const o = lineOrientation(line0)
     if (o === null) continue
+    const rl = o === 0 ? splitWideGaps(line0) : line0
     const vertical = isVertical(o)
     const across = vertical ? width : height
     const medH = median(rl.words.map((w) => across(w.bbox)))
@@ -262,8 +292,10 @@ export function mapRawOcrPage(raw: RawOcr, ctx: MapContext): OcrPage {
         baseline ? rl.bbox.y1 + baseline.intercept + slope * (x - rl.bbox.x0) : fallback
       // Baseline direction in the overlay frame; the em height runs perpendicular to it.
       const dir = applyVec(m, 1, slope)
+      // Snap within 1° of either horizontal: 0, or π when the affine turns the copy upside down
+      // (an OCR copy flipped by the orientation test reads right to left on the page).
       flat = Math.abs(slope) < TAN_1DEG && Math.abs(dir[1]) < TAN_1DEG * Math.abs(dir[0])
-      angle = flat ? 0 : Math.atan2(dir[1], dir[0])
+      angle = flat ? (dir[0] > 0 ? 0 : Math.PI) : Math.atan2(dir[1] + 0, dir[0])
       span = (b) => ({ start: [b.x0, baseY(b.x0, b.y1)], end: [b.x1, baseY(b.x1, b.y1)] })
     } else {
       const r: [number, number] = o === 90 ? [0, -1] : o === 270 ? [0, 1] : [-1, 0]
@@ -272,7 +304,7 @@ export function mapRawOcrPage(raw: RawOcr, ctx: MapContext): OcrPage {
       angle = Math.atan2(dir[1] + 0, dir[0])
       span = (b) => rotatedSpan(rl, b, o)
     }
-    const sizePx = lineSizePx(rl, kept.map((k) => k.t).join(''), vertical)
+    const sizePx = lineSizePx(rl, kept.map((k) => k.t).join(''), vertical, ctx.sizeFactors)
     // px → pt across the baseline (the affine's scale on the image axis across the reading one).
     const size = sizePx * len(vertical ? applyVec(m, 1, 0) : applyVec(m, 0, 1))
 
@@ -282,8 +314,9 @@ export function mapRawOcrPage(raw: RawOcr, ctx: MapContext): OcrPage {
       // Each word on its OWN baseline, also on a snapped line (see the header).
       const [x, y] = apply(m, start[0], start[1])
       const [xe, ye] = apply(m, end[0], end[1])
-      // Snapped lines run horizontally from the word's own left edge.
+      // Snapped lines run horizontally from the word's own reading start.
       const wPt = flat ? Math.abs(xe - x) : Math.sqrt((xe - x) ** 2 + (ye - y) ** 2)
+      if (ctx.native && nativeOverlap({ x, y, w: wPt }, { angle, size }, ctx.native) > 0.5) continue
       const conf = w.conf
       const confCal = calibrate(ctx.calibration, conf)
       const word: OcrWord = { t, x, y, w: wPt, conf, confCal }
@@ -297,13 +330,14 @@ export function mapRawOcrPage(raw: RawOcr, ctx: MapContext): OcrPage {
         weight += n
       }
     }
+    if (words.length === 0) continue
     const line: OcrLine = { angle, size, words }
     if (rl.lang) line.lang = rl.lang
     lines.push(line)
   }
 
   const meanConfCal = weight > 0 ? calWeighted / weight : null
-  const flag = calibrate(ctx.calibration, RAW_THRESHOLDS.flag)
+  const flag = thresholdsFor(ctx.calibration).flag
   const status: OcrPage['status'] =
     lines.length === 0
       ? 'no-text'
@@ -326,6 +360,125 @@ export function mapRawOcrPage(raw: RawOcr, ctx: MapContext): OcrPage {
     status,
     lines
   }
+}
+
+const NUM_OR_PUNCT = /^[\p{N}\p{P}]$/u
+const SYMBOL = /^\p{S}$/u
+
+/** A gap inside a word this share of the line's narrowest inter-word gaps is a missed space … */
+export const SPLIT_GAP_SHARE = 0.6
+/** … at least this many times the line's median gap between the chars of a word … */
+export const SPLIT_INTRA_FACTOR = 3
+/** … and never below this share of the line's x-height. */
+export const SPLIT_GAP_XH = 0.3
+
+/**
+ * Split words at a missed space (§3.4.6 post-processing; copy fidelity's "HelloWorld" rule): the
+ * engine sometimes reads two words as one across a space-wide gap, typically a currency sign and
+ * its amount (`€ 97.558,15` → `€97.558,15`, measured on numbers-table). Using the char boxes:
+ * - between a symbol (\p{S}: €, $, %, +) and a letter or digit, a gap of 0.3 × the x-height splits
+ *   (`€ 97`: 9 px at 11 pt / 300 DPI; ``, no space: 6 px [measured]);
+ * - between letters, a gap of at least 0.6 × the line's narrow inter-word gaps (their lower
+ *   quartile: table columns make the median useless), 3 × the median gap between chars inside the
+ *   line's words (so a monospace font's wide gaps around narrow letters never split) and 0.3 × the
+ *   x-height;
+ * - between two digits or punctuation marks, never: a narrow `1` leaves a gap as wide as a space
+ *   (`1` to `4` in ``: 9 px [measured]), so geometry cannot tell `1 45` from `145`.
+ * Horizontal lines of two or more words only, and only words whose char boxes are one per code
+ * point; the parts keep the word's confidence.
+ */
+export function splitWideGaps(line: RawLine): RawLine {
+  if (line.words.length < 2) return line
+  const gaps: number[] = []
+  for (let i = 1; i < line.words.length; i++)
+    gaps.push(line.words[i].bbox.x0 - line.words[i - 1].bbox.x1)
+  const sortedGaps = gaps.filter((g) => g > 0).sort((a, b) => a - b)
+  if (sortedGaps.length === 0) return line
+  const narrow = sortedGaps[Math.floor((sortedGaps.length - 1) / 4)]
+  const intra: number[] = []
+  for (const w of line.words) {
+    const b = w.chars
+    if (!b || b.length !== [...w.text].length) continue
+    for (let i = 1; i < b.length; i++) intra.push(Math.max(0, b[i].x0 - b[i - 1].x1))
+  }
+  if (intra.length === 0) return line
+  const limit = Math.max(
+    SPLIT_GAP_SHARE * narrow,
+    SPLIT_INTRA_FACTOR * Math.max(1, median(intra)),
+    SPLIT_GAP_XH * line.xHeight
+  )
+  let changed = false
+  const words: RawWord[] = []
+  for (const w of line.words) {
+    const cps = [...w.text]
+    const boxes = w.chars
+    if (!boxes || boxes.length !== cps.length || cps.length < 2) {
+      words.push(w)
+      continue
+    }
+    let start = 0
+    const flush = (end: number): void => {
+      const part = boxes.slice(start, end)
+      words.push({
+        text: cps.slice(start, end).join(''),
+        bbox: {
+          x0: Math.min(...part.map((b) => b.x0)),
+          y0: w.bbox.y0,
+          x1: Math.max(...part.map((b) => b.x1)),
+          y1: w.bbox.y1
+        },
+        conf: w.conf,
+        chars: part
+      })
+    }
+    for (let i = 1; i < cps.length; i++) {
+      const gap = boxes[i].x0 - boxes[i - 1].x1
+      const a = cps[i - 1]
+      const b = cps[i]
+      if (NUM_OR_PUNCT.test(a) && NUM_OR_PUNCT.test(b)) continue
+      const symbol = SYMBOL.test(a) !== SYMBOL.test(b)
+      const need = symbol ? SPLIT_GAP_XH * line.xHeight : limit
+      if (
+        need > 0 &&
+        gap >= need &&
+        boxes[i - 1].x1 > boxes[i - 1].x0 &&
+        boxes[i].x1 > boxes[i].x0
+      ) {
+        flush(i)
+        start = i
+        changed = true
+      }
+    }
+    if (start === 0) words.push(w)
+    else flush(cps.length)
+  }
+  return changed ? { ...line, words } : line
+}
+
+/**
+ * The share of a word's em box (axis-aligned bounds of `wordQuad`) covered by `native` boxes,
+ * 0..1. The native boxes are word unions from one text layer, so they do not overlap each other
+ * in practice; the sum is clamped to 1 regardless.
+ */
+export function nativeOverlap(
+  word: Pick<OcrWord, 'x' | 'y' | 'w'>,
+  line: Pick<OcrLine, 'angle' | 'size'>,
+  native: readonly OcrRect[]
+): number {
+  const q = wordQuad(word, line)
+  const x0 = Math.min(q[0].x, q[1].x, q[2].x, q[3].x)
+  const x1 = Math.max(q[0].x, q[1].x, q[2].x, q[3].x)
+  const y0 = Math.min(q[0].y, q[1].y, q[2].y, q[3].y)
+  const y1 = Math.max(q[0].y, q[1].y, q[2].y, q[3].y)
+  const area = (x1 - x0) * (y1 - y0)
+  if (!(area > 0)) return 0
+  let covered = 0
+  for (const n of native) {
+    const ix = Math.min(x1, n.x1) - Math.max(x0, n.x0)
+    const iy = Math.min(y1, n.y1) - Math.max(y0, n.y0)
+    if (ix > 0 && iy > 0) covered += ix * iy
+  }
+  return Math.min(1, covered / area)
 }
 
 /** Map and pack (what the coordinator posts). */

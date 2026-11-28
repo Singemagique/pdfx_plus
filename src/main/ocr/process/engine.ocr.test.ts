@@ -13,7 +13,7 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
-import { TESS_CORE7_PLACEHOLDER } from '../../../shared/ocr/calibration'
+import { TESS_CORE7 } from '../../../shared/ocr/calibration'
 import { ENGINE_ID, PIPELINE_VERSION } from '../../../shared/ocr/engine/tess-core'
 import type { GrayImage } from '../../../shared/ocr/engine/types'
 import { mapRawOcrPage } from '../../../shared/ocr/map'
@@ -122,7 +122,9 @@ describe('tier 1: the real engine on the synth presets', () => {
     it(spec.id, async () => {
       const { img, dpi, gt } = await input(spec)
       const t0 = performance.now()
-      const reply = await thread.recognize(img, dpi, spec.langs, true)
+      // Pass 1 on the synth raster as given: this file pins the ENGINE (loader, glue, core, data,
+      // parse); the PR6 pipeline over the same presets is pipeline.ocr.test.ts.
+      const reply = await thread.recognize(img, dpi, spec.langs, true, { rawPass1: true })
       const ms = performance.now() - t0
       // Privacy and silence: the thread's tripwire never fired, the engine printed nothing.
       expect(reply.tripwire).toBe(0)
@@ -149,7 +151,7 @@ describe('tier 1: the real engine on the synth presets', () => {
         langs: spec.langs,
         pipelineVersion: PIPELINE_VERSION,
         pageClass: 'scanned',
-        calibration: TESS_CORE7_PLACEHOLDER
+        calibration: TESS_CORE7
       })
       const s = await scorePage(page, gt)
       measured[spec.id] = { ...s, ms: Math.round(ms) }

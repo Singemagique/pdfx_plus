@@ -33,6 +33,7 @@ import {
   LIMITS,
   SELF_CHECK,
   harness,
+  outcomeOf,
   recognized,
   rendered,
   settle,
@@ -290,13 +291,9 @@ describe('the happy path', () => {
         m.taskId % 2
           ? {
               ...recognized(m, t),
-              result: {
-                raw: { lines: [], meanConf: null, confSource: 'none' },
-                chosen: 'pass1',
-                passes: []
-              }
+              result: outcomeOf({ lines: [], meanConf: null, confSource: 'none' })
             }
-          : { ...recognized(m, t), result: { raw: null, chosen: 'pass1', passes: [] } as never }
+          : { ...recognized(m, t), result: outcomeOf(null as never) }
     })
     await open(port, 's1')
     recognize(port, 'j1', 's1', [0, 1])

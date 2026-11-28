@@ -1,0 +1,240 @@
+{
+  "engineId": "tess-lstm/core-7.0.0/simd/fork-2a9c1c4",
+  "placeholder": false,
+  "points": [
+    [0, 0.25],
+    [5, 0.2863],
+    [10, 0.3255],
+    [15, 0.3421],
+    [20, 0.3861],
+    [25, 0.4301],
+    [30, 0.4726],
+    [35, 0.515],
+    [40, 0.5575],
+    [45, 0.5934],
+    [50, 0.6026],
+    [55, 0.6118],
+    [60, 0.6339],
+    [65, 0.6643],
+    [70, 0.6946],
+    [75, 0.7126],
+    [80, 0.7317],
+    [85, 0.767],
+    [90, 0.8413],
+    [95, 0.9942],
+    [100, 1]
+  ],
+  "fit": {
+    "seeds": [1, 2, 3, 4, 5],
+    "presets": [
+      "clean300",
+      "skew2",
+      "blur1",
+      "noise",
+      "jpeg35",
+      "fax200",
+      "low150",
+      "rot180page",
+      "photoLike",
+      "twocol",
+      "smallprint6pt",
+      "smallprint6pt-fax",
+      "numbers-table",
+      "skew5",
+      "border-scan"
+    ],
+    "fonts": ["helvetica", "times", "courier", "dejavu-serif"],
+    "pages": 300,
+    "words": 41946,
+    "correct": 41384,
+    "real": "absent: bench/ocr-real/manifest.json does not exist yet",
+    "ece": {
+      "placeholder": 0.039,
+      "fitted": 0.0024
+    },
+    "thresholds": {
+      "retry": 0.69,
+      "flag": 0.63,
+      "underline": 0.6
+    },
+    "sizeFactor": {
+      "current": 0.56,
+      "best": 0.6,
+      "medianIou": {
+        "0.45": 0.7891,
+        "0.46": 0.8035,
+        "0.47": 0.8172,
+        "0.48": 0.8302,
+        "0.49": 0.8414,
+        "0.50": 0.851,
+        "0.51": 0.8566,
+        "0.52": 0.8611,
+        "0.53": 0.8639,
+        "0.54": 0.868,
+        "0.55": 0.8752,
+        "0.56": 0.8833,
+        "0.57": 0.8889,
+        "0.58": 0.8927,
+        "0.59": 0.8947,
+        "0.60": 0.895,
+        "0.61": 0.895,
+        "0.62": 0.8948,
+        "0.63": 0.8942,
+        "0.64": 0.8933,
+        "0.65": 0.892
+      }
+    },
+    "perPreset": {
+      "clean300": {
+        "words": 2152,
+        "correct": 2151,
+        "orientation": {
+          "helvetica:0": 5,
+          "times:0": 5,
+          "courier:0": 5,
+          "dejavu-serif:0": 5
+        }
+      },
+      "skew2": {
+        "words": 2152,
+        "correct": 2151,
+        "orientation": {
+          "helvetica:0": 5,
+          "times:0": 5,
+          "courier:0": 5,
+          "dejavu-serif:0": 5
+        }
+      },
+      "blur1": {
+        "words": 2152,
+        "correct": 2151,
+        "orientation": {
+          "helvetica:0": 5,
+          "times:0": 5,
+          "courier:0": 5,
+          "dejavu-serif:0": 5
+        }
+      },
+      "noise": {
+        "words": 2152,
+        "correct": 2151,
+        "orientation": {
+          "helvetica:0": 5,
+          "times:0": 5,
+          "courier:0": 5,
+          "dejavu-serif:0": 5
+        }
+      },
+      "jpeg35": {
+        "words": 2154,
+        "correct": 2150,
+        "orientation": {
+          "helvetica:0": 5,
+          "times:0": 5,
+          "courier:0": 5,
+          "dejavu-serif:0": 5
+        }
+      },
+      "fax200": {
+        "words": 2152,
+        "correct": 2151,
+        "orientation": {
+          "helvetica:0": 5,
+          "times:0": 5,
+          "courier:0": 5,
+          "dejavu-serif:0": 5
+        }
+      },
+      "low150": {
+        "words": 2152,
+        "correct": 2150,
+        "orientation": {
+          "helvetica:0": 5,
+          "times:0": 5,
+          "courier:0": 5,
+          "dejavu-serif:0": 5
+        }
+      },
+      "rot180page": {
+        "words": 2152,
+        "correct": 2151,
+        "orientation": {
+          "helvetica:180": 5,
+          "times:180": 5,
+          "courier:180": 5,
+          "dejavu-serif:180": 5
+        }
+      },
+      "photoLike": {
+        "words": 2153,
+        "correct": 2151,
+        "orientation": {
+          "helvetica:0": 5,
+          "times:0": 5,
+          "courier:0": 5,
+          "dejavu-serif:0": 5
+        }
+      },
+      "twocol": {
+        "words": 3230,
+        "correct": 3229,
+        "orientation": {
+          "helvetica:0": 5,
+          "times:0": 5,
+          "courier:0": 5,
+          "dejavu-serif:0": 5
+        }
+      },
+      "smallprint6pt": {
+        "words": 7153,
+        "correct": 7145,
+        "orientation": {
+          "helvetica:0": 5,
+          "times:0": 5,
+          "courier:0": 5,
+          "dejavu-serif:0": 5
+        }
+      },
+      "smallprint6pt-fax": {
+        "words": 7174,
+        "correct": 6898,
+        "orientation": {
+          "helvetica:0": 5,
+          "times:0": 5,
+          "courier:0": 5,
+          "dejavu-serif:0": 5
+        }
+      },
+      "numbers-table": {
+        "words": 714,
+        "correct": 452,
+        "orientation": {
+          "helvetica:0": 5,
+          "times:0": 5,
+          "courier:0": 5,
+          "dejavu-serif:0": 5
+        }
+      },
+      "skew5": {
+        "words": 2152,
+        "correct": 2152,
+        "orientation": {
+          "helvetica:0": 5,
+          "times:0": 5,
+          "courier:0": 5,
+          "dejavu-serif:0": 5
+        }
+      },
+      "border-scan": {
+        "words": 2152,
+        "correct": 2151,
+        "orientation": {
+          "helvetica:0": 5,
+          "times:0": 5,
+          "courier:0": 5,
+          "dejavu-serif:0": 5
+        }
+      }
+    }
+  }
+}

@@ -674,3 +674,84 @@ function readRaw(mod: PdfiumTriage, heap: Heap, obj: number, max: number): Uint8
     rt.wasmExports.free(buf)
   }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Near-scanned masking (§3.4.1): the visible native text must not be recognised a second time.
+
+/** The extra PDFium calls masking needs. */
+export interface PdfiumMask extends PdfiumTriage {
+  FPDFPage_RemoveObject(page: number, obj: number): number | boolean
+  FPDFPageObj_Destroy(obj: number): void
+}
+
+/** FPDF_PAGEOBJ_TEXT. */
+const PAGEOBJ_TEXT = 1
+
+export interface TextMask {
+  /** Top-level text objects taken off the page; the caller destroys them after the render. */
+  removed: number[]
+  /** Visible chars left on the page (inside Form XObjects), overlay frame, pt: paint them white. */
+  boxes: OcrRect[]
+}
+
+/**
+ * Take the page's visible top-level text objects off the in-memory page (FPDFPage_RemoveObject;
+ * the document is never saved, and the next FPDF_LoadPage parses the page afresh), and list the
+ * boxes of the visible chars that are left, which live inside Form XObjects, to be painted white
+ * over the render. Invisible text (mode 3/7) paints nothing and is left alone.
+ */
+export function maskVisibleText(mod: PdfiumMask, page: number): TextMask {
+  const rt = mod.pdfium
+  const heap = new Heap(rt)
+  const scratch = rt.wasmExports.malloc(256)
+  if (!scratch) return { removed: [], boxes: [] }
+  try {
+    const removed: number[] = []
+    const n = Math.min(mod.FPDFPage_CountObjects(page), TRIAGE_LIMITS.maxObjects)
+    for (let i = n - 1; i >= 0; i--) {
+      const o = mod.FPDFPage_GetObject(page, i)
+      if (!o || mod.FPDFPageObj_GetType(o) !== PAGEOBJ_TEXT) continue
+      if (INVISIBLE_MODES.has(mod.FPDFTextObj_GetTextRenderMode(o))) continue
+      if (mod.FPDFPage_RemoveObject(page, o)) removed.push(o)
+    }
+    let box: OcrRect
+    if (mod.FPDF_GetPageBoundingBox(page, scratch)) {
+      const l = heap.f32(scratch)
+      const t = heap.f32(scratch + 4)
+      const r = heap.f32(scratch + 8)
+      const b = heap.f32(scratch + 12)
+      box = { x0: Math.min(l, r), y0: Math.min(b, t), x1: Math.max(l, r), y1: Math.max(b, t) }
+    } else
+      box = { x0: 0, y0: 0, x1: mod.FPDF_GetPageWidthF(page), y1: mod.FPDF_GetPageHeightF(page) }
+    const frame: PageFrame = { box, quarterTurns: Math.max(0, mod.FPDFPage_GetRotation(page)) }
+    const boxes: OcrRect[] = []
+    const tp = mod.FPDFText_LoadPage(page)
+    if (tp) {
+      try {
+        const count = Math.min(mod.FPDFText_CountChars(tp), TRIAGE_LIMITS.maxChars)
+        const cb = scratch + 160
+        for (let i = 0; i < count; i++) {
+          if (mod.FPDFText_IsGenerated(tp, i) === 1) continue
+          if (isSpaceChar(mod.FPDFText_GetUnicode(tp, i) >>> 0)) continue
+          const to = mod.FPDFText_GetTextObject(tp, i)
+          if (to && INVISIBLE_MODES.has(mod.FPDFTextObj_GetTextRenderMode(to))) continue
+          if (!mod.FPDFText_GetCharBox(tp, i, cb, cb + 8, cb + 16, cb + 24)) continue
+          const l = heap.f64(cb)
+          const r = heap.f64(cb + 8)
+          const b = heap.f64(cb + 16)
+          const t = heap.f64(cb + 24)
+          const o = toOverlayFrame(
+            { x0: Math.min(l, r), y0: Math.min(b, t), x1: Math.max(l, r), y1: Math.max(b, t) },
+            frame
+          )
+          if ([o.x0, o.y0, o.x1, o.y1].every(Number.isFinite)) boxes.push(o)
+        }
+      } finally {
+        mod.FPDFText_ClosePage(tp)
+      }
+    }
+    return { removed, boxes }
+  } finally {
+    rt.wasmExports.free(scratch)
+  }
+}

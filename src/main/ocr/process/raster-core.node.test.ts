@@ -9,6 +9,8 @@ import 'pdfjs-dist/legacy/build/pdf.worker.mjs'
 import type { PDFDocumentProxy } from 'pdfjs-dist'
 import {
   PDFDocument,
+  PDFName,
+  StandardFonts,
   concatTransformationMatrix,
   drawObject,
   popGraphicsState,
@@ -18,7 +20,9 @@ import {
 
 import {
   DEFAULT_RASTER_LIMITS,
+  FPDF_RENDER_NO_SMOOTHIMAGE,
   FPDFBitmap_Gray,
+  paintBoxesWhite,
   RasterEngine,
   fitRaster,
   makePrintErr,
@@ -491,5 +495,120 @@ describe('memory guards', () => {
         frame: { width: 612, height: 792 }
       })
     ).toThrow(WebAssembly.RuntimeError)
+  })
+})
+
+describe('PR6: near-scanned text mask and the NO_SMOOTHIMAGE flag (§3.4.1, §3.4.2)', () => {
+  const dark = (d: Uint8Array): number => d.reduce((n, v) => n + (v < 128 ? 1 : 0), 0)
+
+  it('maskText removes visible top-level text, paints text inside forms white, keeps the rest', async () => {
+    const doc = await PDFDocument.create()
+    const font = await doc.embedFont(StandardFonts.Helvetica)
+    const page = doc.addPage([612, 792])
+    // A "scan" (a black box), visible text over it, invisible text, and text inside a Form XObject.
+    page.drawRectangle({ x: 72, y: 72, width: 100, height: 100, color: rgb(0, 0, 0) })
+    page.drawText('VISIBLE HEADER', { x: 72, y: 700, size: 24, font })
+    const formText = page.doc.context.stream(`BT /F1 24 Tf 72 600 Td (IN A FORM) Tj ET`, {
+      Type: 'XObject',
+      Subtype: 'Form',
+      BBox: [0, 0, 612, 792],
+      Resources: { Font: { F1: font.ref } }
+    })
+    const fm = page.node.newXObject('Fm', doc.context.register(formText))
+    page.pushOperators(pushGraphicsState(), drawObject(fm), popGraphicsState())
+    const bytes = await doc.save()
+    const engine = new RasterEngine(mod)
+    engine.attach('m', shared(bytes))
+    const req = { src: 'm', index: 0, dpi: 72, userUnit: 1, frame: { width: 612, height: 792 } }
+    const plain = ok(engine.render(req))
+    const masked = ok(engine.render({ ...req, maskText: true }))
+    const band = (d: Uint8Array, y0: number, y1: number): Uint8Array => d.slice(y0 * 612, y1 * 612)
+    // Header (top-level text) at y ≈ 700 pt → rows 70..100; the form text at y ≈ 600 → rows 170..200.
+    expect(dark(band(plain.data, 70, 100))).toBeGreaterThan(100)
+    expect(dark(band(masked.data, 70, 100))).toBe(0)
+    expect(dark(band(plain.data, 170, 200))).toBeGreaterThan(100)
+    expect(dark(band(masked.data, 170, 200))).toBe(0)
+    // The scan is untouched.
+    expect(dark(band(masked.data, 620, 720))).toBe(dark(band(plain.data, 620, 720)))
+    // In memory only: the next render of the page has its text again.
+    expect(dark(band(ok(engine.render(req)).data, 70, 100))).toBe(dark(band(plain.data, 70, 100)))
+    void PDFName
+    engine.closeAll()
+  })
+
+  it('paintBoxesWhite maps overlay boxes to pixels with a 1 px margin', () => {
+    const d = new Uint8Array(100 * 50)
+    paintBoxesWhite(d, 100, 50, [{ x0: 10, y0: 10, x1: 20, y1: 20 }], 200, 100)
+    // pt → px is ×0.5; y flips: rows 40..45 → minus/plus 1 px.
+    expect(d[39 * 100 + 5]).toBe(255)
+    expect(d[45 * 100 + 10]).toBe(255)
+    expect(d[46 * 100 + 10]).toBe(0)
+    expect(d[42 * 100 + 11]).toBe(0)
+  })
+
+  it('FPDF_RENDER_NO_SMOOTHIMAGE (0x2000): no effect on an exact 1:1 1-bit render, live when scaled', async () => {
+    // A 1-bit checker of 2 px cells, placed 1:1 at 300 DPI (the page is w × 72/300 pt), the way a
+    // scan is: PR0b measured PDFium's raster of such a placement 97.8% exact against the source.
+    const w = 600
+    const h = 300
+    const rowBytes = w / 8
+    const bits = new Uint8Array(rowBytes * h)
+    for (let y = 0; y < h; y++)
+      for (let x = 0; x < w; x++)
+        if (((x >> 1) + (y >> 1)) % 2) bits[y * rowBytes + (x >> 3)] |= 0x80 >> (x & 7)
+    const doc = await PDFDocument.create()
+    const pw = (w * 72) / 300
+    const ph = (h * 72) / 300
+    const page = doc.addPage([pw, ph])
+    const img = doc.context.register(
+      doc.context.stream(bits, {
+        Type: 'XObject',
+        Subtype: 'Image',
+        Width: w,
+        Height: h,
+        ColorSpace: 'DeviceGray',
+        BitsPerComponent: 1
+      })
+    )
+    const name = page.node.newXObject('Im', img)
+    page.pushOperators(
+      pushGraphicsState(),
+      concatTransformationMatrix(pw, 0, 0, ph, 0, 0),
+      drawObject(name),
+      popGraphicsState()
+    )
+    const engine = new RasterEngine(mod)
+    engine.attach('b', shared(await doc.save()))
+    const req = { src: 'b', index: 0, dpi: 300, userUnit: 1, frame: { width: pw, height: ph } }
+    const smooth = ok(engine.render(req))
+    const sharp = ok(engine.render({ ...req, flags: FPDF_RENDER_NO_SMOOTHIMAGE }))
+    expect(FPDF_RENDER_NO_SMOOTHIMAGE).toBe(0x2000)
+    expect([sharp.width, sharp.height]).toEqual([w, h])
+    // The flag is live in this PDFium build: the two renders differ, and the unsmoothed one is
+    // closer to the source bits.
+    const exact = (d: Uint8Array): number => {
+      let n = 0
+      for (let y = 0; y < h; y++)
+        for (let x = 0; x < w; x++) {
+          const ink = ((x >> 1) + (y >> 1)) % 2 === 0
+          if (d[y * w + x] < 128 === ink) n++
+        }
+      return n / (w * h)
+    }
+    const r15 = { ...req, dpi: 450 }
+    const s15 = ok(engine.render(r15))
+    const n15 = ok(engine.render({ ...r15, flags: FPDF_RENDER_NO_SMOOTHIMAGE }))
+    const grey = (d: Uint8Array): number => d.filter((v) => v !== 0 && v !== 255).length
+    // [measured] An exact integer 1:1 placement is copied bit for bit either way …
+    expect(exact(smooth.data)).toBe(1)
+    expect(Buffer.from(sharp.data).equals(Buffer.from(smooth.data))).toBe(true)
+    // … while at 1.5× (a 200 DPI fax rendered at 300) smoothing makes grey edges and the flag
+    // keeps every pixel black or white.
+    expect(grey(s15.data)).toBeGreaterThan(0)
+    expect(grey(n15.data)).toBe(0)
+    // Only that flag gets through: anything else is masked off.
+    const other = ok(engine.render({ ...r15, flags: FPDF_RENDER_NO_SMOOTHIMAGE | 0x10 | 0x01 }))
+    expect(Buffer.from(other.data).equals(Buffer.from(n15.data))).toBe(true)
+    engine.closeAll()
   })
 })

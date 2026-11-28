@@ -10,7 +10,7 @@
 
 import type { PageReason } from '../../../shared/ocr/protocol'
 import type { TriagePage } from '../../../shared/ocr/triage'
-import type { RecognizeOutcome } from './recognize-core'
+import type { RecognizeOutcome, ReuseHint } from './recognize-core'
 
 export interface RasterLimits {
   /** The PDFium WASM memory cap (the module declares 32,768 pages = 2 GiB; PR0). */
@@ -40,6 +40,10 @@ export type ToRaster =
       dpi: number
       userUnit: number
       frame: { width: number; height: number }
+      /** Render flags beyond 0 (only FPDF_RENDER_NO_SMOOTHIMAGE; page-plan.ts). */
+      flags?: number
+      /** A near-scanned page: render without its visible native text (§3.4.1). */
+      maskText?: boolean
     }
   /** Triage these pages of `src` (§3.4.1); answered by one `triaged` (or `triage-failed`). */
   | { type: 'triage'; taskId: number; src: string; pages: number[] }
@@ -102,6 +106,12 @@ export type ToRecognize =
       dpi: number
       data: ArrayBuffer
       langs: string[]
+      /** The adaptive second call (§3.4.3): reuse the first call's geometry and recipe. */
+      reuse?: ReuseHint
+      /** Ask for the adaptive pass (default true). */
+      adaptive?: boolean
+      /** Tests only: pass 1 on the bitmap as given, no preprocessing (the PR5 replay cache). */
+      rawPass1?: boolean
       /**
        * Tests only (the tier-1 harness records the replay cache): also return each pass's raw hOCR.
        * The coordinator never sets it; hOCR is page content and never leaves the process.
