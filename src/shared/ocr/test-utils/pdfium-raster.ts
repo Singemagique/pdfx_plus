@@ -31,18 +31,30 @@ export interface PdfiumRenderModule {
   pdfium: { HEAPU8: Uint8Array; wasmExports: { malloc(n: number): number; free(p: number): void } }
 }
 
-/** Renders page `pageIndex` of `pdf` at `dpi` to an 8-bit grey raster (top-left origin). */
-export type Rasterizer = (pdf: Uint8Array, dpi: number, pageIndex?: number) => GreyImage
+/**
+ * Renders page `pageIndex` of `pdf` at `dpi` to an 8-bit grey raster (top-left origin). `flags`
+ * are FPDF_RenderPageBitmap flags (default 0).
+ */
+export type Rasterizer = (
+  pdf: Uint8Array,
+  dpi: number,
+  pageIndex?: number,
+  flags?: number
+) => GreyImage
 
 const FPDFBitmap_BGRA = 4
+/** FPDF_RenderPageBitmap flags: aliased (monochrome) text, and the print path. */
+export const FPDF_RENDER_NO_SMOOTHTEXT = 0x1000
+export const FPDF_PRINTING = 0x800
 
 /**
- * A rasteriser over an initialised PDFium module: BGRA render onto opaque white (no flags: PDFium's
- * default anti-aliased path, no LCD text), then integer BT.601 luma (77R + 150G + 29B + 128) >> 8,
- * which is exact for neutral greys. The bitmap is page size × dpi / 72, rounded.
+ * A rasteriser over an initialised PDFium module: BGRA render onto opaque white (by default no
+ * flags: PDFium's anti-aliased path, no LCD text), then integer BT.601 luma
+ * (77R + 150G + 29B + 128) >> 8, which is exact for neutral greys. The bitmap is page size ×
+ * dpi / 72, rounded.
  */
 export function createPdfiumRasterizer(mod: PdfiumRenderModule): Rasterizer {
-  return (pdf, dpi, pageIndex = 0) => {
+  return (pdf, dpi, pageIndex = 0, flags = 0) => {
     const rt = mod.pdfium
     const ptr = rt.wasmExports.malloc(pdf.length)
     rt.HEAPU8.set(pdf, ptr)
@@ -58,7 +70,7 @@ export function createPdfiumRasterizer(mod: PdfiumRenderModule): Rasterizer {
         if (!bmp) throw new Error('PDFium could not allocate the bitmap')
         try {
           mod.FPDFBitmap_FillRect(bmp, 0, 0, w, h, 0xffffffff)
-          mod.FPDF_RenderPageBitmap(bmp, page, 0, 0, w, h, 0, 0)
+          mod.FPDF_RenderPageBitmap(bmp, page, 0, 0, w, h, 0, flags)
           const buf = mod.FPDFBitmap_GetBuffer(bmp)
           const stride = mod.FPDFBitmap_GetStride(bmp)
           const heap = rt.HEAPU8

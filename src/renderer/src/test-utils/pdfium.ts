@@ -56,7 +56,9 @@ export function extractText(pdfium: TextPdfium, bytes: Uint8Array): string {
     const n = pdfium.FPDFText_CountChars(tp)
     const buf = rt.wasmExports.malloc((n + 1) * 2)
     try {
-      pdfium.FPDFText_GetText(tp, 0, n, buf)
+      // With 0 chars PDFium writes nothing, not even the NUL: never read malloc garbage as text.
+      rt.HEAPU8.fill(0, buf, buf + (n + 1) * 2)
+      if (n > 0) pdfium.FPDFText_GetText(tp, 0, n, buf)
       return rt.UTF16ToString(buf).replace(/\s+/g, ' ').trim()
     } finally {
       rt.wasmExports.free(buf)

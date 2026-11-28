@@ -55,7 +55,7 @@ interface Box {
  * the export math in the same coordinate space for every valid box configuration. Degenerate
  * intersections fall back to the MediaBox, as pdf.js does.
  */
-function viewBox(crop: Box, media: Box): Box {
+export function viewBox(crop: Box, media: Box): Box {
   const x0 = Math.max(crop.x, media.x)
   const y0 = Math.max(crop.y, media.y)
   const x1 = Math.min(crop.x + crop.width, media.x + media.width)
@@ -93,7 +93,7 @@ export function unrotateCrop(c: CropBox, intrinsic: number, W: number, H: number
  * then displays them exactly where the user put them. Returns null for an unrotated page (no-op).
  * (W, H) are the unrotated view-box dimensions. Mirrors the rect logic in unrotateCrop.
  */
-function intrinsicMatrix(
+export function intrinsicMatrix(
   intrinsic: number,
   W: number,
   H: number
