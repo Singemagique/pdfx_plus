@@ -40,13 +40,18 @@ yarn install --frozen-lockfile
 
 ## Tests
 
-Tests use [Vitest](https://vitest.dev). The suite is split into two projects in
+Tests use [Vitest](https://vitest.dev). The suite is split into three projects in
 `vitest.config.mts`:
 
 - a **node** project for pure logic (PDFX manifest build, format partitioning,
   doc-ops reducers, name de-duplication, main-process file intake) — files named
   `*.node.test.ts`;
-- a **jsdom** project for DOM/browser-dependent code — files named `*.dom.test.ts`.
+- a **jsdom** project for DOM/browser-dependent code — files named `*.dom.test.ts`;
+- an **ocr** project that runs the real OCR engine (the same Tesseract WebAssembly core and
+  language data the app ships) on synthetic scans — files named `*.ocr.test.ts`. Run it alone
+  with `yarn test:ocr`. Every live recognition must match its recorded replay entry
+  (`src/shared/ocr/test-utils/ocr-cache/`); `PDFX_OCR_CACHE_STRICT=1` (what CI sets) fails on any
+  mismatch, and `yarn ocr:record` re-records after a deliberate engine or pipeline change.
 
 Place a test next to the code it covers (e.g. `src/renderer/src/pdfx/build.node.test.ts`).
 The `@renderer` alias resolves the same way it does in the app, so you can import
@@ -94,9 +99,22 @@ must be green before merging. Each PR therefore lands as exactly one commit on
 Every push to `main` and every PR runs `.github/workflows/ci.yml`:
 
 1. **Lint, typecheck, test** on Ubuntu — `yarn typecheck`, `yarn format:check`,
-   `yarn test:run`.
+   `yarn test:run`, then `yarn test:ocr` with `PDFX_OCR_CACHE_STRICT=1`.
 2. **Build** matrix on macOS, Windows, and Ubuntu — packages the app with
-   code-signing disabled so forks build without secrets.
+   code-signing disabled so forks build without secrets, then:
+   - runs the packaged app's OCR self-test (`pdfx --ocr-selftest out.json`, via
+     `scripts/ocr-selftest-run.mjs`): a scanned page recognized exactly as recorded, every
+     network tripwire at 0, nothing printed by the engine, a crashed OCR process detected and
+     restarted, and the Ctrl/Cmd+Shift+R shortcut on a hidden window. On Ubuntu it runs twice,
+     the second time with no network at all (`unshare --net`);
+   - on Windows, checks the installer grew by at most 15 MB over v1.1.3 (`scripts/ocr-nsis-size.mjs`);
+   - runs the `ocr` project again and uploads what it recognized.
+3. **OCR cross-OS diff** — compares the three OSes' recognized text, word boxes, engine output and
+   input pixels, and fails on any difference (`scripts/ocr-xos-diff.mjs`).
 
 The build job depends on the check job, so lint/typecheck/test failures stop the
 matrix early.
+
+`.github/workflows/ocr-bench.yml` runs the slower OCR bench nightly, on demand, and on pull
+requests labelled `ocr`: the seeds × presets × fonts sweep, the calibration check, per-page timing
+on all three OSes, and the 1,000-page and 1.5 GiB scale tests. It never blocks a merge.
