@@ -1,5 +1,5 @@
 import { zoom as d3zoom, type ZoomBehavior } from 'd3-zoom'
-import { reversibleConstrain } from './constrain'
+import { panConstrain, type PanBounds } from './constrain'
 import { MIN_SCALE, MAX_SCALE } from './zoom-constants'
 
 interface ZoomHandlerRefs {
@@ -11,14 +11,27 @@ interface ZoomHandlerRefs {
   lastTick: { current: number }
   onScaleRef: { current: ((scale: number) => void) | undefined }
   onSettleRef: { current: (() => void) | undefined }
+  /** The live pan bounds (useAutoFit keeps them current; see boundTransform). */
+  panBoundsRef: { current: PanBounds }
 }
 
 export function createZoomBehavior(refs: ZoomHandlerRefs): ZoomBehavior<HTMLDivElement, unknown> {
-  const { vp, worldRef, overlayRef, userMovedRef, idleTimer, lastTick, onScaleRef, onSettleRef } =
-    refs
+  const {
+    vp,
+    worldRef,
+    overlayRef,
+    userMovedRef,
+    idleTimer,
+    lastTick,
+    onScaleRef,
+    onSettleRef,
+    panBoundsRef
+  } = refs
   return d3zoom<HTMLDivElement, unknown>()
     .scaleExtent([MIN_SCALE, MAX_SCALE])
-    .constrain(reversibleConstrain)
+    .constrain((transform, extent, translateExtent) =>
+      panConstrain(transform, extent, translateExtent, panBoundsRef.current)
+    )
     .filter((event) => {
       if (event.type === 'wheel') return false
       if ((event as MouseEvent).button) return false

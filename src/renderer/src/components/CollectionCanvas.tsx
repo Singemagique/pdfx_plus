@@ -3,9 +3,11 @@ import {
   MIN_DOC_WIDTH,
   BASE_PAGE_HEIGHT,
   betweenSlotY,
+  panReachWidth,
   wrapWidthForViewport
 } from '../canvas/layout'
 import { useImportFocus } from '../canvas/imported-doc'
+import { PAN_TOP_MARGIN, REVEAL_TOP_MARGIN } from '../canvas/zoom-constants'
 import { Canvas } from './Canvas'
 import { EmptyState } from './EmptyState'
 import { AddDocGhost, GhostRow } from './DropGhost'
@@ -31,6 +33,11 @@ interface CollectionCanvasProps {
   dropTarget: DropTarget | null
   collapsedId: string | null
   externalCount: number
+  /**
+   * True while the find bar is open over the top of the canvas: the content's top may then be
+   * scrolled down to clear it too, so Find can bring a first-row page fully into view.
+   */
+  findOpen?: boolean
   canvasRef: React.Ref<CanvasHandle>
   onScaleChange: (scale: number) => void
   onSettle: () => void
@@ -115,6 +122,8 @@ export function CollectionCanvas(props: CollectionCanvasProps): React.JSX.Elemen
       ref={props.canvasRef}
       contentWidth={layout.contentWidth}
       contentHeight={layout.contentHeight}
+      reachWidth={panReachWidth(layout)}
+      panTopReach={props.findOpen ? REVEAL_TOP_MARGIN : PAN_TOP_MARGIN}
       focus={focus}
       dragging={dragKind !== null}
       onScaleChange={props.onScaleChange}

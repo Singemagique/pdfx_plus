@@ -326,6 +326,18 @@ export function computeLayout(
   return { items, contentWidth, contentHeight, wrapWidth: wrap }
 }
 
+/**
+ * The world width the view can be panned across (see boundTransform): the collection's width, plus
+ * the outer half of any round "Add page" button straddling a card's right edge, so that button can
+ * be brought fully into view when zoomed in (up to the point where that half alone would fill half
+ * the window: PanBounds.overhang).
+ */
+export function panReachWidth(layout: CanvasLayout): number {
+  let right = layout.contentWidth
+  for (const item of layout.items) right = Math.max(right, item.addPage.x + item.addPage.w)
+  return right
+}
+
 export interface DocReflow {
   /** Page cells (excluded page omitted) in visible order, world coordinates. */
   pages: PageSlot[]

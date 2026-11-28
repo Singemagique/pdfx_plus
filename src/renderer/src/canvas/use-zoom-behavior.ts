@@ -2,13 +2,13 @@ import { useLayoutEffect, useRef, type RefObject } from 'react'
 import { pointer, select } from 'd3-selection'
 import { zoomIdentity, zoomTransform, type ZoomBehavior } from 'd3-zoom'
 import { createZoomBehavior } from './create-zoom-behavior'
+import { PAN_BOUNDS, type PanBounds } from './constrain'
 import { computeFitTransform, type FitDims } from './fit-transform'
 import { WHEEL_ZOOM_SPEED } from './zoom-constants'
 
 export {
   MIN_SCALE,
   MAX_SCALE,
-  PAN_MARGIN,
   FIT_MARGIN,
   TARGET_FIT_SCALE,
   WHEEL_ZOOM_SPEED,
@@ -37,9 +37,12 @@ export function useZoomBehavior({
   onSettle
 }: ZoomBehaviorArgs): {
   zoomRef: RefObject<ZoomBehavior<HTMLDivElement, unknown> | null>
+  /** The pan bounds every gesture is held to; useAutoFit keeps them current. */
+  panBoundsRef: RefObject<PanBounds>
   fitTransform: (focusY?: number) => ReturnType<typeof zoomIdentity.translate>
 } {
   const zoomRef = useRef<ZoomBehavior<HTMLDivElement, unknown> | null>(null)
+  const panBoundsRef = useRef<PanBounds>(PAN_BOUNDS)
   const idleTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const lastTick = useRef(0)
   const onScaleRef = useRef(onScaleChange)
@@ -62,7 +65,8 @@ export function useZoomBehavior({
       idleTimer,
       lastTick,
       onScaleRef,
-      onSettleRef
+      onSettleRef,
+      panBoundsRef
     })
 
     zoomRef.current = zoomBehavior
@@ -102,5 +106,5 @@ export function useZoomBehavior({
     }
   }, [])
 
-  return { zoomRef, fitTransform }
+  return { zoomRef, panBoundsRef, fitTransform }
 }

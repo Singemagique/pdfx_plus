@@ -16,7 +16,9 @@ function prefersReducedMotion(): boolean {
  * geometrically so zooming feels even). Every frame goes through `zoom.transform` without a source
  * event, so it never counts as a user move. The tween stops early when `shouldAbort()` turns true
  * (the user grabbed the view). Returns a cancel function. Jumps straight to the target when motion
- * is reduced or there is no animation frame clock.
+ * is reduced or there is no animation frame clock. Each frame is passed through `bound` (the pan
+ * bounds; see boundToViewport): zoom.transform does not constrain, and a frame between two in-bounds
+ * transforms at different scales can stray slightly outside them.
  */
 export function animateZoomTo(
   vp: HTMLDivElement,
@@ -24,11 +26,12 @@ export function animateZoomTo(
   target: ZoomTransform,
   duration: number,
   shouldAbort: () => boolean,
-  onDone?: () => void
+  onDone?: () => void,
+  bound: (t: ZoomTransform) => ZoomTransform = (t) => t
 ): () => void {
   const sel = select(vp)
   if (duration <= 0 || prefersReducedMotion() || typeof requestAnimationFrame !== 'function') {
-    zoom.transform(sel, target)
+    zoom.transform(sel, bound(target))
     onDone?.()
     return () => {}
   }
@@ -56,7 +59,7 @@ export function animateZoomTo(
         : zoomIdentity
             .translate(start.x + (target.x - start.x) * e, start.y + (target.y - start.y) * e)
             .scale(Math.exp(lk0 + (lk1 - lk0) * e))
-    zoom.transform(sel, t)
+    zoom.transform(sel, bound(t))
     if (p < 1) raf = requestAnimationFrame(step)
     else finish()
   }

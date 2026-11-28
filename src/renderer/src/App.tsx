@@ -17,7 +17,7 @@ import { SignaturePad } from './components/edit/SignaturePad'
 import { makePageKey } from './edit/model'
 import { useFind } from './search/useFind'
 import { useFindShortcuts } from './search/useFindShortcuts'
-import { FindProvider } from './search/FindContext'
+import { FindProvider, useFindOpen } from './search/FindContext'
 import type { FindMatch } from './search/find-controller'
 import { FindBarHost } from './components/FindBar'
 import { CloseIcon } from './components/icons'
@@ -227,6 +227,7 @@ export default function App(): React.JSX.Element {
     onNavigate: onFindNavigate
   })
   useFindShortcuts({ controller: find, enabled: !modalOpen })
+  const findOpen = useFindOpen(find)
 
   // Text recognition (DESIGN.md §3.5.2): the OCR store and its Find supply live outside React
   // state, like the find controller, and are created once. The port is connected only when OCR is
@@ -468,6 +469,7 @@ export default function App(): React.JSX.Element {
               dropTarget={drag.dropTarget}
               collapsedId={drag.collapsedId}
               externalCount={drag.externalCount}
+              findOpen={findOpen}
               canvasRef={canvasRef}
               onScaleChange={onScaleChange}
               onSettle={onSettle}

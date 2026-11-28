@@ -77,3 +77,8 @@ export function useFindBarState(controller?: FindController): FindBarState {
   const ctl = controller ?? fromContext
   return useSyncExternalStore(ctl.subscribe, ctl.getBarState)
 }
+
+/** Whether the find bar is open; re-renders only when that flips, not on every keystroke. */
+export function useFindOpen(controller: FindController): boolean {
+  return useSyncExternalStore(controller.subscribe, () => controller.getBarState().open)
+}
