@@ -355,13 +355,21 @@ function scriptKind(filePath: string): ts.ScriptKind {
  * handed on as a value (`const M = Math`: an alias no rule can follow), and the `**` operator
  * (which is `Math.pow`). AST-based like `scanSource`, so comments and strings never count. Works
  * on .ts and .js text. `Math.sqrt` is allowed: IEEE-754 requires it to be correctly rounded.
+ * With `integerPow`, `**` between two non-negative integer literals (`2 ** 30`: a constant whose
+ * value is exact) is allowed too.
  */
 export function scanMath(
   source: string,
   filePath = 'scan.ts',
-  banned: readonly string[] = NONDETERMINISTIC_MATH
+  banned: readonly string[] = NONDETERMINISTIC_MATH,
+  opts: { integerPow?: boolean } = {}
 ): ScanFinding[] {
   const bannedSet = new Set(banned)
+  /** A non-negative integer literal's value, else null. */
+  const intLiteral = (e: ts.Expression): number | null => {
+    e = unwrap(e)
+    return ts.isNumericLiteral(e) && /^\d+$/.test(e.text) ? Number(e.text) : null
+  }
   const sf = ts.createSourceFile(
     filePath,
     source,
@@ -413,7 +421,15 @@ export function scanMath(
       (node.operatorToken.kind === ts.SyntaxKind.AsteriskAsteriskToken ||
         node.operatorToken.kind === ts.SyntaxKind.AsteriskAsteriskEqualsToken)
     ) {
-      report(node.operatorToken, '**')
+      const base = intLiteral(node.left)
+      const exp = intLiteral(node.right)
+      const exact =
+        opts.integerPow === true &&
+        node.operatorToken.kind === ts.SyntaxKind.AsteriskAsteriskToken &&
+        base !== null &&
+        exp !== null &&
+        Number.isSafeInteger(base ** exp)
+      if (!exact) report(node.operatorToken, '**')
     }
     ts.forEachChild(node, visit)
   }

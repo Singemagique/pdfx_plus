@@ -144,7 +144,7 @@ export const OCR_LIMITS = {
   maxLangs: 3,
   /** Page frame sides in pt (PDF caps user space at 14,400 units; leave room for rotation). */
   maxPageSidePt: 100_000,
-  /** Render DPI accepted from the renderer until PR6's DPI selection lands. */
+  /** Render DPI overrides the renderer may send (triage chooses each page's DPI otherwise). */
   minRenderDpi: 36,
   maxRenderDpi: 1200
 } as const
@@ -165,11 +165,19 @@ export interface PageRequest {
   /** The pdf.js PageEntry frame in pt (`getViewport({ scale: 1 })`); the raster must match it. */
   width: number
   height: number
+  /**
+   * The edit rotation the page shows (clockwise degrees, §3.4.5): the result's `rotateBy` is the
+   * detected orientation less this. Absent = 0.
+   */
+  editRotation?: 0 | 90 | 180 | 270
 }
 
 export interface RecognizeOpts {
   langs: string[]
-  /** Render DPI. PR6 derives it from triage; until then the caller states it (default 300). */
+  /**
+   * Render DPI override. Without it each page renders at the DPI triage chose from its dominant
+   * image (§3.4.3), or 300 for a page triage has not answered.
+   */
   renderDpi?: number
 }
 
@@ -201,6 +209,12 @@ export interface PageResult {
   raster: { width: number; height: number } | null
   /** The recognised page, packed (§3.5.1), or null when the page never recognised. */
   recognition: PackedOcrPage | null
+  /**
+   * The extra clockwise turn the page needs on screen, `Δ = (orientation − editRotation) mod 360`
+   * (§3.4.5), when it is not 0: the "looks sideways — Rotate?" offer. Recognition already used
+   * the detected orientation either way.
+   */
+  rotateBy?: 90 | 180 | 270
 }
 
 export interface ProgressInfo {
@@ -499,12 +513,22 @@ const pageIndex = int(0, OCR_LIMITS.maxPageIndex)
 const side = num(0, OCR_LIMITS.maxPageSidePt, { minExclusive: true })
 const count = int(0, Number.MAX_SAFE_INTEGER)
 
-const pageRequest = object<PageRequest>({
-  index: pageIndex,
-  userUnit: num(0, 1000, { minExclusive: true }),
-  width: side,
-  height: side
-})
+const quarter =
+  <T extends number>(allowed: readonly T[]): Check<T> =>
+  (v, p) => {
+    if (!allowed.includes(v as T)) fail(p, `expected one of ${allowed.join('/')}`)
+    return v as T
+  }
+
+const pageRequest = object<PageRequest>(
+  {
+    index: pageIndex,
+    userUnit: num(0, 1000, { minExclusive: true }),
+    width: side,
+    height: side
+  },
+  { editRotation: quarter([0, 90, 180, 270] as const) }
+)
 
 const recognizeOpts = object<RecognizeOpts>(
   {
@@ -682,7 +706,7 @@ const pageResult = object<PageResult>(
           })(x, path),
     recognition: (x, path) => (x === null ? null : packedOcrPage(x, path))
   },
-  { reason: oneOf(PAGE_REASONS) }
+  { reason: oneOf(PAGE_REASONS), rotateBy: quarter([90, 180, 270] as const) }
 )
 
 /** At most this many native words per page, and characters per word, cross the port. */

@@ -8,9 +8,11 @@
 // SharedArrayBuffer so a recycled or crashed raster thread can reopen it without the renderer
 // sending the file again.
 
+import type { CalibrationTable } from '../../../shared/ocr/engine/types'
+import type { Orientation } from '../../../shared/ocr/preprocess/orientation'
 import type { PageReason } from '../../../shared/ocr/protocol'
 import type { TriagePage } from '../../../shared/ocr/triage'
-import type { RecognizeOutcome } from './recognize-core'
+import type { RecognizeOutcome, ReuseHint } from './recognize-core'
 
 export interface RasterLimits {
   /** The PDFium WASM memory cap (the module declares 32,768 pages = 2 GiB; PR0). */
@@ -40,6 +42,10 @@ export type ToRaster =
       dpi: number
       userUnit: number
       frame: { width: number; height: number }
+      /** Render flags beyond 0 (only FPDF_RENDER_NO_SMOOTHIMAGE; page-plan.ts). */
+      flags?: number
+      /** A near-scanned page: render without its visible native text (§3.4.1). */
+      maskText?: boolean
     }
   /** Triage these pages of `src` (§3.4.1); answered by one `triaged` (or `triage-failed`). */
   | { type: 'triage'; taskId: number; src: string; pages: number[] }
@@ -102,6 +108,21 @@ export type ToRecognize =
       dpi: number
       data: ArrayBuffer
       langs: string[]
+      /** The adaptive second call (§3.4.3): reuse the first call's geometry and recipe. */
+      reuse?: ReuseHint
+      /** Ask for the adaptive pass (default true). */
+      adaptive?: boolean
+      /**
+       * The page's edit rotation (§3.4.5 priors: tried first). Absent = 0: the 90° test decides.
+       */
+      editRotation?: Orientation
+      /**
+       * Tests only (the calibration run): the table the pipeline's own gates (Retry A) read, so a
+       * refit is not fed by the table it replaces. Default: the shipped TESS_CORE7.
+       */
+      calibration?: CalibrationTable
+      /** Tests only: pass 1 on the bitmap as given, no preprocessing (the PR5 replay cache). */
+      rawPass1?: boolean
       /**
        * Tests only (the tier-1 harness records the replay cache): also return each pass's raw hOCR.
        * The coordinator never sets it; hOCR is page content and never leaves the process.

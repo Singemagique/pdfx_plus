@@ -13,6 +13,7 @@ import type {
 } from '../process/thread-messages'
 import type { RawOcr } from '../../../shared/ocr/engine/types'
 import type { Budgets } from '../process/budget'
+import type { RecognizeOutcome } from '../process/recognize-core'
 
 const later = (fn: () => void): void => {
   void Promise.resolve().then(fn)
@@ -223,11 +224,39 @@ export function oneWord(width: number, height: number): RawOcr {
   }
 }
 
+/** A recognize-thread outcome around `raw`: pass 1 only, upright, no deskew, no adaptive pass. */
+export function outcomeOf(raw: RawOcr, extra: Partial<RecognizeOutcome> = {}): RecognizeOutcome {
+  return {
+    raw,
+    chosen: 'pass1',
+    passes: [],
+    toSource: [1, 0, 0, 1, 0, 0],
+    orientation: 0,
+    plan: { quarterTurns: 0, skewDeg: 0 },
+    recipe: { psm: 3, thresholding: 0 },
+    adaptive: null,
+    stats: {
+      photo: false,
+      noisy: false,
+      specks: 0,
+      borderRemoved: 0,
+      ink: 0,
+      vertical: false,
+      skew: { deg: 0, conf: 0, applied: false },
+      orientationChecked: false,
+      flipped: false,
+      chars: 0,
+      meanConfCal: null
+    },
+    ...extra
+  }
+}
+
 export function recognized(msg: RecognizeMsg, thread: FakeRecognizer): FromRecognize {
   return {
     type: 'result',
     taskId: msg.taskId,
-    result: { raw: oneWord(msg.width, msg.height), chosen: 'pass1', passes: [] },
+    result: outcomeOf(oneWord(msg.width, msg.height)),
     heap: 50 * 2 ** 20,
     stderrLines: 0,
     tripwire: thread.tripwire

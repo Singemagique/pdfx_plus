@@ -460,3 +460,37 @@ describe('unknown keys named after Object.prototype members', () => {
     expect(Object.prototype).not.toHaveProperty('polluted')
   })
 })
+
+describe('PR6 fields: the edit rotation in, rotateBy out (§3.4.5)', () => {
+  it('accepts editRotation 0/90/180/270 on a page request and nothing else', () => {
+    for (const editRotation of [0, 90, 180, 270]) {
+      const m = { recognize: { ...recognize.recognize, pages: [{ ...page, editRotation }] } }
+      expect(parseToOcr(m)).toEqual(m)
+    }
+    for (const bad of [45, -90, 360, '90', null])
+      rejects(() =>
+        parseToOcr({
+          recognize: { ...recognize.recognize, pages: [{ ...page, editRotation: bad }] }
+        })
+      )
+  })
+
+  it('accepts rotateBy 90/180/270 on a page result; 0 is never sent', () => {
+    const result = (rotateBy: unknown): unknown => ({
+      result: {
+        jobId: 'j1',
+        src: 's1',
+        index: 0,
+        page: {
+          status: 'no-text',
+          renderDpi: 300,
+          raster: { width: 10, height: 10 },
+          recognition: null,
+          rotateBy
+        }
+      }
+    })
+    for (const r of [90, 180, 270]) expect(() => parseFromOcr(result(r) as never)).not.toThrow()
+    for (const r of [0, 45, '90']) rejects(() => parseFromOcr(result(r) as never))
+  })
+})

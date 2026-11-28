@@ -29,8 +29,10 @@ export const ENGINE_ID = 'tess-lstm/core-7.0.0/simd/fork-2a9c1c4'
 /**
  * The recognition pipeline's version: bump it whenever preprocessing, the pass plan, the hOCR
  * parse, the filter or the mapping changes what a page yields (it is part of configHash).
+ * 2: PR6 (preprocessing, orientation, deskew, retries, the adaptive pass, the refit size factor,
+ * the missed-space split).
  */
-export const PIPELINE_VERSION = 1
+export const PIPELINE_VERSION = 2
 
 /** OEM_LSTM_ONLY: the simd-lstm build has no legacy engine. */
 export const OEM_LSTM_ONLY = 1
