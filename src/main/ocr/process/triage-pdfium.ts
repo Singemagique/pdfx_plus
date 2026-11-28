@@ -9,39 +9,52 @@
 //   chars' boxes (GetCharBox returns doubles l, r, b, t) give the text area (an exact union), the
 //   band and the visible native words; FPDFText_HasUnicodeMapError (= 1) and the code points give
 //   the broken-text signals.
-// - Page objects, recursing into Form XObjects: image bounds for the coverage, marks (/PDFxOCR on
-//   text, /PDFxImportedImage on images), and the dominant image. Composition rule (PR0): an object
-//   inside a Form already has that Form's /Matrix in its GetMatrix, and a form object's GetMatrix
-//   is only the CTM at its `Do`, so fullCTM = child × Π ancestor form objects' GetMatrix.
-// - The dominant image (largest placed area): pixel size (GetImagePixelSize, no decode) against
-//   the placed size → d_eff; PDFium's own dpi fields are wrong on rotated placements and never
-//   used. FPDFImageObj_GetImageMetadata WITH the page decodes a JPX image (CPDF_DIB::
-//   StartLoadDIBBase → LoadJpxBitmap), which is exactly the trap the pre-check exists to avoid, so
-//   it is called only for non-JPX images (for bits_per_pixel).
+// - Page objects, recursing into Form XObjects: image placements for the coverage (the placed
+//   parallelograms, not their axis-aligned boxes), marks (/PDFxOCR on text, /PDFxImportedImage on
+//   images), and the dominant image. Composition rule (PR0): an object inside a Form already has
+//   that Form's /Matrix in its GetMatrix, and a form object's GetMatrix is only the CTM at its
+//   `Do`, so fullCTM = child × Π ancestor form objects' GetMatrix. The walk goes as deep as
+//   PDFium's own Form nesting limit; when its object limit stops it early the page is refused
+//   (`too-complex`), since unseen objects are still parsed and decoded by PDFium.
+// - The dominant image (largest placed area; a near-tie goes to the higher density, so an MRC
+//   scan's full-resolution foreground beats its low-resolution background): pixel size
+//   (GetImagePixelSize, no decode) against the placed size → d_eff; PDFium's own dpi fields are
+//   wrong on rotated placements and never used. FPDFImageObj_GetImageMetadata WITH the page decodes
+//   a JPX image (CPDF_DIB::StartLoadDIBBase → LoadJpxBitmap), which is exactly the trap the
+//   pre-check exists to avoid, so it is called only for non-JPX images (for bits_per_pixel).
 // - Every JPX image on the page (rendering decodes them all, not only the dominant one) goes
-//   through the SIZ pre-check, with its /ColorSpace read from the file bytes.
+//   through the SIZ pre-check, with its /ColorSpace read from the file bytes; so does every
+//   JPXDecode stream an image names as its /SMask or /Mask, read from the file bytes too. Not
+//   covered: images inside tiling patterns and soft-mask groups (PDFium exposes neither as page
+//   objects); for those the raster thread's crash path is the guard.
 
 import {
   IDENTITY,
   IMPORTED_IMAGE_MARK,
   bandFraction,
   classifyPage,
+  dictColourComponents,
   effectiveDpi,
   emptyQuality,
+  imageCoverage,
+  imageStreamDict,
   isForeignGlyphlessFont,
   isSpaceChar,
   baseFontCore,
+  jpxObjectRefusal,
   jpxPrecheck,
   makeByteFind,
+  maskRefs,
   mulMatrix,
+  pickDominant,
   placedArea,
   selectRenderDpi,
-  streamColourComponents,
   tallyChar,
   toOverlayFrame,
   unionArea,
-  unitSquareBounds,
   wantsNativeWords,
+  type ByteFind,
+  type JpxInfo,
   type JpxRefusal,
   type Matrix6,
   type NativeWord,
@@ -118,8 +131,17 @@ export const PDFX_OCR_FONT = 'PDFxOCR-GlyphLess'
 
 /** Bounds on the work one page may cost (a crafted page can hold millions of objects). */
 export const TRIAGE_LIMITS = {
+  /** Past this many objects the walk stops and the page is refused (`too-complex`). */
   maxObjects: 200_000,
-  maxFormDepth: 12,
+  /**
+   * PDFium's own Form nesting limit [measured: 40 nested Forms parse, the 41st is left empty], so
+   * the walk sees every object PDFium would draw and a legitimate deep file is never refused.
+   */
+  maxFormDepth: 40,
+  /** Images per page whose stream dictionary is read for a JPX /SMask or /Mask. */
+  maxMaskLookups: 64,
+  /** Raw data read to locate a non-JPX image's dictionary (its masks); larger ones are skipped. */
+  maxMaskLookupBytes: 64 * 2 ** 20,
   maxChars: 2_000_000,
   maxJpxImages: 64,
   /** Raw JPX data read for the SIZ check (the whole stream is needed only to locate its dict). */
@@ -140,6 +162,22 @@ interface ImageHit {
   obj: number
   full: Matrix6
   marks: string[]
+}
+
+/** Below this final DPI (a page so large the pixel caps leave nothing) the page fails `render`. */
+export const MIN_RENDER_DPI = 1
+
+/** A page with nothing known yet (the base of every failure entry). */
+export function failedPage(index: number): TriagePage {
+  return {
+    index,
+    pageClass: null,
+    renderDpi: null,
+    raster: null,
+    effectiveDpi: null,
+    bitsPerPixel: null,
+    imageOrigin: false
+  }
 }
 
 /** Typed reads of the WASM heap; the view is refreshed when the heap grows. */
@@ -190,15 +228,7 @@ export function triagePages(
   const find = makeByteFind(ctx.file)
   try {
     return pages.map((index) => {
-      const base: TriagePage = {
-        index,
-        pageClass: null,
-        renderDpi: null,
-        raster: null,
-        effectiveDpi: null,
-        bitsPerPixel: null,
-        imageOrigin: false
-      }
+      const base = failedPage(index)
       if (index < 0 || index >= count) return { ...base, failure: 'page-missing' }
       // An encrypted source is skipped whole (§3.4.1): nothing of its pages is read.
       if (encrypted) return { ...base, pageClass: 'protected' }
@@ -240,21 +270,30 @@ function markNames(mod: PdfiumTriage, heap: Heap, obj: number, p: number): strin
   return out
 }
 
-/** Every image on the page with its full CTM and marks, recursing into Forms; and our OCR mark. */
+/**
+ * Every image on the page with its full CTM and marks, recursing into Forms; and our OCR mark.
+ * `truncated`: a walk limit stopped it before every object PDFium parsed was seen, so an image
+ * (and a JPX one in particular) may have been missed.
+ */
 function collectObjects(
   mod: PdfiumTriage,
   heap: Heap,
   page: number,
   scratch: number
-): { images: ImageHit[]; pdfxOcrMark: boolean } {
+): { images: ImageHit[]; pdfxOcrMark: boolean; truncated: boolean } {
   const images: ImageHit[] = []
   let pdfxOcrMark = false
   let visited = 0
+  let truncated = false
   const walk = (container: number, isForm: boolean, ctm: Matrix6, depth: number): void => {
     const n = isForm
       ? mod.FPDFFormObj_CountObjects(container)
       : mod.FPDFPage_CountObjects(container)
-    for (let i = 0; i < n && visited < TRIAGE_LIMITS.maxObjects; i++) {
+    for (let i = 0; i < n; i++) {
+      if (visited >= TRIAGE_LIMITS.maxObjects) {
+        truncated = true
+        return
+      }
       visited++
       const o = isForm
         ? mod.FPDFFormObj_GetObject(container, i)
@@ -275,10 +314,12 @@ function collectObjects(
       if (type === FPDF_PAGEOBJ_IMAGE)
         images.push({ obj: o, full, marks: markNames(mod, heap, o, scratch) })
       else if (depth < TRIAGE_LIMITS.maxFormDepth) walk(o, true, full, depth + 1)
+      // PDFium leaves a Form past its own nesting limit empty; one with objects is unseen work.
+      else if (mod.FPDFFormObj_CountObjects(o) > 0) truncated = true
     }
   }
   walk(page, false, IDENTITY, 0)
-  return { images, pdfxOcrMark }
+  return { images, pdfxOcrMark, truncated }
 }
 
 /**
@@ -293,20 +334,114 @@ export function jpxRefusalOf(mod: PdfiumTriage, page: number, file: Uint8Array):
   const scratch = rt.wasmExports.malloc(256)
   if (!scratch) return 'jpx-malformed'
   try {
-    const { images } = collectObjects(mod, heap, page, scratch)
-    let find: ReturnType<typeof makeByteFind> | null = null
-    let seen = 0
-    for (const im of images) {
-      if (!isJpx(mod, heap, im.obj, scratch)) continue
-      if (++seen > TRIAGE_LIMITS.maxJpxImages) return 'jpx-malformed'
-      find ??= makeByteFind(file)
-      const check = checkJpx(mod, heap, im.obj, file, find)
-      if (!check.ok) return check.reason
-    }
-    return null
+    const { images, truncated } = collectObjects(mod, heap, page, scratch)
+    if (truncated) return 'too-complex'
+    return checkImages(mod, heap, scratch, images, file, makeByteFind(file), true).refused ?? null
   } finally {
     rt.wasmExports.free(scratch)
   }
+}
+
+/** Per source file: whether it names any mask at all, and every mask stream's verdict so far. */
+interface MaskIndex {
+  present: boolean
+  verdicts: Map<string, JpxRefusal | null>
+}
+const maskIndexes = new WeakMap<Uint8Array, MaskIndex>()
+
+function maskIndexOf(file: Uint8Array, find: ByteFind): MaskIndex {
+  let ix = maskIndexes.get(file)
+  if (!ix) {
+    const enc = new TextEncoder()
+    // A literal gate, so a file without masks pays one scan per document, not one per image. A
+    // name spelt with #xx escapes slips past it; such a crafted file still meets the crash path.
+    const present = find(enc.encode('/SMask'), 0) >= 0 || find(enc.encode('/Mask'), 0) >= 0
+    ix = { present, verdicts: new Map() }
+    maskIndexes.set(file, ix)
+  }
+  return ix
+}
+
+interface ImageChecks {
+  /** The first refusal, if any. */
+  refused?: JpxRefusal
+  /** The SIZ of every JPX image that passed, by object handle. */
+  jpx: Map<number, JpxInfo>
+  /** Every JPX image's object handle (passed or not). */
+  jpxObjs: Set<number>
+  /** Images whose /SMask or /Mask is a JPX stream the pre-check refused. */
+  badMask: Set<number>
+}
+
+/**
+ * The JPX SIZ pre-check over a page's images (rendering decodes them all, not only the dominant
+ * one), and over the JPXDecode streams any image names as its /SMask or /Mask: PDFium decodes those
+ * with the image. With `stopAtFirst` it returns at the first refusal (the render-time guard).
+ */
+function checkImages(
+  mod: PdfiumTriage,
+  heap: Heap,
+  scratch: number,
+  images: readonly ImageHit[],
+  file: Uint8Array,
+  find: ByteFind,
+  stopAtFirst: boolean
+): ImageChecks {
+  const out: ImageChecks = { jpx: new Map(), jpxObjs: new Set(), badMask: new Set() }
+  const refuse = (r: JpxRefusal): boolean => {
+    out.refused ??= r
+    return stopAtFirst
+  }
+  const masks = maskIndexOf(file, find)
+  let jpxSeen = 0
+  let lookups = 0
+  for (const im of images) {
+    let raw: Uint8Array | null = null
+    let dict: string | null | undefined
+    if (isJpx(mod, heap, im.obj, scratch)) {
+      out.jpxObjs.add(im.obj)
+      if (++jpxSeen > TRIAGE_LIMITS.maxJpxImages) {
+        refuse('jpx-malformed')
+        break
+      }
+      raw = readRaw(mod, heap, im.obj, TRIAGE_LIMITS.maxJpxBytes)
+      if (!raw) {
+        if (refuse('jpx-malformed')) break
+        continue
+      }
+      dict = imageStreamDict(file, raw, find)
+      // A /ColorSpace we cannot find or read counts as absent: the JP2 header may still name one.
+      const cs = dict === null ? 'unknown' : dictColourComponents(dict, file, find)
+      const check = jpxPrecheck(raw, cs === 'unknown' ? null : cs)
+      if (!check.ok) {
+        if (refuse(check.reason)) break
+      } else out.jpx.set(im.obj, check.info)
+    }
+    if (!masks.present || lookups >= TRIAGE_LIMITS.maxMaskLookups) continue
+    lookups++
+    if (dict === undefined) {
+      raw ??= readRaw(mod, heap, im.obj, TRIAGE_LIMITS.maxMaskLookupBytes)
+      dict = raw ? imageStreamDict(file, raw, find) : null
+    }
+    if (!dict) continue
+    let stop = false
+    for (const r of maskRefs(dict)) {
+      const key = `${r.n} ${r.g}`
+      let v = masks.verdicts.get(key)
+      if (v === undefined) {
+        v = jpxObjectRefusal(file, find, r.n, r.g)
+        masks.verdicts.set(key, v)
+      }
+      if (!v) continue
+      out.badMask.add(im.obj)
+      if (refuse(v)) {
+        stop = true
+        break
+      }
+    }
+    if (stop) break
+  }
+  return out
 }
 
 function triageOne(
@@ -331,12 +466,12 @@ function triageOne(
   const pageArea = (box.x1 - box.x0) * (box.y1 - box.y0)
 
   // --- Objects: images (recursing into forms) and marks.
-  const { images, pdfxOcrMark } = collectObjects(mod, heap, page, scratch)
+  const { images, pdfxOcrMark, truncated } = collectObjects(mod, heap, page, scratch)
 
   const cov =
     pageArea > 0
-      ? unionArea(
-          images.map((im) => unitSquareBounds(im.full)),
+      ? imageCoverage(
+          images.map((im) => im.full),
           box
         ) / pageArea
       : 0
@@ -456,49 +591,58 @@ function triageOne(
   const pageClass = classifyPage(signals)
   ctx.onSignals?.(index, signals)
 
-  // --- Dominant image, d_eff, the JPX pre-check.
-  let dominant: ImageHit | null = null
-  for (const im of images)
-    if (!dominant || placedArea(im.full) > placedArea(dominant.full)) dominant = im
+  // --- The JPX pre-check, the dominant image and its d_eff.
+  const checks = checkImages(mod, heap, scratch, images, ctx.file, find, false)
+  let refused: JpxRefusal | undefined = checks.refused
+  // A walk limit hid objects PDFium would still parse and decode: nothing vouches for them.
+  if (truncated) refused ??= 'too-complex'
+
+  const densities = new Map<ImageHit, number | null>()
+  const densityOf = (im: ImageHit): number | null => {
+    if (densities.has(im)) return densities.get(im)!
+    const d = mod.FPDFImageObj_GetImagePixelSize(im.obj, scratch, scratch + 4)
+      ? effectiveDpi({ width: heap.u32(scratch), height: heap.u32(scratch + 4) }, im.full)
+      : null
+    densities.set(im, d)
+    return d
+  }
+  const dominant = pickDominant(images, (im) => placedArea(im.full), densityOf)
   let dEff: number | null = null
   let bitsPerPixel: number | null = null
-  let refused: JpxRefusal | undefined
-  let jpxSeen = 0
-  for (const im of images) {
-    const jpx = isJpx(mod, heap, im.obj, scratch)
-    if (jpx) {
-      if (++jpxSeen > TRIAGE_LIMITS.maxJpxImages) {
-        refused ??= 'jpx-malformed'
-        break
-      }
-      const check = checkJpx(mod, heap, im.obj, ctx.file, find)
-      if (!check.ok) refused ??= check.reason
-      else if (im === dominant) bitsPerPixel = check.info.bitsPerComponent * check.info.components
-    }
-    if (im !== dominant) continue
-    if (mod.FPDFImageObj_GetImagePixelSize(im.obj, scratch, scratch + 4)) {
-      dEff = effectiveDpi({ width: heap.u32(scratch), height: heap.u32(scratch + 4) }, im.full)
-    }
-    // Metadata with the page decodes JPX (see the header): only for other filters.
-    if (!jpx && mod.FPDFImageObj_GetImageMetadata(im.obj, page, scratch)) {
+  if (dominant) {
+    dEff = densityOf(dominant)
+    const info = checks.jpx.get(dominant.obj)
+    if (info) bitsPerPixel = info.bitsPerComponent * info.components
+    else if (
+      // Metadata with the page decodes JPX (see the header): only for other filters, and never
+      // for an image whose JPX mask was refused (loading the image may load its mask).
+      !checks.jpxObjs.has(dominant.obj) &&
+      !checks.badMask.has(dominant.obj) &&
+      mod.FPDFImageObj_GetImageMetadata(dominant.obj, page, scratch)
+    ) {
       const bpp = heap.u32(scratch + 16)
       bitsPerPixel = bpp > 0 ? bpp : null
     }
   }
+  // Kept to 0.01 and clamped into what the port accepts: a crafted placement can make d_eff absurd
+  // either way, and one that rounds to 0 says nothing about the image (the DPI falls back).
+  const effective = dEff === null ? null : Math.min(1e6, Math.round(dEff * 100) / 100)
+  const dEffKept = effective !== null && effective > 0 ? effective : null
 
   const dpi = selectRenderDpi({
     page: { width: mod.FPDF_GetPageWidthF(page), height: mod.FPDF_GetPageHeightF(page) },
-    dEff,
+    dEff: dEffKept === null ? null : dEff,
     imageOrigin,
     caps: ctx.caps
   })
+  // A page so large that the pixel caps leave under 1 DPI cannot be recognised.
+  if (!(dpi.renderDpi >= MIN_RENDER_DPI)) return { ...failedPage(index), failure: 'render' }
   const out: TriagePage = {
     index,
     pageClass,
     renderDpi: dpi.renderDpi,
     raster: { width: dpi.width, height: dpi.height },
-    // Clamped into what the port accepts: a crafted placement can make d_eff absurd.
-    effectiveDpi: dEff === null ? null : Math.min(1e6, Math.round(dEff * 100) / 100),
+    effectiveDpi: dEffKept,
     bitsPerPixel: bitsPerPixel !== null && bitsPerPixel <= 1024 ? bitsPerPixel : null,
     imageOrigin
   }
@@ -516,26 +660,17 @@ function isJpx(mod: PdfiumTriage, heap: Heap, obj: number, p: number): boolean {
   return false
 }
 
-function checkJpx(
-  mod: PdfiumTriage,
-  heap: Heap,
-  obj: number,
-  file: Uint8Array,
-  find: ReturnType<typeof makeByteFind>
-): ReturnType<typeof jpxPrecheck> {
+/** An image's raw (undecoded) stream data, or null when it is empty, over `max` or unreadable. */
+function readRaw(mod: PdfiumTriage, heap: Heap, obj: number, max: number): Uint8Array | null {
   const rt = mod.pdfium
   const len = mod.FPDFImageObj_GetImageDataRaw(obj, 0, 0)
-  if (!(len > 0) || len > TRIAGE_LIMITS.maxJpxBytes) return { ok: false, reason: 'jpx-malformed' }
+  if (!(len > 0) || len > max) return null
   const buf = rt.wasmExports.malloc(len)
-  if (!buf) return { ok: false, reason: 'jpx-malformed' }
-  let raw: Uint8Array
+  if (!buf) return null
   try {
     const got = mod.FPDFImageObj_GetImageDataRaw(obj, buf, len)
-    raw = heap.bytes(buf, Math.min(got, len))
+    return heap.bytes(buf, Math.min(got, len))
   } finally {
     rt.wasmExports.free(buf)
   }
-  // A /ColorSpace we cannot find or read counts as absent: the JP2 header may still name one.
-  const cs = streamColourComponents(file, raw, find)
-  return jpxPrecheck(raw, cs === 'unknown' ? null : cs)
 }

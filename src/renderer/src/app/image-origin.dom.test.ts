@@ -11,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 // pdf.js's worker in-process (its "fake worker" picks up globalThis.pdfjsWorker).
 import 'pdfjs-dist/legacy/build/pdf.worker.mjs'
 
+import { imageToPdf } from '../pdfx/images'
 import { useImport } from './useImport'
 import { usePaste } from './usePaste'
 import type { Collection } from './useCollection'
@@ -153,6 +154,32 @@ describe('every import path carries the image-origin marker', () => {
     })
     expect(origins(c)).toEqual([
       ['setDocs', 'image'],
+      ['setDocs', undefined]
+    ])
+  })
+
+  it('a PDF from disk that only CLAIMS the Producer is not image-origin (it must be triaged)', async () => {
+    // A third-party or crafted file with imageToPdf's exact Producer: trusting it would skip
+    // triage (protected, OCR-layer and JPX checks) and auto-recognise every page (D4).
+    const doc = await PDFDocument.create()
+    doc.setProducer('PDFx image import')
+    doc.addPage([200, 300])
+    doc.addPage([200, 300])
+    const crafted = await doc.save()
+    // And bytes imageToPdf really made, once copied (as a save and reopen would): not fresh either.
+    const copied = (await imageToPdf(PNG)).slice()
+    stubApi()
+    const c = fakeCollection([], null)
+    const { addFiles } = await mountImport(c.collection)
+    await act(async () => {
+      await addFiles([
+        { name: 'crafted.pdf', data: crafted },
+        { name: 'copied.pdf', data: copied }
+      ])
+    })
+    expect(origins(c)).toEqual([
+      ['setDocs', undefined],
+      ['setDocs', undefined],
       ['setDocs', undefined]
     ])
   })

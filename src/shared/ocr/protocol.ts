@@ -56,7 +56,8 @@ export const JPX_REFUSALS = [
   'jpx-malformed',
   'jpx-subsampled',
   'jpx-components',
-  'jpx-no-colour-space'
+  'jpx-no-colour-space',
+  'too-complex'
 ] as const satisfies readonly JpxRefusal[]
 const _allRefusals: Exclude<JpxRefusal, (typeof JPX_REFUSALS)[number]> extends never
   ? true
@@ -641,6 +642,14 @@ const fromOcr = message<FromOcr>(
   },
   'FromOcr'
 )
+
+/**
+ * Validate one triage result (the coordinator runs this on every page a raster thread returns, so
+ * one bad page becomes a failure entry instead of making the renderer reject the whole batch).
+ */
+export function parseTriagePage(x: unknown, path = 'TriagePage'): TriagePage {
+  return triagePage(x, path)
+}
 
 /** Validate a coordinator → renderer message (the renderer's ocr-store runs this). */
 export function parseFromOcr(x: unknown): FromOcr {

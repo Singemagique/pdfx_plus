@@ -6,8 +6,13 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  DOMINANT_TIE,
   DPI_RULES,
   PIXEL_CAPS,
+  imageCoverage,
+  jpxObjectRefusal,
+  maskRefs,
+  pickDominant,
   TRIAGE_THRESHOLDS as T,
   bandFraction,
   classifyPage,
@@ -87,6 +92,20 @@ describe('classifyPage, in the design order', () => {
     expect(classifyPage(sig({ ...page, band: 0.1, cov: 0.749 }))).toBe('mixed')
   })
 
+  it('a stamp over a scan that already carries an invisible layer is ocr-foreign (D5)', () => {
+    // 69% invisible: under the 80% ocr-foreign share, so the near-scanned rule would fire.
+    const page = { cov: 1, visible: 826, invisible: 1861, textArea: 0.015, band: 0.05 }
+    expect(classifyPage(sig(page))).toBe('ocr-foreign')
+    expect(classifyPage(sig({ ...page, invisible: T.nearScannedForeignInvisible }))).toBe(
+      'ocr-foreign'
+    )
+    expect(classifyPage(sig({ ...page, invisible: T.nearScannedForeignInvisible - 1 }))).toBe(
+      'near-scanned'
+    )
+    // Only where near-scanned would have fired: real body text over an image stays mixed.
+    expect(classifyPage(sig({ ...page, textArea: 0.3, band: 0.9, visible: 2000 }))).toBe('mixed')
+  })
+
   it('mixed from 10% coverage, else text', () => {
     expect(classifyPage(sig({ visible: 500, textArea: 0.2, band: 0.8, cov: 0.1 }))).toBe('mixed')
     expect(classifyPage(sig({ visible: 500, textArea: 0.2, band: 0.8, cov: 0.099 }))).toBe('text')
@@ -131,6 +150,28 @@ describe('isBrokenText', () => {
     )
     // Numbers and codes are not letters.
     expect(v('INV-01OI3 2026-11-27 $1,234.56 0O1lI 445566 778899 112233 445566')).toBe(false)
+  })
+
+  it('the script gate: 40+ consonant-heavy Latin letters inside mostly-Cyrillic text are not judged', () => {
+    const v = (text: string): boolean =>
+      isBrokenText({
+        visible: text.replace(/\s/g, '').length,
+        invisible: 0,
+        quality: quality(text)
+      })
+    // 48 Latin letters with one vowel (codes, URLs, abbreviations) on a Cyrillic invoice.
+    const codes = 'HTTP PDF NDS XML SKU CRM HTTPS WWW BTC SMS GPS DVD NDA KPI'
+    const cyrillic =
+      'Счёт на оплату номер сорок два от двадцать седьмого ноября для портовой конторы ' +
+      'оплатить до конца месяца по реквизитам указанным ниже спасибо за сотрудничество'
+    const q = quality(codes)
+    expect(q.latinLetters).toBeGreaterThanOrEqual(T.brokenMinLatinLetters)
+    expect(q.latinVowels / q.latinLetters).toBeLessThan(T.brokenVowelMin)
+    const mixed = quality(`${cyrillic} ${codes}`)
+    expect(mixed.latinLetters).toBeLessThan(T.brokenLatinShare * mixed.letters)
+    expect(v(`${cyrillic} ${codes}`)).toBe(false)
+    // The same Latin run on its own is mostly Latin, and judged broken.
+    expect(v(codes)).toBe(true)
   })
 
   it('counts the bad code points', () => {
@@ -196,6 +237,81 @@ describe('geometry', () => {
           if (rects.some((r) => x >= r.x0 && x < r.x1 && y >= r.y0 && y < r.y1)) brute++
       expect(unionArea(rects, clip)).toBe(brute)
     }
+  })
+
+  it('unionArea stays O(n log n) on a crafted staircase of overlapping char boxes', () => {
+    // Every box overlaps every other in x (the layout that made the per-slab rebuild quadratic:
+    // 80k chars took 42 s through RasterEngine.triage).
+    const n = 200_000
+    const rects = Array.from({ length: n }, (_, i) => ({
+      x0: i * 1e-4,
+      y0: i * 1e-3,
+      x1: 50 + i * 1e-4,
+      y1: 5 + i * 1e-3
+    }))
+    const t0 = performance.now()
+    const a = unionArea(rects)
+    const ms = performance.now() - t0
+    // The 50 × 5 box swept along (dx, dy): w·h + w·dy + h·dx (less ~0.02 of staircase notches).
+    const dx = (n - 1) * 1e-4
+    const dy = (n - 1) * 1e-3
+    expect(a).toBeCloseTo(50 * 5 + 50 * dy + 5 * dx, -1)
+    expect(ms).toBeLessThan(5000)
+  })
+
+  it('pickDominant: largest placed area; a near-tie goes to the higher density, in any order', () => {
+    type Im = { name: string; area: number; dpi: number | null }
+    const pick = (ims: Im[]): string | undefined =>
+      pickDominant(
+        ims,
+        (i) => i.area,
+        (i) => i.dpi
+      )?.name
+    const bg = { name: 'bg', area: 484_704, dpi: 100 }
+    const fg = { name: 'fg', area: 484_704 * (1 - 1e-6), dpi: 400 } // float32 ulps apart
+    expect(pick([bg, fg])).toBe('fg')
+    expect(pick([fg, bg])).toBe('fg')
+    // Not a tie: the bigger one wins whatever its density.
+    const logo = { name: 'logo', area: 2_500, dpi: 600 }
+    expect(pick([logo, bg])).toBe('bg')
+    expect(pick([{ ...fg, area: 484_704 * (1 - 2 * DOMINANT_TIE) }, bg])).toBe('bg')
+    // An exact tie at equal density: the first drawn.
+    expect(pick([bg, { ...bg, name: 'bg2' }])).toBe('bg')
+    expect(pick([])).toBeUndefined()
+  })
+
+  it('imageCoverage: placed parallelograms, clipped; exact unless rotated images overlap', () => {
+    const box = { x0: 0, y0: 0, x1: 612, y1: 792 }
+    const a = Math.PI / 4
+    const rotSquare = (k: number, cx: number, cy: number): Matrix6 => {
+      const m: Matrix6 = [k * Math.cos(a), k * Math.sin(a), -k * Math.sin(a), k * Math.cos(a), 0, 0]
+      m[4] = cx - 0.5 * (m[0] + m[2])
+      m[5] = cy - 0.5 * (m[1] + m[3])
+      return m
+    }
+    expect(imageCoverage([rotSquare(300, 306, 396)], box)).toBeCloseTo(90_000, 6)
+    // Two disjoint rotated images: the sum.
+    expect(imageCoverage([rotSquare(100, 100, 100), rotSquare(100, 400, 600)], box)).toBeCloseTo(
+      20_000,
+      6
+    )
+    // Half off the page edge: clipped to its visible half.
+    expect(imageCoverage([rotSquare(100, 0, 400)], box)).toBeCloseTo(5_000, 6)
+    // Axis-aligned overlaps: the exact union.
+    expect(
+      imageCoverage(
+        [
+          [100, 0, 0, 100, 0, 0],
+          [100, 0, 0, 100, 50, 50]
+        ],
+        box
+      )
+    ).toBeCloseTo(17_500, 6)
+    // Overlapping rotated images: bounded by both the sum and the boxes' union.
+    const two = [rotSquare(100, 200, 200), rotSquare(100, 230, 200)]
+    const got = imageCoverage(two, box)
+    expect(got).toBeLessThanOrEqual(20_000)
+    expect(got).toBeGreaterThan(10_000)
   })
 
   it('maps user space into the overlay frame for every /Rotate', () => {
@@ -468,6 +584,43 @@ describe('streamColourComponents: an image /ColorSpace from the file bytes', () 
     expect(streamColourComponents(f, enc('not-in-the-file-at-all'), makeByteFind(f))).toBe(
       'unknown'
     )
+  })
+
+  it('maskRefs: /SMask and /Mask streams, #-escaped names too; a colour-key /Mask array is not one', () => {
+    expect(maskRefs('<< /Width 8 /SMask 12 0 R /Mask 13 0 R >>')).toEqual([
+      { n: 12, g: 0 },
+      { n: 13, g: 0 }
+    ])
+    expect(maskRefs('<< /S#4Dask\n7 1 R >>')).toEqual([{ n: 7, g: 1 }])
+    expect(maskRefs('<< /Mask [0 10] /SMaskInData 1 >>')).toEqual([])
+  })
+
+  it('jpxObjectRefusal: the SIZ pre-check on a JPX mask stream, found by object number', () => {
+    const latin = (s: string): Uint8Array => Uint8Array.from(s, (c) => c.charCodeAt(0))
+    const code = (sub: Array<[number, number]>): string => String.fromCharCode(...siz(sub, 8, 8))
+    const f = (objs: string): Uint8Array => latin(`%PDF-1.7\n${objs}`)
+    const stream = (n: number, dict: string, data: string): string =>
+      `${n} 0 obj\n<< ${dict} /Length ${data.length} >>\nstream\n${data}\nendstream\nendobj\n`
+    const at = (file: Uint8Array, n: number) => jpxObjectRefusal(file, makeByteFind(file), n, 0)
+    const bad = f(stream(9, '/Filter /JPXDecode /ColorSpace /DeviceGray', code([[2, 2]])))
+    expect(at(bad, 9)).toBe('jpx-subsampled')
+    // No /ColorSpace: a mask is DeviceGray, so 3 components mismatch and 1 passes.
+    const three = code([
+      [1, 1],
+      [1, 1],
+      [1, 1]
+    ])
+    expect(at(f(stream(9, '/Filter /JPXDecode', three)), 9)).toBe('jpx-components')
+    expect(at(f(stream(9, '/Filter /JPXDecode', code([[1, 1]]))), 9)).toBeNull()
+    // Not a JPX stream at all, or not in the file: nothing to refuse.
+    expect(at(f(stream(9, '/Filter /FlateDecode', 'xx')), 9)).toBeNull()
+    expect(at(bad, 10)).toBeNull()
+    // An incremental update that replaces a clean copy with a bad one is still caught.
+    const both = f(
+      stream(9, '/Filter /JPXDecode', code([[1, 1]])) +
+        stream(9, '/Filter /JP#58Decode', code([[2, 2]]))
+    )
+    expect(at(both, 9)).toBe('jpx-subsampled')
   })
 
   it('makeByteFind finds every occurrence from a start offset', () => {

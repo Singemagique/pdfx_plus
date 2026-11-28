@@ -38,13 +38,20 @@ export type JpxRefusal =
   | 'jpx-subsampled' // a component has XRsiz/YRsiz ≠ 1 (PDFium decodes these wrongly, PR0)
   | 'jpx-components' // component count ≠ the colour space's (PDFium traps on these, PR0)
   | 'jpx-no-colour-space' // neither the PDF nor the JP2 header names a colour space
+  // More objects, or deeper Form nesting, than triage walks: its images were not all checked, and
+  // PDFium would still parse and decode them.
+  | 'too-complex'
 
 export interface TriagePage {
   /** 0-based page index in the source. */
   index: number
   /** The §3.4.1 class; null when triage could not read the page at all (`failure` says why). */
   pageClass: PageClass | null
-  /** Set when the page could not be triaged: 'page-missing', 'render' (PDFium refused the page). */
+  /**
+   * Set when the page could not be triaged: 'page-missing'; 'render' (PDFium refused the page, the
+   * pixel caps would leave it under 1 DPI, or the thread's result failed validation);
+   * 'raster-crash' (it killed the raster thread twice, or its source's triage was cut off).
+   */
   failure?: 'page-missing' | 'render' | 'raster-crash'
   /** Set when the page must not be rendered by PDFium (the JPX pre-check refused an image). */
   refused?: JpxRefusal
@@ -111,6 +118,11 @@ export const TRIAGE_THRESHOLDS = {
   nearScannedTextArea: 0.03,
   nearScannedVisible: 40,
   nearScannedBand: 0.1,
+  /**
+   * A page that passes the near-scanned tests but carries at least this many invisible chars is
+   * another tool's OCR under a stamp or header (`ocr-foreign`, D5), not a scan to recognise again.
+   */
+  nearScannedForeignInvisible: 40,
   /** Coverage below which a page with text is plain `text` rather than `mixed`. */
   mixedCov: 0.1,
   /** Broken text: judged only with at least this many counted chars. */
@@ -163,7 +175,10 @@ export function classifyPage(s: PageSignals): PageClass {
       s.visible < T.nearScannedVisible ||
       s.band <= T.nearScannedBand)
   )
-    return 'near-scanned' // Bates no., fax header, DMS stamp
+    // Bates no., fax header, DMS stamp. The visible text being only a stamp says nothing about an
+    // invisible layer under it: a substantial one is already searchable text (D5), and OCR on top
+    // would make Find return every word twice. (An addition to the §3.4.1 pseudo-code.)
+    return s.invisible >= T.nearScannedForeignInvisible ? 'ocr-foreign' : 'near-scanned'
   if (s.cov >= T.mixedCov) return 'mixed'
   return 'text'
 }
@@ -294,8 +309,9 @@ function clip(r: OcrRect, c: OcrRect | undefined): OcrRect | null {
 }
 
 /**
- * The exact area of the union of `rects` (optionally clipped to `clipTo`), by a sweep over x with
- * the union length of the active y intervals in each slab. O(n log n + slabs × active).
+ * The exact area of the union of `rects` (optionally clipped to `clipTo`), by a sweep over x with a
+ * segment tree over the compressed y coordinates (covered length per node). O(n log n) whatever
+ * the layout: a crafted page of millions of overlapping char boxes costs no more than a plain one.
  */
 export function unionArea(rects: readonly OcrRect[], clipTo?: OcrRect): number {
   const rs: OcrRect[] = []
@@ -303,38 +319,181 @@ export function unionArea(rects: readonly OcrRect[], clipTo?: OcrRect): number {
     const c = clip(r, clipTo)
     if (c) rs.push(c)
   }
-  if (rs.length === 0) return 0
-  const events: { x: number; i: number; open: boolean }[] = []
-  rs.forEach((r, i) => {
-    events.push({ x: r.x0, i, open: true }, { x: r.x1, i, open: false })
-  })
-  events.sort((a, b) => a.x - b.x)
-  const active = new Set<number>()
-  let area = 0
-  let prevX = events[0].x
-  let k = 0
-  while (k < events.length) {
-    const x = events[k].x
-    if (active.size > 0 && x > prevX) {
-      const spans = [...active].map((i) => [rs[i].y0, rs[i].y1]).sort((a, b) => a[0] - b[0])
-      let len = 0
-      let [s0, s1] = spans[0]
-      for (let j = 1; j < spans.length; j++) {
-        if (spans[j][0] > s1) {
-          len += s1 - s0
-          ;[s0, s1] = spans[j]
-        } else if (spans[j][1] > s1) s1 = spans[j][1]
-      }
-      len += s1 - s0
-      area += len * (x - prevX)
+  const n = rs.length
+  if (n === 0) return 0
+  const ysAll = new Float64Array(2 * n)
+  for (let i = 0; i < n; i++) {
+    ysAll[2 * i] = rs[i].y0
+    ysAll[2 * i + 1] = rs[i].y1
+  }
+  ysAll.sort()
+  let m = 0
+  for (let i = 0; i < ysAll.length; i++)
+    if (i === 0 || ysAll[i] !== ysAll[m - 1]) ysAll[m++] = ysAll[i]
+  const ys = ysAll.subarray(0, m)
+  const segs = m - 1 // elementary y intervals [ys[k], ys[k + 1])
+  if (segs <= 0) return 0
+  const yIndex = (y: number): number => {
+    let lo = 0
+    let hi = m - 1
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1
+      if (ys[mid] < y) lo = mid + 1
+      else hi = mid
     }
-    for (; k < events.length && events[k].x === x; k++) {
-      if (events[k].open) active.add(events[k].i)
-      else active.delete(events[k].i)
+    return lo
+  }
+  const count = new Int32Array(4 * segs)
+  const covered = new Float64Array(4 * segs)
+  const update = (node: number, l: number, r: number, a: number, b: number, d: number): void => {
+    if (b <= l || r <= a) return
+    if (a <= l && r <= b) count[node] += d
+    else {
+      const mid = (l + r) >> 1
+      update(2 * node, l, mid, a, b, d)
+      update(2 * node + 1, mid, r, a, b, d)
+    }
+    covered[node] =
+      count[node] > 0 ? ys[r] - ys[l] : r - l === 1 ? 0 : covered[2 * node] + covered[2 * node + 1]
+  }
+  // Events: rect i opens at x0 (+1) and closes at x1 (−1), sorted by x.
+  const order = new Uint32Array(2 * n)
+  for (let i = 0; i < 2 * n; i++) order[i] = i
+  const xOf = (e: number): number => (e & 1 ? rs[e >> 1].x1 : rs[e >> 1].x0)
+  order.sort((p, q) => xOf(p) - xOf(q))
+  const lo = new Int32Array(n)
+  const hi = new Int32Array(n)
+  for (let i = 0; i < n; i++) {
+    lo[i] = yIndex(rs[i].y0)
+    hi[i] = yIndex(rs[i].y1)
+  }
+  let area = 0
+  let prevX = xOf(order[0])
+  for (let k = 0; k < order.length; ) {
+    const x = xOf(order[k])
+    area += covered[1] * (x - prevX)
+    for (; k < order.length && xOf(order[k]) === x; k++) {
+      const e = order[k]
+      const i = e >> 1
+      update(1, 0, segs, lo[i], hi[i], e & 1 ? -1 : 1)
     }
     prevX = x
   }
   return area
+}
+
+/** The unit square under `m` as a quadrilateral (user space). */
+function placedQuad(m: Matrix6): [number, number][] {
+  return [
+    [m[4], m[5]],
+    [m[0] + m[4], m[1] + m[5]],
+    [m[0] + m[2] + m[4], m[1] + m[3] + m[5]],
+    [m[2] + m[4], m[3] + m[5]]
+  ]
+}
+
+/** Sutherland–Hodgman: a convex polygon clipped to an axis-aligned rectangle. */
+function clipToRect(poly: [number, number][], c: OcrRect): [number, number][] {
+  let out = poly
+  const edges: Array<[(p: [number, number]) => number, number, 0 | 1]> = [
+    [(p) => p[0] - c.x0, c.x0, 0],
+    [(p) => c.x1 - p[0], c.x1, 0],
+    [(p) => p[1] - c.y0, c.y0, 1],
+    [(p) => c.y1 - p[1], c.y1, 1]
+  ]
+  for (const [inside, at, axis] of edges) {
+    const src = out
+    out = []
+    for (let i = 0; i < src.length; i++) {
+      const p = src[i]
+      const q = src[(i + 1) % src.length]
+      const ip = inside(p) >= 0
+      const iq = inside(q) >= 0
+      if (ip) out.push(p)
+      if (ip !== iq) {
+        const t = (at - p[axis]) / (q[axis] - p[axis])
+        out.push(axis === 0 ? [at, p[1] + t * (q[1] - p[1])] : [p[0] + t * (q[0] - p[0]), at])
+      }
+    }
+    if (out.length === 0) break
+  }
+  return out
+}
+
+function polygonArea(poly: [number, number][]): number {
+  let a = 0
+  for (let i = 0; i < poly.length; i++) {
+    const [x0, y0] = poly[i]
+    const [x1, y1] = poly[(i + 1) % poly.length]
+    a += x0 * y1 - x1 * y0
+  }
+  return Math.abs(a) / 2
+}
+
+/**
+ * The page area (pt²) the images placed by `placements` cover inside `box` (§3.4.1's
+ * union(image bounds) ∩ page). "Image bounds" are the placed parallelograms, not their axis-aligned
+ * boxes, which would overstate a 45° image twofold: exact for axis-aligned images (their union) and
+ * for images that do not overlap (the sum of the clipped parallelograms); for overlapping rotated
+ * or skewed images, the smaller of those two upper bounds.
+ */
+export function imageCoverage(placements: readonly Matrix6[], box: OcrRect): number {
+  const boxes: OcrRect[] = []
+  let exactSum = 0
+  let allAligned = true
+  for (const m of placements) {
+    const b = clip(unitSquareBounds(m), box)
+    if (!b) continue
+    boxes.push(b)
+    const aligned = (m[1] === 0 && m[2] === 0) || (m[0] === 0 && m[3] === 0)
+    if (aligned) exactSum += (b.x1 - b.x0) * (b.y1 - b.y0)
+    else {
+      allAligned = false
+      exactSum += polygonArea(clipToRect(placedQuad(m), box))
+    }
+  }
+  if (boxes.length === 0) return 0
+  const union = unionArea(boxes)
+  return allAligned ? union : Math.min(union, exactSum)
+}
+
+/**
+ * Two placed areas closer than this (relative) are a tie for the dominant image: float32 matrices
+ * make two full-page layers differ by a few ulps.
+ */
+export const DOMINANT_TIE = 0.02
+
+/**
+ * The dominant image (§3.4.1: the largest placed area). A near-tie goes to the higher effective
+ * density, so on a mixed-raster-content scan (a low-resolution colour or grey background and a
+ * full-resolution 1-bit foreground, both full-page) the foreground's density and bit depth drive
+ * the render, whichever layer is drawn first. Ties after that go to the first drawn. `density` is
+ * asked only for the tied candidates (it reads pixel sizes).
+ */
+export function pickDominant<T>(
+  images: readonly T[],
+  area: (im: T) => number,
+  density: (im: T) => number | null
+): T | null {
+  if (images.length === 0) return null
+  const areas = images.map(area)
+  let max = 0
+  for (const a of areas) if (a > max) max = a
+  let best: T | null = null
+  let bestDensity = -Infinity
+  let tied = 0
+  for (let i = 0; i < images.length; i++) {
+    if (!(areas[i] >= max * (1 - DOMINANT_TIE))) continue
+    if (best === null) best = images[i]
+    // Bound the pixel-size reads on a crafted page of thousands of identical full-page images.
+    if (++tied > 64) break
+    const d = density(images[i]) ?? -1
+    if (d > bestDensity) {
+      bestDensity = d
+      best = images[i]
+    }
+  }
+  return best
 }
 
 /** The page's view box (CropBox ∩ MediaBox) in user space and its intrinsic quarter turns. */
@@ -685,7 +844,7 @@ const isWs = (c: number): boolean =>
   c === 0x20 || c === 0x0a || c === 0x0d || c === 0x09 || c === 0x0c || c === 0x00
 
 /** The stream dictionary text that precedes stream data starting at `dataStart`, or null. */
-function streamDictBefore(file: Uint8Array, dataStart: number): string | null {
+export function streamDictBefore(file: Uint8Array, dataStart: number): string | null {
   let p = dataStart
   // `stream` EOL: CRLF or LF (a lone CR is tolerated too).
   if (p > 0 && file[p - 1] === 0x0a) p--
@@ -840,7 +999,28 @@ export function streamColourComponents(
   raw: Uint8Array,
   find: ByteFind
 ): number | null | 'unknown' {
-  if (raw.length === 0) return 'unknown'
+  const dict = imageStreamDict(file, raw, find)
+  if (dict === null) return 'unknown'
+  return dictColourComponents(dict, file, find)
+}
+
+/** A stream dictionary's /ColorSpace component count; null without one. */
+export function dictColourComponents(
+  dict: string,
+  file: Uint8Array,
+  find: ByteFind
+): number | null | 'unknown' {
+  const m = /\/ColorSpace(?![A-Za-z])/.exec(dict)
+  if (!m) return null
+  return colourComponents(tokens(dict, m.index + m[0].length), file, find)
+}
+
+/**
+ * The dictionary of the stream whose raw (undecoded) data is `raw`, from the source file (a window
+ * from the middle of the data, then checked from the start), or null when it cannot be found.
+ */
+export function imageStreamDict(file: Uint8Array, raw: Uint8Array, find: ByteFind): string | null {
+  if (raw.length === 0) return null
   const win = Math.min(64, raw.length)
   const mid = Math.max(0, Math.floor((raw.length - win) / 2))
   const needle = raw.subarray(mid, mid + win)
@@ -848,7 +1028,7 @@ export function streamColourComponents(
   let from = 0
   for (let tries = 0; tries < 16; tries++) {
     const at = find(needle, from)
-    if (at < 0) return 'unknown'
+    if (at < 0) return null
     from = at + 1
     const start = at - mid
     if (start < 0 || start + head > file.length) continue
@@ -856,10 +1036,124 @@ export function streamColourComponents(
     for (let i = 0; i < head && same; i++) same = file[start + i] === raw[i]
     if (!same) continue
     const dict = streamDictBefore(file, start)
-    if (dict === null) continue
-    const m = /\/ColorSpace(?![A-Za-z])/.exec(dict)
-    if (!m) return null
-    return colourComponents(tokens(dict, m.index + m[0].length), file, find)
+    if (dict !== null) return dict
   }
-  return 'unknown'
+  return null
+}
+
+/** A PDF name's text with its `#xx` escapes decoded (`/S#4Dask` is `/SMask`). */
+function decodeName(s: string): string {
+  return s.replace(/#([0-9A-Fa-f]{2})/g, (_, h: string) => String.fromCharCode(parseInt(h, 16)))
+}
+
+/** Every name in a dictionary's text, escapes decoded, with the offset just past it. */
+function namesIn(dict: string): Array<{ name: string; end: number }> {
+  const out: Array<{ name: string; end: number }> = []
+  for (let i = dict.indexOf('/'); i >= 0 && out.length < 4096; i = dict.indexOf('/', i + 1)) {
+    let j = i + 1
+    while (j < dict.length && !/[\s/[\]<>()%{}]/.test(dict[j])) j++
+    out.push({ name: decodeName(dict.slice(i + 1, j)), end: j })
+    i = j - 1
+  }
+  return out
+}
+
+/**
+ * The streams an image dictionary names as its /SMask or /Mask (a /Mask array is a colour key, not
+ * a stream, and is skipped). PDFium decodes these with the image, so a JPX one needs the SIZ
+ * pre-check as much as the image itself.
+ */
+export function maskRefs(dict: string): Array<{ n: number; g: number }> {
+  const out: Array<{ n: number; g: number }> = []
+  const ref = /\s*(\d+)\s+(\d+)\s+R(?![A-Za-z])/y
+  for (const { name, end } of namesIn(dict)) {
+    if (name !== 'SMask' && name !== 'Mask') continue
+    ref.lastIndex = end
+    const m = ref.exec(dict)
+    if (m) out.push({ n: Number(m[1]), g: Number(m[2]) })
+    if (out.length >= 8) break
+  }
+  return out
+}
+
+/** Where each copy of indirect object `n g` starts (after `n g obj`); incremental updates add more. */
+function objectStarts(find: ByteFind, file: Uint8Array, n: number, g: number, max = 8): number[] {
+  const needle = new TextEncoder().encode(`${n} ${g} obj`)
+  const out: number[] = []
+  let from = 0
+  for (let tries = 0; tries < 64 && out.length < max; tries++) {
+    const at = find(needle, from)
+    if (at < 0) break
+    const before = at === 0 ? 0x0a : file[at - 1]
+    if (isWs(before)) out.push(at + needle.length)
+    from = at + 1
+  }
+  return out
+}
+
+/** The dictionary that starts at `at` (after whitespace) and the offset just past its `>>`. */
+function dictAt(file: Uint8Array, at: number): { text: string; end: number } | null {
+  let p = at
+  while (p < file.length && isWs(file[p])) p++
+  if (file[p] !== 0x3c || file[p + 1] !== 0x3c) return null
+  let depth = 0
+  const limit = Math.min(file.length - 1, p + 65536)
+  for (let i = p; i < limit; i++) {
+    if (file[i] === 0x3c && file[i + 1] === 0x3c) {
+      depth++
+      i++
+    } else if (file[i] === 0x3e && file[i + 1] === 0x3e) {
+      depth--
+      i++
+      if (depth === 0) return { text: latin1(file, p, i + 1), end: i + 1 }
+    }
+  }
+  return null
+}
+
+/**
+ * The SIZ pre-check on every copy of stream object `n g` that is JPXDecode data (§3.4.1, extended
+ * to masks): the first refusal, or null when no copy is a JPX stream PDFium would mis-decode or
+ * trap on. A mask's colour space is its /ColorSpace, else DeviceGray (a soft mask's and an image
+ * mask's by definition). A copy whose stream data cannot be located is skipped: the raster
+ * thread's crash path is the remaining guard.
+ */
+export function jpxObjectRefusal(
+  file: Uint8Array,
+  find: ByteFind,
+  n: number,
+  g: number
+): JpxRefusal | null {
+  for (const at of objectStarts(find, file, n, g)) {
+    const dict = dictAt(file, at)
+    if (!dict) continue
+    if (!namesIn(dict.text).some((x) => x.name === 'JPXDecode')) continue
+    let p = dict.end
+    while (p < file.length && isWs(file[p])) p++
+    if (latin1(file, p, Math.min(file.length, p + 6)) !== 'stream') continue
+    p += 6
+    if (file[p] === 0x0d) p++
+    if (file[p] === 0x0a) p++
+    const start = p
+    let len = -1
+    const lm = /\/Length\s+(\d+)(?:\s+(\d+)\s+R(?![A-Za-z]))?/.exec(dict.text)
+    if (lm && lm[2] === undefined) len = Number(lm[1])
+    else if (lm) {
+      const lat = objectStarts(find, file, Number(lm[1]), Number(lm[2]), 1)[0]
+      const v =
+        lat === undefined
+          ? null
+          : /^\s*(\d+)/.exec(latin1(file, lat, Math.min(file.length, lat + 32)))
+      if (v) len = Number(v[1])
+    }
+    if (!(len >= 0) || start + len > file.length) {
+      const endAt = find(new TextEncoder().encode('endstream'), start)
+      len = (endAt < 0 ? file.length : endAt) - start
+    }
+    const data = file.subarray(start, start + Math.max(0, len))
+    const cs = dictColourComponents(dict.text, file, find)
+    const check = jpxPrecheck(data, cs === null ? 1 : cs === 'unknown' ? null : cs)
+    if (!check.ok) return check.reason
+  }
+  return null
 }

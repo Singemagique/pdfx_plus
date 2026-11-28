@@ -5,12 +5,15 @@
 // - `placedScan`: a scan image on any placement matrix, optionally inside nested Form XObjects
 //   (rotated-placement, formxobject-scan, skew, non-90° rotation).
 // - `stripScan`: the scan cut into horizontal image strips (strip-scan).
+// - `imagesPage`: several images, each on its own placement, in drawing order (mrc-scan, a logo
+//   before the scan, off-page and cropped images, rotated coverage).
 // - `addText`: vector text over a page, visible or invisible (fax-header, near-scanned-bates,
-//   ocr-foreign, mixed, text pages).
+//   ocr-foreign, mixed, text pages), in any render mode.
 // - `encryptedScan`: a scan written with the Standard security handler, owner password only
-//   (encrypted-owner; R3 RC4-128 and R6 AES-256), ported from the PR0 spike's encrypt.mjs
-//   (ISO 32000-1 7.6.3 algorithms 2–5, ISO 32000-2 algorithm 2.B).
-// - `jpxPage`, `j2k`, `jp2`: a page whose image is JPXDecode data we write by hand (SOC + SIZ +
+//   (encrypted-owner; R2 RC4-40, R3 RC4-128 and R6 AES-256), ported from the PR0 spike's
+//   encrypt.mjs (ISO 32000-1 7.6.3 algorithms 2–5, ISO 32000-2 algorithm 2.B).
+// - `jpxPage`, `jpxMaskPage`, `j2k`, `jp2`: a page whose image (optionally Form-nested, or after
+//   many other objects), or an image's /SMask, is JPXDecode data we write by hand (SOC + SIZ +
 //   EOC, or that codestream in a JP2 wrapper). Triage only ever reads the SIZ, so the codestream
 //   needs no tiles; it must never be rendered.
 
@@ -118,6 +121,35 @@ export async function placedScan(
   return doc.save()
 }
 
+/**
+ * One page of `size` pt drawing each layer's raster with its placement, in order (the first is
+ * drawn first, i.e. underneath). `cropBox` sets a CropBox smaller than the MediaBox.
+ */
+export async function imagesPage(
+  size: { width: number; height: number },
+  layers: { raster: GreyImage; place: Matrix6 }[],
+  opts: { cropBox?: [number, number, number, number] } = {}
+): Promise<Uint8Array> {
+  const doc = await PDFDocument.create()
+  const page = doc.addPage([size.width, size.height])
+  const xo: Record<string, PDFRef> = {}
+  const ops = layers.map((l, i) => {
+    xo[`L${i}`] = imageXObject(doc, l.raster)
+    return `q ${cm(l.place)} /L${i} Do Q`
+  })
+  page.node.set(PDFName.of('Resources'), doc.context.obj({ XObject: xo }))
+  if (opts.cropBox) page.node.set(PDFName.of('CropBox'), doc.context.obj(opts.cropBox))
+  setContent(doc, page, ops.join('\n'))
+  return doc.save()
+}
+
+/** A `w` × `h` grey raster with mid-grey values (8 bpc when embedded), e.g. an MRC background. */
+export function greyRaster(w: number, h: number): GreyImage {
+  const data = new Uint8Array(w * h)
+  for (let i = 0; i < data.length; i++) data[i] = 96 + (i % 61)
+  return { width: w, height: h, data }
+}
+
 /** The scan's own page: the image filling a page of its size at `dpi`. */
 export function fillPage(raster: GreyImage, dpi: number): Promise<Uint8Array> {
   const w = (raster.width * 72) / dpi
@@ -160,6 +192,8 @@ export interface TextItem {
   size: number
   /** Render mode 3 (no paint). */
   invisible?: boolean
+  /** Any other text render mode (e.g. 7, clip only); `invisible` is mode 3. */
+  mode?: number
   font?: 'helvetica' | 'times' | 'courier'
   /** Baseline rotation, degrees counter-clockwise. */
   rotate?: number
@@ -187,7 +221,8 @@ export async function addText(
       font = await doc.embedFont(FONTS[id])
       fonts.set(id, font)
     }
-    if (it.invisible) page.pushOperators(pushGraphicsState(), setTextRenderingMode(3))
+    const mode = it.invisible ? 3 : it.mode
+    if (mode !== undefined) page.pushOperators(pushGraphicsState(), setTextRenderingMode(mode))
     page.drawText(it.text, {
       x: it.x,
       y: it.y,
@@ -196,7 +231,7 @@ export async function addText(
       color: rgb(0, 0, 0),
       rotate: it.rotate ? degrees(it.rotate) : undefined
     })
-    if (it.invisible) page.pushOperators(popGraphicsState())
+    if (mode !== undefined) page.pushOperators(popGraphicsState())
   }
   if (opts.renameFont) {
     await doc.flush() // standard fonts are only written into the context on flush/save
@@ -282,7 +317,13 @@ interface Handler {
   enc: (num: number, gen: number, data: Buffer) => Buffer
 }
 
-function securityHandler(R: 3 | 6, owner: string, user: string, P: number, id0: Buffer): Handler {
+function securityHandler(
+  R: 2 | 3 | 6,
+  owner: string,
+  user: string,
+  P: number,
+  id0: Buffer
+): Handler {
   if (R === 6) {
     const fileKey = randomBytes(32)
     const upw = Buffer.from(user, 'utf8')
@@ -312,28 +353,36 @@ function securityHandler(R: 3 | 6, owner: string, user: string, P: number, id0: 
       }
     }
   }
-  const len = 16
+  // R2 is RC4-40 (5-byte key, no 50/19 rounds, Algorithm 4 for U); R3 is RC4-128.
+  const r2 = R === 2
+  const len = r2 ? 5 : 16
   // Algorithm 3: O.
   let h = md5(padPw(owner || user))
-  for (let i = 0; i < 50; i++) h = md5(h)
+  if (!r2) for (let i = 0; i < 50; i++) h = md5(h)
   const okey = h.subarray(0, len)
   let O = rc4(okey, padPw(user))
-  for (let i = 1; i <= 19; i++) O = rc4(Buffer.from(okey.map((b) => b ^ i)), O)
+  if (!r2) for (let i = 1; i <= 19; i++) O = rc4(Buffer.from(okey.map((b) => b ^ i)), O)
   // Algorithm 2: the file key.
   let k = md5(padPw(user), O, le32(P), id0)
-  for (let i = 0; i < 50; i++) k = md5(k.subarray(0, len))
+  if (!r2) for (let i = 0; i < 50; i++) k = md5(k.subarray(0, len))
   const key = k.subarray(0, len)
-  // Algorithm 5: U.
-  let x = rc4(key, md5(PAD, id0))
-  for (let i = 1; i <= 19; i++) x = rc4(Buffer.from(key.map((b) => b ^ i)), x)
-  const U = Buffer.concat([x, Buffer.alloc(16)])
+  // Algorithm 4 (R2) or 5 (R3): U.
+  let U: Buffer
+  if (r2) U = rc4(key, PAD)
+  else {
+    let x = rc4(key, md5(PAD, id0))
+    for (let i = 1; i <= 19; i++) x = rc4(Buffer.from(key.map((b) => b ^ i)), x)
+    U = Buffer.concat([x, Buffer.alloc(16)])
+  }
   const objKey = (num: number, gen: number): Buffer =>
     md5(
       key,
       Buffer.from([num & 255, (num >> 8) & 255, (num >> 16) & 255, gen & 255, (gen >> 8) & 255])
     ).subarray(0, Math.min(len + 5, 16))
   return {
-    dict: `<< /Filter /Standard /V 2 /R 3 /Length 128 /P ${P} /O <${O.toString('hex')}> /U <${U.toString('hex')}> >>`,
+    dict: r2
+      ? `<< /Filter /Standard /V 1 /R 2 /Length 40 /P ${P} /O <${O.toString('hex')}> /U <${U.toString('hex')}> >>`
+      : `<< /Filter /Standard /V 2 /R 3 /Length 128 /P ${P} /O <${O.toString('hex')}> /U <${U.toString('hex')}> >>`,
     enc: (num, gen, data) => rc4(objKey(num, gen), data)
   }
 }
@@ -346,7 +395,7 @@ function securityHandler(R: 3 | 6, owner: string, user: string, P: number, id0: 
 export function encryptedScan(
   raster: GreyImage,
   dpi: number,
-  R: 3 | 6,
+  R: 2 | 3 | 6,
   opts: { user?: string; owner?: string; P?: number } = {}
 ): Uint8Array {
   const id0 = randomBytes(16)
@@ -474,6 +523,10 @@ export async function jpxPage(
     height: number
     colorSpace: string | 'icc3' | null
     decoy?: Uint8Array
+    /** Draw the image inside this many nested (identity) Form XObjects. */
+    forms?: number
+    /** Page content drawn before the image (e.g. many cheap path objects). */
+    before?: string
   }
 ): Promise<Uint8Array> {
   const doc = await PDFDocument.create()
@@ -508,7 +561,61 @@ export async function jpxPage(
     )
     ops.unshift('q 10 0 0 10 0 0 cm /Im1 Do Q')
   }
-  page.node.set(PDFName.of('Resources'), ctx.obj({ XObject: xo }))
-  setContent(doc, page, ops.join('\n'))
+  let resources = ctx.obj({ XObject: xo })
+  let content = ops.join('\n')
+  for (let i = 0; i < (opts.forms ?? 0); i++) {
+    const form = ctx.register(
+      ctx.stream(content, {
+        Type: 'XObject',
+        Subtype: 'Form',
+        BBox: [0, 0, 612, 792],
+        Resources: resources
+      })
+    )
+    content = `q /Fm${i} Do Q`
+    resources = ctx.obj({ XObject: { [`Fm${i}`]: form } })
+  }
+  page.node.set(PDFName.of('Resources'), resources)
+  setContent(doc, page, (opts.before ?? '') + content)
+  return doc.save({ useObjectStreams: false })
+}
+
+/**
+ * A Letter page filled by a Flate DeviceGray image whose /SMask (or /Mask, with `key`) is a
+ * JPXDecode stream of `mask` with the given /ColorSpace (null: none, as a soft mask may omit it).
+ */
+export async function jpxMaskPage(
+  mask: Uint8Array,
+  opts: { colorSpace: string | null; key?: 'SMask' | 'Mask'; size?: number }
+): Promise<Uint8Array> {
+  const doc = await PDFDocument.create()
+  const page = doc.addPage([612, 792])
+  const ctx = doc.context
+  const px = opts.size ?? 64
+  const maskDict: Record<string, unknown> = {
+    Type: 'XObject',
+    Subtype: 'Image',
+    Width: px,
+    Height: px,
+    BitsPerComponent: 8,
+    Filter: 'JPXDecode'
+  }
+  if (opts.colorSpace) maskDict.ColorSpace = opts.colorSpace
+  const maskRef = ctx.register(ctx.stream(mask, maskDict as never))
+  const grey = new Uint8Array(px * px).fill(128)
+  const img = ctx.register(
+    ctx.stream(zlibSync(grey, { level: 1 }), {
+      Type: 'XObject',
+      Subtype: 'Image',
+      Width: px,
+      Height: px,
+      ColorSpace: 'DeviceGray',
+      BitsPerComponent: 8,
+      Filter: 'FlateDecode',
+      [opts.key ?? 'SMask']: maskRef
+    } as never)
+  )
+  page.node.set(PDFName.of('Resources'), ctx.obj({ XObject: { Im0: img } }))
+  setContent(doc, page, 'q 612 0 0 792 0 0 cm /Im0 Do Q')
   return doc.save({ useObjectStreams: false })
 }

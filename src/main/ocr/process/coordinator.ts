@@ -24,8 +24,11 @@
 // §3.3.5  Progress ≤ 10 Hz per job; activity (busy, done, total) to main for the power blocker.
 // §3.3.6  Work order: the focused page, then the rest of its source, then the other jobs in order.
 // §3.4.1  Triage requests go to the raster thread in chunks of TRIAGE_CHUNK pages, one PDFium task
-//         at a time with the renders. A chunk that kills the thread is retried one page at a
-//         time; a page that kills it twice is reported with `failure: 'raster-crash'`.
+//         at a time with the renders, which go first (triage is background work). A chunk that
+//         kills the thread is retried one page at a time, uncharged; a page that kills it twice is
+//         reported with `failure: 'raster-crash'`, and once TRIAGE_SOURCE_CRASH_PAGES pages of one
+//         source have, the rest of that source's triage is answered the same way without PDFium.
+//         Every page a thread returns is validated before it is forwarded.
 
 import {
   ELECTRON_NET_MEMBERS,
@@ -33,6 +36,7 @@ import {
   OcrError,
   parseMainToOcr,
   parseToOcr,
+  parseTriagePage,
   type FromOcr,
   type Heartbeat,
   type OcrHostLimits,
@@ -148,6 +152,8 @@ interface Source {
   countPending: boolean
   /** From the raster thread's `opened` (a triage of every page needs it). */
   pageCount: number | null
+  /** Pages of this source whose triage killed the raster thread twice on their own. */
+  triageCrashedPages: number
 }
 
 /** A renderer `triage` request (§3.4.1). */
@@ -200,6 +206,19 @@ const DEFAULT_RENDER_DPI = 300
 export const TRIAGE_CHUNK = 32
 /** A triage chunk that takes longer than this is treated like a hung render. */
 export const triageWatchdogMs = (pages: number): number => 15_000 + 1_000 * pages
+/** Pages of one source whose triage may kill the raster thread before the rest is not tried. */
+export const TRIAGE_SOURCE_CRASH_PAGES = 2
+
+/** A triage result with nothing known (the base of every failure entry). */
+const noPage = (index: number): TriagePage => ({
+  index,
+  pageClass: null,
+  renderDpi: null,
+  raster: null,
+  effectiveDpi: null,
+  bitsPerPixel: null,
+  imageOrigin: false
+})
 /** Consecutive threads of one kind that may die before ever reporting ready. */
 const MAX_START_FAILURES = 3
 /**
@@ -467,7 +486,8 @@ export class Coordinator {
       bytes: bytes.byteLength,
       lastUse: Date.now(),
       countPending: true,
-      pageCount: null
+      pageCount: null,
+      triageCrashedPages: 0
     }
     this.sources.set(src, source)
     this.evictOverBudget(src)
@@ -531,7 +551,7 @@ export class Coordinator {
       this.toRenderer({ triaged: { src, pages: [], done: true } })
       return
     }
-    this.triages.push({
+    const task: TriageTask = {
       id: ++this.taskSeq,
       src,
       pending: pages
@@ -542,9 +562,40 @@ export class Coordinator {
       chunk: null,
       solo: new Set(),
       failures: new Map()
-    })
+    }
+    this.triages.push(task)
+    // A source that already broke the circuit (or a process that gave up) answers without PDFium.
+    if (this.gaveUp) task.pending ??= []
+    if ((this.gaveUp || source.triageCrashedPages >= TRIAGE_SOURCE_CRASH_PAGES) && task.pending) {
+      this.failTriage(task)
+      return
+    }
     if (source.pageCount === 0 && !pages) this.finishEmptyTriages(src)
     this.pump()
+  }
+
+  /** Answer every page `task` still has with `failure: 'raster-crash'` and end it. */
+  private failTriage(task: TriageTask): void {
+    const i = this.triages.indexOf(task)
+    if (i < 0) return
+    this.triages.splice(i, 1)
+    const rest = task.pending ?? []
+    task.pending = []
+    task.chunk = null
+    if (rest.length === 0) {
+      this.toRenderer({ triaged: { src: task.src, pages: [], done: true } })
+      return
+    }
+    for (let k = 0; k < rest.length; k += TRIAGE_CHUNK) {
+      const part = rest.slice(k, k + TRIAGE_CHUNK)
+      this.toRenderer({
+        triaged: {
+          src: task.src,
+          pages: part.map((p) => ({ ...noPage(p), failure: 'raster-crash' as const })),
+          done: k + TRIAGE_CHUNK >= rest.length
+        }
+      })
+    }
   }
 
   /** A whole-document triage of a source with no pages answers at once. */
@@ -617,22 +668,36 @@ export class Coordinator {
     const n = (task.failures.get(p) ?? 0) + 1
     task.failures.set(p, n)
     if (n < 2) return
-    this.triageAnswered(
-      task,
-      [p],
-      [
-        {
-          index: p,
-          pageClass: null,
-          failure: 'raster-crash',
-          renderDpi: null,
-          raster: null,
-          effectiveDpi: null,
-          bitsPerPixel: null,
-          imageOrigin: false
-        }
-      ]
-    )
+    this.triageAnswered(task, [p], [{ ...noPage(p), failure: 'raster-crash' }])
+    // Circuit breaker: pages of one source that keep killing PDFium usually share the cause (a
+    // self-referencing Form, a trapping image used on every page). Past the limit the rest of the
+    // source's triage fails without PDFium, so one document cannot exhaust the process-wide fatal
+    // budget and take OCR down for every source.
+    const source = this.sources.get(task.src)
+    if (!source) return
+    source.triageCrashedPages++
+    if (source.triageCrashedPages < TRIAGE_SOURCE_CRASH_PAGES) return
+    for (const t of [...this.triages]) if (t.src === task.src && t.pending) this.failTriage(t)
+  }
+
+  /**
+   * The pages a thread returned for `chunk`, validated: one the port would reject (a NaN, a 0 DPI)
+   * becomes a `render` failure instead of making the renderer drop the whole message, a page the
+   * thread left out is answered the same way, and anything not asked for is dropped.
+   */
+  private checkedTriage(chunk: number[], pages: unknown): TriagePage[] {
+    const asked = new Set(chunk)
+    const got = new Map<number, TriagePage>()
+    for (const [i, raw] of (Array.isArray(pages) ? pages : []).entries()) {
+      const index = (raw as { index?: unknown } | null)?.index
+      if (typeof index !== 'number' || !asked.has(index) || got.has(index)) continue
+      try {
+        got.set(index, parseTriagePage(raw, `triaged.pages[${i}]`))
+      } catch {
+        got.set(index, { ...noPage(index), failure: 'render' })
+      }
+    }
+    return chunk.map((p) => got.get(p) ?? { ...noPage(p), failure: 'render' })
   }
 
   // -------------------------------------------------------------------------------------------
@@ -805,11 +870,8 @@ export class Coordinator {
       if (t.state === 'rendered') waiting++
       else if (t.state === 'queued') queued++
     }
-    const triage = this.triages.find((t) => t.pending && t.pending.length > 0 && !t.chunk)
-    if (triage && this.pdfiumModule) {
-      const r = this.ensureRaster()
-      if (r.ready && !r.task && !r.triage) this.startTriage(r, triage)
-    }
+    // Renders first: triage is background work (§3.4.1, idle priority) and must not hold up the
+    // pages a user asked to recognise; it takes the thread whenever no render can start.
     if (queued > 0 && waiting < n + 1 && this.pdfiumModule) {
       const r = this.ensureRaster()
       if (r.ready && !r.task && !r.triage) {
@@ -822,6 +884,11 @@ export class Coordinator {
           } else this.startRender(r, t)
         }
       }
+    }
+    const triage = this.triages.find((t) => t.pending && t.pending.length > 0 && !t.chunk)
+    if (triage && this.pdfiumModule && !this.gaveUp) {
+      const r = this.ensureRaster()
+      if (r.ready && !r.task && !r.triage) this.startTriage(r, triage)
     }
 
     // Recognize: up to n threads; a big page runs alone.
@@ -956,9 +1023,11 @@ export class Coordinator {
         if (s) {
           s.pageCount = m.pageCount
           // Whole-document triages were waiting for the count.
-          for (const t of this.triages)
-            if (t.src === m.src && t.pending === null)
+          for (const t of [...this.triages])
+            if (t.src === m.src && t.pending === null) {
               t.pending = Array.from({ length: m.pageCount }, (_, i) => i)
+              if (s.triageCrashedPages >= TRIAGE_SOURCE_CRASH_PAGES) this.failTriage(t)
+            }
           this.finishEmptyTriages(m.src)
         }
         if (s && s.countPending) {
@@ -974,7 +1043,7 @@ export class Coordinator {
         const chunk = task?.chunk
         if (task && chunk) {
           task.chunk = null
-          this.triageAnswered(task, chunk, m.pages)
+          this.triageAnswered(task, chunk, this.checkedTriage(chunk, m.pages))
         }
         break
       }
@@ -1058,11 +1127,18 @@ export class Coordinator {
    * failure. Anything else in flight was never reached and is re-queued uncharged by retireRaster.
    */
   private rasterCrashed(slot: RasterSlot, taskId: number | null): void {
-    this.noteRasterFatal()
     const head =
       taskId === null
         ? slot.inflight[0]
         : (slot.inflight.find((w) => 'triage' in w && w.triage === taskId) ?? { render: taskId })
+    // A multi-page triage chunk charges no page (its pages go again one at a time), so its death
+    // does not count towards giving up either: only deaths a page or an open is charged with do.
+    const chunkDeath =
+      head !== undefined &&
+      'triage' in head &&
+      slot.triage?.id === head.triage &&
+      (slot.triage.chunk?.length ?? 0) > 1
+    if (!chunkDeath) this.noteRasterFatal()
     if (head && 'open' in head) {
       this.retireRaster()
       this.openFailed(head.open, 'PDFium crashed opening the file')
@@ -1105,6 +1181,12 @@ export class Coordinator {
       crashing || this.startFailures.raster >= MAX_START_FAILURES ? 'raster' : 'recognize'
     for (const t of [...this.tasks])
       this.fail(t, 'failed', which === 'raster' ? 'raster-crash' : 'recognize-crash')
+    // Every triage request still open ends too: the renderer must not wait for a `done: true` that
+    // a process that gave up would never send. A page count still unknown leaves nothing to list.
+    for (const t of [...this.triages]) {
+      t.pending ??= []
+      this.failTriage(t)
+    }
     this.toParent({
       fatal: {
         code: 'init',

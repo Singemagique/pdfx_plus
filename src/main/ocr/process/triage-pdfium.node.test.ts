@@ -8,22 +8,33 @@ import { PDFDict, PDFDocument, PDFName, degrees } from 'pdf-lib'
 import { beforeAll, describe, expect, it } from 'vitest'
 
 import { loadNodeSynthDeps } from '../../../shared/ocr/test-utils/node-deps'
-import type { PageSignals, TriagePage } from '../../../shared/ocr/triage'
+import {
+  effectiveDpi,
+  mulMatrix,
+  placedArea,
+  type Matrix6,
+  type PageSignals,
+  type TriagePage
+} from '../../../shared/ocr/triage'
 import { RasterEngine } from './raster-core'
 import { loadTestPdfium, type TestPdfium } from '../test-utils/pdfium-node'
 import {
   addText,
   encryptedScan,
   fillPage,
+  greyRaster,
   imageXObject,
+  imagesPage,
   j2k,
   jp2,
+  jpxMaskPage,
   jpxPage,
   paragraphItems,
   placedScan,
   scan,
   stripScan
 } from '../test-utils/triage-fixtures'
+import { parseTriagePage } from '../../../shared/ocr/protocol'
 import { SAMPLE_SENTENCES } from '../../../shared/ocr/test-utils/synth'
 
 let mod: TestPdfium
@@ -185,6 +196,50 @@ describe('page classes on built fixtures', () => {
     expect(t.pageClass).toBe('ocr-foreign')
   })
 
+  it('clip-only (7 Tr) text paints nothing: it counts as invisible, like 3 Tr', async () => {
+    const s = await scan('near-scanned-bates')
+    const bytes = await addText(
+      await fillPage(s.raster, 150),
+      paragraphItems(WORDS, { x: 72, y: 72, w: 468, h: 648 }, 11, { font: 'times' }).map((it) => ({
+        ...it,
+        mode: 7
+      }))
+    )
+    const t = one(bytes)
+    expect(t.signals.invisible).toBeGreaterThan(200)
+    expect(t.signals.visible).toBe(0)
+    expect(t.pageClass).toBe('ocr-foreign')
+  })
+
+  it('another tool’s OCR layer under a stamp-like header is `ocr-foreign`, not near-scanned', async () => {
+    const s = await scan('near-scanned-bates')
+    const layer = s.gt.lines.map((l) => ({
+      text: l.text,
+      x: s.gt.words[l.words[0]].box.x,
+      y: l.baseline * (s.gt.page.height / s.gt.sourcePage.height),
+      size: l.size,
+      invisible: true,
+      font: 'times' as const
+    }))
+    // Seven 5-pt lines of visible header in the top band: past 40 chars, under 80% invisible.
+    const header = Array.from({ length: 7 }, (_, i) => ({
+      text: `Received 2026-11-27 09:${10 + i} From +1 555 0100 Harbour Office Ref PDFX-${1000 + i} `.repeat(
+        2
+      ),
+      x: 20,
+      y: 780 - i * 5.5,
+      size: 5
+    }))
+    const t = one(await addText(await fillPage(s.raster, 150), [...layer, ...header]))
+    expect(t.signals.visible).toBeGreaterThanOrEqual(40)
+    expect(t.signals.invisible).toBeGreaterThanOrEqual(40)
+    expect(t.signals.invisible).toBeLessThan(0.8 * (t.signals.visible + t.signals.invisible))
+    expect(t.signals.band).toBeLessThanOrEqual(0.1)
+    expect(t.signals.cov).toBeGreaterThanOrEqual(0.75)
+    expect(t.pageClass).toBe('ocr-foreign')
+    expect(t.nativeWords).toBeUndefined()
+  })
+
   it('broken-text: a page whose font has an empty ToUnicode (FPDFText_HasUnicodeMapError = 1)', async () => {
     const deps = await loadNodeSynthDeps()
     const doc = await PDFDocument.create()
@@ -305,12 +360,142 @@ describe('effective density through placements (PR0 composition rule)', () => {
     expect(rot.pageClass).toBe('scanned')
   })
 
+  it('a Form under a rotating, translating page cm: child × ancestors, not the reverse', async () => {
+    // A non-square image (1650 × 1275 px) at 300 DPI, 396 × 306 pt, inside a Form drawn under
+    // `0 1 -1 0 612 0 cm`. Composed the right way it lands upright-turned at x ∈ [612 − ty − 306,
+    // 612 − ty], y ∈ [tx, tx + 396]; composed the wrong way it is off the page with the x and y
+    // densities swapped (388 DPI).
+    const r = await scan('rotated-placement')
+    const turn: Matrix6 = [0, 1, -1, 0, 612, 0]
+    const at = (tx: number, ty: number): Promise<Uint8Array> =>
+      placedScan(
+        r.raster,
+        { width: 612, height: 792 },
+        [396, 0, 0, 306, tx, ty],
+        [{ matrix: [1, 0, 0, 1, 0, 0], ctm: turn }]
+      )
+    const inside = one(await at(100, 50))
+    expect(inside.effectiveDpi).toBeCloseTo(300, 3)
+    expect(inside.signals.cov).toBeCloseTo((396 * 306) / (612 * 792), 6)
+    expect(inside.pageClass).toBe('scanned')
+    // Off-centre: the translation decides how much of it is on the page (292 of its 396 pt).
+    const partly = one(await at(500, 50))
+    expect(partly.signals.cov).toBeCloseTo((292 * 306) / (612 * 792), 6)
+  })
+
+  it('two nested rotated Forms: cov is the placed area, not the axis-aligned box', async () => {
+    const s = await scan('formxobject-scan') // 1275 × 1650 px
+    const r4 = (v: number): number => Number(v.toFixed(4)) // what the fixture writes
+    const rot = (deg: number, k: number): Matrix6 => {
+      const a = (deg * Math.PI) / 180
+      return [
+        r4(k * Math.cos(a)),
+        r4(k * Math.sin(a)),
+        r4(-k * Math.sin(a)),
+        r4(k * Math.cos(a)),
+        0,
+        0
+      ]
+    }
+    const place: Matrix6 = [612, 0, 0, 792, 0, 0]
+    const mIn = rot(90, 0.5)
+    const cIn: Matrix6 = [1.2, 0, 0, 1.2, 0, 0]
+    const mOut = rot(30, 0.8)
+    const cOut: Matrix6 = [1.5, 0, 0, 1.5, 900, 500]
+    const full = [mIn, cIn, mOut, cOut].reduce(mulMatrix, place)
+    const t = one(
+      await placedScan(s.raster, { width: 1400, height: 1400 }, place, [
+        { matrix: mOut, ctm: cOut },
+        { matrix: mIn, ctm: cIn }
+      ])
+    )
+    // The placement lies inside the page, so its whole parallelogram counts, and nothing more.
+    const xs = [0, full[0], full[2], full[0] + full[2]].map((v) => v + full[4])
+    const ys = [0, full[1], full[3], full[1] + full[3]].map((v) => v + full[5])
+    expect(Math.min(...xs) >= 0 && Math.max(...xs) <= 1400).toBe(true)
+    expect(Math.min(...ys) >= 0 && Math.max(...ys) <= 1400).toBe(true)
+    expect(t.signals.cov).toBeCloseTo(placedArea(full) / (1400 * 1400), 4)
+    expect(t.effectiveDpi).toBeCloseTo(effectiveDpi(s.raster, full)!, 1)
+  })
+
+  it('a 45° image covers its own area, not its bounding box (twice as much)', async () => {
+    const img = greyRaster(300, 300)
+    const a = Math.PI / 4
+    const k = 300
+    const m: Matrix6 = [k * Math.cos(a), k * Math.sin(a), -k * Math.sin(a), k * Math.cos(a), 0, 0]
+    m[4] = 306 - 0.5 * (m[0] + m[2])
+    m[5] = 396 - 0.5 * (m[1] + m[3])
+    const t = one(await imagesPage({ width: 612, height: 792 }, [{ raster: img, place: m }]))
+    expect(t.signals.cov).toBeCloseTo((300 * 300) / (612 * 792), 3)
+  })
+
+  it('coverage is clipped to the page: a CropBox inside the image, an image half off-page', async () => {
+    const img = greyRaster(100, 100)
+    const crop = one(
+      await imagesPage(
+        { width: 612, height: 792 },
+        [{ raster: img, place: [612, 0, 0, 792, 0, 0] }],
+        {
+          cropBox: [0, 0, 306, 396]
+        }
+      )
+    )
+    expect(crop.signals.cov).toBeCloseTo(1, 6)
+    const off = one(
+      await imagesPage({ width: 612, height: 792 }, [
+        { raster: img, place: [612, 0, 0, 792, 459, 0] }
+      ])
+    )
+    expect(off.signals.cov).toBeCloseTo(0.25, 6)
+  })
+
   it('strip-scan: four strips cover the page; the dominant strip gives the density', async () => {
     const s = await scan('strip-scan')
     const t = one(await stripScan(s.raster, 150, 4))
     expect(t.pageClass).toBe('scanned')
     expect(t.signals.cov).toBeCloseTo(1, 4)
     expect(t.effectiveDpi).toBeCloseTo(150, 4)
+  })
+})
+
+describe('the dominant image (§3.4.1: largest placed area; a near-tie to the higher density)', () => {
+  it('a small logo drawn before the full-page scan does not set the density', async () => {
+    const s = await scan('fax-header') // 1-bit, 200 DPI
+    const W = (s.raster.width * 72) / 200
+    const H = (s.raster.height * 72) / 200
+    const t = one(
+      await imagesPage({ width: W, height: H }, [
+        { raster: greyRaster(50, 50), place: [50, 0, 0, 50, 36, H - 86] }, // 72 DPI, 8 bpc
+        { raster: s.raster, place: [W, 0, 0, H, 0, 0] }
+      ])
+    )
+    expect(t.effectiveDpi).toBeCloseTo(200, 3)
+    expect(t.bitsPerPixel).toBe(1)
+  })
+
+  it('mrc-scan: a 1-bit 400 DPI foreground beats a full-page 100 DPI background, in either order', async () => {
+    const s = await scan('fax-header')
+    const fg = s.raster
+    const bg = greyRaster(Math.round(fg.width / 4), Math.round(fg.height / 4))
+    const W = (fg.width * 72) / 400
+    const H = (fg.height * 72) / 400
+    const full: Matrix6 = [W, 0, 0, H, 0, 0]
+    for (const order of [
+      [bg, fg],
+      [fg, bg]
+    ]) {
+      const t = one(
+        await imagesPage(
+          { width: W, height: H },
+          order.map((raster) => ({ raster, place: full }))
+        )
+      )
+      const label = order[0] === bg ? 'background first' : 'foreground first'
+      expect(t.pageClass, label).toBe('scanned')
+      expect(t.effectiveDpi, label).toBeCloseTo(400, 3)
+      expect(t.bitsPerPixel, label).toBe(1)
+      expect(t.renderDpi, label).toBe(400)
+    }
   })
 })
 
@@ -332,10 +517,67 @@ describe('the DPI table on scans (§3.4.3)', () => {
   })
 })
 
+describe('every page triage emits passes the port validator', () => {
+  it('a density that rounds to 0 is no density (fallback DPI), not effectiveDpi 0', async () => {
+    const doc = await PDFDocument.create()
+    const page = doc.addPage([612, 792])
+    const img = imageXObject(doc, greyRaster(1, 1))
+    page.node.set(PDFName.of('Resources'), doc.context.obj({ XObject: { Im0: img } }))
+    page.node.set(
+      PDFName.of('Contents'),
+      doc.context.register(doc.context.stream('q 100000 0 0 100000 -50000 -50000 cm /Im0 Do Q'))
+    )
+    const t = triage(await doc.save()).pages[0]
+    expect(t.pageClass).toBe('scanned')
+    expect(t.effectiveDpi).toBeNull()
+    expect(t.renderDpi).toBe(300)
+    expect(() => parseTriagePage(t)).not.toThrow()
+  })
+
+  it('a page too large for any raster under the caps fails `render` instead of renderDpi 0', async () => {
+    const doc = await PDFDocument.create()
+    doc.addPage([1e8, 10])
+    const t = triage(await doc.save()).pages[0]
+    expect(t).toMatchObject({ pageClass: null, failure: 'render', renderDpi: null, raster: null })
+    expect(() => parseTriagePage(t)).not.toThrow()
+  })
+})
+
+describe('the generated-char rule (PR0): IsGenerated before any text-object lookup', () => {
+  it('never asks for the text object of a generated char', async () => {
+    const doc = await PDFDocument.create()
+    doc.addPage([612, 792])
+    const bytes = await addText(
+      await doc.save(),
+      paragraphItems(WORDS, { x: 72, y: 400, w: 468, h: 300 }, 11)
+    )
+    const generated = new Set<string>()
+    const lookedUp: string[] = []
+    const spy = {
+      ...mod,
+      FPDFText_IsGenerated: (tp: number, i: number) => {
+        const g = mod.FPDFText_IsGenerated(tp, i)
+        if (g === 1) generated.add(`${tp}:${i}`)
+        return g
+      },
+      FPDFText_GetTextObject: (tp: number, i: number) => {
+        lookedUp.push(`${tp}:${i}`)
+        return mod.FPDFText_GetTextObject(tp, i)
+      }
+    } as TestPdfium
+    const t = triage(bytes, [0], spy).pages[0]
+    expect(t.pageClass).toBe('text')
+    // The multi-line paragraph has PDFium-generated line breaks, and none was looked up.
+    expect(generated.size).toBeGreaterThan(0)
+    expect(lookedUp.length).toBeGreaterThan(100)
+    expect(lookedUp.filter((k) => generated.has(k))).toEqual([])
+  })
+})
+
 describe('encryption → protected (§3.0 #17)', () => {
-  it('RC4-128 (R3) and AES-256 (R6) owner-password scans are `protected` on every page', async () => {
+  it('RC4-40 (R2), RC4-128 (R3) and AES-256 (R6) owner-password scans are `protected`', async () => {
     const s = await scan('encrypted-owner')
-    for (const R of [3, 6] as const) {
+    for (const R of [2, 3, 6] as const) {
       const t = triage(encryptedScan(s.raster, 100, R))
       expect(t.pages).toEqual([
         {
@@ -509,6 +751,83 @@ describe('the JPX SIZ pre-check (§3.4.1), without ever decoding the image', () 
       await jpxPage(good, { width: 64, height: 64, colorSpace: 'DeviceGray', decoy: bad })
     )
     expect(t.refused).toBe('jpx-subsampled')
+    // The decoy is drawn first but is not dominant: the density and depth are the page image's.
+    expect(t.effectiveDpi).toBeCloseTo((64 * 72) / 612, 2)
+    expect(t.bitsPerPixel).toBe(8)
+  })
+
+  /** Triage and the render-time guard on `bytes`: refusal and render outcome, no JPX decode. */
+  function both(bytes: Uint8Array): { t: TriagePage; render: unknown } {
+    const t = run(bytes)
+    const { m, decodes } = noJpxDecode()
+    const sab = new SharedArrayBuffer(bytes.length)
+    new Uint8Array(sab).set(bytes)
+    const engine = new RasterEngine(m)
+    engine.attach('s', new Uint8Array(sab))
+    const render = engine.render({
+      src: 's',
+      index: 0,
+      dpi: 72,
+      userUnit: 1,
+      frame: { width: 612, height: 792 }
+    })
+    engine.closeAll()
+    expect(decodes()).toBe(0)
+    return { t, render }
+  }
+  const REFUSED_RENDER = { kind: 'failed', status: 'failed', reason: 'image-format' }
+  const sub420 = (): Uint8Array =>
+    j2k({
+      width: 64,
+      height: 64,
+      components: 3,
+      sub: [
+        [1, 1],
+        [2, 2],
+        [2, 2]
+      ]
+    })
+
+  it('walks Forms as deep as PDFium draws them (40): a JPX image 13 or 40 Forms down is checked', async () => {
+    for (const forms of [13, 40]) {
+      const { t, render } = both(
+        await jpxPage(sub420(), { width: 64, height: 64, colorSpace: 'DeviceRGB', forms })
+      )
+      expect(t.refused, `${forms}`).toBe('jpx-subsampled')
+      expect(render, `${forms}`).toEqual(REFUSED_RENDER)
+    }
+    // 41 deep, PDFium itself leaves the innermost Form empty: nothing is drawn, nothing decoded.
+    const t = run(
+      await jpxPage(sub420(), { width: 64, height: 64, colorSpace: 'DeviceRGB', forms: 41 })
+    )
+    expect(t.refused).toBeUndefined()
+    expect(t.effectiveDpi).toBeNull()
+  })
+
+  it('a page past the object limit is refused (`too-complex`): unseen images are unchecked', async () => {
+    const before = '0 0 1 1 re f\n'.repeat(200_001)
+    const { t, render } = both(
+      await jpxPage(sub420(), { width: 64, height: 64, colorSpace: 'DeviceRGB', before })
+    )
+    expect(t.refused).toBe('too-complex')
+    expect(render).toEqual(REFUSED_RENDER)
+    expect(() => parseTriagePage(t)).not.toThrow()
+  }, 60_000)
+
+  it('checks a JPXDecode /SMask too: PDFium decodes it with the image', async () => {
+    const bad = j2k({ width: 64, height: 64, components: 1, sub: [[2, 2]] })
+    const { t, render } = both(await jpxMaskPage(bad, { colorSpace: 'DeviceGray' }))
+    expect(t.refused).toBe('jpx-subsampled')
+    expect(t.pageClass).toBe('scanned')
+    expect(render).toEqual(REFUSED_RENDER)
+    // A soft mask without /ColorSpace is DeviceGray: a 3-component codestream is a mismatch.
+    const rgbMask = j2k({ width: 64, height: 64, components: 3 })
+    expect(run(await jpxMaskPage(rgbMask, { colorSpace: null })).refused).toBe('jpx-components')
+    // A well-formed JPX soft mask (no /ColorSpace, 1 component) passes.
+    const good = j2k({ width: 64, height: 64, components: 1 })
+    const ok = triage(await jpxMaskPage(good, { colorSpace: null })).pages[0]
+    expect(ok.refused).toBeUndefined()
+    expect(ok.bitsPerPixel).toBe(8)
   })
 })
 

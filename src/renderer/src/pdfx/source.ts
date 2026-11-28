@@ -1,6 +1,7 @@
 import { getDocument } from 'pdfjs-dist'
 import { partitionPages, readManifest, stripExtension } from './format'
 import { findConverter } from './convert'
+import { isFreshImageImport } from './images'
 import { rendererPdfjsAssetOptions } from './pdfjs-assets'
 import { deserializeMirror, type ImportedMirror } from './mirror'
 import { CANON_ALG, compareIntegrity, integrityOf, type IntegrityComparison } from './canonicalize'
@@ -35,7 +36,7 @@ export async function loadSource(bytes: Uint8Array): Promise<LoadedSource> {
     throw new Error(`PDF declares ${pdf.numPages} pages; refusing to load more than ${MAX_PAGES}`)
   }
   const source: PdfSource = { id: crypto.randomUUID(), bytes, pdf }
-  if (await madeFromImage(pdf)) source.origin = 'image'
+  if (await madeFromImage(bytes, pdf)) source.origin = 'image'
   const sizes: PageSize[] = []
   for (let i = 1; i <= pdf.numPages; i++) {
     const page = await pdf.getPage(i)
@@ -49,10 +50,14 @@ export async function loadSource(bytes: Uint8Array): Promise<LoadedSource> {
 }
 
 /**
- * Whether imageToPdf made these bytes: its Producer marker (DESIGN.md §3.4.1). The only change the
- * OCR triage makes to loading; a PDF without readable metadata is simply not an image import.
+ * Whether imageToPdf made these bytes: its Producer marker (DESIGN.md §3.4.1), read at creation
+ * time only, i.e. on the array imageToPdf itself just returned. A file opened from disk is never
+ * image-origin whatever its Producer says (a crafted one would skip triage); its pages still go
+ * through Stage 0 and triage, which reads the /PDFxImportedImage mark for the DPI rule. The only
+ * change the OCR triage makes to loading; a PDF without readable metadata is not an image import.
  */
-async function madeFromImage(pdf: PdfSource['pdf']): Promise<boolean> {
+async function madeFromImage(bytes: Uint8Array, pdf: PdfSource['pdf']): Promise<boolean> {
+  if (!isFreshImageImport(bytes)) return false
   try {
     const { info } = await pdf.getMetadata()
     return (info as { Producer?: unknown } | null)?.Producer === IMAGE_IMPORT_PRODUCER

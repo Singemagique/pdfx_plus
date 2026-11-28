@@ -117,15 +117,20 @@ describe('runStage0', () => {
   })
 
   it('never extracts an imported-image source', async () => {
+    // Counted, not thrown: runStage0 swallows an extractor error (the page becomes a candidate),
+    // so a throwing extractor could not tell whether it was called.
+    let calls = 0
     const d = await runStage0(
       { pdf: fakePdf(3), origin: 'image' },
       {
         extract: async () => {
-          throw new Error('should not extract')
+          calls++
+          return chars(0)
         }
       }
     )
     expect(d).toEqual({ kind: 'image-origin' })
+    expect(calls).toBe(0)
   })
 
   it('stops when aborted (the source closed)', async () => {

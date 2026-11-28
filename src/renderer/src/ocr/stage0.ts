@@ -3,7 +3,9 @@
 // Opening an ordinary text PDF must never spawn the OCR process or copy its bytes.
 //
 // - Imported-image sources (`PdfSource.origin === 'image'`, from imageToPdf's Producer marker)
-//   need no triage: PDFx made them from a photo, so they are recognised as such (D4).
+//   need no Stage 0: PDFx made them from a photo, so they are recognised as such (D4). loadSource
+//   sets that origin only on the bytes imageToPdf just returned, never on a file opened from disk,
+//   so a crafted Producer cannot route a PDF past this gate.
 // - Any other PDF: the search engine's own extractor (`search/extract.ts`, pdf.js
 //   `getTextContent`) runs on the first min(8, pageCount) pages and on the page in view. A page
 //   is a CANDIDATE if it has fewer than 200 visible non-space characters; the source goes to
