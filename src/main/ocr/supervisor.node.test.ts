@@ -1,0 +1,745 @@
+// The supervisor state machine with a fake child (DESIGN.md §3.3.2, §3.9.3 tier 0): spawn laziness,
+// the minimal env, the alive flag, both pipes drained (a 10 MB stderr flood must not block the
+// child), the PR0 Windows exit matrix filtered on details.name, killRequested, respawn backoff with
+// its 3-in-60-s cap, oom halving, launch-failed as fatal, the idle kill, the power blocker and
+// progress bar during a batch, teardown on window close / render-process-gone / reload, and a
+// fresh port per connect.
+
+import { EventEmitter } from 'node:events'
+import { PassThrough } from 'node:stream'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
+import {
+  BACKOFF_MS,
+  ByteRing,
+  GONE_GRACE_MS,
+  IDLE_KILL_MS,
+  OcrSupervisor,
+  RING_BYTES,
+  SERVICE_NAME,
+  type ChildLike,
+  type ForkOptions,
+  type ProcessGoneDetails,
+  type SupervisorDeps,
+  type WebContentsLike
+} from './supervisor'
+
+class FakeChild extends EventEmitter implements ChildLike {
+  pid: number | undefined = 4242
+  readonly stdout = new PassThrough({ highWaterMark: 16 * 1024 })
+  readonly stderr = new PassThrough({ highWaterMark: 16 * 1024 })
+  readonly received: Array<{ msg: unknown; transfer?: unknown[] }> = []
+  killed = false
+  exited = false
+
+  constructor(
+    readonly modulePath: string,
+    readonly options: ForkOptions
+  ) {
+    super()
+  }
+
+  postMessage(msg: unknown, transfer?: unknown[]): void {
+    if (this.exited) throw new Error('posted to an exited child (the alive flag failed)')
+    this.received.push({ msg, transfer })
+  }
+
+  kill(): boolean {
+    this.killed = true
+    // Windows (PR0): our own kill() → 'exit' with code 0, and NO child-process-gone.
+    queueMicrotask(() => this.exit(0))
+    return true
+  }
+
+  exit(code: number): void {
+    if (this.exited) return
+    this.exited = true
+    this.emit('exit', code)
+  }
+
+  /** The child speaks. */
+  say(msg: unknown): void {
+    this.emit('message', msg)
+  }
+
+  messages(key: string): unknown[] {
+    return this.received
+      .map((r) => r.msg)
+      .filter((m) => typeof m === 'object' && m !== null && key in m)
+  }
+
+  /**
+   * Write `bytes` to stderr the way a real child does: respecting backpressure. A child whose pipe
+   * nobody reads stalls here forever, exactly like PR0's undrained child.
+   */
+  async flood(bytes: number): Promise<number> {
+    const chunk = Buffer.alloc(64 * 1024, 0x41)
+    chunk[chunk.length - 1] = 0x0a
+    let written = 0
+    while (written < bytes) {
+      if (!this.stderr.write(chunk)) await new Promise((r) => this.stderr.once('drain', r))
+      written += chunk.length
+    }
+    return written
+  }
+}
+
+class FakeWebContents extends EventEmitter implements WebContentsLike {
+  static next = 1
+  readonly id = FakeWebContents.next++
+  destroyed = false
+  readonly ports: unknown[][] = []
+  readonly sends: Array<{ channel: string; args: unknown[] }> = []
+
+  isDestroyed(): boolean {
+    return this.destroyed
+  }
+
+  postMessage(channel: string, _message: unknown, transfer: unknown[] = []): void {
+    expect(channel).toBe('ocr:port')
+    this.ports.push(transfer)
+  }
+
+  send(channel: string, ...args: unknown[]): void {
+    this.sends.push({ channel, args })
+  }
+
+  disconnects(): unknown[] {
+    return this.sends.filter((s) => s.channel === 'ocr:disconnected').map((s) => s.args[0])
+  }
+}
+
+interface Ctx {
+  sup: OcrSupervisor
+  children: FakeChild[]
+  gone: (d: Partial<ProcessGoneDetails>) => void
+  blockers: { started: number[]; stopped: number[] }
+  progress: Array<{ wc: number; frac: number }>
+  priorities: number[]
+  logs: string[]
+  closers: Map<WebContentsLike, () => void>
+  channels: Array<{
+    port1: { closed: boolean; close(): void }
+    port2: { closed: boolean; close(): void }
+  }>
+  deps: SupervisorDeps
+}
+
+const READY = {
+  ready: { tripwire: 0, electronNet: ['fetch', 'request', 'resolveHost', 'isOnline'] }
+}
+const HB = {
+  heartbeat: {
+    tripwire: { process: 0, raster: 0, recognize: 0 },
+    tripwireIntact: true,
+    rss: 1,
+    threads: { raster: 0, recognize: 0 },
+    pending: 0,
+    concurrency: 1
+  }
+}
+
+function setup(over: Partial<SupervisorDeps> = {}): Ctx {
+  const children: FakeChild[] = []
+  let goneListener: (d: ProcessGoneDetails) => void = () => {}
+  const blockers = { started: [] as number[], stopped: [] as number[] }
+  const progress: Array<{ wc: number; frac: number }> = []
+  const priorities: number[] = []
+  const logs: string[] = []
+  const closers = new Map<WebContentsLike, () => void>()
+  const channels: Ctx['channels'] = []
+  let blockerSeq = 0
+  const port = (): { closed: boolean; close(): void } => {
+    const p = {
+      closed: false,
+      close() {
+        p.closed = true
+      }
+    }
+    return p
+  }
+  const deps: SupervisorDeps = {
+    fork: (modulePath, _args, options) => {
+      const c = new FakeChild(modulePath, options)
+      children.push(c)
+      queueMicrotask(() => c.emit('spawn'))
+      return c
+    },
+    modulePath: '/app.asar/out/main/chunks/index-ocr.js',
+    onChildProcessGone: (l) => {
+      goneListener = l
+    },
+    createChannel: () => {
+      const ch = { port1: port(), port2: port() }
+      channels.push(ch)
+      return ch
+    },
+    powerSaveBlocker: {
+      start: () => {
+        const id = ++blockerSeq
+        blockers.started.push(id)
+        return id
+      },
+      stop: (id) => blockers.stopped.push(id)
+    },
+    setPriority: (pid) => priorities.push(pid),
+    setProgress: (wc, frac) => progress.push({ wc: wc.id, frac }),
+    onWindowClosed: (wc, l) => {
+      closers.set(wc, l)
+      return () => closers.delete(wc)
+    },
+    init: () => ({
+      limits: { onBattery: false, thermal: 'nominal', speedLimit: 100, divisor: 1 },
+      paths: { pdfiumWasm: '/app.asar/node_modules/@embedpdf/pdfium/dist/pdfium.wasm' }
+    }),
+    platform: 'win32',
+    env: {
+      SystemRoot: 'C:\\Windows',
+      PATH: 'C:\\x',
+      NODE_OPTIONS: '--inspect',
+      HTTPS_PROXY: 'http://p'
+    },
+    isPackaged: true,
+    log: (l) => logs.push(l),
+    ...over
+  }
+  const sup = new OcrSupervisor(deps)
+  return {
+    sup,
+    children,
+    gone: (d) =>
+      goneListener({
+        type: 'Utility',
+        reason: 'crashed',
+        exitCode: 1,
+        serviceName: 'node.mojom.NodeService',
+        name: SERVICE_NAME,
+        ...d
+      }),
+    blockers,
+    progress,
+    priorities,
+    logs,
+    closers,
+    channels,
+    deps
+  }
+}
+
+const tick = async (): Promise<void> => {
+  for (let i = 0; i < 10; i++) await Promise.resolve()
+}
+
+/** connect(wc) and let the child come up. */
+async function connected(
+  ctx: Ctx,
+  wc = new FakeWebContents()
+): Promise<{ wc: FakeWebContents; child: FakeChild }> {
+  ctx.sup.connect(wc)
+  await tick()
+  const child = ctx.children.at(-1)!
+  child.say(READY)
+  await tick()
+  return { wc, child }
+}
+
+beforeEach(() => {
+  vi.useFakeTimers()
+})
+
+afterEach(() => {
+  vi.useRealTimers()
+})
+
+describe('ByteRing', () => {
+  it('keeps only the last 64 KB and counts every line and byte', () => {
+    const r = new ByteRing()
+    for (let i = 0; i < 100; i++) r.push(Buffer.alloc(4096, 0x61))
+    r.push('tail line\n')
+    expect(r.bytes).toBe(RING_BYTES)
+    expect(r.total).toBe(100 * 4096 + 10)
+    expect(r.lines).toBe(1)
+    expect(r.text().endsWith('tail line\n')).toBe(true)
+    r.push(Buffer.alloc(200_000, 0x0a))
+    expect(r.bytes).toBe(RING_BYTES)
+    expect(r.lines).toBe(200_001)
+  })
+})
+
+describe('spawning', () => {
+  it('is lazy: nothing forks until a renderer connects', async () => {
+    const ctx = setup()
+    await tick()
+    expect(ctx.children).toHaveLength(0)
+    expect(ctx.sup.state).toBe('stopped')
+    await connected(ctx)
+    expect(ctx.children).toHaveLength(1)
+  })
+
+  it('forks the ?modulePath entry as pdfx-ocr with piped stdio and only SystemRoot in env', async () => {
+    const ctx = setup()
+    const { child } = await connected(ctx)
+    expect(child.modulePath).toBe(ctx.deps.modulePath)
+    expect(child.options).toEqual({
+      serviceName: 'pdfx-ocr',
+      stdio: 'pipe',
+      env: { SystemRoot: 'C:\\Windows' }
+    })
+    expect(ctx.priorities).toEqual([4242])
+  })
+
+  it('passes no environment at all off Windows', async () => {
+    const ctx = setup({ platform: 'linux', env: { HOME: '/home/u', http_proxy: 'x' } })
+    const { child } = await connected(ctx)
+    expect(child.options.env).toEqual({})
+  })
+
+  it('sends init on ready, then a port; never posts before ready', async () => {
+    const ctx = setup()
+    const wc = new FakeWebContents()
+    ctx.sup.connect(wc)
+    await tick()
+    const child = ctx.children[0]
+    expect(child.received).toEqual([])
+    child.say(READY)
+    await tick()
+    expect(child.messages('init')).toEqual([
+      {
+        init: {
+          limits: { onBattery: false, thermal: 'nominal', speedLimit: 100, divisor: 1 },
+          paths: { pdfiumWasm: '/app.asar/node_modules/@embedpdf/pdfium/dist/pdfium.wasm' }
+        }
+      }
+    ])
+    const portMsg = child.received.find((r) => 'port' in (r.msg as object))!
+    expect(portMsg.transfer).toEqual([ctx.channels[0].port2])
+    expect(wc.ports).toEqual([[ctx.channels[0].port1]])
+    expect(ctx.sup.state).toBe('running')
+  })
+
+  it('gives every connect a fresh channel and reuses the running process', async () => {
+    const ctx = setup()
+    const { wc } = await connected(ctx)
+    ctx.sup.connect(wc)
+    await tick()
+    ctx.sup.connect(wc)
+    await tick()
+    expect(ctx.children).toHaveLength(1)
+    expect(ctx.channels).toHaveLength(3)
+    expect(new Set(wc.ports.map((p) => p[0])).size).toBe(3)
+  })
+
+  it('drops messages from the child that fail the schema', async () => {
+    const ctx = setup()
+    const { child } = await connected(ctx)
+    child.say({ activity: { busy: true, done: 0, total: 1, text: 'page words' } })
+    child.say({ stderr: 'x' })
+    await tick()
+    expect(ctx.blockers.started).toEqual([])
+    expect(ctx.logs.filter((l) => l.includes('malformed'))).toHaveLength(2)
+  })
+})
+
+describe('stdio', () => {
+  it('drains a 10 MB stderr flood so the child never blocks, keeping 64 KB', async () => {
+    vi.useRealTimers()
+    const ctx = setup()
+    const { child } = await connected(ctx)
+    const t0 = Date.now()
+    const written = await Promise.race([
+      child.flood(10 * 1024 * 1024),
+      new Promise<number>((r) => setTimeout(() => r(-1), 10_000))
+    ])
+    expect(written).toBe(10 * 1024 * 1024)
+    expect(Date.now() - t0).toBeLessThan(10_000)
+    // stdout is drained too.
+    child.stdout.write('hello\n')
+    await new Promise((r) => setImmediate(r))
+    expect(ctx.sup.output).toEqual({
+      lines: 160 + 1,
+      bytes: 10 * 1024 * 1024 + 6,
+      buffered: RING_BYTES
+    })
+    // The child still answers after the flood.
+    const hb = ctx.sup.requestHeartbeat(1000)
+    child.say(HB)
+    await expect(hb).resolves.toEqual(HB.heartbeat)
+  })
+
+  it('control: an undrained pipe does block a child that respects backpressure', async () => {
+    vi.useRealTimers()
+    const stuck = new FakeChild('/x', { serviceName: 'x', stdio: 'pipe', env: {} })
+    const r = await Promise.race([
+      stuck.flood(10 * 1024 * 1024).then(() => 'done'),
+      new Promise<string>((res) => setTimeout(() => res('blocked'), 300))
+    ])
+    expect(r).toBe('blocked')
+  })
+
+  it('logs only the exit reason, code and line count in packaged builds', async () => {
+    const ctx = setup({ isPackaged: true })
+    const { child } = await connected(ctx)
+    child.stderr.write('Secret Page Text\n')
+    await tick()
+    child.exit(2)
+    ctx.gone({ reason: 'crashed', exitCode: 2 })
+    await tick()
+    expect(ctx.logs.join('\n')).not.toContain('Secret')
+    expect(ctx.logs).toContainEqual(
+      'ocr: utility process exited unexpectedly (crashed, code 2); 1 line(s) of output'
+    )
+  })
+
+  it('shows the tail in development builds only', async () => {
+    const ctx = setup({ isPackaged: false })
+    const { child } = await connected(ctx)
+    child.stderr.write('dev diagnostics\n')
+    await tick()
+    child.exit(2)
+    ctx.gone({ reason: 'crashed', exitCode: 2 })
+    expect(ctx.logs.join('\n')).toContain('dev diagnostics')
+  })
+})
+
+describe('the alive flag', () => {
+  it('never posts to a child that has exited', async () => {
+    const ctx = setup()
+    const { child } = await connected(ctx)
+    child.exit(1)
+    // FakeChild.postMessage throws after exit; none of these may reach it.
+    ctx.sup.setLimits({ onBattery: true, thermal: 'nominal', speedLimit: 100 })
+    await expect(ctx.sup.requestHeartbeat()).rejects.toThrow(/not running/)
+  })
+})
+
+describe('exits (the PR0 Windows matrix)', () => {
+  it('a requested kill() is exit 0 with no child-process-gone: no respawn, no crash log', async () => {
+    const ctx = setup()
+    const { wc, child } = await connected(ctx)
+    ctx.sup.teardown('test')
+    await tick()
+    expect(child.killed).toBe(true)
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(ctx.children).toHaveLength(1)
+    expect(ctx.sup.state).toBe('stopped')
+    expect(ctx.logs.filter((l) => l.includes('unexpectedly'))).toEqual([])
+    expect(wc.disconnects()).toEqual([])
+  })
+
+  for (const [name, reason, code] of [
+    ['exit 1 → killed (Node uncaught exception)', 'killed', 1],
+    ['exit 2 → crashed', 'crashed', 2],
+    ['process.crash() → crashed −36861', 'crashed', -36861],
+    ['abnormal-exit', 'abnormal-exit', 3]
+  ] as const) {
+    it(`${name}: an unrequested exit respawns after backoff and re-sends a port`, async () => {
+      const ctx = setup()
+      const { wc, child } = await connected(ctx)
+      child.exit(code < 0 ? 0xffff7000 : code) // the 'exit' code is lossy for native crashes
+      ctx.gone({ reason, exitCode: code })
+      await tick()
+      expect(ctx.sup.lastExit).toMatchObject({ reason, exitCode: code })
+      expect(wc.disconnects()).toEqual([{ reason: 'crashed' }])
+      expect(ctx.sup.state).toBe('backoff')
+      await vi.advanceTimersByTimeAsync(BACKOFF_MS[0])
+      expect(ctx.children).toHaveLength(2)
+      ctx.children[1].say(READY)
+      await tick()
+      expect(wc.ports).toHaveLength(2)
+      expect(wc.ports[1][0]).not.toBe(wc.ports[0][0])
+    })
+  }
+
+  it('a bare exit with no gone event is still a crash (classified after the grace period)', async () => {
+    const ctx = setup()
+    const { child } = await connected(ctx)
+    child.exit(0)
+    await tick()
+    expect(ctx.sup.lastExit).toBeNull()
+    await vi.advanceTimersByTimeAsync(GONE_GRACE_MS)
+    expect(ctx.sup.lastExit).toMatchObject({ reason: 'clean-exit', exitCode: 0 })
+    expect(ctx.sup.state).toBe('backoff')
+  })
+
+  it('accepts the gone event before the exit event', async () => {
+    const ctx = setup()
+    const { child } = await connected(ctx)
+    ctx.gone({ reason: 'crashed', exitCode: 5 })
+    child.exit(5)
+    await vi.advanceTimersByTimeAsync(GONE_GRACE_MS)
+    expect(ctx.sup.lastExit).toMatchObject({ reason: 'crashed', exitCode: 5 })
+    expect(ctx.logs.filter((l) => l.includes('unexpectedly'))).toHaveLength(1)
+  })
+
+  it('ignores child-process-gone for other utility processes (filtered on details.name)', async () => {
+    const ctx = setup()
+    await connected(ctx)
+    ctx.gone({ name: 'Network Service', reason: 'crashed' })
+    ctx.gone({ name: undefined, serviceName: SERVICE_NAME, reason: 'crashed' })
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(ctx.sup.state).toBe('running')
+    expect(ctx.sup.lastExit).toBeNull()
+  })
+
+  it('caps respawns at 3 in 60 s, then stops with crash-loop', async () => {
+    const ctx = setup()
+    const { wc } = await connected(ctx)
+    for (let i = 0; i < 4; i++) {
+      const c = ctx.children.at(-1)!
+      c.exit(2)
+      ctx.gone({ reason: 'crashed', exitCode: 2 })
+      await vi.advanceTimersByTimeAsync(BACKOFF_MS[Math.min(i, 2)])
+      ctx.children.at(-1)!.say(READY)
+      await tick()
+    }
+    expect(ctx.children).toHaveLength(4)
+    expect(ctx.sup.state).toBe('crash-loop')
+    expect(wc.disconnects().at(-1)).toEqual({ reason: 'crash-loop' })
+    // A deliberate user action (connect, e.g. Resume) may still try again.
+    ctx.sup.connect(wc)
+    await tick()
+    expect(ctx.children).toHaveLength(5)
+  })
+
+  it('crashes spread over more than 60 s keep respawning', async () => {
+    const ctx = setup()
+    await connected(ctx)
+    for (let i = 0; i < 6; i++) {
+      ctx.children.at(-1)!.exit(2)
+      ctx.gone({ reason: 'crashed', exitCode: 2 })
+      await vi.advanceTimersByTimeAsync(30_000)
+      ctx.children.at(-1)!.say(READY)
+      await tick()
+    }
+    expect(ctx.sup.state).toBe('running')
+    expect(ctx.children).toHaveLength(7)
+  })
+
+  it('oom and memory-eviction halve the concurrency for the session and respawn', async () => {
+    const ctx = setup()
+    const { child } = await connected(ctx)
+    child.exit(1)
+    ctx.gone({ reason: 'oom', exitCode: -536870904 })
+    await vi.advanceTimersByTimeAsync(BACKOFF_MS[0])
+    expect(ctx.sup.concurrencyDivisor).toBe(2)
+    ctx.children[1].say(READY)
+    await tick()
+    expect(
+      (ctx.children[1].messages('init')[0] as { init: { limits: { divisor: number } } }).init.limits
+        .divisor
+    ).toBe(2)
+    ctx.children[1].exit(1)
+    ctx.gone({ reason: 'memory-eviction', exitCode: 1 })
+    await vi.advanceTimersByTimeAsync(BACKOFF_MS[1])
+    expect(ctx.sup.concurrencyDivisor).toBe(4)
+    expect(ctx.children).toHaveLength(3)
+  })
+
+  it('launch-failed is fatal: no respawn loop, and later connects are refused', async () => {
+    const ctx = setup()
+    const wc = new FakeWebContents()
+    ctx.sup.connect(wc)
+    await tick()
+    ctx.gone({ reason: 'launch-failed', exitCode: 0 })
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(ctx.sup.state).toBe('fatal')
+    expect(ctx.children).toHaveLength(1)
+    expect(wc.disconnects()).toEqual([{ reason: 'fatal' }])
+    ctx.sup.connect(wc)
+    await tick()
+    expect(ctx.children).toHaveLength(1)
+    expect(wc.disconnects()).toEqual([{ reason: 'fatal' }, { reason: 'fatal' }])
+  })
+
+  it('a fork that throws is fatal too', async () => {
+    const ctx = setup({
+      fork: () => {
+        throw new Error('ENOENT')
+      }
+    })
+    const wc = new FakeWebContents()
+    ctx.sup.connect(wc)
+    expect(ctx.sup.state).toBe('fatal')
+    expect(wc.disconnects()).toEqual([{ reason: 'fatal' }])
+  })
+
+  it('the child reporting an init failure is fatal (deterministic: respawning would loop)', async () => {
+    const ctx = setup()
+    const { wc, child } = await connected(ctx)
+    child.say({ fatal: { code: 'init', message: 'CompileError' } })
+    await tick()
+    expect(child.killed).toBe(true)
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(ctx.sup.state).toBe('fatal')
+    expect(ctx.children).toHaveLength(1)
+    expect(wc.disconnects()).toEqual([{ reason: 'fatal' }])
+  })
+
+  it('a crash with nobody connected does not respawn (lazy)', async () => {
+    const ctx = setup()
+    const port = ctx.sup.connectLocal()
+    await tick()
+    ctx.children[0].say(READY)
+    await port
+    // The local owner is dropped by the crash.
+    ctx.children[0].exit(2)
+    ctx.gone({ reason: 'crashed', exitCode: 2 })
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(ctx.children).toHaveLength(1)
+    expect(ctx.sup.state).toBe('stopped')
+  })
+})
+
+describe('idle, power and progress', () => {
+  it('kills the process 3 minutes after the last job, as a requested kill', async () => {
+    const ctx = setup()
+    const { wc, child } = await connected(ctx)
+    child.say({ activity: { busy: true, done: 0, total: 4 } })
+    await vi.advanceTimersByTimeAsync(IDLE_KILL_MS * 2)
+    expect(child.killed).toBe(false) // busy: never idle-killed mid-batch
+    child.say({ activity: { busy: false, done: 0, total: 0 } })
+    await vi.advanceTimersByTimeAsync(IDLE_KILL_MS - 1)
+    expect(child.killed).toBe(false)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(child.killed).toBe(true)
+    expect(wc.disconnects()).toEqual([{ reason: 'idle' }])
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(ctx.children).toHaveLength(1) // no respawn after an idle kill
+    // The next need spawns it again.
+    ctx.sup.connect(wc)
+    await tick()
+    expect(ctx.children).toHaveLength(2)
+  })
+
+  it('kills an idle process that was never used', async () => {
+    const ctx = setup()
+    const { child } = await connected(ctx)
+    await vi.advanceTimersByTimeAsync(IDLE_KILL_MS)
+    expect(child.killed).toBe(true)
+  })
+
+  it('holds the power blocker and shows progress only while a batch runs', async () => {
+    const ctx = setup()
+    const { wc, child } = await connected(ctx)
+    child.say({ activity: { busy: true, done: 0, total: 4 } })
+    child.say({ activity: { busy: true, done: 2, total: 4 } })
+    expect(ctx.blockers.started).toEqual([1])
+    child.say({ activity: { busy: false, done: 0, total: 0 } })
+    expect(ctx.blockers.stopped).toEqual([1])
+    expect(ctx.progress).toEqual([
+      { wc: wc.id, frac: 0 },
+      { wc: wc.id, frac: 0.5 },
+      { wc: wc.id, frac: -1 }
+    ])
+  })
+
+  it('releases the blocker when the process dies mid-batch', async () => {
+    const ctx = setup()
+    const { child } = await connected(ctx)
+    child.say({ activity: { busy: true, done: 1, total: 4 } })
+    child.exit(2)
+    expect(ctx.blockers.stopped).toEqual([1])
+  })
+})
+
+describe('window and renderer lifecycle', () => {
+  for (const [name, fire] of [
+    ['window closed', (ctx: Ctx, wc: FakeWebContents) => ctx.closers.get(wc)!()],
+    [
+      'render-process-gone',
+      (_: Ctx, wc: FakeWebContents) => wc.emit('render-process-gone', {}, { reason: 'crashed' })
+    ],
+    [
+      'main-frame reload',
+      (_: Ctx, wc: FakeWebContents) =>
+        wc.emit('did-start-navigation', {
+          isMainFrame: true,
+          isSameDocument: false,
+          url: 'file:///x'
+        })
+    ],
+    [
+      'main-frame reload (deprecated positional args)',
+      (_: Ctx, wc: FakeWebContents) => wc.emit('did-start-navigation', {}, 'file:///x', false, true)
+    ],
+    ['webContents destroyed', (_: Ctx, wc: FakeWebContents) => wc.emit('destroyed')]
+  ] as const) {
+    it(`${name} cancels everything and kills the process, no respawn`, async () => {
+      const ctx = setup()
+      const { wc, child } = await connected(ctx)
+      fire(ctx, wc)
+      await tick()
+      expect(child.killed).toBe(true)
+      await vi.advanceTimersByTimeAsync(60_000)
+      expect(ctx.children).toHaveLength(1)
+      expect(ctx.sup.state).toBe('stopped')
+      // Listeners are detached: a second event is a no-op.
+      expect(wc.listenerCount('render-process-gone')).toBe(0)
+      expect(ctx.closers.has(wc)).toBe(false)
+    })
+  }
+
+  it('ignores same-document and subframe navigations', async () => {
+    const ctx = setup()
+    const { wc, child } = await connected(ctx)
+    wc.emit('did-start-navigation', { isMainFrame: true, isSameDocument: true })
+    wc.emit('did-start-navigation', { isMainFrame: false, isSameDocument: false })
+    await tick()
+    expect(child.killed).toBe(false)
+  })
+
+  it('a new window gets a fresh process and port; the old owner is torn down', async () => {
+    const ctx = setup()
+    const { wc: a, child } = await connected(ctx)
+    const b = new FakeWebContents()
+    ctx.sup.connect(b)
+    await tick()
+    expect(child.killed).toBe(true)
+    expect(a.listenerCount('destroyed')).toBe(0)
+    ctx.children[1].say(READY)
+    await tick()
+    expect(b.ports).toHaveLength(1)
+    expect(b.ports[0][0]).not.toBe(a.ports[0][0])
+    // macOS: window closed, app alive, window reopened → its first connect spawns afresh.
+    ctx.closers.get(b)!()
+    await tick()
+    const c = new FakeWebContents()
+    ctx.sup.connect(c)
+    await tick()
+    expect(ctx.children).toHaveLength(3)
+  })
+
+  it('a renderer reload followed by a new connect gets a new process and port', async () => {
+    const ctx = setup()
+    const { wc } = await connected(ctx)
+    wc.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false })
+    await tick()
+    ctx.sup.connect(wc)
+    await tick()
+    ctx.children[1].say(READY)
+    await tick()
+    expect(wc.ports).toHaveLength(2)
+    expect(new Set(ctx.channels.map((c) => c.port1)).size).toBe(ctx.channels.length)
+  })
+
+  it('dispose (before-quit) kills the child', async () => {
+    const ctx = setup()
+    const { child } = await connected(ctx)
+    ctx.sup.dispose()
+    expect(child.killed).toBe(true)
+  })
+})
+
+describe('heartbeat', () => {
+  it('logs the network tripwire once if any counter is above 0', async () => {
+    const ctx = setup()
+    const { child } = await connected(ctx)
+    const bad = {
+      heartbeat: { ...HB.heartbeat, tripwire: { process: 0, raster: 1, recognize: 0 } }
+    }
+    child.say(bad)
+    child.say(bad)
+    expect(ctx.logs.filter((l) => l.includes('TRIPWIRE'))).toHaveLength(1)
+    expect(ctx.sup.lastHeartbeat?.tripwire.raster).toBe(1)
+  })
+})

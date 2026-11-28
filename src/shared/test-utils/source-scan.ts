@@ -50,6 +50,11 @@ export interface ScanOptions {
   forbiddenDirs?: readonly string[]
   /** The scanned file's repo-relative path (for `forbiddenDirs`); defaults to no check. */
   filePath?: string
+  /**
+   * Vite query suffixes allowed on an import (`./thread?modulePath`). Any other `?query` import is
+   * reported: it only exists under a bundler. Empty by default (src/shared runs unbundled too).
+   */
+  allowedQueries?: readonly string[]
 }
 
 /**
@@ -128,9 +133,17 @@ export const NETWORK_GLOBALS = [
   'Function'
 ]
 
-function moduleBanned(spec: string, banned: readonly string[]): boolean {
+function moduleBanned(
+  spec: string,
+  banned: readonly string[],
+  allowedQueries: readonly string[] = []
+): boolean {
   // Vite query imports (`x?url`, `x?worker`) only exist under a bundler.
-  if (/\?[a-z]/i.test(spec)) return true
+  const q = spec.indexOf('?')
+  if (q >= 0 && /\?[a-z]/i.test(spec)) {
+    if (!allowedQueries.includes(spec.slice(q + 1))) return true
+    spec = spec.slice(0, q)
+  }
   for (const b of banned) {
     if (b.endsWith('/*')) {
       const prefix = b.slice(0, -2)
@@ -452,7 +465,10 @@ export function scanSource(source: string, opts: ScanOptions = {}): ScanFinding[
     findings.push({ line: line + 1, column: character + 1, kind, name })
   }
   const checkSpec = (node: ts.Node, spec: string): void => {
-    if (moduleBanned(spec, modules) || resolvesInto(spec, opts.filePath, dirs))
+    if (
+      moduleBanned(spec, modules, opts.allowedQueries) ||
+      resolvesInto(spec.split('?')[0], opts.filePath, dirs)
+    )
       report(node, 'import', spec)
   }
   const checkCallArg = (node: ts.CallExpression, what: string): void => {
