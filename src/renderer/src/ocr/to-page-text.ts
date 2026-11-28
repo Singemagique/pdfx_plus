@@ -120,3 +120,71 @@ export function ocrPageTextItems(
   }
   return out
 }
+
+/** A visible native word triage returned (shared/ocr/triage.ts `NativeWord`): overlay-frame box. */
+export interface NativeWordBox {
+  t: string
+  x0: number
+  y0: number
+  x1: number
+  y1: number
+}
+
+/**
+ * Triage's visible native words of an `ocr-ours` page as Find items, for the `replace` supplement
+ * (DESIGN.md §3.6.1: "replace with triage's visible native words plus the new OCR words"). Each
+ * word is an upright item whose em box is its char-box union (ascent 0.8, descent −0.2), in pdf.js
+ * user space like `ocrPageTextItems`. They are NATIVE text (no `ocr` flag), so a redaction slices
+ * them per character, as it does pdf.js items. A ' ' item separates two words unless both are CJK
+ * (`needsSpaceBetween`); words come in PDFium's order and buildPageText breaks lines where the
+ * baseline jumps.
+ */
+export function nativeWordItems(
+  words: readonly NativeWordBox[],
+  vt: readonly number[],
+  pageHeight: number
+): PageTextItem[] {
+  const m = overlayToUser(vt, pageHeight)
+  const map = (x: number, y: number): [number, number] => [
+    m[0] * x + m[2] * y + m[4],
+    m[1] * x + m[3] * y + m[5]
+  ]
+  const turn = (x: number, y: number): [number, number] => [
+    m[0] * x + m[2] * y,
+    m[1] * x + m[3] * y
+  ]
+  const out: PageTextItem[] = []
+  const valid = words.filter(
+    (w) =>
+      w.t.trim() && [w.x0, w.y0, w.x1, w.y1].every(Number.isFinite) && w.x1 > w.x0 && w.y1 > w.y0
+  )
+  valid.forEach((w, i) => {
+    const s = w.y1 - w.y0
+    const baseline = w.y0 + OCR_DESCENT * s
+    const [ax, ay] = turn(s, 0)
+    const [ux, uy] = turn(0, s)
+    const item = (str: string, x: number, width: number): PageTextItem => {
+      const [e, f] = map(x, baseline)
+      return {
+        str,
+        t: [ax, ay, ux, uy, e, f],
+        width,
+        height: s,
+        ascent: OCR_ASCENT,
+        descent: -OCR_DESCENT,
+        vertical: false,
+        rtl: false,
+        hasEOL: false
+      }
+    }
+    out.push(item(w.t, w.x0, w.x1 - w.x0))
+    const next = valid[i + 1]
+    if (!next) {
+      out[out.length - 1].hasEOL = true
+      return
+    }
+    if (needsSpaceBetween(w.t, next.t))
+      out.push(item(' ', w.x1, Math.max(0, Math.min(next.x0 - w.x1, s))))
+  })
+  return out
+}

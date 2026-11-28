@@ -146,6 +146,9 @@ const api = {
     ipcRenderer.invoke('pdfx:read-clipboard-image'),
   readClipboardFiles: (): Promise<OpenedFile[]> => ipcRenderer.invoke('pdfx:read-clipboard-files'),
   clearClipboard: (): Promise<void> => ipcRenderer.invoke('pdfx:clipboard-clear'),
+  /** Put plain text on the clipboard (Copy Page Text); main refuses more than 16 MB. */
+  writeClipboardText: (text: string): Promise<void> =>
+    ipcRenderer.invoke('pdfx:clipboard-write-text', text),
   getPathForFile: (file: File): string => webUtils.getPathForFile(file),
   expandDropPaths: (paths: string[]): Promise<OpenedFile[]> =>
     ipcRenderer.invoke('pdfx:expand-drop-paths', paths),

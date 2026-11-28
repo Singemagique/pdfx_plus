@@ -50,7 +50,8 @@ vi.mock('electron', () => ({
   },
   clipboard: {
     readImage: vi.fn(() => ({ isEmpty: () => true, toPNG: () => Buffer.alloc(0) })),
-    clear: vi.fn()
+    clear: vi.fn(),
+    writeText: vi.fn()
   }
 }))
 
@@ -77,13 +78,18 @@ vi.mock('./cert-info', () => ({
   certInfoFromDer: vi.fn(() => null),
   certInfoFromP12: vi.fn(() => null)
 }))
-vi.mock('./clipboard', () => ({ clipboardFilePaths: vi.fn(() => [] as string[]) }))
+// The clipboard-path reader is a boundary; the text writer's guard stays REAL (it is under test).
+vi.mock('./clipboard', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./clipboard')>()),
+  clipboardFilePaths: vi.fn(() => [] as string[])
+}))
 vi.mock('./window', () => ({
   getMainWindow: vi.fn(() => h.mainWindow.current),
   setRendererReady: vi.fn(),
   sendOpenPaths: vi.fn(async () => {})
 }))
 
+import { clipboard } from 'electron'
 import { stat, writeFile } from 'fs/promises'
 import { signPdf, signPdfWithCard, signPdfWithWindowsCert } from './sign'
 import { cardCertDer, listTokens } from './pkcs11'
@@ -149,7 +155,8 @@ describe('registration', () => {
       'pdfx:sign-pdf-win-cert',
       'pdfx:open-files',
       'pdfx:settings-get',
-      'pdfx:settings-set'
+      'pdfx:settings-set',
+      'pdfx:clipboard-write-text'
     ]) {
       expect(h.handlers.has(channel)).toBe(true)
     }
@@ -496,6 +503,32 @@ describe('unreadable files raise a notice', () => {
 
     expect(h.send).not.toHaveBeenCalled()
     warn.mockRestore()
+  })
+})
+
+describe('pdfx:clipboard-write-text', () => {
+  it('puts the text on the clipboard', async () => {
+    await invoke('pdfx:clipboard-write-text', 'Page text\nline two · ü 山田')
+    expect(vi.mocked(clipboard.writeText)).toHaveBeenCalledWith('Page text\nline two · ü 山田')
+  })
+
+  it('refuses anything that is not a string', () => {
+    for (const bad of [null, undefined, 42, { toString: () => 'x' }, ['a'], new Uint8Array([65])])
+      expect(() => invoke('pdfx:clipboard-write-text', bad)).toThrow(/non-string/)
+    expect(vi.mocked(clipboard.writeText)).not.toHaveBeenCalled()
+  })
+
+  it('refuses more than 16 MB of UTF-8, and takes exactly 16 MB', () => {
+    expect(() => invoke('pdfx:clipboard-write-text', 'a'.repeat(16 * 1024 * 1024 + 1))).toThrow(
+      /too large/
+    )
+    // 3 bytes per char in UTF-8: a string well under 16 M chars can still be over 16 MB.
+    expect(() => invoke('pdfx:clipboard-write-text', '山'.repeat(6 * 1024 * 1024))).toThrow(
+      /too large/
+    )
+    expect(vi.mocked(clipboard.writeText)).not.toHaveBeenCalled()
+    invoke('pdfx:clipboard-write-text', 'a'.repeat(16 * 1024 * 1024))
+    expect(vi.mocked(clipboard.writeText)).toHaveBeenCalledTimes(1)
   })
 })
 

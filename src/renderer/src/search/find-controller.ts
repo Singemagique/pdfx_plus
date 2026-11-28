@@ -66,7 +66,20 @@ export interface FindController {
   setDocs(docs: readonly DocEntry[]): void
   setOverlays(overlays: readonly Overlay[]): void
   cancelTimers(): void
+  /** The index's per-page text, for the OCR side (supply, Stage 0, Copy Page Text). */
+  text: FindTextAccess
 }
+
+/**
+ * What the OCR side reads and writes in Find's index, per page key (DESIGN.md §3.4.1, §3.6): the
+ * recognised-text supplement, the native text (extracted once, shared with Find), a hook on every
+ * native extraction (Stage 0 and Find's full-extraction trigger) and the effective page text
+ * (native ∪ supplement, redaction-filtered: what Find searches and Copy Page Text copies).
+ */
+export type FindTextAccess = Pick<
+  FindEngine,
+  'setSupplement' | 'readNative' | 'onNativeText' | 'getPageText'
+>
 
 export interface FindControllerOptions {
   /** Builds the index (tests pass a fake); it must call `onChange` when results may differ. */
@@ -534,6 +547,12 @@ export function createFindController({
     cancelTimers() {
       clearDebounce()
       clearThrottle()
+    },
+    text: {
+      setSupplement: (key, s) => engine.setSupplement(key, s),
+      readNative: (key) => engine.readNative(key),
+      onNativeText: (listener) => engine.onNativeText(listener),
+      getPageText: (key) => engine.getPageText(key)
     }
   }
 }

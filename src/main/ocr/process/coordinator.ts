@@ -50,6 +50,7 @@
 
 import {
   ELECTRON_NET_MEMBERS,
+  MAX_INFLIGHT_REPORT,
   OCR_LIMITS,
   OcrError,
   parseMainToOcr,
@@ -1762,16 +1763,21 @@ export class Coordinator {
     for (const job of this.jobs.values()) {
       if (!job.progressDirty) continue
       let inflight = 0
+      // The pages in flight, so the renderer can tell which ones a process crash implicates.
+      const pages: number[] = []
       for (const t of job.tasks)
-        if (t.state !== 'queued' && t.startedAt > 0)
+        if (t.state !== 'queued' && t.startedAt > 0) {
           inflight += Math.min(0.95, (now - t.startedAt) / this.expectedPageMs)
+          if (pages.length < MAX_INFLIGHT_REPORT) pages.push(t.req.index)
+        }
       job.progressDirty = false
       this.toRenderer({
         progress: {
           jobId: job.jobId,
           doneOrFailed: job.done + job.failed,
           total: job.total,
-          inflightFrac: Math.min(inflight, job.total)
+          inflightFrac: Math.min(inflight, job.total),
+          ...(pages.length ? { inflight: pages } : {})
         }
       })
     }

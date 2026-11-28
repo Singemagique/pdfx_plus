@@ -606,3 +606,58 @@ describe('find engine', () => {
     expect(calls).toEqual(['aa', 'ab', 'ac', 'ad'])
   })
 })
+
+describe('the OCR side of the index (readNative, onNativeText, setSupplement)', () => {
+  it('readNative extracts one page before activate(), once, and Find reuses it', async () => {
+    const x = deferredExtract()
+    const seen: string[] = []
+    const engine = createFindEngine({ onChange: () => {}, extract: x.extract as never })
+    engine.onNativeText((key) => seen.push(key))
+    const pdf = fakePdf('alpha', 'beta', 'gamma')
+    engine.reconcile([docOf('a', source('s1', pdf), [0, 1, 2])])
+    const read = engine.readNative('s1#2')
+    expect(x.extract).toHaveBeenCalledTimes(1)
+    expect(x.extract.mock.calls[0][1]).toBe(2)
+    await resolveAll(x.calls)
+    expect((await read)?.norm).toContain('gamma')
+    expect(seen).toEqual(['s1#2'])
+    // Find's full extraction later does not extract page 2 again.
+    engine.activate()
+    await resolveAll(x.calls)
+    expect(x.extract).toHaveBeenCalledTimes(3)
+    expect(seen.sort()).toEqual(['s1#0', 's1#1', 's1#2'])
+    // Stored text answers at once.
+    expect((await engine.readNative('s1#0'))?.norm).toContain('alpha')
+  })
+
+  it('readNative jumps the queue, and answers undefined for a key that is not (or no longer) live', async () => {
+    const x = deferredExtract()
+    const engine = createFindEngine({ onChange: () => {}, extract: x.extract as never })
+    const pdf = fakePdf(...Array.from({ length: 6 }, (_, i) => `p${i}`))
+    const src = source('s1', pdf)
+    engine.reconcile([docOf('a', src, [0, 1, 2, 3, 4, 5])])
+    engine.activate()
+    // Two extractions are in flight; page 5 goes next, before 2, 3 and 4.
+    const read = engine.readNative('s1#5')
+    x.calls.splice(0).forEach((c) => c.resolve())
+    await flush()
+    expect(x.extract.mock.calls.map((c) => c[1]).slice(0, 3)).toEqual([0, 1, 5])
+    x.calls.splice(0).forEach((c) => c.resolve())
+    expect((await read)?.norm).toContain('p5')
+    await expect(engine.readNative('nope#0')).resolves.toBeUndefined()
+    const gone = engine.readNative('s1#4')
+    engine.reconcile([docOf('a', src, [0])])
+    await expect(gone).resolves.toBeUndefined()
+    await resolveAll(x.calls)
+  })
+
+  it('setSupplement says whether the engine holds the supplement (false for a key not live)', () => {
+    const engine = createFindEngine({ onChange: () => {}, extract: vi.fn() as never })
+    engine.reconcile([docOf('a', source('s1', fakePdf('x')), [0])])
+    const s = { mode: 'append' as const, items: [] }
+    expect(engine.setSupplement('gone#0', s)).toBe(false)
+    expect(engine.setSupplement('s1#0', s)).toBe(true)
+    expect(engine.setSupplement('s1#0', s)).toBe(true)
+    expect(engine.setSupplement('s1#0', null)).toBe(true)
+  })
+})

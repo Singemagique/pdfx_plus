@@ -10,6 +10,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   OCR_HEARTBEAT_INTERVAL_MS,
   OcrError,
+  parseFromOcr,
   type FromOcr,
   type Heartbeat,
   type PageResult
@@ -1098,6 +1099,26 @@ describe('progress, activity and heartbeat', () => {
     const act = h.parent.of('activity') as Array<{ busy: boolean; done: number; total: number }>
     expect(act[0]).toMatchObject({ busy: true, total: 40 })
     expect(act.at(-1)).toEqual({ busy: false, done: 0, total: 0, triage: false })
+  })
+
+  it('names the pages in flight on each progress event (the renderer blames them for a crash)', async () => {
+    // Page 1 never finishes rendering: it stays in flight; page 0 finishes.
+    const { port } = await start({
+      threads: 2,
+      raster: (m, t) => (m.index === 1 ? 'hang' : rendered(m, t))
+    })
+    await open(port, 's')
+    recognize(port, 'j', 's', [0, 1])
+    await settle(60)
+    // Past the 10 Hz throttle, so the event after page 0's result has gone out.
+    await new Promise((r) => setTimeout(r, 250))
+    await settle(10)
+    const progress = port.of('progress') as Array<{ inflight?: number[]; doneOrFailed: number }>
+    const last = progress.at(-1)!
+    expect(last.doneOrFailed).toBe(1)
+    expect(last.inflight).toEqual([1])
+    // Every progress event validates against the renderer's parser.
+    for (const p of progress) expect(() => parseFromOcr({ progress: p })).not.toThrow()
   })
 
   it('sums the tripwire counters of the process and of every thread, retired ones included', async () => {

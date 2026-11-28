@@ -1733,3 +1733,26 @@ body {
   color: var(--ink-faint);
   white-space: nowrap;
 }
+
+/* The export mid-job prompt's NON-modal waiting card (OcrExportPrompt): the editor and the toolbar
+   stay usable while recognition finishes, so no scrim; above the toast's row, below the dialogs. */
+.ocr-export-waiting {
+  position: fixed;
+  right: 20px;
+  bottom: 72px;
+  z-index: 45;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: min(520px, 92vw);
+  padding: 10px 12px 10px 16px;
+  border-radius: 12px;
+  font-size: 13px;
+  background: var(--overlay-strong, #1b1d23);
+  color: var(--ink, #e8e8ec);
+  color-scheme: light dark;
+  box-shadow: 0 8px 28px rgba(20, 20, 24, 0.3);
+}
+.ocr-export-waiting span {
+  flex: 1;
+}

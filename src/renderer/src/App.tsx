@@ -22,6 +22,9 @@ import { FindProvider } from './search/FindContext'
 import type { FindMatch } from './search/find-controller'
 import { FindBarHost } from './components/FindBar'
 import type { FullViewNav } from './components/full-view/use-full-view-controls'
+import { OcrExportPrompt } from './components/OcrExportPrompt'
+import { createOcrStore } from './ocr/ocr-store'
+import { createOcrFindSupply } from './ocr/ocr-find-supply'
 
 const TOAST_MS = 4000
 
@@ -139,20 +142,6 @@ export default function App(): React.JSX.Element {
     setSignOpen(false)
   }, [placing, fullView])
 
-  const {
-    exportCollection,
-    exportZip,
-    signAndExport,
-    signWithCardAndExport,
-    signWithWindowsCertAndExport
-  } = useExport(
-    docs,
-    editStore.editLayer,
-    setBusy,
-    flash,
-    editStore.signaturePlacement,
-    editStore.savedSignature
-  )
   const { addFiles, openViaDialog, addPagesToDoc, handleExternalDropFiles } = useImport(
     collection,
     editStore.loadEditState,
@@ -220,6 +209,52 @@ export default function App(): React.JSX.Element {
     onNavigate: onFindNavigate
   })
   useFindShortcuts({ controller: find, enabled: !modalOpen })
+
+  // Text recognition (DESIGN.md §3.5.2): the OCR store and its Find supply live outside React
+  // state, like the find controller, and are created once. The port is connected only when OCR is
+  // really needed (a scan, an imported image, a request); a text PDF never spawns the process.
+  const [ocrStore] = useState(() =>
+    createOcrStore({
+      port: window.api.ocr ?? null,
+      text: find.text,
+      getSettings: window.api.getSettings,
+      setSettings: window.api.setSettings
+    })
+  )
+  const [ocrSupply] = useState(() => createOcrFindSupply({ store: ocrStore, text: find.text }))
+  const { ocrSelect, selectOcr, editLayer } = editStore
+  // After useFind's own effects (declared above, so they run first): the engine knows the page
+  // keys before anything is supplied for them.
+  useEffect(() => ocrStore.reconcile(docs), [ocrStore, docs])
+  useEffect(
+    () => ocrStore.syncEdits({ ocrSelect, rotations, selectOcr }),
+    [ocrStore, ocrSelect, rotations, selectOcr]
+  )
+  useEffect(() => ocrSupply.sync(docs, editLayer), [ocrSupply, docs, editLayer])
+  // The page in view is recognised first (§3.3.6): the full-view page, else the selected one.
+  const focusPageId = fullView ? fullViewState.hiddenPageId : (collection.selected?.pageId ?? null)
+  useEffect(() => {
+    const page = focusPageId
+      ? docs.flatMap((d) => d.pages).find((p) => p.id === focusPageId)
+      : undefined
+    ocrStore.setFocus(page ? makePageKey(page.source.id, page.pageIndex) : null)
+  }, [ocrStore, docs, focusPageId])
+
+  const {
+    exportCollection,
+    exportZip,
+    signAndExport,
+    signWithCardAndExport,
+    signWithWindowsCertAndExport
+  } = useExport(
+    docs,
+    editLayer,
+    setBusy,
+    flash,
+    editStore.signaturePlacement,
+    editStore.savedSignature,
+    ocrStore.exportSource
+  )
 
   const onScaleChange = useCallback((next: number) => setScale(next), [])
   const onSettle = useCallback(() => setRenderVersion((v) => v + 1), [])
@@ -361,6 +396,8 @@ export default function App(): React.JSX.Element {
           )}
 
           <FindBarHost controller={find} />
+
+          <OcrExportPrompt store={ocrStore} />
 
           {toast && <div className="toast">{toast}</div>}
         </div>

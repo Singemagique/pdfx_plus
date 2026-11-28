@@ -79,9 +79,23 @@ export interface FindEngine {
    * Set (or clear, with null) a page key's recognised text. Ignored for a key that is not live
    * (a late result for a removed page); dropped by reconcile when its key goes, so the supplier
    * re-supplies a key that comes back. Searchable once the key's native text is indexed (its
-   * viewport transform comes from there).
+   * viewport transform comes from there). Returns whether the engine now holds `supplement` for
+   * the key (false for a key that is not live), so a supplier knows what it must send again.
    */
-  setSupplement(pageKey: string, supplement: PageSupplement | null): void
+  setSupplement(pageKey: string, supplement: PageSupplement | null): boolean
+  /**
+   * The NATIVE text of a live page key (no supplement, no redaction filter), extracting it now if
+   * it is not indexed yet, through the same write-once store Find uses (DESIGN.md §3.4.1 Stage 0:
+   * "Find never extracts them twice"). Works before `activate()`. Undefined for a key that is not
+   * live, or that stopped being live before its text arrived.
+   */
+  readNative(pageKey: string): Promise<PageText | undefined>
+  /**
+   * Called with every native page text the engine stores, whoever asked for it (Find's full
+   * extraction or `readNative`): the OCR store's Stage 0 / full-extraction candidate trigger.
+   * Returns an unsubscribe function.
+   */
+  onNativeText(listener: (pageKey: string, text: PageText) => void): () => void
   /**
    * Set (or clear, with null or []) the redaction boxes of a page key, in page px (the frame
    * textMatchRects returns). Kept until cleared, whether or not the key is live: forgetting a box
@@ -158,12 +172,36 @@ export function createFindEngine({
     derived.delete(key)
   }
 
+  /** readNative callers waiting for a key's native text. */
+  const waiters = new Map<string, Array<(t: PageText | undefined) => void>>()
+  const nativeListeners = new Set<(pageKey: string, text: PageText) => void>()
+
+  /** Answer every readNative waiting on `key` with what the engine now holds for it. */
+  const wake = (key: string): void => {
+    const list = waiters.get(key)
+    if (!list) return
+    waiters.delete(key)
+    const t = texts.get(key)
+    for (const w of list) w(t)
+  }
+
   const store = (key: string, result: PageText): boolean => {
     // A stale completion for a source that has since been removed must not resurrect it. A key
     // that was removed and re-added meanwhile is fine: sources are immutable, so its text is too.
-    if (!live.has(key) || texts.has(key)) return false
+    if (!live.has(key) || texts.has(key)) {
+      wake(key)
+      return false
+    }
     texts.set(key, result)
     invalidate(key)
+    wake(key)
+    for (const l of [...nativeListeners]) {
+      try {
+        l(key, result)
+      } catch (err) {
+        console.error(err)
+      }
+    }
     return true
   }
 
@@ -191,15 +229,37 @@ export function createFindEngine({
     return pt
   }
 
-  function setSupplement(key: string, s: PageSupplement | null): void {
+  function setSupplement(key: string, s: PageSupplement | null): boolean {
     if (s === null) {
-      if (!supplements.delete(key)) return
+      if (!supplements.delete(key)) return true
     } else {
-      if (!live.has(key) || supplements.get(key) === s) return
+      if (!live.has(key)) return false
+      if (supplements.get(key) === s) return true
       supplements.set(key, s)
     }
     invalidate(key)
     onChange()
+    return true
+  }
+
+  function readNative(key: string): Promise<PageText | undefined> {
+    const known = texts.get(key)
+    if (known) return Promise.resolve(known)
+    if (!live.has(key)) return Promise.resolve(undefined)
+    const p = new Promise<PageText | undefined>((resolve) => {
+      const list = waiters.get(key)
+      if (list) list.push(resolve)
+      else waiters.set(key, [resolve])
+    })
+    // To the front of the queue (it is wanted now), unless an extraction is already outstanding.
+    if (!outstanding.has(key)) {
+      const at = queue.indexOf(key)
+      if (at >= 0) queue.splice(at, 1)
+      queue.unshift(key)
+      queued.add(key)
+      pump()
+    }
+    return p
   }
 
   const sameRects = (a: readonly PageRect[], b: readonly PageRect[]): boolean =>
@@ -339,6 +399,8 @@ export function createFindEngine({
         dropped = true
       }
     }
+    // A readNative for a page that went away answers undefined; one still live keeps waiting.
+    for (const key of [...waiters.keys()]) if (!live.has(key)) wake(key)
     if (active) for (const key of live.keys()) enqueue(key)
     pump()
     if (dropped) onChange()
@@ -441,6 +503,13 @@ export function createFindEngine({
     reconcile,
     setOverlays,
     setSupplement,
+    readNative,
+    onNativeText(listener) {
+      nativeListeners.add(listener)
+      return () => {
+        nativeListeners.delete(listener)
+      }
+    },
     setRedactions,
     search,
     progress() {

@@ -15,7 +15,7 @@ import {
   skippedNotice,
   expandDropPaths
 } from './file-intake'
-import { clipboardFilePaths } from './clipboard'
+import { clipboardFilePaths, writeClipboardText } from './clipboard'
 import { readResource } from './resource'
 import { getMainWindow, setRendererReady, sendOpenPaths } from './window'
 import { SettingsStore, type Settings } from './settings'
@@ -107,6 +107,9 @@ export function registerIpc(getPending: () => string[], clearPending: () => void
   })
 
   ipcMain.handle('pdfx:clipboard-clear', () => clipboard.clear())
+
+  // Copy Page Text (DESIGN.md §3.6.3): plain text only, at most 16 MB (clipboard.ts).
+  ipcMain.handle('pdfx:clipboard-write-text', (_event, text: unknown) => writeClipboardText(text))
 
   ipcMain.handle(
     'pdfx:expand-drop-paths',
