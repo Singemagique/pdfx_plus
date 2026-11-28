@@ -25,6 +25,7 @@ export default defineConfig({
         test: {
           name: 'node',
           environment: 'node',
+          // Covers src/shared/**/*.node.test.ts too (the DOM-free modules shared by every process).
           include: ['src/**/*.node.test.ts']
         }
       },
