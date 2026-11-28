@@ -2270,12 +2270,32 @@ button.ocr-chip:hover {
   color: var(--ink-faint);
 }
 
-/* PR9: a language option's name, its CJK note and its download size and host. */
+/* PR9: with the Download group (31 languages) the list gets room for seven or eight rows, kept
+   short enough that the dialog still fits a 1080p window without its own scrollbar (which would
+   narrow the rows and wrap the names). */
+.ocr-picker-list.ocr-picker-list-tall {
+  max-height: min(32vh, 300px);
+}
+
+/* A language option: name and download size/host on one line, the CJK note under them. */
 .ocr-picker-list button[role='option'] {
   display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+/* When the name and the size/host don't fit side by side (a narrow dialog), the size/host moves
+   under the name rather than the name wrapping. */
+.ocr-picker-row {
+  display: flex;
+  flex-wrap: wrap;
   justify-content: space-between;
   align-items: baseline;
-  gap: 10px;
+  gap: 1px 10px;
+}
+
+.ocr-picker-detail {
+  margin-left: auto;
 }
 
 .ocr-picker-note,
@@ -2288,6 +2308,49 @@ button.ocr-chip:hover {
   flex: none;
   white-space: nowrap;
   font-variant-numeric: tabular-nums;
+}
+
+/* A chosen language that isn't installed: marked, with its own [Download]. */
+.ocr-lang-chip.ocr-lang-chip-missing {
+  background: rgba(255, 196, 0, 0.12);
+  border-color: rgba(255, 196, 0, 0.55);
+}
+
+.ocr-lang-chip-note {
+  color: var(--ink-soft);
+}
+
+.ocr-lang-chip .ocr-lang-chip-download {
+  margin-left: 2px;
+  font-size: 12px;
+}
+
+.ocr-lang-missing {
+  color: var(--ink-soft);
+}
+
+/* The manual route in a download prompt: the file's address, Copy link, Install from file…. */
+.ocr-lang-manual {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.ocr-lang-url {
+  display: block;
+  padding: 6px 8px;
+  border: 1px solid var(--hairline);
+  border-radius: 6px;
+  background: var(--group-bg);
+  font-size: 11px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+  user-select: all;
+}
+
+.ocr-lang-manual-actions {
+  display: flex;
+  gap: 14px;
 }
 
 .ocr-picker-footer {

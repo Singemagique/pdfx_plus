@@ -178,6 +178,9 @@ async function main() {
     languages
   }
   const text = JSON.stringify(out, null, 2) + '\n'
+  // lang-manifest.node.test.ts pins this digest (LANGUAGES_SHA256): a regenerated catalogue ships
+  // only with a deliberate update there too.
+  console.log(`languages digest: ${sha256(JSON.stringify(languages))}`)
   if (check) {
     const now = JSON.stringify({ ...out, optionalMirrors: [] })
     const was = JSON.stringify({ ...previous, optionalMirrors: [] })

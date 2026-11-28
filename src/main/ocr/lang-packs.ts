@@ -18,7 +18,7 @@
 // - The utility process gets only `paths()` from here (main → init / `languages`), and checks every
 //   file against the same compiled hashes again before any thread sees it.
 
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { mkdir, open, readdir, readFile, rename, rm, stat, type FileHandle } from 'node:fs/promises'
 import { basename, extname, join } from 'node:path'
 import { gunzipSync } from 'node:zlib'
@@ -74,11 +74,21 @@ interface Installed {
 interface Active {
   ctrl: AbortController
   received: number
+  /** What callers get (an install that superseded the download reports as installed). */
   promise: Promise<LangDownloadResult>
+  /** The transfer itself; settles once its file handle is closed and its .part is gone. */
+  inner: Promise<LangDownloadResult>
   timedOut: boolean
+  /** Stopped for good (cancel, or an Install from file… of the same language took over). */
+  stopped: boolean
+  /** Install from file… of the same language took over: its outcome is the download's. */
+  superseded: Promise<LangInstallResult> | null
   proxyAuth: boolean
   url: string
 }
+
+/** A writer's own temporary file (never shared: `wx` refuses one that exists). */
+const partFor = (final: string): string => `${final}.${randomUUID()}.part`
 
 const sha256 = (b: Uint8Array): string => createHash('sha256').update(b).digest('hex')
 
@@ -113,6 +123,8 @@ export class LangPacks {
   private readonly mirrors: readonly string[]
   private readonly installed = new Map<string, Installed>()
   private readonly active = new Map<string, Active>()
+  /** Install from file… writes in progress, per language (one writer per language at a time). */
+  private readonly installing = new Map<string, Promise<LangInstallResult>>()
   private ready: Promise<void> | null = null
 
   constructor(private readonly o: LangPacksOptions) {
@@ -175,6 +187,7 @@ export class LangPacks {
         script: l.script as LangScript,
         bytes: l.bytes,
         host: hostOf(this.urlsFor(l)[0] ?? ''),
+        url: this.urlsFor(l)[0] ?? '',
         state: this.installed.has(l.code) ? 'installed' : a ? 'downloading' : 'available'
       }
       if (a && !this.installed.has(l.code)) info.received = a.received
@@ -191,7 +204,8 @@ export class LangPacks {
 
   /**
    * Download one catalogue language (the renderer asked the user first; nothing here ever runs
-   * on its own). Resolves, never rejects. A second call while one runs joins it.
+   * on its own). Resolves, never rejects. A second call while one runs joins it; a call while an
+   * Install from file… of the same language is writing waits for it (and is then usually done).
    */
   download(code: string): Promise<LangDownloadResult> {
     const entry = this.catalogue.get(code)
@@ -199,26 +213,44 @@ export class LangPacks {
     if (this.installed.has(code)) return Promise.resolve({ ok: true, code })
     const running = this.active.get(code)
     if (running) return running.promise
+    const installing = this.installing.get(code)
+    if (installing) return installing.then(() => this.download(code))
     const a: Active = {
       ctrl: new AbortController(),
       received: 0,
       promise: Promise.resolve({ ok: false, error: 'cancelled' }),
+      inner: Promise.resolve({ ok: false, error: 'cancelled' }),
       timedOut: false,
+      stopped: false,
+      superseded: null,
       proxyAuth: false,
       url: ''
     }
     this.active.set(code, a)
-    a.promise = this.run(entry, a).finally(() => {
-      this.active.delete(code)
-      this.o.onProgress?.({ code, received: a.received, total: entry.bytes, done: true })
-    })
+    a.inner = this.run(entry, a)
+    a.promise = a.inner
+      .then(async (r): Promise<LangDownloadResult> => {
+        // Install from file… of this language stopped the transfer and installed it instead.
+        if (!r.ok && a.superseded) {
+          const ir = await a.superseded
+          if (ir.ok) return { ok: true, code }
+        }
+        return r
+      })
+      .finally(() => {
+        if (this.active.get(code) === a) this.active.delete(code)
+        this.o.onProgress?.({ code, received: a.received, total: entry.bytes, done: true })
+      })
     this.o.onProgress?.({ code, received: 0, total: entry.bytes })
     return a.promise
   }
 
   /** Stop a download (its .part is deleted). */
   cancel(code: string): void {
-    this.active.get(code)?.ctrl.abort()
+    const a = this.active.get(code)
+    if (!a) return
+    a.stopped = true
+    a.ctrl.abort()
   }
 
   /**
@@ -246,13 +278,15 @@ export class LangPacks {
     const urls = this.urlsFor(entry)
     let last: LangDownloadError = 'offline'
     for (const url of urls) {
-      if (a.ctrl.signal.aborted && !a.timedOut) return { ok: false, error: 'cancelled' }
+      if (a.stopped || (a.ctrl.signal.aborted && !a.timedOut))
+        return { ok: false, error: 'cancelled' }
       const r = await this.fetchOne(entry, a, url)
       if (r.ok) return r
       last = r.error
       // A wrong file from one host may be a bad mirror; anything the user did, or that the next
       // host can't fix (the proxy, the disk), ends the download.
       if (r.error === 'cancelled' || r.error === 'proxy-auth' || r.error === 'disk') return r
+      if (a.stopped) return { ok: false, error: 'cancelled' }
       a.ctrl = new AbortController()
       a.timedOut = false
     }
@@ -267,7 +301,7 @@ export class LangPacks {
     const connectMs = this.o.connectTimeoutMs ?? CONNECT_TIMEOUT_MS
     const idleMs = this.o.idleTimeoutMs ?? IDLE_TIMEOUT_MS
     const final = join(this.o.dir, `${entry.code}.traineddata.gz`)
-    const part = `${final}.part`
+    const part = partFor(final)
     const signal = a.ctrl.signal
     let timer: ReturnType<typeof setTimeout> | undefined
     const arm = (ms: number): void => {
@@ -297,7 +331,7 @@ export class LangPacks {
       arm(idleMs)
       try {
         await mkdir(this.o.dir, { recursive: true })
-        fh = await open(part, 'w', 0o600)
+        fh = await open(part, 'wx', 0o600)
       } catch {
         throw new DownloadFailure('disk')
       }
@@ -463,14 +497,42 @@ export class LangPacks {
     }
     const m = this.matchBytes(bytes)
     if (!m) return { ok: false, error: 'unknown-file' }
+    // One writer per language: wait for another install of it, then take over from a download of
+    // it (stopped, its file closed and deleted before this one writes).
+    for (let prev = this.installing.get(m.code); prev; prev = this.installing.get(m.code))
+      await prev
+    const a = this.active.get(m.code)
+    const run = (async (): Promise<LangInstallResult> => {
+      if (a) {
+        a.stopped = true
+        a.ctrl.abort()
+        await a.inner
+      }
+      return this.writeInstall(m)
+    })()
+    // The stopped download reports this install's outcome (installed → ok).
+    if (a) a.superseded = run
+    this.installing.set(m.code, run)
+    try {
+      return await run
+    } finally {
+      if (this.installing.get(m.code) === run) this.installing.delete(m.code)
+    }
+  }
+
+  private async writeInstall(m: {
+    code: string
+    form: 'gz' | 'raw'
+    bytes: Uint8Array
+  }): Promise<LangInstallResult> {
     const name = m.form === 'gz' ? `${m.code}.traineddata.gz` : `${m.code}.traineddata`
     const other = m.form === 'gz' ? `${m.code}.traineddata` : `${m.code}.traineddata.gz`
     const final = join(this.o.dir, name)
-    const part = `${final}.part`
+    const part = partFor(final)
     let fh: FileHandle | null = null
     try {
       await mkdir(this.o.dir, { recursive: true })
-      fh = await open(part, 'w', 0o600)
+      fh = await open(part, 'wx', 0o600)
       await fh.writeFile(m.bytes)
       await fh.sync()
       await fh.close()

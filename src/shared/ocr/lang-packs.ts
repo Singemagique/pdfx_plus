@@ -31,6 +31,11 @@ export interface LangPackInfo {
   /** Where a download comes from ("cdn.jsdelivr.net"): the consent names it. */
   host: string
   /**
+   * The catalogue's download URL (from main's compiled catalogue). Shown, never fetched by the
+   * renderer: where to get the file on another computer when this one can't download it.
+   */
+  url: string
+  /**
    * installed: on this computer (downloaded, installed from a file, or provisioned by an admin in
    * resources/ocr/tessdata); available: can be downloaded; downloading: in progress.
    */
@@ -83,6 +88,9 @@ export type LangInstallResult =
   | { ok: false; error: LangInstallError }
   /** The user closed the file dialog. */
   | { ok: false; error: 'cancelled' }
+
+/** The file a download installs (and the name to look for when getting it by hand). */
+export const langFileName = (code: string): string => `${code}.traineddata.gz`
 
 /** Install from file… refuses anything this size or larger (§3.2.5). */
 export const INSTALL_MAX_BYTES = 100 * 1024 * 1024

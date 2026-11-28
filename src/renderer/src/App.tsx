@@ -236,7 +236,9 @@ export default function App(): React.JSX.Element {
   )
   const [ocrSupply] = useState(() => createOcrFindSupply({ store: ocrStore, text: find.text }))
   // Downloadable languages (PR9): the list comes from main; nothing downloads without consent.
-  const [langPacks] = useState(() => createLangPacks(window.api.ocrLangs ?? null))
+  const [langPacks] = useState(() =>
+    createLangPacks(window.api.ocrLangs ?? null, (t) => window.api.writeClipboardText(t))
+  )
   const { ocrSelect, selectOcr, editLayer } = editStore
   // After useFind's own effects (declared above, so they run first): the engine knows the page
   // keys before anything is supplied for them.

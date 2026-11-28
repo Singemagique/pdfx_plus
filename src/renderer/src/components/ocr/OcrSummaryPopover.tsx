@@ -107,6 +107,7 @@ export function OcrSummaryPopover({ anchor, docId, onClose }: Props): React.JSX.
         {prompt && (
           <div className="ocr-summary-prompt">
             <LangDownloadPrompt
+              key={prompt.code}
               info={prompt}
               onCancel={() => setAsking(null)}
               onInstalled={(code) => {

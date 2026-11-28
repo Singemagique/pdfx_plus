@@ -17,10 +17,23 @@ import {
   truncateSync,
   writeFileSync
 } from 'node:fs'
+import * as fsp from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import * as zlib from 'node:zlib'
 import { gzipSync } from 'node:zlib'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+
+// The same functions, watched: which files main reads, when it renames, and how it gunzips (the
+// caps and the fsync are rules no outcome shows on its own).
+vi.mock('node:zlib', async (orig) => {
+  const a = await orig<typeof import('node:zlib')>()
+  return { ...a, gunzipSync: vi.fn(a.gunzipSync) }
+})
+vi.mock('node:fs/promises', async (orig) => {
+  const a = await orig<typeof import('node:fs/promises')>()
+  return { ...a, readFile: vi.fn(a.readFile), rename: vi.fn(a.rename) }
+})
 
 import { INSTALL_MAX_BYTES, type LangProgress } from '../../shared/ocr/lang-packs'
 import {
@@ -71,6 +84,9 @@ let dirs: string[] = []
 afterEach(() => {
   for (const d of dirs) rmSync(d, { recursive: true, force: true })
   dirs = []
+  vi.mocked(zlib.gunzipSync).mockClear()
+  vi.mocked(fsp.readFile).mockClear()
+  vi.mocked(fsp.rename).mockClear()
 })
 function tmp(): string {
   const d = mkdtempSync(join(tmpdir(), 'pdfx-langs-'))
@@ -148,6 +164,34 @@ async function until(cond: () => boolean, ms = 4000): Promise<void> {
     if (Date.now() > end) throw new Error('condition not reached')
     await new Promise((res) => setTimeout(res, 5))
   }
+}
+
+/** A writer's own temporary file: `<code>.traineddata.gz.<uuid>.part`. */
+const PART = /^aaa\.traineddata\.gz\.[0-9a-f-]{36}\.part$/
+
+/** FileHandle's prototype (the class is not exported), to watch `sync`. */
+async function fileHandleProto(): Promise<{ sync: () => Promise<void> }> {
+  const f = join(tmp(), 'probe')
+  writeFileSync(f, '')
+  const fh = await fsp.open(f, 'r')
+  const proto = Object.getPrototypeOf(fh) as { sync: () => Promise<void> }
+  await fh.close()
+  return proto
+}
+
+/** Some fsync ran before the rename onto `final` (the directory's own fsync comes after). */
+function expectSyncedBeforeRename(
+  syncSpy: { mock: { invocationCallOrder: number[] } },
+  final: string
+): void {
+  const rename = vi.mocked(fsp.rename)
+  const at = rename.mock.calls.findIndex((c) => c[1] === final)
+  expect(at, 'renamed into place').toBeGreaterThanOrEqual(0)
+  const renameOrder = rename.mock.invocationCallOrder[at]
+  expect(
+    syncSpy.mock.invocationCallOrder.some((o) => o < renameOrder),
+    'fsync before rename'
+  ).toBe(true)
 }
 
 describe('download', () => {
@@ -244,9 +288,66 @@ describe('download', () => {
     const r = p.download('aaa')
     // The first chunk was written to the .part, then nothing more arrives.
     await until(() => p.list().find((l) => l.code === 'aaa')?.received === 1000)
-    expect(files(dir)).toEqual(['aaa.traineddata.gz.part'])
+    expect(files(dir)).toEqual([expect.stringMatching(PART)])
     expect(await r).toEqual({ ok: false, error: 'timeout' })
     expect(files(dir)).toEqual([])
+  })
+
+  it('the idle timeout restarts with every chunk: a slow, steady body finishes', async () => {
+    // 8 chunks 75 ms apart: 600 ms in all, twice the idle timeout, every gap well under it.
+    const chunks = split(AAA.gz, 8)
+    let i = 0
+    const slow = new ReadableStream<Uint8Array>({
+      async pull(c) {
+        await new Promise((res) => setTimeout(res, 75))
+        if (i < chunks.length) c.enqueue(chunks[i++])
+        else c.close()
+      }
+    })
+    const { p, dir } = packs(async () => ok(slow), { idleTimeoutMs: 300 })
+    const t0 = Date.now()
+    expect(await p.download('aaa')).toEqual({ ok: true, code: 'aaa' })
+    expect(Date.now() - t0).toBeGreaterThan(300)
+    expect(sha(readFileSync(join(dir, 'aaa.traineddata.gz')))).toBe(AAA.entry.sha256Gz)
+  })
+
+  it('a challenge the login hook saw fails as proxy-auth even if a response follows', async () => {
+    let pk!: LangPacks
+    const { p, dir } = packs(async (url) => {
+      // Chromium called app 'login' for this request (PDFx cancels), then answered anyway.
+      expect(pk.proxyAuthRequested(url)).toBe(true)
+      return ok(body([AAA.gz]))
+    })
+    pk = p
+    expect(await p.download('aaa')).toEqual({ ok: false, error: 'proxy-auth' })
+    expect(files(dir)).toEqual([])
+    expect(p.paths()).toEqual({})
+  })
+
+  it('a proxy sign-in ends the download: the mirror (same proxy) is not tried', async () => {
+    const urls: string[] = []
+    const { p } = packs(
+      async (url) => {
+        urls.push(url)
+        if (url.includes('data.example')) return { status: 407, ok: false, body: null }
+        return ok(body([BBB.gz]))
+      },
+      { mirrors: ['https://mirror.example/ocr-data-1/{code}.traineddata.gz'] }
+    )
+    expect(await p.download('bbb')).toEqual({ ok: false, error: 'proxy-auth' })
+    expect(urls).toEqual(['https://data.example/bbb.traineddata.gz'])
+  })
+
+  it('fsyncs the file before the rename that installs it', async () => {
+    const proto = await fileHandleProto()
+    const syncSpy = vi.spyOn(proto, 'sync')
+    try {
+      const { p, dir } = packs(async () => ok(body(split(AAA.gz))))
+      expect(await p.download('aaa')).toEqual({ ok: true, code: 'aaa' })
+      expectSyncedBeforeRename(syncSpy, join(dir, 'aaa.traineddata.gz'))
+    } finally {
+      syncSpy.mockRestore()
+    }
   })
 
   it('cancel stops it and deletes the .part', async () => {
@@ -334,6 +435,23 @@ describe('startup', () => {
     expect(p.paths()).toEqual({ aaa: join(admin, 'aaa.traineddata') })
     expect(p.list().find((l) => l.code === 'bbb')?.state).toBe('available')
   })
+
+  it('a startup file of 100 MB or more is ignored without being read', async () => {
+    const admin = tmp()
+    const big = join(admin, 'aaa.traineddata')
+    writeFileSync(big, '')
+    truncateSync(big, INSTALL_MAX_BYTES)
+    const { p, dir } = packs(async () => ok(body([])), { adminDir: admin })
+    mkdirSync(dir, { recursive: true })
+    const bigToo = join(dir, 'bbb.traineddata.gz')
+    writeFileSync(bigToo, '')
+    truncateSync(bigToo, INSTALL_MAX_BYTES + 1)
+    await p.init()
+    expect(p.paths()).toEqual({})
+    const read = vi.mocked(fsp.readFile).mock.calls.map((c) => String(c[0]))
+    expect(read).not.toContain(big)
+    expect(read).not.toContain(bigToo)
+  })
 })
 
 describe('Install from file…', () => {
@@ -404,6 +522,119 @@ describe('Install from file…', () => {
     await p.installFile(src('a.traineddata', AAA.raw))
     await p.installFile(src('a.gz', AAA.gz))
     expect(files(dir)).toEqual(['aaa.traineddata.gz'])
+  })
+
+  it('gunzipping a picked file stops past the largest raw size the catalogue knows', async () => {
+    // A .gz that inflates to more than any catalogue language (a few KB on disk).
+    const maxRaw = Math.max(AAA.entry.rawBytes, BBB.entry.rawBytes)
+    const bomb = gzipSync(new Uint8Array(maxRaw + 1_000_000))
+    expect(bomb.length).toBeLessThan(10_000)
+    const { p, dir } = packs(async () => ok(body([])))
+    const gunzip = vi.mocked(zlib.gunzipSync)
+    gunzip.mockClear()
+    expect(await p.installFile(src('bomb.gz', bomb))).toEqual({ ok: false, error: 'unknown-file' })
+    expect(gunzip).toHaveBeenCalledTimes(1)
+    const opts = gunzip.mock.calls[0][1] as zlib.ZlibOptions | undefined
+    expect(opts?.maxOutputLength).toBeLessThanOrEqual(maxRaw + 1)
+    // Refused because the cap stopped it, not after inflating the whole thing.
+    expect(gunzip.mock.results[0].type).toBe('throw')
+    expect(gunzip.mock.results[0].value).toBeInstanceOf(RangeError)
+    expect(files(dir)).toEqual([])
+  })
+
+  it('fsyncs the installed file before its rename', async () => {
+    const proto = await fileHandleProto()
+    const syncSpy = vi.spyOn(proto, 'sync')
+    try {
+      const { p, dir } = packs(async () => ok(body([])))
+      expect(await p.installFile(src('x.gz', AAA.gz))).toEqual({ ok: true, code: 'aaa' })
+      expectSyncedBeforeRename(syncSpy, join(dir, 'aaa.traineddata.gz'))
+    } finally {
+      syncSpy.mockRestore()
+    }
+  })
+
+  it('takes over from a running download of the same language: only verified bytes land', async () => {
+    // The download has half the file when the user installs the right file by hand; the rest of
+    // the network body is wrong. The transfer stops, and its bytes never reach the installed file.
+    const half = AAA.gz.length >> 1
+    const badTail = AAA.gz.slice(half)
+    badTail[10] ^= 0xff
+    let release!: () => void
+    const gate = new Promise<void>((res) => (release = res))
+    let sent = 0
+    const stream = new ReadableStream<Uint8Array>({
+      async pull(c) {
+        if (sent === 0) c.enqueue(AAA.gz.slice(0, half))
+        else if (sent === 1) {
+          await gate
+          c.enqueue(badTail)
+        } else c.close()
+        sent++
+      }
+    })
+    let fetches = 0
+    const { p, dir } = packs(async () => {
+      fetches++
+      return ok(stream)
+    })
+    const d = p.download('aaa')
+    await until(() => p.list().find((l) => l.code === 'aaa')?.received === half)
+    // Installed while the transfer is still open (the order the picker allows); then the wrong
+    // tail arrives.
+    expect(await p.installFile(src('picked.gz', AAA.gz))).toEqual({ ok: true, code: 'aaa' })
+    release()
+    // The download reports what happened to the language: installed.
+    expect(await d).toEqual({ ok: true, code: 'aaa' })
+    expect(files(dir)).toEqual(['aaa.traineddata.gz'])
+    expect(sha(readFileSync(join(dir, 'aaa.traineddata.gz')))).toBe(AAA.entry.sha256Gz)
+    expect(p.paths()).toEqual({ aaa: join(dir, 'aaa.traineddata.gz') })
+    expect(p.list().find((l) => l.code === 'aaa')?.state).toBe('installed')
+    // Installed: nothing more is fetched.
+    expect(await p.download('aaa')).toEqual({ ok: true, code: 'aaa' })
+    expect(fetches).toBe(1)
+  })
+
+  it('a download asked for while an install is writing that language waits, and fetches nothing', async () => {
+    let fetches = 0
+    const { p, dir } = packs(async () => {
+      fetches++
+      return ok(body(split(AAA.gz)))
+    })
+    // Hold the install's rename: it is writing when the download is asked for.
+    const real = (await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises'))
+      .rename
+    let release!: () => void
+    const gate = new Promise<void>((res) => (release = res))
+    vi.mocked(fsp.rename).mockImplementationOnce(async (a, b) => {
+      await gate
+      return real(a, b)
+    })
+    const i = p.installFile(src('picked.traineddata', AAA.raw))
+    await until(() => vi.mocked(fsp.rename).mock.calls.length > 0)
+    const d = p.download('aaa')
+    await new Promise((res) => setTimeout(res, 30))
+    expect(fetches).toBe(0)
+    release()
+    expect(await i).toEqual({ ok: true, code: 'aaa' })
+    expect(await d).toEqual({ ok: true, code: 'aaa' })
+    expect(fetches).toBe(0)
+    expect(files(dir)).toEqual(['aaa.traineddata'])
+  })
+
+  it('a download asked for while an install of that language is under way waits for it', async () => {
+    let fetches = 0
+    const { p, dir } = packs((_url, { signal }) => {
+      fetches++
+      return abortable(signal, new Promise(() => {}))
+    })
+    const i = p.installFile(src('picked.traineddata', AAA.raw))
+    const d = p.download('aaa')
+    expect(await i).toEqual({ ok: true, code: 'aaa' })
+    expect(await d).toEqual({ ok: true, code: 'aaa' })
+    expect(files(dir)).toEqual(['aaa.traineddata'])
+    expect(sha(readFileSync(join(dir, 'aaa.traineddata')))).toBe(AAA.entry.sha256Raw)
+    expect(fetches).toBeLessThanOrEqual(1)
   })
 })
 

@@ -202,6 +202,11 @@ describe('raw .traineddata files and catalogue languages', () => {
     const sab = await loadTraineddataGz('fra', join(d, 'fra.traineddata'))
     expect(sab.byteLength).toBe(ENGINE_DATA.fra.rawBytes)
     expect(sha256Hex(gunzipTraineddata('fra', new Uint8Array(sab)))).toBe(ENGINE_DATA.fra.rawSha256)
+    // One identity per language whichever form is on disk: the raw file stamps the .gz hash.
+    const loaded = await loadLanguage('fra', join(d, 'fra.traineddata'))
+    expect(loaded.data.byteLength).toBe(ENGINE_DATA.fra.rawBytes)
+    expect(loaded.sha256).toBe(ENGINE_DATA.fra.sha256)
+    expect(loaded.sha256).not.toBe(ENGINE_DATA.fra.rawSha256)
     const bad = raw.slice()
     bad[bad.length >> 1] ^= 1
     writeFileSync(join(d, 'fra.traineddata'), bad)

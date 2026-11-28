@@ -26,6 +26,7 @@ import {
   langMatches,
   langName,
   langOption,
+  notInstalledCopy,
   pagesWord,
   type LangInfo,
   type LangOption
@@ -275,15 +276,30 @@ export function RecognizeDialog({
   })
 
   const closePicker = (): void => {
+    consentFromChip.current = false
     setPicking(false)
     setQuery('')
     setConsent(null)
     setInstallNote(null)
     refocus.current = { kind: 'add' }
   }
+  /** The consent prompt was opened from a chip's [Download] (not from the picker's list). */
+  const consentFromChip = useRef(false)
   const closeConsent = (): void => {
+    if (consentFromChip.current) {
+      consentFromChip.current = false
+      closePicker()
+      return
+    }
     setConsent(null)
     queueMicrotask(() => searchRef.current?.focus())
+  }
+  const downloadFromChip = (code: string): void => {
+    consentFromChip.current = true
+    setQuery('')
+    setInstallNote(null)
+    setPicking(true)
+    setConsent(code)
   }
   escape.current = () => (consent ? closeConsent() : picking ? closePicker() : onClose())
 
@@ -317,7 +333,7 @@ export function RecognizeDialog({
   const packOptions = [...packSnap.list]
     .filter((p) => !isIncluded(p.code))
     .sort((a, b) => a.name.localeCompare(b.name, 'en'))
-    .map(langOption)
+    .map((p) => langOption(p, packSnap.progress.get(p.code)))
   const installedOptions: LangOption[] = [
     ...packOptions.filter((o) => packs?.installed().has(o.code)),
     ...installed
@@ -336,6 +352,16 @@ export function RecognizeDialog({
     closePicker()
   }
   const consentInfo = consent ? packSnap.list.find((p) => p.code === consent) : undefined
+  /**
+   * Chosen languages this computer doesn't have (remembered from another run, a file deleted or
+   * refused at startup): marked on their chips, with [Download], before anything is recognized.
+   */
+  const notInstalled =
+    packs && packSnap.loaded
+      ? langs.filter(
+          (c) => !isIncluded(c) && !packs.installed().has(c) && !installed.some((l) => l.code === c)
+        )
+      : []
   const installFromFile = async (): Promise<void> => {
     if (!packs) return
     setInstallNote(null)
@@ -351,11 +377,11 @@ export function RecognizeDialog({
     const o = l as Partial<LangOption>
     return (
       <button key={l.code} role="option" aria-selected={false} onClick={onPick}>
-        <span className="ocr-picker-name">
-          {l.label}
-          {o.cjk && <span className="ocr-picker-note"> {CJK_NOTE}</span>}
+        <span className="ocr-picker-row">
+          <span className="ocr-picker-name">{l.label}</span>
+          {o.detail && <span className="ocr-picker-detail">{o.detail}</span>}
         </span>
-        {o.detail && <span className="ocr-picker-detail">{o.detail}</span>}
+        {o.cjk && <span className="ocr-picker-note">{CJK_NOTE}</span>}
       </button>
     )
   }
@@ -422,8 +448,25 @@ export function RecognizeDialog({
           <legend>Languages</legend>
           <div className="ocr-langs">
             {langs.map((code, i) => (
-              <span key={code} className="ocr-lang-chip">
+              <span
+                key={code}
+                className={`ocr-lang-chip${notInstalled.includes(code) ? ' ocr-lang-chip-missing' : ''}`}
+              >
                 {langLabel(code)}
+                {notInstalled.includes(code) && (
+                  <>
+                    <span className="ocr-lang-chip-note"> · not installed</span>
+                    {packSnap.list.some((p) => p.code === code) && (
+                      <button
+                        className="sign-link ocr-lang-chip-download"
+                        aria-label={`Download ${langName(code)} language data`}
+                        onClick={() => downloadFromChip(code)}
+                      >
+                        Download
+                      </button>
+                    )}
+                  </>
+                )}
                 <button
                   className="ocr-lang-x"
                   aria-label={`Remove ${langLabel(code)}`}
@@ -444,9 +487,15 @@ export function RecognizeDialog({
               </button>
             )}
           </div>
+          {notInstalled.length > 0 && !(picking && consentInfo) && (
+            <p className="sign-module-hint ocr-lang-missing" role="note">
+              {notInstalledCopy(notInstalled)}
+            </p>
+          )}
           {picking && consentInfo && (
             <div className="ocr-picker">
               <LangDownloadPrompt
+                key={consentInfo.code}
                 info={consentInfo}
                 onInstalled={(code) => add(code)}
                 onCancel={closeConsent}
@@ -470,7 +519,11 @@ export function RecognizeDialog({
                   }
                 }}
               />
-              <div className="ocr-picker-list" role="listbox" aria-label="Languages">
+              <div
+                className={`ocr-picker-list${downloadable.length > 0 ? ' ocr-picker-list-tall' : ''}`}
+                role="listbox"
+                aria-label="Languages"
+              >
                 {included.length > 0 && <div className="ocr-picker-group">Included</div>}
                 {included.map((l) => option(l, () => add(l.code)))}
                 {downloaded.length > 0 && <div className="ocr-picker-group">Installed</div>}

@@ -23,15 +23,20 @@ import {
   summarizeOcr,
   unavailableDetails,
   CJK_NOTE,
+  MANUAL_ROUTE_ERRORS,
+  consentCopy,
   downloadErrorCopy,
   formatSize,
   installErrorCopy,
   langName,
   langOption,
+  manualCopy,
   missingLangs,
   needsLanguageCopy,
+  notInstalledCopy,
   registerLangNames
 } from './ocr-ui'
+import type { LangDownloadError } from '../../../shared/ocr/lang-packs'
 
 const state = (s: Partial<OcrPageState> = {}): OcrPageState => ({
   pageClass: 'scanned',
@@ -346,6 +351,7 @@ describe('language packs copy (PR9)', () => {
     script: 'Cyrl' as const,
     bytes: 2_679_598,
     host: 'cdn.jsdelivr.net',
+    url: 'https://cdn.jsdelivr.net/npm/@tesseract.js-data/rus@1.0.0/4.0.0_best_int/rus.traineddata.gz',
     state: 'available' as const
   }
 
@@ -364,6 +370,8 @@ describe('language packs copy (PR9)', () => {
       detail: '2.7 MB from cdn.jsdelivr.net'
     })
     expect(langOption({ ...rus, state: 'installed' }).detail).toBeUndefined()
+    // While it downloads (from any prompt), the row says so.
+    expect(langOption(rus, { received: 268_000, total: 2_679_598 }).detail).toBe('Downloading… 10%')
     for (const script of ['Hans', 'Hant', 'Jpan', 'Kore'] as const)
       expect(langOption({ ...rus, script }).cjk).toBe(true)
     for (const script of ['Latn', 'Cyrl', 'Grek', 'Deva'] as const)
@@ -390,18 +398,59 @@ describe('language packs copy (PR9)', () => {
   })
 
   it('download and install outcomes never echo a path or a server message', () => {
-    expect(downloadErrorCopy('offline', 'Greek')).toBe(
-      'Connect to the internet once to add Greek, or choose a language that’s already installed.'
+    const ell = { code: 'ell', name: 'Greek' }
+    const copy: Record<LangDownloadError, string> = {
+      offline:
+        'Connect to the internet once to add Greek, or choose a language that’s already installed.',
+      timeout:
+        'The download of Greek language data stopped responding. Try again, or choose a language that’s already installed.',
+      // A proxy sign-in is not retried: it names the file and points to Install from file….
+      'proxy-auth':
+        'Your network’s proxy asks for a sign-in PDFx can’t give. Get ell.traineddata.gz on another computer from the address below, then use Install from file…',
+      http: 'The server couldn’t provide Greek language data right now. Try again later.',
+      verify:
+        'The downloaded Greek language data didn’t match what PDFx expects, so it was deleted. Try again.',
+      disk: 'PDFx couldn’t save Greek language data on this computer (is the disk full?).',
+      'unknown-language': 'PDFx doesn’t offer Greek language data.',
+      cancelled: 'Download stopped.'
+    }
+    for (const [e, text] of Object.entries(copy))
+      expect(downloadErrorCopy(e as LangDownloadError, ell), e).toBe(text)
+    expect([...MANUAL_ROUTE_ERRORS].sort()).toEqual(['http', 'offline', 'proxy-auth', 'timeout'])
+    expect(manualCopy(ell)).toBe(
+      'Or get ell.traineddata.gz on another computer from the address below, then use Install from file…'
     )
-    for (const e of ['timeout', 'proxy-auth', 'http', 'verify', 'disk'] as const)
-      expect(downloadErrorCopy(e, 'Greek').length).toBeGreaterThan(10)
     expect(installErrorCopy({ ok: false, error: 'cancelled' })).toBeNull()
     expect(installErrorCopy({ ok: true, code: 'rus' })).toBeNull()
     expect(installErrorCopy({ ok: false, error: 'unknown-file' })).toBe(
-      'This file isn’t one of the language files PDFx knows. PDFx 1.1.4 only installs its own language files.'
+      'This file isn’t one of the language files PDFx knows. PDFx 1.1.4 only installs its own language files. Each language has its own <code>.traineddata.gz file; when a download can’t finish, PDFx names the file and where to get it.'
     )
     expect(installErrorCopy({ ok: false, error: 'wrong-type' })).toBe(
       installErrorCopy({ ok: false, error: 'unknown-file' })
+    )
+    // In a language's prompt, the refusal names the file that language needs.
+    expect(installErrorCopy({ ok: false, error: 'unknown-file' }, ell)).toBe(
+      'This file isn’t one of the language files PDFx knows. PDFx 1.1.4 only installs its own language files. Greek needs ell.traineddata.gz, from the address above.'
+    )
+  })
+
+  it('the consent carries the CJK quality note for CJK languages only', () => {
+    const base =
+      'Download Russian language data (2.7 MB) from cdn.jsdelivr.net? It’s stored on this computer and used offline after that.'
+    expect(consentCopy(rus)).toBe(base)
+    for (const script of ['Hans', 'Hant', 'Jpan', 'Kore'] as const)
+      expect(consentCopy({ ...rus, script })).toBe(
+        `${base} Works best on printed text; photos may be less accurate.`
+      )
+  })
+
+  it('names the chosen languages that are not installed', () => {
+    registerLangNames([rus, { code: 'jpn', name: 'Japanese', nativeName: '日本語' }])
+    expect(notInstalledCopy(['rus'])).toBe(
+      'Russian language data isn’t installed yet. Download it, or remove the language, before recognizing.'
+    )
+    expect(notInstalledCopy(['rus', 'jpn'])).toBe(
+      'Russian and Japanese language data isn’t installed yet. Download it, or remove those languages, before recognizing.'
     )
   })
 })

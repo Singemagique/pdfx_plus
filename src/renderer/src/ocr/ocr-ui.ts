@@ -6,6 +6,7 @@
 
 import {
   CJK_SCRIPTS,
+  langFileName,
   type LangDownloadError,
   type LangInstallResult,
   type LangPackInfo
@@ -453,19 +454,43 @@ export interface LangOption extends LangInfo {
   detail?: string
 }
 
-export function langOption(p: LangPackInfo): LangOption {
-  const label = p.nativeName === p.name ? p.name : `${p.nativeName} — ${p.name}`
-  return {
-    code: p.code,
-    label,
-    cjk: CJK_SCRIPTS.has(p.script),
-    ...(p.state !== 'installed' ? { detail: `${formatSize(p.bytes)} from ${p.host}` } : {})
-  }
+/** "Downloading… 10%" (a picker row while that language downloads). */
+export function downloadingCopy(progress: { received: number; total: number }): string {
+  const pct = progress.total > 0 ? Math.floor((100 * progress.received) / progress.total) : 0
+  return `Downloading… ${pct}%`
 }
 
+export function langOption(
+  p: LangPackInfo,
+  progress?: { received: number; total: number }
+): LangOption {
+  const label = p.nativeName === p.name ? p.name : `${p.nativeName} — ${p.name}`
+  const detail =
+    p.state === 'installed'
+      ? undefined
+      : progress
+        ? downloadingCopy(progress)
+        : `${formatSize(p.bytes)} from ${p.host}`
+  return { code: p.code, label, cjk: CJK_SCRIPTS.has(p.script), ...(detail ? { detail } : {}) }
+}
+
+/** The CJK quality note as a sentence, for the consent (§3.2.5 "Quality labels"). */
+export const CJK_CONSENT_NOTE = 'Works best on printed text; photos may be less accurate.'
+
 /** The consent asked before any request (§3.2.5 "Consent wording"). */
-export function consentCopy(p: Pick<LangPackInfo, 'name' | 'bytes' | 'host'>): string {
-  return `Download ${p.name} language data (${formatSize(p.bytes)}) from ${p.host}? It’s stored on this computer and used offline after that.`
+export function consentCopy(
+  p: Pick<LangPackInfo, 'name' | 'bytes' | 'host'> & { script?: LangPackInfo['script'] }
+): string {
+  const base = `Download ${p.name} language data (${formatSize(p.bytes)}) from ${p.host}? It’s stored on this computer and used offline after that.`
+  return p.script && CJK_SCRIPTS.has(p.script) ? `${base} ${CJK_CONSENT_NOTE}` : base
+}
+
+/**
+ * The way round a download this computer can't make (offline, a proxy sign-in): which file, from
+ * where, and what to do with it. The address is the catalogue's (main's compiled list).
+ */
+export function manualCopy(p: Pick<LangPackInfo, 'code'>): string {
+  return `Or get ${langFileName(p.code)} on another computer from the address below, then use Install from file…`
 }
 
 /** §3.2.5 "Offline wording" / §3.8 "Errors". */
@@ -477,15 +502,31 @@ export function offlineCopy(name: string): string {
 export const INSTALL_REFUSED =
   'This file isn’t one of the language files PDFx knows. PDFx 1.1.4 only installs its own language files.'
 
+/** Install from file… refused a file, with nothing more specific to point at (the picker footer). */
+export const INSTALL_REFUSED_HINT =
+  'Each language has its own <code>.traineddata.gz file; when a download can’t finish, PDFx names the file and where to get it.'
+
+/** Download errors that get the manual route (the file, its address, Install from file…). */
+export const MANUAL_ROUTE_ERRORS: ReadonlySet<LangDownloadError> = new Set([
+  'offline',
+  'proxy-auth',
+  'timeout',
+  'http'
+])
+
 /** What a download that did not finish says (never a path, never a server message). */
-export function downloadErrorCopy(error: LangDownloadError, name: string): string {
+export function downloadErrorCopy(
+  error: LangDownloadError,
+  p: Pick<LangPackInfo, 'code' | 'name'>
+): string {
+  const name = p.name
   switch (error) {
     case 'offline':
       return offlineCopy(name)
     case 'timeout':
-      return `The download of ${name} stopped responding. Try again, or choose a language that’s already installed.`
+      return `The download of ${name} language data stopped responding. Try again, or choose a language that’s already installed.`
     case 'proxy-auth':
-      return `Your network’s proxy asks for a sign-in PDFx can’t give. Get the file on another computer, then use Install from file…`
+      return `Your network’s proxy asks for a sign-in PDFx can’t give. Get ${langFileName(p.code)} on another computer from the address below, then use Install from file…`
     case 'http':
       return `The server couldn’t provide ${name} language data right now. Try again later.`
     case 'verify':
@@ -499,13 +540,23 @@ export function downloadErrorCopy(error: LangDownloadError, name: string): strin
   }
 }
 
-/** What Install from file… says when it did not install (null: nothing to say). */
-export function installErrorCopy(r: LangInstallResult): string | null {
+/**
+ * What Install from file… says when it did not install (null: nothing to say). `forLang`: the
+ * language the user is getting (a download prompt), so a refusal names the file it needs.
+ */
+export function installErrorCopy(
+  r: LangInstallResult,
+  forLang?: Pick<LangPackInfo, 'code' | 'name'>
+): string | null {
   if (r.ok || r.error === 'cancelled') return null
-  if (r.error === 'too-large') return `${INSTALL_REFUSED} (It is 100 MB or larger.)`
   if (r.error === 'unreadable') return 'PDFx couldn’t read that file.'
   if (r.error === 'disk') return 'PDFx couldn’t save the language data on this computer.'
-  return INSTALL_REFUSED
+  const refused =
+    r.error === 'too-large' ? `${INSTALL_REFUSED} (It is 100 MB or larger.)` : INSTALL_REFUSED
+  const hint = forLang
+    ? `${forLang.name} needs ${langFileName(forLang.code)}, from the address above.`
+    : INSTALL_REFUSED_HINT
+  return `${refused} ${hint}`
 }
 
 /** The summary row for a page needing languages that aren't installed (§3.8 "Summary popover"). */
@@ -514,6 +565,14 @@ export function needsLanguageCopy(missing: readonly string[]): string {
   const list = missing.map(langName)
   const named = list.length === 1 ? list[0] : `${list.slice(0, -1).join(', ')} and ${list.at(-1)}`
   return `Needs ${named} language data`
+}
+
+/** The dialog's warning for chosen languages that are neither bundled nor installed. */
+export function notInstalledCopy(missing: readonly string[]): string {
+  const list = missing.map(langName)
+  const named = list.length === 1 ? list[0] : `${list.slice(0, -1).join(', ')} and ${list.at(-1)}`
+  const which = list.length === 1 ? 'the language' : 'those languages'
+  return `${named} language data isn’t installed yet. Download it, or remove ${which}, before recognizing.`
 }
 
 /** The page's languages that are neither bundled nor installed. */

@@ -101,6 +101,38 @@ describe('lang-host IPC', () => {
     expect(init.signal).toBeInstanceOf(AbortSignal)
   })
 
+  it('only the app window’s top frame can stop a download', async () => {
+    // A request that never answers until it is aborted.
+    h.fetch.mockImplementationOnce(
+      ((_url: string, init: { signal: AbortSignal }) =>
+        new Promise((_, reject) =>
+          init.signal.addEventListener('abort', () =>
+            reject(new DOMException('aborted', 'AbortError'))
+          )
+        )) as unknown as () => Promise<{ status: number; ok: boolean; body: null }>
+    )
+    let settled = false
+    const r = (call(LANG_CHANNELS.download, fromApp, 'ukr') as Promise<unknown>).then((x) => {
+      settled = true
+      return x
+    })
+    const state = (): string | undefined =>
+      langPacks()
+        .list()
+        .find((l) => l.code === 'ukr')?.state
+    for (let i = 0; i < 400 && h.fetch.mock.calls.length === 0; i++)
+      await new Promise((res) => setTimeout(res, 5))
+    expect(state()).toBe('downloading')
+    await call(LANG_CHANNELS.cancel, fromSubframe, 'ukr')
+    await call(LANG_CHANNELS.cancel, fromOther, 'ukr')
+    await new Promise((res) => setTimeout(res, 30))
+    expect(settled).toBe(false)
+    expect(state()).toBe('downloading')
+    await call(LANG_CHANNELS.cancel, fromApp, 'ukr')
+    expect(await r).toEqual({ ok: false, error: 'cancelled' })
+    expect(state()).toBe('available')
+  })
+
   it('Install from file… uses main’s own dialog and the chosen file only', async () => {
     expect(await call(LANG_CHANNELS.installFile, fromApp, '/renderer/path.gz')).toEqual({
       ok: false,

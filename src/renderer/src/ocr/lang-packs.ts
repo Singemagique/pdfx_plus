@@ -41,13 +41,22 @@ export interface LangPacksStore {
   cancel(code: string): void
   /** Install from file…: main shows the open dialog and checks the file. */
   installFromFile(): Promise<LangInstallResult>
+  /** Put a language's download address on the clipboard (the manual route). False: refused. */
+  copyText(text: string): Promise<boolean>
   /** Installed (downloaded, from a file, or provisioned by an admin) catalogue codes. */
   installed(): ReadonlySet<string>
   info(code: string): LangPackInfo | undefined
   dispose(): void
 }
 
-export function createLangPacks(api: LangPacksApi | null): LangPacksStore {
+/**
+ * `writeText`: `window.api.writeClipboardText` (main writes the clipboard; `navigator.clipboard`
+ * needs user activation the app can't count on).
+ */
+export function createLangPacks(
+  api: LangPacksApi | null,
+  writeText: ((text: string) => Promise<void>) | null = null
+): LangPacksStore {
   let snap: LangPacksSnapshot = {
     list: [],
     loaded: false,
@@ -133,6 +142,15 @@ export function createLangPacks(api: LangPacksApi | null): LangPacksStore {
       }
       if (r.ok) await refresh()
       return r
+    },
+    async copyText(text) {
+      if (!writeText) return false
+      try {
+        await writeText(text)
+        return true
+      } catch {
+        return false
+      }
     },
     installed: () => installedSet,
     info: (code) => snap.list.find((l) => l.code === code),
