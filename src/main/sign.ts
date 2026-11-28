@@ -76,7 +76,9 @@ async function placeAndSign(
   bundledCerts = 1
 ): Promise<Uint8Array> {
   // @signpdf/placeholder-plain parses a classic xref TABLE, so re-save without xref streams.
-  const doc = await PDFDocument.load(bytes)
+  // updateMetadata: false keeps the exported Producer (pdf-lib would overwrite it with its own, and
+  // with it the "text layer by PDFx OCR (machine-generated)" marking the signature must cover).
+  const doc = await PDFDocument.load(bytes, { updateMetadata: false })
   const flat = await doc.save({ useObjectStreams: false })
   // Size the /Contents placeholder to the largest CMS we might produce: a timestamp token + TSA cert
   // chain needs the most room; a bundled signer-cert chain (the .p12 path) also exceeds the 8192-byte

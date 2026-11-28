@@ -25,6 +25,12 @@ import {
 } from './flatten'
 import { serializeMirror, stripRedactedOverlays } from './mirror'
 import { computeIntegrity } from './canonicalize'
+import type { PackedOcrPage } from '../../../shared/ocr/types'
+import { visibleBox } from '../page-geometry'
+import { OcrFontCache } from './ocr-font'
+import { appendOcrLayer, type OcrPageSpace } from './ocr-layer'
+import { catalogLang, dropWordsOutside, ocrAllowed } from './ocr-export'
+import { markOcrDocument, readCatalogLang } from './ocr-marking'
 
 /**
  * The optional edit layer baked into pages on export (PRD §4.4). Overlays are keyed by
@@ -39,6 +45,78 @@ export interface EditLayer {
   rotations?: Map<string, number>
   /** Per-page crop rectangle (PDF points, bottom-left), keyed by page key. Applied via /CropBox. */
   crops?: Map<string, CropBox>
+  /**
+   * Recognised text per page key, baked as the invisible OCR text layer (DESIGN.md §3.7). Never set
+   * on EditProvider's layer: useExport adds it to a copy (`withOcrLayer`, ocr-export.ts).
+   */
+  ocr?: Map<string, PackedOcrPage>
+}
+
+/**
+ * The OCR layer state of ONE output document: its font (finalised once, after the last page and
+ * before computeIntegrity/save) and, per output page, what was baked there (for the marking and
+ * the catalog /Lang rule).
+ */
+interface OcrBake {
+  fonts: OcrFontCache
+  /** Engine ids of the layers written. */
+  engines: Set<string>
+  /** By output page ordinal: the primary Tesseract language of its layer (unset if none). */
+  langs: (string | undefined)[]
+}
+
+const newOcrBake = (doc: PDFDocument, edits: EditLayer | undefined): OcrBake | undefined =>
+  edits?.ocr?.size ? { fonts: new OcrFontCache(doc), engines: new Set(), langs: [] } : undefined
+
+/**
+ * The recognised page to bake for `key`, or undefined. Re-checks the export gate (ocr-export.ts
+ * `ocrAllowed`) so a layer handed over without `withOcrLayer` still never puts text on a page
+ * that has a redaction.
+ */
+function ocrPageFor(edits: EditLayer | undefined, key: string): PackedOcrPage | undefined {
+  const page = edits?.ocr?.get(key)
+  return page && edits && ocrAllowed(edits, key) ? page : undefined
+}
+
+/**
+ * Prepend `ocr` to `page` as its own tagged content stream (ocr-layer.ts `appendOcrLayer`) in the
+ * page space `space`, and record it in `bake`. Returns whether a layer was written.
+ */
+function bakeOcrLayer(
+  page: PDFPage,
+  ocr: PackedOcrPage,
+  bake: OcrBake,
+  ordinal: number,
+  space: OcrPageSpace
+): boolean {
+  if (!appendOcrLayer(page, ocr, bake.fonts, { space })) return false
+  bake.engines.add(ocr.engineId)
+  bake.langs[ordinal] = ocr.langs[0]
+  return true
+}
+
+/**
+ * Finish the OCR layer of `output`: write the font tables from the CIDs actually baked (redaction
+ * rule 5), then the machine-generated marking when any layer was written, and the catalog /Lang
+ * (§3.7.5) from the sources' own /Lang and the baked layers. Runs after the last page is baked and
+ * before computeIntegrity/save; the Producer is set here, so callers must not overwrite it later.
+ */
+function finishOcr(
+  output: PDFDocument,
+  bake: OcrBake | undefined,
+  pageCount: number,
+  sources: Iterable<PDFDocument>,
+  producer: string
+): void {
+  bake?.fonts.finalize(output)
+  if (bake?.engines.size) markOcrDocument(output, producer, bake.engines)
+  else output.setProducer(producer)
+  const langs = bake?.langs ?? []
+  const lang = catalogLang(
+    [...sources].map(readCatalogLang),
+    Array.from({ length: pageCount }, (_, i) => langs[i])
+  )
+  if (lang) output.setLanguage(lang)
 }
 
 interface Box {
@@ -108,6 +186,56 @@ export function intrinsicMatrix(
     default:
       return null
   }
+}
+
+/**
+ * The overlay frame → user space pair of a page: the view-box origin translation and, for a source
+ * /Rotate of 90/180/270, `intrinsicMatrix`. Overlays and the OCR layer both go through it.
+ */
+export function pageSpace(intrinsic: number, view0: Box): OcrPageSpace {
+  return {
+    view: { x: view0.x, y: view0.y },
+    intrinsic: intrinsicMatrix(intrinsic, view0.width, view0.height)
+  }
+}
+
+/**
+ * Draw in a page's overlay frame. Overlay coordinates are captured in the editor's VIEW-relative
+ * space (0-based over the view box, the source's intrinsic /Rotate baked in). Two transforms
+ * reconcile that with pdf-lib's user space, innermost first:
+ *   1. intrinsicMatrix — on a source page with intrinsic /Rotate, convert visual → unrotated
+ *      (still 0-based); the page's /Rotate then displays them where the user placed them.
+ *   2. translate by the view-box origin — so a page whose MediaBox/CropBox doesn't start at (0,0)
+ *      draws at the visible content, not offset by the origin. Mirrors the crop path (setCropBox
+ *      uses view0.x + u.x). Without it every flattened overlay — text, ink, shapes, images, the
+ *      signature appearance, formValue marks — and the OCR layer is shifted on offset pages.
+ *
+ * `draw.prepend` receives that pair and writes its own stream at the FRONT of /Contents (the OCR
+ * layer, which carries the same `q [view cm] [intrinsic cm] … Q` inside its own stream, since an
+ * appended wrapper cannot reach a prepended stream). `draw.append` runs with the pair applied by a
+ * `q … Q` wrapper around the operators it appends (pushOperators), skipped when both are identity.
+ * Either may be absent, so the space is set up whether the page has overlays, OCR, or both.
+ */
+async function withPageSpace(
+  page: PDFPage,
+  intrinsic: number,
+  view0: Box,
+  draw: { prepend?: (space: OcrPageSpace) => void; append?: () => Promise<void> }
+): Promise<void> {
+  const space = pageSpace(intrinsic, view0)
+  // pdf-lib wraps the existing content in q … Q (normalize) the first time it appends operators.
+  // Doing that now, before the prepend, keeps the OCR layer the FIRST stream of /Contents.
+  if (draw.prepend && draw.append) page.node.normalize()
+  draw.prepend?.(space)
+  if (!draw.append) return
+  const m = space.intrinsic
+  const shift = view0.x !== 0 || view0.y !== 0
+  if (!m && !shift) return draw.append()
+  page.pushOperators(pushGraphicsState())
+  if (shift) page.pushOperators(concatTransformationMatrix(1, 0, 0, 1, view0.x, view0.y))
+  if (m) page.pushOperators(concatTransformationMatrix(...m))
+  await draw.append()
+  page.pushOperators(popGraphicsState())
 }
 
 /**
@@ -193,7 +321,8 @@ async function bakePage(
   page: PDFPage,
   exportPage: ExportPage,
   edits: EditLayer | undefined,
-  res: FlattenResources | undefined
+  res: FlattenResources | undefined,
+  ocr?: { bake: OcrBake; ordinal: number }
 ): Promise<void> {
   if (!edits) return
   const key = makePageKey(exportPage.sourceKey, exportPage.pageIndex)
@@ -221,28 +350,28 @@ async function bakePage(
   // here (unlike in the mirror) because the box must still cover the hole the destructive PDFium
   // pass left in the SOURCE content. This also makes .pdf and .pdfx exports agree on what survives.
   const visible = list ? stripRedactedOverlays(list, { keepRedactions: true }) : undefined
-  if (res && visible && visible.length > 0) {
-    const sorted = [...visible].sort((a, b) => a.z - b.z || a.createdAt - b.createdAt)
-    // Overlay coordinates are captured in the editor's VIEW-relative space (0-based over the view
-    // box). Two transforms reconcile that with pdf-lib's user space, innermost first:
-    //   1. intrinsicMatrix — on a source page with intrinsic /Rotate, convert visual → unrotated
-    //      (still 0-based); the page's /Rotate then displays them where the user placed them.
-    //   2. translate by the view-box origin — so a page whose MediaBox/CropBox doesn't start at
-    //      (0,0) draws overlays at the visible content, not offset by the origin. Mirrors the crop
-    //      path (setCropBox uses view0.x + u.x). Without it every flattened overlay — text, ink,
-    //      shapes, images, the signature appearance, formValue marks — is shifted on offset pages.
-    const m = intrinsicMatrix(intrinsic, view0.width, view0.height)
-    const shift = view0.x !== 0 || view0.y !== 0
-    if (m || shift) {
-      page.pushOperators(pushGraphicsState())
-      if (shift) page.pushOperators(concatTransformationMatrix(1, 0, 0, 1, view0.x, view0.y))
-      if (m) page.pushOperators(concatTransformationMatrix(...m))
-      await flattenPageOverlays(page, sorted, res)
-      page.pushOperators(popGraphicsState())
-    } else {
-      await flattenPageOverlays(page, sorted, res)
-    }
+  const sorted =
+    res && visible && visible.length > 0
+      ? [...visible].sort((a, b) => a.z - b.z || a.createdAt - b.createdAt)
+      : undefined
+  // The OCR layer (DESIGN.md §3.7.2): words lie in the same overlay frame. On PDF export, words
+  // entirely outside the visible box after the edit crop are dropped (§3.7.5), so cropped-away
+  // content does not become searchable in other viewers; partly visible words are kept.
+  let ocrPage = ocr ? ocrPageFor(edits, key) : undefined
+  if (ocrPage) {
+    const quarter = intrinsic === 90 || intrinsic === 270
+    const visual = quarter
+      ? { width: view0.height, height: view0.width }
+      : { width: view0.width, height: view0.height }
+    ocrPage = dropWordsOutside(ocrPage, visibleBox(visual, crop)) ?? undefined
   }
+  const layer = ocr && ocrPage ? { ...ocr, page: ocrPage } : undefined
+  await withPageSpace(page, intrinsic, view0, {
+    prepend: layer
+      ? (space) => void bakeOcrLayer(page, layer.page, layer.bake, layer.ordinal, space)
+      : undefined,
+    append: sorted && res ? () => flattenPageOverlays(page, sorted, res) : undefined
+  })
   // Form fill paints the value as page content; drop the matching interactive widget so its own
   // appearance (the original value) doesn't render on top of — and double with — the painted one.
   // Deliberately computed from the FULL list, not `visible`: a formValue overlay a redaction covers
@@ -280,7 +409,10 @@ function pageError(ordinal: number, page: ExportPage, e: unknown): Error {
  * with the first copy, so the copies stay fully independent exactly as before (at the cost of
  * re-copying that page's resources, which only a deliberate duplicate pays).
  */
-async function copyExportPages(output: PDFDocument, pages: ExportPage[]): Promise<PDFPage[]> {
+async function copyExportPages(
+  output: PDFDocument,
+  pages: ExportPage[]
+): Promise<{ copied: PDFPage[]; sources: PDFDocument[] }> {
   const sources = new Map<string, PDFDocument>()
   const occurrences = new Map<string, number>()
   // Insertion-ordered: batch key (source + repeat round) -> the output slots it fills.
@@ -328,7 +460,7 @@ async function copyExportPages(output: PDFDocument, pages: ExportPage[]): Promis
     }
     slots.forEach((s, i) => (copied[s] = result[i]))
   }
-  return copied
+  return { copied, sources: [...sources.values()] }
 }
 
 /**
@@ -366,7 +498,10 @@ export async function buildPdf(
 ): Promise<Uint8Array> {
   const output = await PDFDocument.create()
   const res = edits ? createFlattenResources(output, edits.attachments) : undefined
-  const copied = await copyExportPages(output, pages)
+  // One OCR font per output document (a zip builds one per entry): its tables come only from the
+  // words baked into THIS document (redaction rule 5).
+  const bake = newOcrBake(output, edits)
+  const { copied, sources } = await copyExportPages(output, pages)
   for (let i = 0; i < pages.length; i++) {
     const page = copied[i]
     // Tag any failure with which page failed, so a single bad source (e.g. one odd scan) is
@@ -377,12 +512,12 @@ export async function buildPdf(
       // Before signing, strip empty/leftover signature fields so the signed PDF has only our
       // signature — not a dangling "sign here" field Adobe would offer to sign.
       if (opts?.stripSignatureFields) removeSignatureWidgets(page)
-      await bakePage(page, pages[i], edits, res)
+      await bakePage(page, pages[i], edits, res, bake && { bake, ordinal: i })
     } catch (e) {
       throw pageError(i + 1, pages[i], e)
     }
   }
-  output.setProducer(`PDFX ${PDFX_VERSION}`)
+  finishOcr(output, bake, pages.length, sources, `PDFX ${PDFX_VERSION}`)
   try {
     return await output.save()
   } catch (e) {
@@ -402,12 +537,37 @@ export async function buildPdfx(
 
   // .pdfx keeps pages CLEAN — overlays/rotation are stored in the manifest mirror instead of
   // baked in, so the file reopens fully editable. Export PDF produces the flattened, shareable
-  // copy (any viewer sees the annotations there). Nothing mutates the copied pages here, so they
-  // need no isolateMutableContainers. Pages are copied across ALL documents at once so an image
-  // shared between documents of the same source is also stored once; failures name the page by
-  // its ordinal across documents, as buildPdf does.
+  // copy (any viewer sees the annotations there). Pages are copied across ALL documents at once so
+  // an image shared between documents of the same source is also stored once; failures name the
+  // page by its ordinal across documents, as buildPdf does.
   const ordered = documents.flatMap((doc) => doc.pages)
-  for (const page of await copyExportPages(output, ordered)) output.addPage(page)
+  const { copied, sources } = await copyExportPages(output, ordered)
+  for (const page of copied) output.addPage(page)
+
+  // The one exception to clean pages: the OCR text layer is BAKED (DESIGN.md §3.7.2), so a
+  // reopened .pdfx is searchable without re-recognition, and it is baked BEFORE computeIntegrity
+  // so the pdfx-canon/1 tamper hash covers it. Only those pages are mutated, so only they get
+  // private containers. Rotation and crop stay live mirror edits: words keep the source visual
+  // frame (intrinsic + view-origin matrices only), and every word is kept (no crop drop).
+  const bake = newOcrBake(output, edits)
+  if (bake) {
+    for (let i = 0; i < ordered.length; i++) {
+      const ocrPage = ocrPageFor(edits, makePageKey(ordered[i].sourceKey, ordered[i].pageIndex))
+      if (!ocrPage) continue
+      const page = copied[i]
+      try {
+        isolateMutableContainers(page)
+        const intrinsic = ((page.getRotation().angle % 360) + 360) % 360
+        const view0 = viewBox(page.getCropBox(), page.getMediaBox())
+        await withPageSpace(page, intrinsic, view0, {
+          prepend: (space) => void bakeOcrLayer(page, ocrPage, bake, i, space)
+        })
+      } catch (e) {
+        throw pageError(i + 1, ordered[i], e)
+      }
+    }
+  }
+
   for (const doc of documents) {
     if (doc.pages.length === 0) continue
     manifest.documents.push({ name: doc.name, pages: doc.pages.length })
@@ -421,6 +581,9 @@ export async function buildPdfx(
       manifest.attachments = mirror.attachments
     }
   }
+  // Font tables, Producer + XMP marking and the catalog /Lang, before computeIntegrity and save;
+  // after the mirror, because the Producer names the manifest version, which it can raise to 1.1.
+  finishOcr(output, bake, ordered.length, sources, `PDFX ${manifest.pdfx}`)
 
   // pdfx-canon/1 tamper record over the assembled page content, computed BEFORE the manifest is
   // attached so the manifest itself is excluded from the hash (PRD §4.6). Best-effort: the record is
@@ -439,7 +602,6 @@ export async function buildPdfx(
   })
 
   output.setTitle(title)
-  output.setProducer(`PDFX ${manifest.pdfx}`)
   output.setKeywords(['PDFX'])
 
   try {
