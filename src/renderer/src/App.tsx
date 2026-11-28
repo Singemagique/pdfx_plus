@@ -43,7 +43,11 @@ import { OcrBanner } from './components/ocr/OcrBanner'
 import { OcrSummaryPopover } from './components/ocr/OcrSummaryPopover'
 import { OcrMenuSync, OcrSignDialog, OcrToasts } from './components/ocr/OcrAppParts'
 import { useToast } from './app/useToast'
-import { connectRecognizedText } from './ocr/recognized-text'
+import {
+  connectRecognizedText,
+  toggleRecognizedText,
+  useRecognizedTextShown
+} from './ocr/recognized-text'
 
 export default function App(): React.JSX.Element {
   // Ref-count busy instead of a plain boolean: overlapping operations (a 2nd-instance open / Explorer
@@ -265,7 +269,9 @@ export default function App(): React.JSX.Element {
   useEffect(() => ocrStore.setFocus(focusKey), [ocrStore, focusKey])
 
   // ---- Text recognition UI (DESIGN.md §3.8)
-  const [showRecognizedText, setShowRecognizedText] = useState(false)
+  // Document ▸ Show Recognized Text: the overlay's session toggle (recognized-text.ts), which its
+  // own Hide button also clears; OcrMenuSync mirrors it into the native checkbox.
+  const showRecognizedText = useRecognizedTextShown()
   const [summaryAt, setSummaryAt] = useState<{
     anchor: HTMLElement | null
     docId: string | null
@@ -326,8 +332,11 @@ export default function App(): React.JSX.Element {
         }
         ocrStore.remove(keys) // one undo step for all of them
         flash(removedCopy(keys.length))
-      } else if (action === 'show-recognized-text') setShowRecognizedText((v) => !v)
-      else if (action === 'include-recognized-text') {
+      } else if (action === 'show-recognized-text') {
+        // Electron flipped the checkbox on click: push the toggle's real state back (OcrMenuSync
+        // pushes it only when it changes).
+        window.api.setMenuChecked?.('show-recognized-text', toggleRecognizedText())
+      } else if (action === 'include-recognized-text') {
         const next = !ocrStore.settings()['ocr.includeInExports']
         try {
           await ocrStore.setSettings({ 'ocr.includeInExports': next })

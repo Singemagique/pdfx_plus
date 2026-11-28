@@ -44,6 +44,24 @@ const HEADER_EVENTS = {
   onPointerCancel: stop
 }
 
+/**
+ * `]` steps forward, `[` back: by the character typed, or by the physical key at the US `]` / `[`
+ * position (`BracketRight` / `BracketLeft`) with no modifier at all, for layouts (German, French…)
+ * where the brackets need AltGr. AltGr itself arrives as Ctrl+Alt on Windows: a `]` / `[` typed with
+ * it still counts; a real Ctrl, Alt or Meta chord does not.
+ */
+function stepDirection(event: KeyboardEvent): 1 | -1 | 0 {
+  if (event.metaKey) return 0
+  const altGr = event.getModifierState?.('AltGraph') ?? false
+  if ((event.ctrlKey || event.altKey) && !altGr) return 0
+  if (event.key === ']') return 1
+  if (event.key === '[') return -1
+  if (altGr || event.ctrlKey || event.altKey || event.shiftKey) return 0
+  if (event.code === 'BracketRight') return 1
+  if (event.code === 'BracketLeft') return -1
+  return 0
+}
+
 /** Three decimals of a pt are plenty, and keep Float32 noise out of the markup. */
 const r3 = (v: number): number => Math.round(v * 1000) / 1000
 const placeAt = (w: ShownWord): string => `translate(${r3(w.x)} ${r3(w.y)}) rotate(${r3(w.deg)})`
@@ -103,11 +121,10 @@ export function RecognizedTextLayer({
   useEffect(() => {
     if (!shown || !active || lowCount === 0) return
     const onKey = (event: KeyboardEvent): void => {
-      if (event.key !== ']' && event.key !== '[') return
-      if (event.ctrlKey || event.metaKey || event.altKey || event.defaultPrevented) return
+      const dir = stepDirection(event)
+      if (dir === 0 || event.defaultPrevented) return
       if (isEditableTarget(event.target)) return
       event.preventDefault()
-      const dir = event.key === ']' ? 1 : -1
       setFocus((f) => {
         if (f < 0) return dir > 0 ? 0 : lowCount - 1
         return (f + dir + lowCount) % lowCount

@@ -533,6 +533,34 @@ describe('stepping through low-confidence words', () => {
     expect(focusedWord()).toBeNull()
   })
 
+  it('on AltGr layouts: the US bracket keys by code, and a bracket typed with AltGr, also step', async () => {
+    disconnect = connectRecognizedText(fakeSupply(new Map([[KEY, PAGE]])))
+    await render()
+    // German: the key at the US `]` position types `+`, the one at `[` types `ü`.
+    await press('+', { code: 'BracketRight' })
+    expect(focusedWord()).toBe('wrld')
+    await press('+', { code: 'BracketRight' })
+    expect(focusedWord()).toBe('tbe')
+    await press('ü', { code: 'BracketLeft' })
+    expect(focusedWord()).toBe('wrld')
+    // AltGr+9 types `]` and arrives as Ctrl+Alt on Windows, with the AltGraph modifier state.
+    await press(']', { code: 'Digit9', ctrlKey: true, altKey: true, modifierAltGraph: true })
+    expect(focusedWord()).toBe('tbe')
+    await press('[', { code: 'Digit8', ctrlKey: true, altKey: true, modifierAltGraph: true })
+    expect(focusedWord()).toBe('wrld')
+  })
+
+  it('the bracket codes do not step with a modifier, nor does a real Ctrl+Alt bracket', async () => {
+    disconnect = connectRecognizedText(fakeSupply(new Map([[KEY, PAGE]])))
+    await render()
+    await press('}', { code: 'BracketRight', shiftKey: true })
+    await press('*', { code: 'BracketRight', ctrlKey: true })
+    await press('~', { code: 'BracketRight', ctrlKey: true, altKey: true, modifierAltGraph: true })
+    await press(']', { code: 'BracketRight', ctrlKey: true, altKey: true })
+    await press('ü', { code: 'BracketLeft', altKey: true })
+    expect(focusedWord()).toBeNull()
+  })
+
   it('a handled key is consumed', async () => {
     disconnect = connectRecognizedText(fakeSupply(new Map([[KEY, PAGE]])))
     await render()
