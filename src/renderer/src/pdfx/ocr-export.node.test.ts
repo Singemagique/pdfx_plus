@@ -501,7 +501,9 @@ describe('.pdfx round trip', () => {
 })
 
 // ---------------------------------------------------------------------------------------------
-// Redaction safety until PR3b: a page with any redaction gets no OCR layer at all.
+// ---------------------------------------------------------------------------------------------
+// Redaction safety (PR3b): the boxed word goes, the rest of the page keeps its layer. The full
+// leak suite is ocr-redaction.node.test.ts; these pin the PR3a wiring cases under the new rule.
 
 /** A secret whose characters occur nowhere else in the export. */
 const SECRET = '机密档案'
@@ -520,19 +522,22 @@ function leaks(hay: Uint8Array): string[] {
   return found
 }
 
-describe('redacted pages get no OCR layer (fail-safe until PR3b)', () => {
+describe('a redacted page keeps the words the redaction does not touch', () => {
   const redKey = makePageKey('secret', 0)
   const redaction: Overlay = {
     id: 'r',
     pageKey: redKey,
     z: 0,
     createdAt: 0,
-    geom: { x: 300, y: 300, w: 50, h: 20, rotation: 0, opacity: 1 }, // far from the word
+    geom: { x: 30, y: 100, w: 60, h: 10, rotation: 0, opacity: 1 }, // over the secret only
     type: 'redaction',
     fill: { r: 0, g: 0, b: 0 }
   }
   const secretPage = (): PackedOcrPage =>
-    pack(handPage([{ y: 100, size: 20, words: [{ t: SECRET, x: 20, w: 80 }] }], { langs: ['chi_sim'] })) // prettier-ignore
+    pack(handPage([
+      { y: 300, size: 20, words: [{ t: 'Visible', x: 20, w: 80 }] },
+      { y: 100, size: 20, words: [{ t: SECRET, x: 20, w: 80 }] }
+    ], { langs: ['chi_sim'] })) // prettier-ignore
 
   let secretPdf: Uint8Array
   let docs: DocEntry[]
@@ -556,15 +561,17 @@ describe('redacted pages get no OCR layer (fail-safe until PR3b)', () => {
     docs = [{ id: 'd', name: 'D', pages: [entry('scan', scan.pdfBytes, sw, sh), entry('secret', secretPdf, 400, 400)] }] // prettier-ignore
   })
 
-  /** Export like useExport: redaction pass, then the layer, then the builder. */
+  /** Export like useExport: redaction pass with its report, then the layer, then the builder. */
   async function exportAll(kind: 'pdf' | 'pdfx', bypassWithOcrLayer = false): Promise<Uint8Array> {
     const editLayer = edits({ overlays: new Map([[redKey, [redaction]]]) })
     const ocr = new Map([
       [KEY, scanOcr()],
       [redKey, secretPage()]
     ])
-    const redacted = await buildRedactedSources(editLayer, docs, pdfium)
-    const layer = bypassWithOcrLayer ? { ...editLayer, ocr } : withOcrLayer(editLayer, ocr, INCLUDE)
+    const redacted = await buildRedactedSources(editLayer, docs, { pdfium, report: true })
+    const layer = bypassWithOcrLayer
+      ? { ...editLayer, ocr }
+      : withOcrLayer(editLayer, ocr, { include: true, removed: redacted.removed })
     const pages = applyRedactedBytes(
       docs[0].pages.map((p) => exportPage(p.source.bytes, p.source.id)),
       redacted
@@ -582,10 +589,12 @@ describe('redacted pages get no OCR layer (fail-safe until PR3b)', () => {
     async (name, bypass) => {
       const out = await exportAll(name.startsWith('pdfx') ? 'pdfx' : 'pdf', bypass)
       const doc = await PDFDocument.load(out, { updateMetadata: false })
-      // The unredacted page keeps its layer; the redacted one has none.
+      // The unredacted page keeps its layer. The redacted one keeps the untouched word, unless the
+      // layer came without the removed-object report (fail-safe: no layer at all).
       expect(layerStreams(doc, 0)).toHaveLength(1)
-      expect(layerStreams(doc, 1)).toHaveLength(0)
+      expect(layerStreams(doc, 1)).toHaveLength(bypass ? 0 : 1)
       expect(pdfjsCopyText((await pdfjsText(out, 0)).items)).toBe(scan.gt.text)
+      expect(pdfjsCopyText((await pdfjsText(out, 1)).items)).toBe(bypass ? '' : 'Visible')
       for (const i of [0, 1]) {
         expect(pdfjsCopyText((await pdfjsText(out, i)).items)).not.toContain(SECRET[0])
         expect(pdfiumCopyText(pdfiumProbe(pdfium, out, i))).not.toContain(SECRET[0])
@@ -593,8 +602,6 @@ describe('redacted pages get no OCR layer (fail-safe until PR3b)', () => {
       // Raw-bytes oracle: the file itself, then every stream inflated (content, CMaps, XMP, manifest).
       expect(leaks(out)).toEqual([])
       for (const { data } of await allStreams(out)) expect(leaks(data)).toEqual([])
-      // Not even as a language tag of a layer that was never written.
-      expect(new TextDecoder('latin1').decode(out)).not.toContain('zh-Hans')
     }
   )
 
@@ -603,22 +610,34 @@ describe('redacted pages get no OCR layer (fail-safe until PR3b)', () => {
       [exportPage(secretPdf, 'secret')],
       edits({ ocr: new Map([[redKey, secretPage()]]) })
     )
-    expect(pdfjsCopyText((await pdfjsText(out)).items)).toBe(SECRET)
-    expect(pdfiumCopyText(pdfiumProbe(pdfium, out))).toBe(SECRET)
+    expect(pdfjsCopyText((await pdfjsText(out)).items)).toBe(`Visible\n${SECRET}`)
+    expect(pdfiumCopyText(pdfiumProbe(pdfium, out))).toBe(`Visible\n${SECRET}`)
     const found = (await allStreams(out)).flatMap(({ data }) => leaks(data))
     expect(found).toEqual(expect.arrayContaining(SECRET_CPS.map((cp) => `cmap ${cp.toString(16).toUpperCase()}`))) // prettier-ignore
   })
 
-  it('withOcrLayer drops the page for a redaction overlay or a removed-object report entry', () => {
+  it('withOcrLayer filters words by redaction and by the removed-object report', () => {
     const ocr = new Map([
       [KEY, scanOcr()],
       [redKey, secretPage()]
     ])
     const plain = edits()
+    const texts = (l: EditLayer, key: string): string[] =>
+      [...(l.ocr?.get(key)?.text ?? '')].length ? [l.ocr!.get(key)!.text] : []
     expect([...withOcrLayer(plain, ocr, INCLUDE).ocr!.keys()]).toEqual([KEY, redKey])
-    expect([...withOcrLayer(edits({ overlays: new Map([[redKey, [redaction]]]) }), ocr, INCLUDE).ocr!.keys()]).toEqual([KEY]) // prettier-ignore
-    expect([...withOcrLayer(plain, ocr, { include: true, removed: new Map([[KEY, []]]) }).ocr!.keys()]).toEqual([redKey]) // prettier-ignore
-    expect(withOcrLayer(plain, new Map([[redKey, secretPage()]]), { include: true, removed: new Map([[redKey, [{}]]]) }).ocr).toBeUndefined() // prettier-ignore
+    const redacted = edits({ overlays: new Map([[redKey, [redaction]]]) })
+    // A redaction without the pass's report: the page's whole layer goes (fail-safe).
+    expect([...withOcrLayer(redacted, ocr, INCLUDE).ocr!.keys()]).toEqual([KEY])
+    // With the report: only the boxed word.
+    const reported = withOcrLayer(redacted, ocr, { include: true, removed: new Map([[redKey, []]]) }) // prettier-ignore
+    expect(texts(reported, redKey)).toEqual(['Visible'])
+    expect(reported.ocrRemoved?.get(redKey)).toEqual([])
+    // A removed object under the scan's words takes them; an unknown extent takes the page.
+    const strip = { x: 0, y: 0, w: scan.gt.page.width, h: scan.gt.page.height / 2 }
+    const lower = withOcrLayer(plain, ocr, { include: true, removed: new Map([[KEY, [strip]]]) })
+    expect(lower.ocr!.get(KEY)!.text.length).toBeLessThan(scanOcr().text.length)
+    expect(lower.ocr!.get(KEY)!.text.length).toBeGreaterThan(0)
+    expect(withOcrLayer(plain, new Map([[redKey, secretPage()]]), { include: true, removed: new Map([[redKey, [{ x: NaN, y: 0, w: 1, h: 1 }]]]) }).ocr).toBeUndefined() // prettier-ignore
     expect(withOcrLayer({ ...plain, ocr }, undefined, INCLUDE).ocr).toBeUndefined()
     // The setting or Sign box off: no new layer even when results are handed over, and the
     // sources' own layers are dropped; on: they are kept.
@@ -682,7 +701,7 @@ describe("a reopened OCR'd export", () => {
     kind: 'pdf' | 'pdfx',
     include = true
   ): Promise<{ out: Uint8Array; redacted: Map<string, Uint8Array> }> {
-    const redacted = await buildRedactedSources(editLayer, [doc], pdfium)
+    const redacted = await buildRedactedSources(editLayer, [doc], { pdfium })
     const layer = withOcrLayer(editLayer, undefined, { include })
     const pages = applyRedactedBytes(
       doc.pages.map((p) => exportPage(p.source.bytes, p.source.id, p.pageIndex)),

@@ -386,7 +386,7 @@ describe('every save path shares the same shell', () => {
   )
 
   it.each(ocrPaths)(
-    '%s: a page with a redaction gets no recognised text (fail-safe until PR3b)',
+    '%s: a redaction over the word removes it from the recognised text',
     async (name, run) => {
       const handles = await mountExport(
         oneDoc(),
@@ -395,6 +395,55 @@ describe('every save path shares the same shell', () => {
         vi.fn(),
         fakeOcr()
       )
+      await act(async () => {
+        await run(handles)
+      })
+      expect(builtLayer(name).ocr).toBeUndefined()
+    }
+  )
+
+  /** A redaction far from OCR_PAGE's only word. */
+  const farRedaction = (): Overlay => ({ ...redaction(0), geom: geom(300, 300, 10, 10) })
+
+  it.each(ocrPaths)(
+    '%s: the redaction pass reports what it removed, and the layer is filtered against it',
+    async (name, run) => {
+      const removed = new Map([[KEY, []]])
+      vi.mocked(buildRedactedSources).mockImplementationOnce(async () =>
+        Object.assign(new Map<string, Uint8Array>(), { removed })
+      )
+      const handles = await mountExport(oneDoc(), layer([farRedaction()]), vi.fn(), vi.fn(), fakeOcr()) // prettier-ignore
+      await act(async () => {
+        await run(handles)
+      })
+      expect(vi.mocked(buildRedactedSources).mock.calls[0][2]).toEqual({ report: true })
+      // The word the box does not touch stays, and the build re-checks against the same report.
+      const built = builtLayer(name)
+      expect(built.ocr?.get(KEY)).toBe(OCR_PAGE)
+      expect(built.ocrRemoved).toBe(removed)
+    }
+  )
+
+  it.each(ocrPaths)(
+    '%s: without the removed-object report a redacted page gets no recognised text (fail-safe)',
+    async (name, run) => {
+      // The pass's default mock returns no `removed`.
+      const handles = await mountExport(oneDoc(), layer([farRedaction()]), vi.fn(), vi.fn(), fakeOcr()) // prettier-ignore
+      await act(async () => {
+        await run(handles)
+      })
+      expect(builtLayer(name).ocr).toBeUndefined()
+    }
+  )
+
+  it.each(ocrPaths)(
+    '%s: a removed object under the word removes it, wherever the box is',
+    async (name, run) => {
+      const removed = new Map([[KEY, [{ x: 0, y: 0, w: 612, h: 792 }]]]) // a full-page scan
+      vi.mocked(buildRedactedSources).mockImplementationOnce(async () =>
+        Object.assign(new Map<string, Uint8Array>(), { removed })
+      )
+      const handles = await mountExport(oneDoc(), layer([farRedaction()]), vi.fn(), vi.fn(), fakeOcr()) // prettier-ignore
       await act(async () => {
         await run(handles)
       })

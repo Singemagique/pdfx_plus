@@ -35,7 +35,13 @@ import {
   ocrLayerEngines,
   type OcrPageSpace
 } from './ocr-layer'
-import { catalogLang, dropWordsOutside, ocrAllowed, type OcrPassthrough } from './ocr-export'
+import {
+  catalogLang,
+  dropWordsOutside,
+  redactOcrPage,
+  type OcrPassthrough,
+  type RemovedReport
+} from './ocr-export'
 import { markOcrDocument, readCatalogLang } from './ocr-marking'
 
 /**
@@ -56,6 +62,12 @@ export interface EditLayer {
    * on EditProvider's layer: useExport adds it to a copy (`withOcrLayer`, ocr-export.ts).
    */
   ocr?: Map<string, PackedOcrPage>
+  /**
+   * The redaction pass's removed-object report the `ocr` words were filtered against (ocr-export.ts
+   * `RemovedReport`); `withOcrLayer` sets it, and the bake applies the same filter again. Absent:
+   * every page with a redaction overlay gets no OCR layer at all (fail-safe).
+   */
+  ocrRemoved?: RemovedReport
   /**
    * What to do with a PDFx OCR layer a SOURCE page already carries (ocr-export.ts
    * `OcrPassthrough`); `withOcrLayer` sets it from the export setting or the Sign box. Absent:
@@ -113,13 +125,16 @@ function passExistingOcr(
 }
 
 /**
- * The recognised page to bake for `key`, or undefined. Re-checks the export gate (ocr-export.ts
- * `ocrAllowed`) so a layer handed over without `withOcrLayer` still never puts text on a page
- * that has a redaction.
+ * The recognised page to bake for `key`, or undefined. Re-applies the redaction filter
+ * (ocr-export.ts `redactOcrPage`, against the layer's redactions and `ocrRemoved`), so a layer
+ * handed over without `withOcrLayer` still never puts a redacted word on a page: without a report,
+ * a page with a redaction gets no layer at all.
  */
 function ocrPageFor(edits: EditLayer | undefined, key: string): PackedOcrPage | undefined {
   const page = edits?.ocr?.get(key)
-  return page && edits && ocrAllowed(edits, key) ? page : undefined
+  return page && edits
+    ? (redactOcrPage(page, edits, key, edits.ocrRemoved) ?? undefined)
+    : undefined
 }
 
 /**

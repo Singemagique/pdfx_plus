@@ -237,10 +237,12 @@ describe('OcrFontCache', () => {
     expect(String(f.desc.get(PDFName.of('CapHeight')))).toBe('700')
     expect(f.desc.get(PDFName.of('CIDSet'))).toBeUndefined()
     expect(f.ttf).toEqual(glyphlessTtf())
-    // CIDs: ' ' = 1, H = 2, i = 3, 字 = 4. Only 字 is wide.
-    expect(String(f.w)).toBe('[ 4 [ 1000 ] ]')
-    // CIDToGIDMap: 2·(maxCID + 1) bytes; narrow CIDs → GID 1, the wide 字 → GID 2, CID 0 → GID 0.
-    expect([...f.gidMap]).toEqual([0, 0, 0, 1, 0, 1, 0, 1, 0, 2])
+    // CIDs: ' ' = 1, H = 2, i = 3, 字 = 4. Only 字 is wide; CID 0 is the never-shown monospace
+    // guard (MONO_GUARD_CID), always listed so pdf.js does not flag the font FixedPitch.
+    expect(String(f.w)).toBe('[ 0 [ 1000 ] 4 [ 1000 ] ]')
+    // CIDToGIDMap: 2·(maxCID + 1) bytes; narrow CIDs → GID 1, the wide 字 → GID 2, the guard CID
+    // 0 → GID 2 (the glyph its width describes). No CID maps to GID 0.
+    expect([...f.gidMap]).toEqual([0, 2, 0, 1, 0, 1, 0, 1, 0, 2])
     const { entries, blocks } = parseCMap(f.toUnicode)
     expect(entries).toEqual([
       [1, '0020'],
@@ -288,8 +290,8 @@ describe('OcrFontCache', () => {
     // Dense CIDs 1..n in first-use order: no hole where 三 was provisionally numbered, nothing
     // after c where Ω m e g a were.
     expect(entries.map(([c]) => c)).toEqual([1, 2, 3, 4, 5, 6, 7, 8])
-    expect(String(f.w)).toBe('[ 2 [ 1000 ] ]') // 张 is the only wide character left
-    expect([...f.gidMap]).toEqual([0, 0, 0, 1, 0, 2, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1])
+    expect(String(f.w)).toBe('[ 0 [ 1000 ] 2 [ 1000 ] ]') // 张 is the only wide character left
+    expect([...f.gidMap]).toEqual([0, 2, 0, 1, 0, 2, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1])
     // The kept stream was renumbered to match (张, space, public, trailing space); the dropped
     // and the removed page's streams are deleted from the context (save writes every registered
     // object, linked or not).

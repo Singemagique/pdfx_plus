@@ -4,8 +4,9 @@
 // cannot keep the font tables to the characters actually baked.
 //
 //   Type0 /BaseFont /PDFxOCR-GlyphLess /Encoding /Identity-H /ToUnicode <hand-written CMap>
-//     └ CIDFontType2, CIDSystemInfo (Adobe/Identity/0), /DW 500, /W [c [1000 …] …] for wide CIDs,
-//       /CIDToGIDMap stream (used CIDs → GID 1, or GID 2 when wide), FontDescriptor → FontFile2
+//     └ CIDFontType2, CIDSystemInfo (Adobe/Identity/0), /DW 500, /W [0 [1000] c [1000 …] …] (the
+//       never-shown monospace guard CID 0, then the wide CIDs), /CIDToGIDMap stream (used CIDs →
+//       GID 1, or GID 2 when wide; the guard → GID 2), FontDescriptor → FontFile2
 //
 // One code point = one CID. `encode` hands out PROVISIONAL CIDs from 1 the first time a baked word
 // needs a code point; `finalize` renumbers the CIDs still shown densely from 1 in first-use order
@@ -54,6 +55,16 @@ export const GID_NARROW = 1
 export const GID_WIDE = 2
 /** Identity-H codes are 2 bytes, so a document can hold at most 65535 distinct characters. */
 const MAX_CID = 0xffff
+/**
+ * The pdf.js monospace guard. pdf.js 5.7.284 (`extractWidths`) flags a font FixedPitch when every
+ * /W width equals /DW, which every Latin-only layer did (all 500), and the app's Find then split a
+ * whole merged line evenly per character (search/geometry.ts `mono`), so highlights missed the
+ * words each stretched by its own Tz. /W therefore always lists CID 0 at the wide advance: CID 0
+ * is never shown (CIDs start at 1), has no ToUnicode entry and maps to the wide glyph (GID 2,
+ * advance 1000, so the width agrees with the program), so it carries no character, paints nothing
+ * and is never part of any text, yet one width ≠ /DW clears the flag.
+ */
+export const MONO_GUARD_CID = 0
 
 /**
  * FontDescriptor metrics. `em` (default) matches the glyph box the layer is positioned with:
@@ -349,10 +360,12 @@ export class OcrFontCache {
     const wide = (cid: number): boolean => isWideCodePoint(cpOf(cid))
 
     const gidMap = new Uint8Array(2 * (used.length + 1))
-    // Big-endian GIDs: 1 (narrow) or 2 (wide) for every used CID; only CID 0 stays GID 0.
+    // Big-endian GIDs: 1 (narrow) or 2 (wide) for every used CID. The never-shown monospace guard
+    // CID 0 maps to the wide glyph its /W width describes; no CID maps to GID 0.
+    gidMap[2 * MONO_GUARD_CID + 1] = GID_WIDE
     for (const cid of used) gidMap[2 * cid + 1] = wide(cid) ? GID_WIDE : GID_NARROW
 
-    const w = ctx.obj([])
+    const w = ctx.obj([PDFNumber.of(MONO_GUARD_CID), ctx.obj([OCR_WIDE])])
     for (const part of widthsArray(used, wide))
       w.push(typeof part === 'number' ? PDFNumber.of(part) : ctx.obj(part))
 

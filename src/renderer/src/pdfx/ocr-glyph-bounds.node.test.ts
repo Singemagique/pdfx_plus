@@ -7,13 +7,14 @@
 // [0 0 1000 1000], Flags 5) this measures, as a fraction of the em height (the font size): PDFium
 // FPDFPageObj_GetBounds of the text objects, FPDFText_GetCharBox and FPDFText_GetLooseCharBox,
 // and pdf.js's item geometry (ascent − descent). It then runs the shipped redaction engine
-// (redact.ts `redactPdf`, the 1.1.3 code path) with a box over one word's x-height band that
-// misses its baseline — the case rule 4 is about.
+// (redact.ts `redactPdf`, and the frozen 1.1.3 copy in test-utils/legacy) with a box over one
+// word's x-height band that misses its baseline — the case rule 4 is about.
 //
 // Result [measured, this file]: only the two spanning variants (zero-area, diagonal) give every
-// PDFium measure ≥ 90% of the em, and only with them does the redaction remove the word. With the
-// two contour-less variants PDFium reports zero-height text objects and char boxes, so the word
-// under the box SURVIVES the redaction: a leak. pdf.js ignores outlines for geometry and reports
+// PDFium measure ≥ 90% of the em, and only with them does the 1.1.3 redaction remove the word.
+// With the two contour-less variants PDFium reports zero-height text objects and char boxes, so
+// under 1.1.3 the word under the box SURVIVES the redaction: a leak, which 1.1.4's invisible-text
+// pad (PR3b) closes for every variant. pdf.js ignores outlines for geometry and reports
 // 0.8/−0.2 for all of them. Painting: `diagonal` (the PR2 first choice) paints a 1-px hairline per
 // glyph under PDFium's monochrome text path (FPDF_RENDER_NO_SMOOTHTEXT) at 36/72/90/144 dpi, and
 // under FreeType 2.14.3 mono rendering at every size from 8 to 300 px [measured: Pillow 12.2
@@ -41,6 +42,7 @@ import {
 } from './ocr-glyphless-ttf'
 import type { OcrFontBBox } from './ocr-font'
 import { redactPdf } from './redact'
+import { redactPdf as redactPdf113 } from './test-utils/legacy/redact-1.1.3'
 import {
   allStreams,
   bakeLayer,
@@ -194,18 +196,25 @@ describe.each(BBOXES)('FontBBox %s', (bbox) => {
     ['none', false],
     ['fontbbox', false]
   ] as const)(
-    '%s: redactPage over the x-height band (baseline missed) removes the word: %s',
-    async (variant, removed) => {
+    '%s: redactPage over the x-height band (baseline missed) removes the word: 1.1.3 %s, 1.1.4 always',
+    async (variant, removedBy113) => {
       const baked = await bakeLayer(blank, [PAGE], { ttf: VARIANTS[variant], bbox })
-      const out = redactPdf(pdfium, baked.bytes, [{ pageIndex: 0, rects: [X_HEIGHT_BOX] }])
-      const pdfiumText = pdfiumProbe(pdfium, out).text
-      const pdfjs = pdfjsCopyText((await pdfjsText(out)).items)
-      expect(pdfiumText.includes('word')).toBe(!removed)
-      expect(pdfjs.includes('word')).toBe(!removed)
-      expect(pdfjs).toContain('Secret')
-      expect(pdfjs).toContain('here')
-      // FPDFPage_GenerateContent keeps the survivors invisible.
-      for (const o of pdfiumProbe(pdfium, out).textObjects) expect(o.mode).toBe(3)
+      // The frozen 1.1.3 engine (no pad) and today's (the invisible-text pad of §3.7.3 rule 4).
+      for (const [engine, removed] of [
+        [redactPdf113, removedBy113],
+        [redactPdf, true]
+      ] as const) {
+        const out = engine(pdfium, baked.bytes, [{ pageIndex: 0, rects: [X_HEIGHT_BOX] }])
+        const pdfiumText = pdfiumProbe(pdfium, out).text
+        const pdfjs = pdfjsCopyText((await pdfjsText(out)).items)
+        expect(pdfiumText.includes('word')).toBe(!removed)
+        expect(pdfjs.includes('word')).toBe(!removed)
+        // The pad grows the bounds across the baseline only: the neighbours on the line stay.
+        expect(pdfjs).toContain('Secret')
+        expect(pdfjs).toContain('here')
+        // FPDFPage_GenerateContent keeps the survivors invisible.
+        for (const o of pdfiumProbe(pdfium, out).textObjects) expect(o.mode).toBe(3)
+      }
     }
   )
 
@@ -215,8 +224,9 @@ describe.each(BBOXES)('FontBBox %s', (bbox) => {
     // cannot trim them. "w", "o" and "d" occur only in "word", so this alone would violate §3.7.3
     // rule 5 on the "re-redacting a reopened OCR'd PDF" fixture. The export's redaction pass
     // (redact-export.ts) therefore passes `dropOcrText`, which removes the page's whole OCR layer
-    // and with it the font (ocr-export.node.test.ts "a reopened OCR'd export"). A finer rule (trim
-    // the tables to the CIDs still shown, or drop and re-bake) is PR3b's to choose.
+    // and with it the font (ocr-export.node.test.ts "a reopened OCR'd export"). PR3b keeps that
+    // whole-layer drop: trimming the tables would mean parsing PDFium's regenerated content for
+    // the CIDs still shown, a new parser on the security path; Replace (PR3c) re-bakes instead.
     const baked = await bakeLayer(blank, [PAGE], { ttf: VARIANTS['zero-area'], bbox })
     const out = redactPdf(pdfium, baked.bytes, [{ pageIndex: 0, rects: [X_HEIGHT_BOX] }])
     expect(pdfiumProbe(pdfium, out).text).not.toContain('word')
