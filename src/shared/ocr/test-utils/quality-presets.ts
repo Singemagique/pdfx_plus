@@ -36,6 +36,37 @@ function paragraphs(margin: number, size: number, leading: number): (ctx: Layout
 const body = paragraphs(24, 11, 15)
 const small = paragraphs(24, 6, 7.5)
 
+/** A short letter: ten lines of 11 pt body under a 54 pt top margin, the rest of the page empty. */
+function shortLetter(ctx: LayoutContext): void {
+  const size = 11
+  const lines = ctx.wrap(ctx.bankWords(), ctx.width - 2 * 54, size)
+  let baseline = ctx.height - 54 - ctx.ascent(size)
+  for (const words of lines.slice(0, 10)) {
+    ctx.line(words, 54, baseline, size)
+    baseline -= 15
+  }
+}
+
+/** A solid logo across the middle of the page and two lines of 11 pt text under it. */
+function logoAndFooter(ctx: LayoutContext): void {
+  const size = 11
+  ctx.rule(ctx.width / 2 - 90, ctx.height / 2 + 10, ctx.width / 2 + 90, ctx.height / 2 + 10, 110)
+  const lines = ctx.wrap(ctx.bankWords(), ctx.width - 48, size)
+  ctx.line(lines[0], 24, 44, size)
+  ctx.line(lines[1], 24, 28, size)
+}
+
+/** A till receipt: nine 9 pt lines of `Item 3.37` (seeded amounts) at the top of a narrow slip. */
+function receipt(ctx: LayoutContext): void {
+  const size = 9
+  let baseline = ctx.height - 24 - ctx.ascent(size)
+  for (let i = 0; i < 9; i++) {
+    const amount = `${1 + (ctx.rng() % 9)}.${String(ctx.rng() % 100).padStart(2, '0')}`
+    ctx.line(['Item', amount], 24, baseline, size)
+    baseline -= 13
+  }
+}
+
 /** Body text inside a dark frame: thick rules on all four edges and a wide shadow on the left. */
 function framed(ctx: LayoutContext): void {
   body(ctx)
@@ -124,6 +155,47 @@ export const QUALITY_PRESETS: PresetDef[] = [
     ops: [
       { op: 'resample', dpi: 200 },
       { op: 'binarize', threshold: 128 }
+    ]
+  },
+  // PR6 review: orientation cases whose text is not where a fixed central band looks, or whose
+  // short lines fool the 90° profile test, and a quarter turn together with a skew.
+  {
+    id: 'rot180-short-letter',
+    description: 'a Letter page upside down, ten lines of text in its (now bottom) third only',
+    font: 'helvetica',
+    page: { width: 612, height: 792 },
+    renderDpi: 300,
+    layout: shortLetter,
+    ops: [{ op: 'quarterTurns', turns: 2 }]
+  },
+  {
+    id: 'rot180-logo',
+    description: 'upside down: a solid logo across the middle, two text lines under it',
+    font: 'helvetica',
+    page: { width: 432, height: 288 },
+    renderDpi: 300,
+    layout: logoAndFooter,
+    ops: [{ op: 'quarterTurns', turns: 2 }]
+  },
+  {
+    id: 'receipt90',
+    description: 'a narrow till receipt (nine short 9 pt lines) turned 90° counter-clockwise',
+    font: 'helvetica',
+    page: { width: 144, height: 360 },
+    renderDpi: 300,
+    layout: receipt,
+    ops: [{ op: 'quarterTurns', turns: 1 }]
+  },
+  {
+    id: 'rot90-skew2',
+    description: 'content turned 90° counter-clockwise and tilted by a further 2°',
+    font: 'helvetica',
+    page: PAGE,
+    renderDpi: 300,
+    layout: body,
+    ops: [
+      { op: 'quarterTurns', turns: 1 },
+      { op: 'rotate', deg: 2 }
     ]
   }
 ]

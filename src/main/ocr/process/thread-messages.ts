@@ -8,6 +8,8 @@
 // SharedArrayBuffer so a recycled or crashed raster thread can reopen it without the renderer
 // sending the file again.
 
+import type { CalibrationTable } from '../../../shared/ocr/engine/types'
+import type { Orientation } from '../../../shared/ocr/preprocess/orientation'
 import type { PageReason } from '../../../shared/ocr/protocol'
 import type { TriagePage } from '../../../shared/ocr/triage'
 import type { RecognizeOutcome, ReuseHint } from './recognize-core'
@@ -110,6 +112,15 @@ export type ToRecognize =
       reuse?: ReuseHint
       /** Ask for the adaptive pass (default true). */
       adaptive?: boolean
+      /**
+       * The page's edit rotation (§3.4.5 priors: tried first). Absent = 0: the 90° test decides.
+       */
+      editRotation?: Orientation
+      /**
+       * Tests only (the calibration run): the table the pipeline's own gates (Retry A) read, so a
+       * refit is not fed by the table it replaces. Default: the shipped TESS_CORE7.
+       */
+      calibration?: CalibrationTable
       /** Tests only: pass 1 on the bitmap as given, no preprocessing (the PR5 replay cache). */
       rawPass1?: boolean
       /**

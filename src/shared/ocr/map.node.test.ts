@@ -632,4 +632,24 @@ describe('PR6 post-processing', () => {
     const both = { x0: 0, y0: 0, x1: 432, y1: 180 }
     expect(mapRawOcrPage(raw(l), { ...CTX, native: [both] }).lines).toHaveLength(0)
   })
+
+  it('near-scanned: the drop is "more than half covered" (60% goes, 40% stays)', () => {
+    const l = line([word('Hello', 100, 220), word('world', 250, 400)])
+    const base = mapRawOcrPage(raw(l), CTX)
+    const [hello] = base.lines[0].words
+    const quad = { angle: 0, size: base.lines[0].size }
+    // A native box over the full height of the word's em box and a share of its width.
+    const cover = (share: number) => ({
+      x0: hello.x,
+      y0: hello.y - 50,
+      x1: hello.x + share * hello.w,
+      y1: hello.y + 50
+    })
+    expect(nativeOverlap(hello, quad, [cover(0.6)])).toBeCloseTo(0.6, 9)
+    expect(nativeOverlap(hello, quad, [cover(0.4)])).toBeCloseTo(0.4, 9)
+    const kept = (share: number): string[] =>
+      mapRawOcrPage(raw(l), { ...CTX, native: [cover(share)] }).lines[0].words.map((w) => w.t)
+    expect(kept(0.6)).toEqual(['world'])
+    expect(kept(0.4)).toEqual(['Hello', 'world'])
+  })
 })

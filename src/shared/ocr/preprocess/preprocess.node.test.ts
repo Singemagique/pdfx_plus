@@ -23,14 +23,21 @@ import {
   type Gray
 } from './image'
 import {
+  FLIP_CONF_DELTA,
+  FLIP_MIN_WORDS,
+  FLIP_PLAUSIBILITY_DELTA,
+  VERTICAL_RATIO_DEN,
+  VERTICAL_RATIO_NUM,
   bandReading,
+  isVertical,
   plausibility,
   profileTest,
   rotationDelta,
   shouldFlip,
+  textBand,
   type Orientation
 } from './orientation'
-import { findSkew } from './skew'
+import { SKEW_MIN_CONF, findSkew } from './skew'
 
 const blank = (w: number, h: number, v = 255): Gray => ({
   width: w,
@@ -76,6 +83,30 @@ describe('determinism rules', () => {
     expect(scanMath(readFileSync(fileURLToPath(new URL(f, import.meta.url)), 'utf8'), f)).toEqual(
       []
     )
+  })
+  // Everything else that shapes the pixels or geometry the engine is given: the pass plan and the
+  // band crop (recognize-core), the adaptive DPI (page-plan), the mask boxes painted white
+  // (raster-core, triage-pdfium), and the rest of the utility process. `2 ** 30`-style integer
+  // constants are exact and allowed there.
+  const proc = fileURLToPath(new URL('../../../main/ocr/process/', import.meta.url))
+  const procFiles = readdirSync(proc).filter((f) => f.endsWith('.ts') && !f.includes('.test.'))
+  it('covers the pipeline modules of src/main/ocr/process', () => {
+    for (const f of ['recognize-core.ts', 'page-plan.ts', 'raster-core.ts', 'triage-pdfium.ts'])
+      expect(procFiles).toContain(f)
+  })
+  it.each(procFiles)('src/main/ocr/process/%s too', (f) => {
+    expect(scanMath(readFileSync(proc + f, 'utf8'), f, undefined, { integerPow: true })).toEqual([])
+  })
+  it('the integer-power allowance is that narrow', () => {
+    const names = (src: string): string[] =>
+      scanMath(src, 'x.ts', undefined, { integerPow: true }).map((x) => x.name)
+    expect(names('const a = 2 ** 30; const b = (2) ** 20')).toEqual([])
+    expect(names('let x = 2; const a = x ** 2; const b = 2 ** 0.5; const c = 10 ** 400')).toEqual([
+      '**',
+      '**',
+      '**'
+    ])
+    expect(names('let y = 2; y **= 3')).toEqual(['**'])
   })
   it('sinCosDeg matches Math to 1e-15 on the deskew range and is exact on quarter turns', () => {
     for (let d = -7; d <= 7; d += 0.05) {
@@ -189,6 +220,28 @@ describe('despeckle', () => {
     expect(d.ink).toBe(despeckle(t, 300).ink)
   })
 
+  it('a page under 2,000 specks per MP is not noisy (~1,500/MP)', () => {
+    const page = textPage()
+    const target = Math.round((1500 * page.width * page.height) / 1e6)
+    let n = 0
+    for (let y = 2; y < page.height - 2 && n < target; y += 5)
+      for (let x = 3; x < page.width - 2 && n < target; x += 5) {
+        let clear = true
+        for (let dy = -1; dy <= 1; dy++)
+          for (let dx = -1; dx <= 1; dx++)
+            if (page.data[(y + dy) * page.width + x + dx] !== 255) clear = false
+        if (clear) {
+          page.data[y * page.width + x] = 0
+          n++
+        }
+      }
+    expect(n).toBe(target)
+    const d = despeckle(page, 300)
+    expect(d.specks).toBe(target)
+    expect(d.noisy).toBe(false)
+    expect(d.image).toBe(page)
+  })
+
   it('speck size scales with DPI and is capped at 9 px²', () => {
     expect([maxSpeck(150), maxSpeck(300), maxSpeck(400), maxSpeck(600), maxSpeck(1200)]).toEqual([
       1, 4, 7, 9, 9
@@ -203,6 +256,18 @@ describe('background normalisation', () => {
     for (let i = 0; i < photo.data.length; i++)
       photo.data[i] = Math.floor((photo.data[i] * (150 + ((i % photo.width) >> 4))) / 255)
     expect(looksLikePhoto(photo)).toBe(true)
+  })
+
+  it('the photo test turns at half the pixels at the ends of the grey range', () => {
+    const page = (ends: number): Gray => {
+      const img = blank(100, 10, 128)
+      img.data.fill(255, 0, ends)
+      return img
+    }
+    expect(looksLikePhoto(page(400))).toBe(true)
+    expect(looksLikePhoto(page(499))).toBe(true)
+    expect(looksLikePhoto(page(500))).toBe(false)
+    expect(looksLikePhoto(page(600))).toBe(false)
   })
 
   it('flattens a lighting gradient back to white paper and keeps the ink dark', () => {
@@ -285,6 +350,25 @@ describe('skew', () => {
     expect(s.apply).toBe(Math.abs(s.deg) >= 0.1)
   })
 
+  it('never applies a skew whose score confidence is under 3 (scattered dots, no lines)', () => {
+    expect(SKEW_MIN_CONF).toBe(3)
+    let found = false
+    for (let seed = 1; seed < 50 && !found; seed++) {
+      let s = seed
+      const mask = new Uint8Array(200 * 150)
+      for (let i = 0; i < mask.length; i++) {
+        s = (s * 1103515245 + 12345) & 0x7fffffff
+        mask[i] = s % 20 === 0 ? 1 : 0
+      }
+      const r = findSkew(mask, 200, 150)
+      if (Math.abs(r.deg) < 0.1) continue // in the apply range only
+      found = true
+      expect(r.conf).toBeLessThan(SKEW_MIN_CONF)
+      expect(r.apply).toBe(false)
+    }
+    expect(found).toBe(true)
+  })
+
   it('reports nothing for an empty page', () => {
     expect(findSkew(new Uint8Array(100), 10, 10)).toEqual({
       deg: 0,
@@ -354,6 +438,42 @@ describe('orientation', () => {
     expect(shouldFlip(bandReading(words(12, 80, 'ɥ|,')), bandReading(words(12, 90)))).toBe(false)
     // Too few words.
     expect(shouldFlip(bandReading(words(9, 40, 'ɥ|,')), bandReading(words(9, 90)))).toBe(false)
+  })
+
+  it('the 0/180 thresholds hold at their exact values (§3.4.5: Δconf ≥ 15, ≥ 10 words, Δp ≥ 0.25)', () => {
+    expect([FLIP_CONF_DELTA, FLIP_MIN_WORDS, FLIP_PLAUSIBILITY_DELTA]).toEqual([15, 10, 0.25])
+    const asIs = { words: 12, meanConf: 40, plausibility: 0.5 }
+    const at = (d: Partial<{ words: number; meanConf: number; plausibility: number }>) =>
+      shouldFlip(asIs, { words: 10, meanConf: 55, plausibility: 0.75, ...d })
+    expect(at({})).toBe(true) // every signal exactly at its threshold
+    expect(at({ meanConf: 54.9 })).toBe(false)
+    expect(at({ plausibility: 0.74 })).toBe(false)
+    expect(at({ words: 9 })).toBe(false)
+  })
+
+  it('the 90° test turns at a profile ratio over 1.5, not at or under it', () => {
+    expect([VERTICAL_RATIO_NUM, VERTICAL_RATIO_DEN]).toEqual([3, 2])
+    expect(isVertical(1000, 1500)).toBe(false)
+    expect(isVertical(1000, 1501)).toBe(true)
+    expect(isVertical(1000, 1200)).toBe(false)
+    expect(isVertical(1000, 2900)).toBe(true)
+  })
+
+  it('textBand puts the band on the text: not on a logo, centred when there is none', () => {
+    const img = blank(400, 800)
+    fillRect(img, 50, 300, 350, 500) // a solid logo in the middle
+    const lines = textPage(400, 160)
+    img.data.set(lines.data, 620 * 400) // two text lines, ink in rows 664..711
+    const y0 = textBand(img, 200)
+    expect(y0).toBeLessThanOrEqual(664)
+    expect(y0 + 200).toBeGreaterThanOrEqual(712)
+    expect(textBand(blank(400, 800), 200)).toBe(300)
+    // Text all the way down: the design's central band.
+    expect(textBand(textPage(400, 800), 200)).toBe(300)
+    // Text only in the top 30%: the band moves up onto it.
+    const top = blank(400, 800)
+    top.data.set(textPage(400, 240).data, 0)
+    expect(textBand(top, 200)).toBeLessThan(100)
   })
 
   it('rotation Δ = (θ_detected − r_edit) mod 360', () => {

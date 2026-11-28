@@ -5,6 +5,10 @@
 // correct = exactly the GT text), fits the isotonic P(word correct | raw conf) and writes the
 // 21-point table to src/shared/ocr/calibration/tess-core7-simd.json. It also sweeps the font-size
 // factor (§3.4.6: x-height → em) over the same pages and reports the median word-box IoU of each.
+// The pipeline's own gate (Retry A) reads a fixed table during the sweep (DECISION_TABLE), never
+// the committed one, so the fit is a deterministic function of the code and the seeds:
+// `node scripts/ocr-calibrate.mjs --seeds 1,2,3,4,5 --threads 4 --check` reproduces it byte for
+// byte.
 //
 // The maintainers' real corpus (§3.9.1: 10–20 own scans and photos) does not exist yet. When it
 // does, `bench/ocr-real/manifest.json` lists `{ pdf, gt, kind }` entries (PDF path, a synth-style
@@ -44,7 +48,19 @@ import {
 import { pageHarness, type PageHarness } from '../test-utils/page-harness'
 
 const RUN = process.env.PDFX_OCR_CALIBRATE === '1'
-const OUT = join(REPO_ROOT, 'src/shared/ocr/calibration/tess-core7-simd.json')
+/** Where the table goes (the script's --check writes elsewhere and compares). */
+const OUT =
+  process.env.PDFX_OCR_CAL_OUT ?? join(REPO_ROOT, 'src/shared/ocr/calibration/tess-core7-simd.json')
+
+/**
+ * The table the pipeline's own gate (Retry A, `thresholdsFor(table).retry`) reads during the
+ * sweep: fixed, never the committed fit. With the committed table there the sweep depended on the
+ * table it was replacing, so each refit moved which pages took Retry A and a rerun did not
+ * reproduce the committed JSON [measured, PR6 review: points[90] 0.8413 → 0.84 on a rerun]. The
+ * placeholder's retry gate (p = raw/100 below 0.70) is the design's "≈ raw 70" itself; the app keeps
+ * reading the shipped table, whose retry threshold is read off the curve at that same raw 70.
+ */
+const DECISION_TABLE = TESS_CORE7_PLACEHOLDER
 const REAL = join(REPO_ROOT, 'bench/ocr-real/manifest.json')
 
 const list = (v: string | undefined, d: string[]): string[] =>
@@ -166,7 +182,7 @@ describe.runIf(RUN)('calibration run (tier 2)', () => {
           continue
         }
         const langs = job.preset === 'latin-diacritics' ? ['deu', 'fra', 'spa'] : ['eng']
-        const run = await h.run(r.pdfBytes, r.gt.page, { langs })
+        const run = await h.run(r.pdfBytes, r.gt.page, { langs, calibration: DECISION_TABLE })
         const l = label(run.page, r.gt)
         samples.push(...l.samples)
         const pp = (perPreset[job.preset] ??= { words: 0, correct: 0, orientation: {} })
@@ -203,7 +219,10 @@ describe.runIf(RUN)('calibration run (tier 2)', () => {
       for (const e of entries) {
         const gt = JSON.parse(readFileSync(join(REPO_ROOT, e.gt), 'utf8')) as SynthGt
         const pdf = new Uint8Array(readFileSync(join(REPO_ROOT, e.pdf)))
-        const run = await harnesses[0].run(pdf, gt.page, { langs: ['eng'] })
+        const run = await harnesses[0].run(pdf, gt.page, {
+          langs: ['eng'],
+          calibration: DECISION_TABLE
+        })
         for (const s of label(run.page, gt).samples) {
           samples.push({ ...s, weight: realWeight })
           n++

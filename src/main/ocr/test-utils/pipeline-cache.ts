@@ -30,6 +30,8 @@ export interface PipelineSpec {
   preset: string
   seed: number
   langs: string[]
+  /** The page's edit rotation (the request's), when it has one. */
+  editRotation?: 0 | 90 | 180 | 270
 }
 
 export interface PipelineEntry {
@@ -161,6 +163,8 @@ export function replayRecognizer(entry: PipelineEntry): Recognizer & { remaining
             returnHocr,
             reuse: extra.reuse,
             adaptive: extra.adaptive,
+            prior: extra.editRotation,
+            calibration: extra.calibration,
             now: () => 0
           })
       return { outcome, heap: 0, stderrLines: 0, tripwire: 0 }

@@ -8,11 +8,15 @@
 //  2. Geometry: the 90° projection test, then deskew (sweep and search on the 1/4-scale binary
 //     copy), then a 16 px white pad. `toSource` maps the copy's pixels back to the raster's, so
 //     every word and char box is mapped back with the inverse rotation (map.ts takes the affine).
-//  3. Pass 1: PSM 3, Otsu. If it reads doubtfully, the 0°/180° test (a central band, PSM 6, both
-//     ways; flip only if confidence AND plausibility agree) and, on a flip, pass 1 again.
+//     An edit rotation the page already has is tried first, on the axis the 90° test found.
+//  3. Pass 1: PSM 3, Otsu. If it reads doubtfully, the 0°/180° test (a quarter-height band placed
+//     on the text, PSM 6, both ways; turn only if confidence AND plausibility agree), and when
+//     neither way reads well the same on the copy turned a quarter (90° vs 270°). On a turn,
+//     pass 1 again on the turned copy, kept only if it scores higher than the first.
 //  4. Retry A (Sauvola) if the calibrated mean is below the retry threshold; Retry B (PSM 11) if
 //     the OCR chars are under 30% of the ink components. Keep the higher Σ(conf × chars). At most
-//     MAX_PASSES full-page recognitions; the band reads are not counted (they are a quarter page).
+//     MAX_PASSES full-page recognitions, run against whichever pass 1 was kept; the band reads
+//     are not counted (they are a quarter page each, four at most).
 //  5. The adaptive pass is asked for, not run: the x-height (or, for scripts without one, the char
 //     height) says the page needs more pixels, and only the raster thread can render them. The
 //     coordinator re-renders at `adaptive.dpi` and calls again with `reuse`, which skips the
@@ -49,10 +53,13 @@ import {
 import {
   BAND_DEN,
   BAND_NUM,
+  FLIP_CONF_DELTA,
+  FLIP_MIN_WORDS,
   bandReading,
   plausibility,
   profileTest,
   shouldFlip,
+  textBand,
   type BandReading,
   type Orientation
 } from '../../../shared/ocr/preprocess/orientation'
@@ -140,6 +147,9 @@ export interface PipelineStats {
   orientationChecked: boolean
   /** Its two readings, when it ran. */
   band?: { asIs: BandReading; flipped: BandReading }
+  /** The same on the copy turned a quarter, when neither of those read plausibly. */
+  bandQuarter?: { asIs: BandReading; flipped: BandReading }
+  /** The band test turned the copy (by 180° or a quarter) and the turned pass 1 was kept. */
   flipped: boolean
   /** OCR chars of the chosen result. */
   chars: number
@@ -178,18 +188,33 @@ export const ADAPTIVE_CHAR = { trigger: 30, target: 40 } as const
 export const ADAPTIVE_MAX_DPI = 600
 
 /**
- * A first result whose char-weighted calibrated mean reaches P(correct) at this raw anchor skips
- * the adaptive pass (§3.4.3: "may skip it when the first pass's calibrated confidence is already
- * high"). [measured, PR6 tier 1: smallprint6pt and its blur read at raw ~96 with recall 100% at
- * 300 DPI and skip; the 200 DPI fax variant reads at ~93 and gains +1.4 pp from the pass.]
+ * A first result with at least `share` of its chars in words read at raw confidence ≥ `raw` skips
+ * the adaptive pass (§3.4.3: "may skip it when the first pass's confidence is already high").
+ *
+ * Raw, not calibrated: the fitted curve is steep at the top (P = 0.83 at raw 90, 0.994 at 95), so
+ * a calibrated mean reaches P(95) only when nearly every word does, and it moved with every refit
+ * of the table [measured, PR6 review: smallprint6pt and its blur read at calibrated means of
+ * 0.990–0.995 and 10 of 12 pages took the pass]. [measured, PR6 review, seeds 1–3 ×
+ * Helvetica/Times, HEAD before this change:] smallprint6pt has 0.97–0.99 of its chars at ≥ 95 and
+ * recall 1.000 at 300 DPI, which the pass never improved; smallprint6pt-blur 0.94–0.99, where the
+ * kept adaptive read lowered recall on 4 of 6 pages (e.g. 0.988 → 0.974) and raised it on 1; both
+ * now skip, saving ~1.6–2.0 s a page. smallprint6pt-fax (0.26–0.88) still runs it, though there
+ * the first read was kept on all 6 pages.
  */
-export const ADAPTIVE_SKIP_RAW = 95
+export const ADAPTIVE_SKIP = { raw: 95, share: 0.9 } as const
 
 /** Does this result read well enough to skip the adaptive pass? */
-export function adaptiveSkip(raw: RawOcr, table: CalibrationTable): boolean {
-  const mean = calibratedMean(raw, table)
-  const at = calibrate(table, ADAPTIVE_SKIP_RAW)
-  return mean !== null && at !== null && mean >= at
+export function adaptiveSkip(raw: RawOcr): boolean {
+  let at = 0
+  let all = 0
+  for (const l of raw.lines)
+    for (const w of l.words) {
+      if (w.conf === null || w.conf < 0) continue
+      const k = [...w.text].length
+      all += k
+      if (w.conf >= ADAPTIVE_SKIP.raw) at += k
+    }
+  return all > 0 && at >= ADAPTIVE_SKIP.share * all
 }
 
 /** Retry B: OCR chars below this share of the ink components. */
@@ -202,6 +227,28 @@ export const SPARSE_RATIO = 0.3
  * only numbers-table (letter-digit codes) reads doubtfully, and its band test does not flip.]
  */
 export const DOUBT = { meanConf: 75, plausibility: 0.7 } as const
+
+/** A band reading that clears pass 1's doubt test (DOUBT) on both signals. */
+export function readsWell(b: BandReading): boolean {
+  return b.meanConf >= DOUBT.meanConf && b.plausibility >= DOUBT.plausibility
+}
+
+/**
+ * Does a band read on the copy turned a quarter beat the 0°/180° reads (best mean confidence
+ * `refConf`)? Both signals again, in the form a quarter turn needs: the confidence rises by
+ * FLIP_CONF_DELTA (with FLIP_MIN_WORDS words) AND the turned band reads like text (plausibility at
+ * DOUBT's level). Not a plausibility rise: a sideways receipt's garbage is short tokens and digits
+ * that score as plausible as real text: 0.53–0.88 [measured, PR6 review: receipt90 in Helvetica
+ * and Times, seeds 1/3/5], against 0.94–0.98 for its upright band in Helvetica, whose mean conf
+ * (53–71) is 29–38 above the best sideways read. A turn still has to win the full-page score.
+ */
+export function quarterWins(refConf: number, cand: BandReading): boolean {
+  return (
+    cand.words >= FLIP_MIN_WORDS &&
+    cand.meanConf - refConf >= FLIP_CONF_DELTA &&
+    cand.plausibility >= DOUBT.plausibility
+  )
+}
 
 /** Σ(conf × chars): the score by which two passes over one page are compared. */
 export function passScore(raw: RawOcr): number {
@@ -324,9 +371,19 @@ export interface RecognizePageOptions {
   now?: () => number
   /** The adaptive second call: reuse the first call's geometry and recipe. */
   reuse?: ReuseHint
+  /**
+   * The table Retry A's gate reads (default TESS_CORE7). The calibration run passes a fixed one,
+   * so the fit does not depend on the table it replaces (calibrate.ocr.test.ts).
+   */
   calibration?: CalibrationTable
   /** Ask for the adaptive pass at all (default true; never on a `reuse` call). */
   adaptive?: boolean
+  /**
+   * The page's edit rotation (§3.4.5 priors): pass 1 reads the copy turned this way first when it
+   * lies on the 90° test's axis (it then picks 180 over 0, or 270 over 90); the band tests still
+   * turn it when both of their signals disagree. A prior across the axis is not tried.
+   */
+  prior?: Orientation
 }
 
 /** Recognise one page raster (see the header). */
@@ -368,17 +425,30 @@ export function recognizePage(
   let plan: GeometryPlan
   let vertical = false
   let skew = { deg: 0, conf: 0, applied: false }
+  // The deskew for a copy turned by `turns`: the row profile's, or the quarter-turned mask's for an
+  // odd turn (a half turn keeps a tilt's sense, so 0/180 and 90/270 share one).
+  let skewFor: (turns: QuarterTurns) => number = () => 0
   if (opts.reuse) plan = { ...opts.reuse.plan }
   else {
     const q = boxDownscale(base, QUARTER)
     const t = otsu(histogram(q))
     const prof = profileTest(binarize(q, t), q.width, q.height)
     vertical = prof.vertical
-    const turns: QuarterTurns = vertical ? 1 : 0
-    // The skew of the profile the page is read along (the quarter-turned mask's, when vertical).
-    const s = vertical ? prof.cols : prof.rows
+    skewFor = (turns) => {
+      const s = turns % 2 ? prof.cols : prof.rows
+      return s.apply ? s.deg : 0
+    }
+    // §3.4.5 priors: an edit rotation the page already has is tried first, on the axis the 90° test
+    // found (0/180, or 90/270 when the lines run vertically). A prior across that axis is not
+    // tried: Tesseract reads a sideways copy of a clean page at full confidence, so nothing after
+    // pass 1 could undo a wrong quarter turn [measured, PR6 review: clean300 with prior 90, pass 1
+    // scored 55,624 like the upright read, no band test ran, Find recall 0.23].
+    const axis: QuarterTurns = vertical ? 1 : 0
+    const p = opts.prior ? ((opts.prior / 90) as QuarterTurns) : null
+    const turns: QuarterTurns = p !== null && p % 2 === axis ? p : axis
+    const s = turns % 2 ? prof.cols : prof.rows
     skew = { deg: s.deg, conf: s.conf, applied: s.apply }
-    plan = { quarterTurns: turns, skewDeg: s.apply ? s.deg : 0 }
+    plan = { quarterTurns: turns, skewDeg: skewFor(turns) }
   }
   let copy = orientedCopy(base, plan)
 
@@ -389,30 +459,58 @@ export function recognizePage(
   full++
   let best: Best = { ...first, id: opts.reuse ? 'adaptive' : 'pass1', recipe: recipe0 }
 
-  // 3. 0° vs 180°, only when pass 1 reads doubtfully.
+  // 3. Orientation, only when pass 1 reads doubtfully: 0° vs 180° on a band of the copy, then, if
+  // neither way reads well, 90° vs 270° on a band of the copy turned a quarter.
   let orientationChecked = false
   let flipped = false
   let bandStats: PipelineStats['band']
+  let quarterStats: PipelineStats['bandQuarter']
   if (
     !opts.reuse &&
     (rawMeanConf(best.raw) < DOUBT.meanConf || plausibility(best.raw) < DOUBT.plausibility)
   ) {
     orientationChecked = true
-    const h = copy.image.height
-    const bandH = Math.max(1, Math.floor((h * BAND_NUM) / BAND_DEN))
-    const y0 = Math.floor((h - bandH) / 2)
-    const band = cropRows(copy.image, y0, y0 + bandH)
     const bandParams = { ...fullPageParams(dpi), tessedit_pageseg_mode: 6 }
-    const asIs = bandReading(run('band', band, bandParams).raw)
-    const turned = bandReading(run('band-flipped', rotateQuarterCW(band, 2).image, bandParams).raw)
-    bandStats = { asIs, flipped: turned }
-    if (shouldFlip(asIs, turned)) {
-      flipped = true
-      plan = { ...plan, quarterTurns: ((plan.quarterTurns + 2) % 4) as QuarterTurns }
-      copy = orientedCopy(base, plan)
-      const again = run('pass1-flipped', copy.image, paramsFor(dpi, recipe0))
+    const readBoth = (img: Gray, id: string): { asIs: BandReading; flipped: BandReading } => {
+      const bandH = Math.max(1, Math.floor((img.height * BAND_NUM) / BAND_DEN))
+      const y0 = textBand(img, bandH)
+      const band = cropRows(img, y0, y0 + bandH)
+      return {
+        asIs: bandReading(run(id, band, bandParams).raw),
+        flipped: bandReading(run(`${id}-flipped`, rotateQuarterCW(band, 2).image, bandParams).raw)
+      }
+    }
+    const turn = (by: number): QuarterTurns => ((plan.quarterTurns + by) % 4) as QuarterTurns
+    bandStats = readBoth(copy.image, 'band')
+    let target: { turns: QuarterTurns; id: string } | null = null
+    if (shouldFlip(bandStats.asIs, bandStats.flipped))
+      target = { turns: turn(2), id: 'pass1-flipped' }
+    else if (!readsWell(bandStats.asIs) && !readsWell(bandStats.flipped)) {
+      // Neither way up reads well: maybe the lines run the other way and the 90° test missed them
+      // [measured, PR6 review: receipt90 (narrow, short lines) read as vertical=false in 3 fonts].
+      // Turned a quarter clockwise, the band as is is turn(1) and flipped turn(3).
+      const qPlan = { quarterTurns: turn(1), skewDeg: skewFor(turn(1)) }
+      quarterStats = readBoth(orientedCopy(base, qPlan).image, 'band-quarter')
+      const refConf = Math.max(bandStats.asIs.meanConf, bandStats.flipped.meanConf)
+      const cw = quarterWins(refConf, quarterStats.asIs)
+      const ccw = quarterWins(refConf, quarterStats.flipped)
+      if (cw && (!ccw || quarterStats.asIs.meanConf >= quarterStats.flipped.meanConf))
+        target = { turns: turn(1), id: 'pass1-turned' }
+      else if (ccw) target = { turns: turn(3), id: 'pass1-turned' }
+    }
+    if (target) {
+      // §3.4.5's keep-the-better rule applies to a turn too: the band can be the odd part of the
+      // page (a fold-over mailer's upside-down address block in the middle of upright text).
+      const tPlan = { quarterTurns: target.turns, skewDeg: skewFor(target.turns) }
+      const tCopy = orientedCopy(base, tPlan)
+      const again = run(target.id, tCopy.image, paramsFor(dpi, recipe0))
       full++
-      best = { ...again, id: 'pass1-flipped', recipe: recipe0 }
+      if (again.score > best.score) {
+        flipped = true
+        plan = tPlan
+        copy = tCopy
+        best = { ...again, id: target.id, recipe: recipe0 }
+      }
     }
   }
 
@@ -436,7 +534,7 @@ export function recognizePage(
 
   // §3.4.3: the adaptive pass roughly doubles a page's cost, so a first result that already reads
   // with high confidence skips it.
-  const confident = adaptiveSkip(best.raw, table)
+  const confident = adaptiveSkip(best.raw)
   const adaptive =
     opts.reuse || opts.adaptive === false || confident ? null : adaptiveRequest(best.raw, dpi)
   const out: RecognizeOutcome = {
@@ -458,6 +556,7 @@ export function recognizePage(
       skew,
       orientationChecked,
       ...(bandStats ? { band: bandStats } : {}),
+      ...(quarterStats ? { bandQuarter: quarterStats } : {}),
       flipped,
       chars: charCount(best.raw),
       meanConfCal: calibratedMean(best.raw, table)

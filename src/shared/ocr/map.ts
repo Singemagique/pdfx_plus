@@ -102,11 +102,13 @@ const TAN_1DEG = 0.017455064928217585
 /**
  * The x-height → em factor for Latin-like scripts. PR0 used 0.5, which overestimates Helvetica by
  * 4–12%. PR6 refit it on the calibration sweep (5 seeds × 15 presets × Helvetica, Times, Courier,
- * DejaVu Serif; 41,849 words): median word-box IoU 0.854 at 0.50, 0.882 at 0.56, a flat maximum
- * of 0.892 at 0.59–0.61 [measured, scripts/ocr-calibrate.mjs]. 0.56 is taken rather than the
- * maximum: it keeps a larger em box (the redaction footprint relies on the box covering the ink;
- * a bigger factor shrinks it), it makes the box match Helvetica's own ascent..descent (0.523 em
- * x-height plus the ~1 px anti-aliasing PR0 measured), and it already has ~75% of the IoU gain.
+ * DejaVu Serif; 41,945 words): median word-box IoU 0.852 at 0.50, 0.882 at 0.56, a flat maximum
+ * of 0.893–0.894 at 0.59–0.61 [measured, `node scripts/ocr-calibrate.mjs --seeds 1,2,3,4,5`; the
+ * numbers are the committed calibration/tess-core7-simd.json's `fit.sizeFactor`]. 0.56 is taken
+ * rather than the maximum: it keeps a larger em box (the redaction footprint relies on the box
+ * covering the ink; a bigger factor shrinks it), it makes the box match Helvetica's own
+ * ascent..descent (0.523 em x-height plus the ~1 px anti-aliasing PR0 measured), and it already
+ * has ~70% of the IoU gain.
  */
 export const XHEIGHT_EM = 0.56
 /** The clamp's upper bound: the em box is at most this inverse share of the line's ink height. */
@@ -377,13 +379,13 @@ export const SPLIT_GAP_XH = 0.3
  * engine sometimes reads two words as one across a space-wide gap, typically a currency sign and
  * its amount (`€ 97.558,15` → `€97.558,15`, measured on numbers-table). Using the char boxes:
  * - between a symbol (\p{S}: €, $, %, +) and a letter or digit, a gap of 0.3 × the x-height splits
- *   (`€ 97`: 9 px at 11 pt / 300 DPI; ``, no space: 6 px [measured]);
+ *   (`€ 97`: 9 px at 11 pt / 300 DPI; `$97`, no space: 6 px [measured]);
  * - between letters, a gap of at least 0.6 × the line's narrow inter-word gaps (their lower
  *   quartile: table columns make the median useless), 3 × the median gap between chars inside the
  *   line's words (so a monospace font's wide gaps around narrow letters never split) and 0.3 × the
  *   x-height;
  * - between two digits or punctuation marks, never: a narrow `1` leaves a gap as wide as a space
- *   (`1` to `4` in ``: 9 px [measured]), so geometry cannot tell `1 45` from `145`.
+ *   (`1` to `4` in `$145`: 9 px [measured]), so geometry cannot tell `1 45` from `145`.
  * Horizontal lines of two or more words only, and only words whose char boxes are one per code
  * point; the parts keep the word's confidence.
  */

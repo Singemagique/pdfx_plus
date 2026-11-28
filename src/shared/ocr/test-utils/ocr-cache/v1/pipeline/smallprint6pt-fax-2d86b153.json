@@ -5,7 +5,8 @@
     "preset": "smallprint6pt-fax",
     "seed": 1,
     "langs": ["eng"],
-    "group": "reported"
+    "group": "reported",
+    "adaptive": "run"
   },
   "pipelineVersion": 2,
   "firstRaster": {

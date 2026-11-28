@@ -7,7 +7,7 @@
 
 import { TESS_CORE7 } from '../../../shared/ocr/calibration'
 import { ENGINE_ID, PIPELINE_VERSION } from '../../../shared/ocr/engine/tess-core'
-import type { GrayImage } from '../../../shared/ocr/engine/types'
+import type { CalibrationTable, GrayImage } from '../../../shared/ocr/engine/types'
 import { mapRawOcrPage, type MapContext, type SizeFactors } from '../../../shared/ocr/map'
 import type { TriagePage } from '../../../shared/ocr/triage'
 import type { OcrPage } from '../../../shared/ocr/types'
@@ -34,6 +34,14 @@ export interface PageRunOptions {
   adaptive?: boolean
   /** Return every recognition's hOCR and input record (the replay recorder). */
   record?: boolean
+  /** The page's edit rotation (the request's `editRotation`; tried first). */
+  editRotation?: 0 | 90 | 180 | 270
+  /**
+   * The table the pipeline's gates read (default: the shipped one). The calibration run passes a
+   * fixed table so the fit is not fed by the table it replaces; the mapping's confCal always uses
+   * the shipped table.
+   */
+  calibration?: CalibrationTable
 }
 
 export interface RecordedRecognition extends RecognitionRecord {
@@ -108,7 +116,9 @@ export async function pageHarness(thread: Recognizer): Promise<PageHarness> {
         let recMs = 0
         const t1 = performance.now()
         const first = await thread.recognize(r1, r1.dpi, o.langs, o.record === true, {
-          adaptive: o.adaptive
+          adaptive: o.adaptive,
+          ...(o.editRotation ? { editRotation: o.editRotation } : {}),
+          ...(o.calibration ? { calibration: o.calibration } : {})
         })
         recMs += performance.now() - t1
         const recognitions: RecordedRecognition[] = []
@@ -129,7 +139,8 @@ export async function pageHarness(thread: Recognizer): Promise<PageHarness> {
           const r2 = render(next.dpi)
           const t2 = performance.now()
           second = await thread.recognize(r2, r2.dpi, o.langs, o.record === true, {
-            reuse: { plan: first.outcome.plan, recipe: first.outcome.recipe }
+            reuse: { plan: first.outcome.plan, recipe: first.outcome.recipe },
+            ...(o.calibration ? { calibration: o.calibration } : {})
           })
           recMs += performance.now() - t2
           collect(second, 'adaptive')

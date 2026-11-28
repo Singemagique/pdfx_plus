@@ -13,7 +13,7 @@ import { threadOptions } from '../process/budget'
 import { ENGINE_CORE, ENGINE_DATA } from '../process/engine-manifest'
 import { loadEngine } from '../process/engine-node'
 import type { LoadedEngine } from '../process/coordinator'
-import type { RecognizeOutcome, ReuseHint } from '../process/recognize-core'
+import type { RecognizeOutcome } from '../process/recognize-core'
 import type { FromRecognize, ToRecognize } from '../process/thread-messages'
 import { bundleEntry, type Bundled } from './bundle'
 import { PDFIUM_WASM_PATH } from './pdfium-node'
@@ -38,6 +38,12 @@ export interface RecognizeReply {
   tripwire: number
 }
 
+/** The recognize message's optional fields a test sets (thread-messages.ts). */
+export type RecognizeExtra = Pick<
+  Extract<ToRecognize, { type: 'recognize' }>,
+  'reuse' | 'adaptive' | 'rawPass1' | 'editRotation' | 'calibration'
+>
+
 export interface EngineThread {
   engine: LoadedEngine
   recognize(
@@ -45,7 +51,7 @@ export interface EngineThread {
     dpi: number,
     langs: string[],
     returnHocr?: boolean,
-    extra?: { reuse?: ReuseHint; adaptive?: boolean; rawPass1?: boolean }
+    extra?: RecognizeExtra
   ): Promise<RecognizeReply>
   /** The thread's tripwire counter as of its last message. */
   readonly tripwire: number

@@ -35,12 +35,16 @@
 //         pixel caps) is answered `skipped-protected` / `failed` `image-format` / `too-large`
 //         without a render or the engine, whether triage answered before or after the request.
 // §3.4.2  PR6: each page renders at the DPI triage chose from its dominant image (the request's
-// §3.4.3  renderDpi overrides it; 300 when triage has not answered), with page-plan.ts's render
-//         flags, and a near-scanned page without its visible native text (maskText). A first
-//         result that asks for the adaptive pass is kept while the page renders again at the
-//         higher DPI (capped) and is recognised once more with the same geometry and recipe; the
-//         better of the two is the page's result, and any failure in that phase (render, heap,
-//         crash, timeout, mapping) ends the page with the first result instead.
+// §3.4.3  renderDpi overrides it; 300 for a page nobody asked to triage), with page-plan.ts's
+//         render flags, and a near-scanned page without its visible native text (maskText). A
+//         page whose triage is still open waits for its verdict (its pages go to the front of the
+//         triage queue), and the verdict a page first rendered with is the one its result is
+//         mapped with. A first result that asks for the adaptive pass is kept while the page
+//         renders again at the higher DPI (capped) and is recognised once more with the same
+//         geometry and recipe; the better of the two is the page's result, and any failure in
+//         that phase (render, heap, raster or recognize crash/OOM, timeout, mapping) ends the
+//         page with the first result at once, with no retry.
+//         The recognize message carries the page's edit rotation, the orientation tried first.
 // §3.4.6  Results map through their OCR copy's affine (pad, quarter turns, deskew); a near-scanned
 //         page's OCR words lying on its native text are dropped; `rotateBy` = (θ − r_edit) mod 360.
 
@@ -189,7 +193,7 @@ interface Task {
   /**
    * 'adaptive' after the first recognition asked for the §3.4.3 re-render: the page is rendered
    * again at `adaptiveDpi` and recognised once more with the first result's geometry. Any failure
-   * in that phase ends the page with the first result instead (`fail`).
+   * in that phase ends the page with the first result instead (`fail`), never a retry.
    */
   phase: 'first' | 'adaptive'
   adaptiveDpi: number | null
@@ -197,6 +201,13 @@ interface Task {
     outcome: RecognizeOutcome
     raster: { width: number; height: number; dpi: number }
   } | null
+  /**
+   * What triage had said about the page when its first render started (`v` undefined: nothing).
+   * The render DPI, flags and mask, the adaptive caps and the mapping (physDpi, class, the native
+   * overlap drop) all read this snapshot, so a verdict arriving mid-page cannot mix two states.
+   * Only a refusal is still taken from the live verdict (its words are dropped whenever it comes).
+   */
+  triage: { v: TriageVerdict | undefined } | null
 }
 
 interface Source {
@@ -715,6 +726,20 @@ export class Coordinator {
   }
 
   private startTriage(r: RasterSlot, task: TriageTask): void {
+    // Pages a recognize request is waiting on go first, in the order they would render (§3.3.6:
+    // the focused page first); the rest keep their order.
+    const waitingTasks = [...this.tasks].filter(
+      (t) => t.state === 'queued' && t.job.src === task.src && this.awaitingTriage(t)
+    )
+    if (waitingTasks.length > 0) {
+      const ranked = waitingTasks
+        .map((t) => ({ index: t.req.index, rank: this.rank(t) }))
+        .sort((a, b) => a.rank[0] - b.rank[0] || a.rank[1] - b.rank[1] || a.rank[2] - b.rank[2])
+      const inPending = new Set(task.pending!)
+      const first = [...new Set(ranked.map((x) => x.index))].filter((p) => inPending.has(p))
+      const lead = new Set(first)
+      task.pending = [...first, ...task.pending!.filter((p) => !lead.has(p))]
+    }
     const pending = task.pending!
     const chunk: number[] = []
     if (task.solo.has(pending[0])) chunk.push(pending[0])
@@ -903,7 +928,8 @@ export class Coordinator {
         startedAt: 0,
         phase: 'first',
         adaptiveDpi: null,
-        first: null
+        first: null,
+        triage: null
       }
       job.tasks.add(t)
       this.tasks.add(t)
@@ -1007,11 +1033,11 @@ export class Coordinator {
     return [focusRank, t.job.seq, t.order]
   }
 
-  private pick(state: TaskState): Task | null {
+  private pick(state: TaskState, eligible?: (t: Task) => boolean): Task | null {
     let best: Task | null = null
     let bestRank: [number, number, number] | null = null
     for (const t of this.tasks) {
-      if (t.state !== state) continue
+      if (t.state !== state || (eligible && !eligible(t))) continue
       const r = this.rank(t)
       if (
         !bestRank ||
@@ -1051,8 +1077,11 @@ export class Coordinator {
       const r = this.ensureRaster()
       if (r.ready && !r.task && !r.triage) {
         // The gate before PDFium: a page triage refused is never rendered, whatever re-queued it.
-        let t = this.pick('queued')
-        while (t && this.refuseIfTriaged(t)) t = this.pick('queued')
+        // A page whose triage is still open waits for it (the triage then takes the thread), so
+        // its DPI, flags and mask never depend on which message happened to come first.
+        const ready = (x: Task): boolean => !this.awaitingTriage(x)
+        let t = this.pick('queued', ready)
+        while (t && this.refuseIfTriaged(t)) t = this.pick('queued', ready)
         if (t) {
           if (r.lastSrc !== null && r.lastSrc !== t.job.src && r.heap > this.b.rasterRecycleHeap) {
             // Between documents and the heap only grows: hand the memory back (§3.3.3).
@@ -1154,7 +1183,9 @@ export class Coordinator {
     job.progressDirty = true
     r.task = t
     r.lastSrc = job.src
-    const v = this.verdict(t)
+    // The first render fixes what the page is recognised and mapped with (see Task.triage).
+    t.triage ??= { v: this.verdict(t) }
+    const v = t.triage.v
     const dpi = this.renderDpiOf(t)
     const fit = fitRaster(t.req.width, t.req.height, dpi, this.b.raster)
     r.watchdog = setTimeout(
@@ -1176,8 +1207,28 @@ export class Coordinator {
     this.sendRaster(r, msg)
   }
 
+  /** What triage has said about `t`'s page so far (live; see Task.triage for the snapshot). */
   private verdict(t: Task): TriageVerdict | undefined {
     return this.sources.get(t.job.src)?.triaged.get(t.req.index)
+  }
+
+  /** The verdict `t` is rendered and mapped with: the snapshot once it has rendered. */
+  private pageVerdict(t: Task): TriageVerdict | undefined {
+    return t.triage ? t.triage.v : this.verdict(t)
+  }
+
+  /**
+   * A queued page with no verdict yet whose triage the renderer has asked for (its page is still
+   * pending in an open triage request, or that request is still waiting for the page count): it
+   * waits for the verdict rather than render at the 300 DPI fallback. A page nobody asked to triage
+   * renders at once, at 300; a page that has rendered once never waits again.
+   */
+  private awaitingTriage(t: Task): boolean {
+    if (t.triage || this.verdict(t)) return false
+    // A chunk at the raster thread is still a prefix of its request's `pending`.
+    return this.triages.some(
+      (x) => x.src === t.job.src && (x.pending === null || x.pending.includes(t.req.index))
+    )
   }
 
   /**
@@ -1185,7 +1236,7 @@ export class Coordinator {
    * DPI triage chose from the page's dominant image, else 300.
    */
   private renderDpiOf(t: Task): number {
-    return t.adaptiveDpi ?? t.job.dpi ?? this.verdict(t)?.renderDpi ?? DEFAULT_RENDER_DPI
+    return t.adaptiveDpi ?? t.job.dpi ?? this.pageVerdict(t)?.renderDpi ?? DEFAULT_RENDER_DPI
   }
 
   private takeRasterTask(slot: RasterSlot, taskId: number | null): Task | null {
@@ -1281,7 +1332,8 @@ export class Coordinator {
         const t = this.takeRasterTask(slot, m.taskId)
         if (t) {
           t.heapFailures++
-          if (t.heapFailures >= 2) this.fail(t, 'too-large', 'heap')
+          // The adaptive re-render is not retried: the page keeps its first result (fail).
+          if (t.heapFailures >= 2 || t.phase === 'adaptive') this.fail(t, 'too-large', 'heap')
           else this.requeue(t)
         }
         this.retireRaster()
@@ -1393,7 +1445,7 @@ export class Coordinator {
 
   private rasterFailure(t: Task): void {
     t.rasterFailures++
-    if (t.rasterFailures >= 2) this.fail(t, 'failed', 'raster-crash')
+    if (t.rasterFailures >= 2 || t.phase === 'adaptive') this.fail(t, 'failed', 'raster-crash')
     else this.requeue(t)
   }
 
@@ -1487,6 +1539,8 @@ export class Coordinator {
     }
     if (t.phase === 'adaptive' && t.first)
       msg.reuse = { plan: t.first.outcome.plan, recipe: t.first.outcome.recipe }
+    // §3.4.5 priors: the orientation the user already gave the page is tried first.
+    else if (t.req.editRotation) msg.editRotation = t.req.editRotation
     if (slot.ready) slot.worker.postMessage(msg, [data])
     else slot.outbox.push({ msg, transfer: [data] })
   }
@@ -1544,7 +1598,7 @@ export class Coordinator {
       outcome.adaptive,
       raster.dpi,
       { width: t.req.width, height: t.req.height },
-      this.verdict(t),
+      this.pageVerdict(t),
       this.b.raster
     )
     if (!next) return false
@@ -1593,7 +1647,8 @@ export class Coordinator {
     raster: { width: number; height: number; dpi: number }
   ): PackedOcrPage {
     const frame = { width: t.req.width, height: t.req.height }
-    const v = this.verdict(t)
+    // The verdict the page was rendered with, never one that arrived while it was at the engine.
+    const v = this.pageVerdict(t)
     const langs = t.job.langs
     const hashes = this.engine?.dataHashes ?? {}
     const dataHashes: Record<string, string> = {}
@@ -1627,7 +1682,10 @@ export class Coordinator {
     // (PDFium must never render a page whose image the JPX pre-check refused).
     if (this.refuseIfTriaged(t)) return
     t.recognizeFailures++
-    if (t.recognizeFailures >= 2) this.fail(t, 'failed', 'recognize-crash')
+    // A crash or OOM on the adaptive pass's bigger raster is not retried (it would render and
+    // recognise ~20 MP again): the page keeps its first result (fail).
+    if (t.recognizeFailures >= 2 || t.phase === 'adaptive')
+      this.fail(t, 'failed', 'recognize-crash')
     else this.requeue(t) // the bitmap went with the thread: render again
   }
 

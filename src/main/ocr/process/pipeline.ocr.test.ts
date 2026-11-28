@@ -56,6 +56,8 @@ interface Spec extends PipelineSpec {
   group: Group
   /** The orientation (θ_detected) the page must come out with. */
   orientation?: 0 | 90 | 180 | 270
+  /** Whether the first result must skip the adaptive pass or take it (§3.4.3's skip rule). */
+  adaptive?: 'skip' | 'run'
 }
 const spec = (id: string, group: Group, extra: Partial<Spec> = {}): Spec => ({
   id,
@@ -82,6 +84,14 @@ export const PIPELINE_SPECS: Spec[] = [
   spec('bilevel300', 'g98'),
   spec('bilevel240', 'g98'),
   spec('letter10pt', 'g98', { orientation: 0 }),
+  // PR6 review: text away from the page's centre, a sideways receipt the 90° test misses, a turn
+  // with a skew, and a page the user already turned (its edit rotation is tried first).
+  spec('rot180-short-letter', 'g98', { orientation: 180 }),
+  spec('rot180-logo', 'g98', { orientation: 180 }),
+  // Recall reported: upright, its 9 pt Helvetica reads 16/18 words (the engine, not the turn).
+  spec('receipt90', 'reported', { orientation: 90 }),
+  spec('rot90-skew2', 'g98', { orientation: 90 }),
+  spec('rot180page-edit180', 'g98', { preset: 'rot180page', orientation: 180, editRotation: 180 }),
   spec('blur1', 'g90'),
   spec('noise', 'g90'),
   spec('jpeg35', 'g90'),
@@ -89,9 +99,9 @@ export const PIPELINE_SPECS: Spec[] = [
   spec('latin-diacritics', 'g90', { langs: ['deu', 'fra', 'spa'] }),
   spec('numbers-table', 'g90'),
   spec('photoLike', 'reported'),
-  spec('smallprint6pt', 'reported'),
-  spec('smallprint6pt-blur', 'reported'),
-  spec('smallprint6pt-fax', 'reported'),
+  spec('smallprint6pt', 'reported', { adaptive: 'skip' }),
+  spec('smallprint6pt-blur', 'reported', { adaptive: 'skip' }),
+  spec('smallprint6pt-fax', 'reported', { adaptive: 'run' }),
   spec('margin-label', 'reported')
 ]
 
@@ -184,7 +194,11 @@ describe('tier 1: the PR6 pipeline on the synth presets (§3.9.4)', () => {
   for (const s of PIPELINE_SPECS)
     it(s.id, async () => {
       const r = await synthOf(s)
-      const run = await harness.run(r.pdfBytes, r.gt.page, { langs: s.langs, record: true })
+      const run = await harness.run(r.pdfBytes, r.gt.page, {
+        langs: s.langs,
+        record: true,
+        ...(s.editRotation ? { editRotation: s.editRotation } : {})
+      })
       // Privacy and silence: the thread's tripwire never fired, the engine printed nothing.
       expect(run.first.tripwire).toBe(0)
       expect(run.first.stderrLines).toBe(0)
@@ -216,6 +230,7 @@ describe('tier 1: the PR6 pipeline on the synth presets (§3.9.4)', () => {
           ...(run.second?.outcome.passes.map((p) => `${p.id}:${p.ms}`) ?? [])
         ],
         meanConfCal: run.page.meanConfCal,
+        adaptive: run.second ? 'run' : run.first.outcome.adaptive ? 'capped' : 'none',
         ms: Math.round(run.ms.total)
       }
       measured[s.id] = row
@@ -238,6 +253,16 @@ describe('tier 1: the PR6 pipeline on the synth presets (§3.9.4)', () => {
       expect.soft(fid.doubleNewlinesWithinLine, `${s.id} double newlines`).toBe(0)
       if (s.orientation !== undefined)
         expect.soft(run.page.orientation, `${s.id} orientation`).toBe(s.orientation)
+      if (s.adaptive)
+        expect.soft(run.second ? 'run' : 'skip', `${s.id} adaptive pass`).toBe(s.adaptive)
+      // The user's own turn is tried first: an upright read in pass 1, no band test.
+      if (s.editRotation)
+        expect
+          .soft(
+            run.first.outcome.passes.map((p) => p.id),
+            `${s.id} passes`
+          )
+          .toEqual(['pass1'])
     })
 
   // The codec outcome gate (§3.4.2, §3.9.4 R4): OCR on PDFium's raster of the 1-bit image must do

@@ -76,7 +76,9 @@ async function handle(msg: ToRecognize): Promise<void> {
       : recognizePage(counted, img, msg.dpi, {
           returnHocr: msg.returnHocr === true,
           reuse: msg.reuse,
-          adaptive: msg.adaptive
+          adaptive: msg.adaptive,
+          prior: msg.editRotation,
+          calibration: msg.calibration
         })
     post({
       type: 'result',

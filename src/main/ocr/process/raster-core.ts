@@ -76,8 +76,7 @@ export const FPDFBitmap_Gray = 1
 export const RENDER_FLAGS = 0
 /**
  * FPDF_RENDER_NO_SMOOTHIMAGE (fpdfview.h: 0x2000; the @embedpdf/pdfium typings list no flag
- * constants). PR6's A/B decides when it is passed (page-plan.ts 
-enderFlagsFor).
+ * constants). PR6's A/B decides when it is passed (page-plan.ts renderFlagsFor).
  */
 export const FPDF_RENDER_NO_SMOOTHIMAGE = 0x2000
 

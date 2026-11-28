@@ -23,7 +23,14 @@ const REPLAYED = [
   'photoLike',
   'border-scan',
   'smallprint6pt',
-  'numbers-table'
+  'smallprint6pt-fax',
+  'numbers-table',
+  // PR6 review: the band on the text, the quarter-turn band test, a turn with a skew, the prior.
+  'rot180-short-letter',
+  'rot180-logo',
+  'receipt90',
+  'rot90-skew2',
+  'rot180page-edit180'
 ]
 
 describe('the PR6 pipeline replays its recordings exactly', () => {
@@ -35,7 +42,10 @@ describe('the PR6 pipeline replays its recordings exactly', () => {
       const r = await synthesize({ preset: entry.spec.preset, seed: entry.spec.seed }, deps)
       const rec = replayRecognizer(entry)
       const harness = await pageHarness(rec)
-      const run = await harness.run(r.pdfBytes, r.gt.page, { langs: entry.spec.langs })
+      const run = await harness.run(r.pdfBytes, r.gt.page, {
+        langs: entry.spec.langs,
+        ...(entry.spec.editRotation ? { editRotation: entry.spec.editRotation } : {})
+      })
       expect(rec.remaining()).toBe(0)
       expect({
         orientation: run.page.orientation,
