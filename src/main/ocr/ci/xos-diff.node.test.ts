@@ -67,6 +67,58 @@ describe('the cross-OS OCR diff (tier 1b)', () => {
     expect(r.differences[0]).toMatchObject({ kind: 'boxes', key: 'pipeline/x', at: 1 })
   })
 
+  // PR11 review: CI compares three OSes, and windows sorts last; a difference on the third OS only
+  // must be caught (not just the first pair), with `at` taken over every OS.
+  it('catches a difference on the third OS alone, in boxes, text and the engine output', () => {
+    const changed = [
+      [10, 20, 30, 12, 0],
+      [45, 21, 40, 12, 0]
+    ]
+    const boxes = diffXos({
+      macos: run({ 'pipeline/x': rec() }),
+      ubuntu: run({ 'pipeline/x': rec() }),
+      windows: run({ 'pipeline/x': rec({ boxes: changed }) })
+    })
+    expect(boxes.ok).toBe(false)
+    expect(boxes.differences).toEqual([
+      {
+        kind: 'boxes',
+        key: 'pipeline/x',
+        at: 1,
+        byOs: {
+          macos: JSON.stringify([45, 20, 40, 12, 0]),
+          ubuntu: JSON.stringify([45, 20, 40, 12, 0]),
+          windows: JSON.stringify([45, 21, 40, 12, 0])
+        }
+      }
+    ])
+
+    const text = diffXos({
+      macos: run({ 'engine/x': rec() }),
+      ubuntu: run({ 'engine/x': rec() }),
+      windows: run({ 'engine/x': rec({ text: 'Hello world\nsecond 1ine' }) })
+    })
+    expect(text.differences).toEqual([
+      {
+        kind: 'text',
+        key: 'engine/x',
+        byOs: {
+          macos: 'line 2: second line',
+          ubuntu: 'line 2: second line',
+          windows: 'line 2: second 1ine'
+        }
+      }
+    ])
+
+    // `at` is the earliest difference against ANY OS: ubuntu differs at 2, windows at 0.
+    const engine = diffXos({
+      macos: run({ 'p/x': rec({ engine: ['a', 'b', 'c'] }) }),
+      ubuntu: run({ 'p/x': rec({ engine: ['a', 'b', 'C'] }) }),
+      windows: run({ 'p/x': rec({ engine: ['A', 'b', 'c'] }) })
+    })
+    expect(engine.differences).toMatchObject([{ kind: 'engine', key: 'p/x', at: 0 }])
+  })
+
   it('fails on engine, input and meta differences too', () => {
     const r = diffXos({
       a: run({ 'p/x': rec() }),

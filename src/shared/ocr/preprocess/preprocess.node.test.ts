@@ -6,7 +6,13 @@ import { describe, expect, it } from 'vitest'
 
 import { scanMath } from '../../test-utils/source-scan'
 import type { RawOcr } from '../engine/types'
-import { looksLikePhoto, normalizeBackground } from './background'
+import {
+  contentBox,
+  looksLikePhoto,
+  normalizeBackground,
+  normalizeRegion,
+  photoRegion
+} from './background'
 import { BORDER_PAD, removeBorder } from './border'
 import { labelComponents } from './components'
 import { NOISY_PER_MP, despeckle, maxSpeck } from './despeckle'
@@ -296,6 +302,71 @@ describe('background normalisation', () => {
       }
     expect(paper / papers).toBeGreaterThan(245)
     expect(ink / inks).toBeLessThan(40)
+  })
+
+  // PR11 review: a photo fitted onto a white Letter page. The margin alone is more than half the
+  // pixels, so the whole-page test calls it a scan; the photo's own box must still be normalised.
+  /** A dim, unevenly lit text photo (×0.75 → ×0.55 across) placed at (x, y) on a white page. */
+  function photoOnPage(pw: number, ph: number, x: number, y: number): { page: Gray; photo: Gray } {
+    const t = textPage(320, 160)
+    const photo: Gray = { width: t.width, height: t.height, data: new Uint8Array(t.data.length) }
+    for (let yy = 0; yy < t.height; yy++)
+      for (let xx = 0; xx < t.width; xx++) {
+        const k = 192 - Math.floor((xx * 51) / t.width)
+        photo.data[yy * t.width + xx] = (t.data[yy * t.width + xx] * k) >> 8
+      }
+    const page = blank(pw, ph)
+    for (let yy = 0; yy < photo.height; yy++)
+      page.data.set(
+        photo.data.subarray(yy * photo.width, (yy + 1) * photo.width),
+        (y + yy) * pw + x
+      )
+    return { page, photo }
+  }
+
+  it('finds a photo placed on a white page by its own box, and leaves scans alone', () => {
+    const { page, photo } = photoOnPage(640, 800, 160, 320)
+    expect(looksLikePhoto(page)).toBe(false) // the old whole-page test: the margin wins
+    expect(looksLikePhoto(photo)).toBe(true)
+    expect(contentBox(page)).toEqual({ x: 160, y: 320, w: 320, h: 160 })
+    expect(photoRegion(page)).toEqual({ x: 160, y: 320, w: 320, h: 160 })
+    // A whole-page photo keeps the whole page; a scan (text on white paper) and a blank page have
+    // no photo region, wherever their text sits.
+    expect(photoRegion(photo)).toEqual({ x: 0, y: 0, w: 320, h: 160 })
+    expect(photoRegion(textPage())).toBeNull()
+    const corner = blank(640, 800)
+    const t = textPage(200, 120)
+    for (let yy = 0; yy < t.height; yy++)
+      corner.data.set(t.data.subarray(yy * 200, (yy + 1) * 200), (600 + yy) * 640 + 400)
+    expect(photoRegion(corner)).toBeNull()
+    expect(contentBox(blank(50, 50))).toBeNull()
+    expect(photoRegion(blank(50, 50))).toBeNull()
+  })
+
+  it('normalises only the photo box: the margin is untouched, the photo becomes white paper', () => {
+    const { page } = photoOnPage(640, 800, 160, 320)
+    const box = photoRegion(page)!
+    const n = normalizeRegion(page, box, 300)
+    let paper = 0
+    let papers = 0
+    let changedOutside = 0
+    for (let y = 0; y < page.height; y++)
+      for (let x = 0; x < page.width; x++) {
+        const i = y * page.width + x
+        const inside = x >= box.x && x < box.x + box.w && y >= box.y && y < box.y + box.h
+        if (!inside) changedOutside += n.data[i] === page.data[i] ? 0 : 1
+        else if (page.data[i] > 100) {
+          paper += n.data[i]
+          papers++
+        }
+      }
+    expect(changedOutside).toBe(0)
+    expect(paper / papers).toBeGreaterThan(245)
+    // On the whole page it is exactly normalizeBackground.
+    const full = { x: 0, y: 0, w: page.width, h: page.height }
+    expect(Buffer.from(normalizeRegion(page, full, 300).data)).toEqual(
+      Buffer.from(normalizeBackground(page, 300).data)
+    )
   })
 })
 

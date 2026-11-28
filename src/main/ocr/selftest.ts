@@ -509,6 +509,36 @@ export async function crashPhase(
   let heartbeat: Heartbeat | null = null
   let detectMs: number | null = null
   try {
+    await crashAndRespawn()
+  } catch (e) {
+    failures.push(e instanceof Error ? e.message : 'crash phase failed')
+  } finally {
+    // Whatever happened above (a heartbeat that threw included): exactly one respawn, no loop.
+    if (sup.spawnCount !== 2) failures.push(`${sup.spawnCount} child(ren) forked, expected 2`)
+    if (disconnects.includes('crash-loop')) failures.push('the supervisor reported a crash loop')
+    sup.dispose()
+    for (const p of ports)
+      try {
+        closePort(p)
+      } catch {
+        // Already closed with its child.
+      }
+  }
+  return {
+    ok: failures.length === 0,
+    failures,
+    firstExit,
+    disconnects,
+    spawnCount: sup.spawnCount,
+    respawned: ports.length >= 2,
+    heartbeat,
+    detectMs,
+    totalMs: Date.now() - t0
+  }
+
+  // Connect, see the first child crash and be classified, then the respawned child's fresh port
+  // and heartbeat. (A function declaration: hoisted above the try that calls it.)
+  async function crashAndRespawn(): Promise<void> {
     sup.connect(wc)
     if (await until('the crashing child to hand over its port', () => ports.length >= 1, 30_000)) {
       // A crashed Linux child may never exit (R23); the liveness check then kills it as 'hung'.
@@ -536,28 +566,5 @@ export async function crashPhase(
         }
       }
     }
-    if (sup.spawnCount !== 2) failures.push(`${sup.spawnCount} child(ren) forked, expected 2`)
-    if (disconnects.includes('crash-loop')) failures.push('the supervisor reported a crash loop')
-  } catch (e) {
-    failures.push(e instanceof Error ? e.message : 'crash phase failed')
-  } finally {
-    sup.dispose()
-    for (const p of ports)
-      try {
-        closePort(p)
-      } catch {
-        // Already closed with its child.
-      }
-  }
-  return {
-    ok: failures.length === 0,
-    failures,
-    firstExit,
-    disconnects,
-    spawnCount: sup.spawnCount,
-    respawned: ports.length >= 2,
-    heartbeat,
-    detectMs,
-    totalMs: Date.now() - t0
   }
 }

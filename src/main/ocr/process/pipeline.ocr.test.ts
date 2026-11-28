@@ -100,6 +100,10 @@ export const PIPELINE_SPECS: Spec[] = [
   spec('latin-diacritics', 'g90', { langs: ['deu', 'fra', 'spa'] }),
   spec('numbers-table', 'g90'),
   spec('photoLike', 'reported'),
+  // PR11 review: the same photo fitted onto a white Letter page, as PDFx imports one (D4). The
+  // white margin hid it from the photo test (4 words of 116) until the test looked at the part of
+  // the page that holds the image (background.ts `photoRegion`).
+  spec('photoLike-fit-letter', 'g98'),
   spec('smallprint6pt', 'reported', { adaptive: 'skip' }),
   spec('smallprint6pt-blur', 'reported', { adaptive: 'skip' }),
   spec('smallprint6pt-fax', 'reported', { adaptive: 'run' }),

@@ -167,9 +167,11 @@ jobs:
       # The same self-test with NO network at all, exactly as PR0b ran it (§3.9.3 1c, revision 4):
       # a root-created network namespace, back to the runner user with HOME, PATH and
       # PDFX_USER_DATA passed explicitly (sudo resets the environment), Xvfb started inside the
-      # namespace. The script builds the command:
-      #   sudo unshare --net -- sudo -u runner env HOME=... PATH=... PDFX_USER_DATA=<fresh dir> \
+      # namespace. The script builds the command (src/main/ocr/ci/selftest-verdict.ts):
+      #   sudo unshare --net -- sh -c 'ip -o link > "$1" …; shift; exec "$@"' sh <netns.txt> \
+      #     sudo -u runner env HOME=... PATH=... PDFX_USER_DATA=<fresh dir> \
       #     xvfb-run -a dist/linux-unpacked/pdfx --ocr-selftest <out.json>
+      # so the link listing comes from the namespace the app itself runs in (it must be `lo` only),
       # and records /proc/sys/kernel/core_pattern (R23).
       - name: Packaged OCR self-test with no network (unshare --net)
         if: ${{ !cancelled() && matrix.os == 'ubuntu-latest' }}

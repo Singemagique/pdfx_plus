@@ -45,7 +45,14 @@ See [SPEC.md](SPEC.md) for the format. It is short: the entire trick is one embe
   FINAL CHECK before the 1.1.4 release: the menu, toolbar, dialog and language-picker wording below
   follows DESIGN §3.8 (the approved copy). PR8 (UI) and PR9 (language downloads) were built in
   parallel with this section; confirm every quoted label against the shipped UI, and drop the
-  language-download sentences if PR9 ships as Install-from-file only.
+  language-download sentences if PR9 ships as Install-from-file only. Also confirm against PR9:
+  - the download hosts named below are exactly the ones PR9 contacts (DESIGN §3.2.5 designs the
+    GitHub release plus a jsDelivr fallback; drop the jsDelivr clause if PR9 drops the fallback),
+    and the consent dialog names the same hosts;
+  - PR9's language catalogue leaves out ara, heb and fas: the RTL gate (§3.7.4) failed in 1.1.4
+    (the layer writer has no visual reordering, and pdf.js copies a logical-order layer reversed),
+    so right-to-left languages wait for 1.1.5;
+  - Install from file accepts only catalogue files (§3.2.5, 1.1.4).
 -->
 
 PDFx can recognize the text in scanned pages and photos, so you can find words in them with Find
@@ -54,27 +61,33 @@ PDFx can recognize the text in scanned pages and photos, so you can find words i
 - **Runs on this computer. Nothing is uploaded.** Recognition uses the Tesseract engine, compiled to
   WebAssembly and bundled with the app, in a separate background process whose network functions
   are disabled (CI also runs it with no network at all). Your pages never leave your machine.
-- **Your pages are not changed.** The page images are never re-encoded; an invisible text layer is
-  added when you export. **Include Recognized Text When Exporting** (Document menu, on by default)
+- **Recognizing text does not change your pages.** It never changes or re-encodes the page images;
+  an invisible text layer is added when you export. (Redaction does rewrite a scan image: see
+  below.) **Include Recognized Text When Exporting** (Document menu, on by default)
   turns that off. When signing, **Include recognized text (machine-generated, not reviewed)** is
   unticked by default, because the signature would also cover that text.
 - **Searchable, not "accessible".** The text layer makes a scanned PDF searchable and its text
   copyable. It does not add the structure (tags, reading order, alternative text) that accessible
   PDFs need, so PDFx never calls its output an accessible PDF.
 - **What it is for.** Recognizes printed text. Handwriting, curved book pages and photos with heavy
-  perspective may give poor results.
+  perspective may give poor results. Right-to-left scripts (Arabic, Hebrew, Persian) are not
+  supported yet.
 - **When it runs.** Photos and scans you import as images are recognized automatically. For scanned
   PDFs you choose: **Document ▸ Recognize Text…** (Ctrl/Cmd+Shift+R), the **Recognize Text**
   toolbar button, or the prompt in Find and on the page. Pages that already have searchable text,
   including text another OCR tool added, are skipped and say so.
 - **Keeping it.** Recognition is kept while the file is open. Export or save as .pdfx to keep it.
-- **Redaction.** Redacting removes the covered pixels and any recognized words under them. Where a
-  scan image cannot be cut in place (an unusual image format or placement), the whole image and its
-  recognized text are removed instead.
+- **Redaction.** Redacting removes the covered pixels and any recognized words under them: the
+  scan image is rewritten (losslessly) with the covered pixels blanked. Where a scan image cannot be
+  cut in place (an unusual image format or placement), the whole image and its recognized text are
+  removed instead. Redacting a page of a PDF that PDFx already made searchable removes that page's
+  recognized text; run Recognize Text again to restore it.
 - **Languages.** English, German, French and Spanish are included. Other languages can be added from
-  the language picker: PDFx downloads the language data from github.com only when you add one, and
-  checks it against a hash list built into the app before using it. **Install from file…** adds a
-  language without a download.
+  the language picker: PDFx downloads the language data only when you add one, from PDFx's GitHub
+  releases (github.com) or, if that fails, the jsDelivr CDN (cdn.jsdelivr.net), and checks it
+  against a hash list built into the app before using it. **Install from file…** adds a language
+  without a download; it accepts the same language files, checked against that built-in list, and
+  refuses any other file.
 - **Licences.** The engine, the libraries linked into it and the language data have their own
   licences. Their texts ship with the app in `resources/licenses/` (Windows:
   `<install folder>\resources\licenses\`; macOS: `PDFx.app/Contents/Resources/licenses/`; Linux:

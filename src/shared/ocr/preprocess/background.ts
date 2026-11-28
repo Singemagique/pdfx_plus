@@ -26,6 +26,82 @@ export function looksLikePhoto(img: Gray): boolean {
   return 2 * ends < img.data.length
 }
 
+/** A pixel rectangle: columns [x, x + w), rows [y, y + h). */
+export interface PixelBox {
+  x: number
+  y: number
+  w: number
+  h: number
+}
+
+/**
+ * The rows and columns of `img` that hold anything darker than paper white (null for a blank
+ * page): where an image placed on a white page sits, or a scan's text block.
+ */
+export function contentBox(img: Gray): PixelBox | null {
+  const { width: w, height: h, data } = img
+  let x0 = w
+  let x1 = -1
+  let y0 = h
+  let y1 = -1
+  for (let y = 0; y < h; y++) {
+    const row = y * w
+    let first = -1
+    let last = -1
+    for (let x = 0; x < w; x++)
+      if (data[row + x] < WHITE) {
+        if (first < 0) first = x
+        last = x
+      }
+    if (first < 0) continue
+    if (y0 > y) y0 = y
+    y1 = y
+    if (first < x0) x0 = first
+    if (last > x1) x1 = last
+  }
+  return y1 < 0 ? null : { x: x0, y: y0, w: x1 - x0 + 1, h: y1 - y0 + 1 }
+}
+
+function cropBox(img: Gray, b: PixelBox): Gray {
+  const out = new Uint8Array(b.w * b.h)
+  for (let y = 0; y < b.h; y++) {
+    const s = (b.y + y) * img.width + b.x
+    out.set(img.data.subarray(s, s + b.w), y * b.w)
+  }
+  return { width: b.w, height: b.h, data: out }
+}
+
+/**
+ * Where the page looks like a photo (§3.4.4), or null: the whole page when it does, else the part
+ * of it that holds anything when THAT does. The second case is a photo placed on a white page
+ * (PDFx fits an imported photo onto a Letter or A4 page, D4): the white margin alone pushes the
+ * whole-page test past half, so the photo was never normalised, and Tesseract's page layout read
+ * its tinted, unevenly lit paper as one picture block: 4 words of 111 [measured, PR11 review:
+ * photoLike fitted to 612 × 792 pt]. A scan's text block is still mostly white paper, so it stays
+ * a scan.
+ */
+export function photoRegion(img: Gray): PixelBox | null {
+  const full: PixelBox = { x: 0, y: 0, w: img.width, h: img.height }
+  if (looksLikePhoto(img)) return full
+  const box = contentBox(img)
+  if (!box || (box.w === img.width && box.h === img.height)) return null
+  return looksLikePhoto(cropBox(img, box)) ? box : null
+}
+
+/**
+ * `normalizeBackground` on `box` only (the paper estimate then never sees the page's white margin,
+ * which would leave the photo's edges unnormalised); the rest of the page is kept as it is.
+ */
+export function normalizeRegion(img: Gray, box: PixelBox, dpi: number): Gray {
+  if (box.x === 0 && box.y === 0 && box.w === img.width && box.h === img.height)
+    return normalizeBackground(img, dpi)
+  const n = normalizeBackground(cropBox(img, box), dpi)
+  const out = img.data.slice()
+  for (let y = 0; y < box.h; y++)
+    out.set(n.data.subarray(y * box.w, (y + 1) * box.w), (box.y + y) * img.width + box.x)
+  return { width: img.width, height: img.height, data: out }
+}
+
 /** Separable running max over a (2r + 1) window, clamped at the edges. */
 function maxFilter(src: Uint8Array, w: number, h: number, r: number): Uint8Array {
   const tmp = new Uint8Array(w * h)

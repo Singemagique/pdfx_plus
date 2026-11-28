@@ -12,8 +12,13 @@
 //   unshare  Linux with NO network at all, the recipe exactly as PR0b ran it (§3.9.3 1c): a
 //            root-created network namespace, back to the runner user with HOME, PATH and
 //            PDFX_USER_DATA passed explicitly (sudo resets the environment), Xvfb started inside
-//            the namespace (no DISPLAY passed). Needs xvfb, xauth, iproute2 and the setuid
-//            chrome-sandbox (root:root 4755), as the deb's after-install sets it.
+//            the namespace (no DISPLAY passed). `ip -o link` runs inside that same namespace just
+//            before the app is exec'd in it, and the run fails unless it lists only `lo`. Needs
+//            xvfb, xauth, iproute2 and the setuid chrome-sandbox (root:root 4755), as the deb's
+//            after-install sets it.
+//
+// The command and every check are src/main/ocr/ci/selftest-verdict.ts (erasable TypeScript: Node 24
+// runs it as is; node-tested in selftest-verdict.node.test.ts). This file is the fs/spawn wrapper.
 //
 // Every run gets a fresh PDFX_USER_DATA directory. Writes <results-dir>/selftest-<mode>.json (the
 // app's report) and selftest-<mode>.run.json (this script's verdict, command, timings and, on
@@ -32,9 +37,15 @@ import {
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
+import {
+  SELFTEST_MODES,
+  selftestCommand,
+  selftestProblems
+} from '../src/main/ocr/ci/selftest-verdict.ts'
+
 const [resultsArg, mode = 'direct'] = process.argv.slice(2)
-if (!resultsArg || !['direct', 'xvfb', 'unshare'].includes(mode)) {
-  console.error('usage: ocr-selftest-run.mjs <results-dir> <direct|xvfb|unshare>')
+if (!resultsArg || !SELFTEST_MODES.includes(mode)) {
+  console.error(`usage: ocr-selftest-run.mjs <results-dir> <${SELFTEST_MODES.join('|')}>`)
   process.exit(2)
 }
 const results = resolve(resultsArg)
@@ -60,42 +71,18 @@ if (!existsSync(exe)) {
 }
 const userData = mkdtempSync(join(process.env.RUNNER_TEMP || tmpdir(), `pdfx-selftest-${mode}-`))
 const out = join(results, `selftest-${mode}.json`)
+const netnsFile = join(results, `selftest-${mode}.netns.txt`)
 const run = { mode, platform: process.platform, exe, userData }
 
-let cmd = exe
-let args = ['--ocr-selftest', out]
-if (mode === 'xvfb') {
-  cmd = 'xvfb-run'
-  args = ['-a', exe, ...args]
-} else if (mode === 'unshare') {
-  const user = process.env.USER || 'runner'
-  const links = spawnSync('sudo', ['unshare', '--net', '--', 'ip', '-o', 'link'], {
-    encoding: 'utf8'
-  })
-  // A fresh network namespace has only `lo`, and it is DOWN.
-  run.netnsLinks = (links.stdout || '').trim()
-  run.netnsOnlyLoopback =
-    links.status === 0 &&
-    run.netnsLinks.split('\n').filter(Boolean).length === 1 &&
-    /^\d+: lo:/.test(run.netnsLinks)
-  cmd = 'sudo'
-  args = [
-    'unshare',
-    '--net',
-    '--',
-    'sudo',
-    '-u',
-    user,
-    'env',
-    `HOME=${process.env.HOME}`,
-    `PATH=${process.env.PATH}`,
-    `PDFX_USER_DATA=${userData}`,
-    'xvfb-run',
-    '-a',
-    exe,
-    ...args
-  ]
-}
+const { cmd, args } = selftestCommand(mode, {
+  exe,
+  out,
+  user: process.env.USER || 'runner',
+  home: process.env.HOME,
+  path: process.env.PATH,
+  userData,
+  netnsFile
+})
 if (process.platform === 'linux') {
   try {
     run.corePattern = readFileSync('/proc/sys/kernel/core_pattern', 'utf8').trim()
@@ -115,33 +102,18 @@ run.signal = r.signal
 run.spawnError = r.error ? String(r.error) : null
 run.stdoutTail = (r.stdout ?? '').slice(-4000)
 run.stderrTail = (r.stderr ?? '').slice(-6000)
-
-const problems = []
-let report = null
-if (existsSync(out)) report = JSON.parse(readFileSync(out, 'utf8'))
-else problems.push('the app wrote no report')
-if (r.status !== 0)
-  problems.push(`exit status ${r.status}${r.signal ? ` (signal ${r.signal})` : ''}`)
-if (report) {
-  if (!report.ok) problems.push(`report not ok: ${(report.failures ?? []).join('; ')}`)
-  if (!report.app?.isPackaged) problems.push('not a packaged build')
-  if (!report.page?.digestMatches || !report.page?.textMatches)
-    problems.push('the clean300 page does not match the recorded replay exactly')
-  const tw = report.heartbeat?.tripwire
-  if (!tw || tw.process !== 0 || tw.raster !== 0 || tw.recognize !== 0)
-    problems.push(`tripwire ${JSON.stringify(tw ?? null)}`)
-  if (!report.heartbeat?.tripwireIntact) problems.push('a tripwire stub was replaced')
-  if (report.child?.stdio?.bytes !== 0)
-    problems.push(`utility stdout/stderr ${JSON.stringify(report.child?.stdio ?? null)}`)
-  if (report.app?.ocrEngineInAsar) problems.push('the OCR engine was loaded from inside the asar')
-  if (!report.crashPhase?.ok)
-    problems.push(`crash phase: ${(report.crashPhase?.failures ?? ['no report']).join('; ')}`)
-  const sc = report.shortcut?.status
-  if (sc !== 'pass' && sc !== 'skipped')
-    problems.push(`shortcut: ${report.shortcut?.message ?? 'no report'}`)
+if (mode === 'unshare') {
+  // Written by the probe inside the app's own namespace (selftest-verdict.ts NETNS_PROBE).
+  run.netnsLinks = existsSync(netnsFile) ? readFileSync(netnsFile, 'utf8').trim() : null
 }
-if (mode === 'unshare' && !run.netnsOnlyLoopback)
-  problems.push(`the network namespace is not loopback-only: ${run.netnsLinks}`)
+
+const report = existsSync(out) ? JSON.parse(readFileSync(out, 'utf8')) : null
+const problems = selftestProblems(report, {
+  mode,
+  exitStatus: r.status,
+  signal: r.signal,
+  netnsLinks: run.netnsLinks
+})
 
 run.ok = problems.length === 0
 run.problems = problems
@@ -173,6 +145,7 @@ const line =
       ` · crash phase ${s.crashPhase?.ok ? `ok (${s.crashPhase.firstExit?.reason}, detected in ${s.crashPhase.detectMs} ms)` : 'FAIL'}` +
       ` · shortcut ${s.shortcut?.status}: ${s.shortcut?.message}`
     : '') +
+  (mode === 'unshare' ? ` · app namespace links \`${run.netnsLinks ?? '(none recorded)'}\`` : '') +
   (run.corePattern ? ` · core_pattern \`${run.corePattern}\`` : '') +
   (problems.length ? `\n  - ${problems.join('\n  - ')}` : '')
 if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, line + '\n')

@@ -102,6 +102,7 @@ const PRESETS = list(process.env.PDFX_OCR_BENCH_PRESETS, [
   'latin-diacritics',
   'numbers-table',
   'photoLike',
+  'photoLike-fit-letter',
   'smallprint6pt',
   'smallprint6pt-fax',
   'margin-label'

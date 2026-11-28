@@ -16,8 +16,10 @@
 //   row's page (the design names A4; Letter is the same 8.4–8.7 MP class) and a full-page check.
 // - smallprint6pt-blur / smallprint6pt-fax: 6 pt text degraded, where the adaptive pass has
 //   something to win (§3.4.3: "PR6 measures what the pass gains on smallprint6pt + degradations").
+// - photoLike-fit-letter (PR11 review): photoLike fitted onto a white Letter page, the way PDFx
+//   imports a photo next to a Letter page (D4).
 
-import { listPresets, registerPreset, type LayoutContext, type PresetDef } from './synth'
+import { getPreset, listPresets, registerPreset, type LayoutContext, type PresetDef } from './synth'
 
 const PAGE = { width: 432, height: 180 }
 
@@ -197,6 +199,15 @@ export const QUALITY_PRESETS: PresetDef[] = [
       { op: 'quarterTurns', turns: 1 },
       { op: 'rotate', deg: 2 }
     ]
+  },
+  // PR11 review: photoLike as PDFx imports a photo next to a Letter page (imageToPdf fits it onto
+  // 612 × 792 pt, centred, D4): a tinted, unevenly lit photo inside a white margin. The whole-page
+  // photo test read the margin as paper and skipped normalisation: 4 words of 116.
+  {
+    ...getPreset('photoLike'),
+    id: 'photoLike-fit-letter',
+    description: 'photoLike fitted onto a white Letter page (an imported photo, D4)',
+    place: { width: 612, height: 792 }
   }
 ]
 

@@ -388,6 +388,12 @@ export interface PresetDef {
   renderDpi: number
   layout(ctx: LayoutContext): void
   ops: DegradeOp[]
+  /**
+   * Put the degraded scan on a white page of this size (pt), scaled to fit and centred, the way
+   * `imageToPdf` fits an imported photo onto a page (renderer `images.ts`, D4). The GT, `gt.page`
+   * and `gt.dpi` then describe the placed page; `raster` is still the image itself.
+   */
+  place?: { width: number; height: number }
 }
 
 const REGISTRY = new Map<string, PresetDef>()
@@ -733,13 +739,25 @@ export interface SynthSpec {
   font?: FontId
 }
 
-/** Build the image-only PDF: one DeviceGray Flate XObject filling the page. */
-async function scannedPdf(raster: GreyImage, dpi: number): Promise<Uint8Array> {
+/** The image's rectangle on the page, pt (bottom-left origin). */
+interface Placement {
+  page: { width: number; height: number }
+  x: number
+  y: number
+  w: number
+  h: number
+}
+
+/**
+ * Build the image-only PDF: one DeviceGray Flate XObject filling the page, or drawn at `place` on
+ * a larger white page.
+ */
+async function scannedPdf(raster: GreyImage, dpi: number, place?: Placement): Promise<Uint8Array> {
   const { width: w, height: h, data } = raster
   const doc = await PDFDocument.create({ updateMetadata: false })
-  const pw = (w * 72) / dpi
-  const ph = (h * 72) / dpi
-  const page = doc.addPage([pw, ph])
+  const pw = place ? place.w : (w * 72) / dpi
+  const ph = place ? place.h : (h * 72) / dpi
+  const page = doc.addPage(place ? [place.page.width, place.page.height] : [pw, ph])
   let bits = 8
   let samples = data
   if (data.every((v) => v === 0 || v === 255)) {
@@ -763,7 +781,7 @@ async function scannedPdf(raster: GreyImage, dpi: number): Promise<Uint8Array> {
   const name = page.node.newXObject('Im', doc.context.register(stream))
   page.pushOperators(
     pushGraphicsState(),
-    concatTransformationMatrix(pw, 0, 0, ph, 0, 0),
+    concatTransformationMatrix(pw, 0, 0, ph, place?.x ?? 0, place?.y ?? 0),
     drawObject(name),
     popGraphicsState()
   )
@@ -931,11 +949,30 @@ export async function synthesize(spec: SynthSpec, deps: SynthDeps): Promise<Synt
   })
   const raster = st.image
   const t = 72 / st.dpi
-  const pageOut = { width: (raster.width * 72) / st.dpi, height: (raster.height * 72) / st.dpi }
+  const imagePage = { width: (raster.width * 72) / st.dpi, height: (raster.height * 72) / st.dpi }
   // source pt (bottom-left) → source px (top-left) → … → output px → output pt (bottom-left).
   const toPx: Affine = [s, 0, 0, -s, 0, eh]
-  const fromPx: Affine = [t, 0, 0, -t, 0, pageOut.height]
-  const toOutput = composeAffine(composeAffine(toPx, st.px), fromPx)
+  const fromPx: Affine = [t, 0, 0, -t, 0, imagePage.height]
+  let toOutput = composeAffine(composeAffine(toPx, st.px), fromPx)
+  let pageOut = imagePage
+  let dpiOut = st.dpi
+  let placement: Placement | undefined
+  if (def.place) {
+    // imageToPdf's fit: scale = min(page / image) on both axes, centred.
+    const k = Math.min(def.place.width / imagePage.width, def.place.height / imagePage.height)
+    const w = imagePage.width * k
+    const h = imagePage.height * k
+    placement = {
+      page: def.place,
+      x: (def.place.width - w) / 2,
+      y: (def.place.height - h) / 2,
+      w,
+      h
+    }
+    toOutput = composeAffine(toOutput, [k, 0, 0, k, placement.x, placement.y])
+    pageOut = { ...def.place }
+    dpiOut = st.dpi / k
+  }
 
   // 4. GT.
   const words: GtWord[] = srcWords.map((w, order) => {
@@ -957,7 +994,7 @@ export async function synthesize(spec: SynthSpec, deps: SynthDeps): Promise<Synt
     preset: def.id,
     seed: spec.seed,
     font: fontId,
-    dpi: st.dpi,
+    dpi: dpiOut,
     renderDpi: def.renderDpi,
     page: pageOut,
     sourcePage: { width: W, height: H },
@@ -970,6 +1007,6 @@ export async function synthesize(spec: SynthSpec, deps: SynthDeps): Promise<Synt
   }
 
   // 5. Re-wrap as a scan.
-  const pdfBytes = await scannedPdf(raster, st.dpi)
+  const pdfBytes = await scannedPdf(raster, st.dpi, placement)
   return { pdfBytes, raster, clean, vectorPdf, gt }
 }

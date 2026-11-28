@@ -115,6 +115,13 @@ Every push to `main` and every PR runs `.github/workflows/ci.yml`:
 The build job depends on the check job, so lint/typecheck/test failures stop the
 matrix early.
 
+Which checks block a merge is set by `main`'s branch protection, which matches checks by job
+name. It requires **Lint, typecheck, test**. Until a maintainer also adds **Build (macos-latest)**,
+**Build (windows-latest)**, **Build (ubuntu-latest)** and **OCR cross-OS diff** there, GitHub
+shows a PR as mergeable without them, so check them by hand: a red packaged self-test, size gate
+or cross-OS diff blocks the merge all the same. (`OCR cross-OS diff` runs even when a build
+failed, because GitHub counts a skipped required check as passing.)
+
 `.github/workflows/ocr-bench.yml` runs the slower OCR bench nightly, on demand, and on pull
 requests labelled `ocr`: the seeds × presets × fonts sweep, the calibration check, per-page timing
 on all three OSes, and the 1,000-page and 1.5 GiB scale tests. It never blocks a merge.
