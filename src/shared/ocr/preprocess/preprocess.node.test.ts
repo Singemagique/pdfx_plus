@@ -174,10 +174,13 @@ describe('border removal', () => {
     expect(r.removed).toBeGreaterThan(0)
     for (let y = 0; y < 10; y++) expect(r.image.data[y * img.width + 300]).toBe(255)
     // The text block (x 48.., y 48..) is untouched.
+    // One assertion over the block, not one per pixel (that took > 5 s on a loaded machine).
     const t = textPage()
+    const changed: number[] = []
     for (let y = 40; y < img.height - 40; y++)
       for (let x = 40; x < img.width - 40; x++)
-        expect(r.image.data[y * img.width + x]).toBe(t.data[y * img.width + x])
+        if (r.image.data[y * img.width + x] !== t.data[y * img.width + x]) changed.push(x, y)
+    expect(changed).toEqual([])
   })
 
   it('does nothing to a clean page, and never erases a background covering half the page', () => {
