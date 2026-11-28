@@ -7,7 +7,8 @@ import { describe, expect, it } from 'vitest'
 import type { Heartbeat } from '../../shared/ocr/protocol'
 import { Coordinator } from './process/coordinator'
 import { REQUIRED_CHILD_CHECKS, childTripwireFailures, selftestSession } from './selftest'
-import { FakeParent, INIT, harness, settle } from './test-utils/fake-threads'
+import type { FromRaster } from './process/thread-messages'
+import { FakeParent, INIT, harness, settle, triaged } from './test-utils/fake-threads'
 import { portPair } from './test-utils/port-pair'
 
 function heartbeatVia(parent: FakeParent): () => Promise<Heartbeat> {
@@ -38,6 +39,29 @@ describe('selftestSession', () => {
     expect(report.ok).toBe(false)
     expect(report.failures.join('\n')).toMatch(/page status too-large/)
     expect(report.failures.join('\n')).toMatch(/network tripwire fired/)
+    // Triage ran first (the scripted thread says `scanned`).
+    expect(report.triage).toMatchObject({ pageClass: 'scanned', renderDpi: 300 })
+  })
+
+  it('fails when triage does not class the page `scanned`', async () => {
+    const h = harness({
+      pageCount: () => 1,
+      rasterTriage: (m, t) => {
+        const out = triaged(m, t) as Extract<FromRaster, { type: 'triaged' }>
+        out.pages = out.pages.map((p) => ({ ...p, pageClass: 'text' as const }))
+        return out
+      }
+    })
+    const c = new Coordinator(h.deps)
+    h.parent.send(INIT)
+    const [coordinatorEnd, mainEnd] = portPair()
+    h.parent.send({ port: {} }, [coordinatorEnd])
+    const report = await selftestSession(mainEnd, heartbeatVia(h.parent))
+    c.dispose()
+    expect(report.ok).toBe(false)
+    expect(report.failures).toContain('triage class text, expected scanned')
+    // The recognised page carries the class triage gave it.
+    expect(report.page?.pageClass).toBe('text')
   })
 })
 

@@ -18,7 +18,13 @@ import { synthesize } from '../../shared/ocr/test-utils/synth'
 import { threadOptions } from './process/budget'
 import { Coordinator } from './process/coordinator'
 import { loadEngine } from './process/engine-node'
-import { packedCopyText, packedDigest, selftestSession, SELFTEST_DPI } from './selftest'
+import {
+  packedCopyText,
+  packedDigest,
+  selftestSession,
+  SELFTEST_DPI,
+  SELFTEST_PAGE_CLASS
+} from './selftest'
 import { SELFTEST, selftestPdf, type SelftestFixture } from './selftest-fixture'
 import { bundleEntry, type Bundled } from './test-utils/bundle'
 import { nodeModulesEnginePaths } from './test-utils/engine-harness'
@@ -85,6 +91,10 @@ async function record(pdf: Uint8Array, page: { width: number; height: number }):
   const got: FromOcr[] = []
   mainEnd.on('message', (e: { data: unknown }) => got.push(e.data as FromOcr))
   mainEnd.postMessage({ open: { src: 'rec', bytes: pdf } })
+  // As the session does: triage first, so the recorded page carries triage's class.
+  mainEnd.postMessage({ triage: { src: 'rec', pages: [0] } })
+  for (let i = 0; i < 6000 && !got.some((m) => 'triaged' in m && m.triaged.done); i++)
+    await new Promise((r) => setTimeout(r, 10))
   mainEnd.postMessage({
     recognize: {
       jobId: 'rec',
@@ -137,12 +147,15 @@ describe('the packaged self-test session, real engine', () => {
     const report = await selftestSession(mainEnd, heartbeat)
     expect(report.failures).toEqual([])
     expect(report.ok).toBe(true)
+    // Triage ran first in the real raster thread and its class reached the packed page.
+    expect(report.triage).toMatchObject({ pageClass: SELFTEST_PAGE_CLASS, renderDpi: 300 })
     expect(report.page).toMatchObject({
       status: 'ok',
       renderDpi: 300,
       raster: { width: 1800, height: 750 },
       digestMatches: true,
-      textMatches: true
+      textMatches: true,
+      pageClass: SELFTEST_PAGE_CLASS
     })
     expect(report.page!.words).toBeGreaterThan(100)
     expect(report.heartbeat?.tripwire).toEqual({ process: 0, raster: 0, recognize: 0 })

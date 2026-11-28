@@ -1,8 +1,9 @@
 // `pdfx --ocr-selftest <out.json>` (DESIGN.md §3.9.3 tier 1c). Main plays the renderer over a real
-// port into the real utility process: open the embedded clean300 scan, render it in the raster
-// thread, recognise it with the real engine from resources/ocr, and require the packed result to
-// match the recorded replay exactly (selftest-fixture.ts), then check every tripwire counter is 0.
-// PR11 adds triage, the shortcut check and the 3-OS CI wiring.
+// port into the real utility process: open the embedded clean300 scan, triage it with PDFium in the
+// raster thread (it must be `scanned`), render it, recognise it with the real engine from
+// resources/ocr, and require the packed result (stamped with triage's class) to match the recorded
+// replay exactly (selftest-fixture.ts), then check every tripwire counter is 0. PR11 adds the
+// shortcut check and the 3-OS CI wiring.
 //
 // This file is the session logic only (no Electron import), so it also runs in vitest against the
 // coordinator; host.ts `runOcrSelftest` wires it to the packaged app and writes the report.
@@ -70,7 +71,25 @@ export interface SelftestPageSummary {
   digestMatches: boolean
   textMatches: boolean
   meanConfCal: number | null
+  /** The class the recognised page was stamped with (triage's). */
+  pageClass: string | null
 }
+
+/** What the report carries about the page's triage (never its native words). */
+export interface SelftestTriageSummary {
+  pageClass: string | null
+  failure?: string
+  refused?: string
+  renderDpi: number | null
+  effectiveDpi: number | null
+  bitsPerPixel: number | null
+}
+
+/**
+ * The class triage must give the self-test page: an image-only scan of the clean300 preset. The
+ * recognised page carries it too, and the recorded digest covers it.
+ */
+export const SELFTEST_PAGE_CLASS = 'scanned'
 
 /** The renderer end of the port, as main holds it (a MessagePortMain). */
 export interface SelftestPort {
@@ -88,6 +107,8 @@ export interface SelftestReport {
   protocolVersion: number
   timingsMs: Record<string, number>
   opened: { pageCount: number } | null
+  /** What triage said about the page (it runs first, as the renderer would run it). */
+  triage: SelftestTriageSummary | null
   page: SelftestPageSummary | null
   jobDone: { done: number; failed: number; cancelled: boolean } | null
   heartbeat: Heartbeat | null
@@ -149,7 +170,8 @@ function summarise(p: PageResult): SelftestPageSummary {
     digest,
     digestMatches: digest === SELFTEST.expected.digest,
     textMatches: !!rec && packedCopyText(rec) === SELFTEST.expected.text,
-    meanConfCal: rec?.meanConfCal ?? null
+    meanConfCal: rec?.meanConfCal ?? null,
+    pageClass: rec?.pageClass ?? null
   }
   if (p.reason) s.reason = p.reason
   return s
@@ -249,6 +271,7 @@ export async function selftestSession(
   const errorOf = (m: FromOcr): string | null => ('error' in m ? m.error.code : null)
 
   let opened: SelftestReport['opened'] = null
+  let triage: SelftestTriageSummary | null = null
   let page: SelftestPageSummary | null = null
   let jobDone: SelftestReport['jobDone'] = null
   let hb: Heartbeat | null = null
@@ -260,6 +283,31 @@ export async function selftestSession(
     if ('opened' in o) opened = { pageCount: o.opened.pageCount }
     else throw new Error(`open failed: ${errorOf(o)}`)
     if (opened.pageCount !== 1) failures.push(`page count ${opened.pageCount}, expected 1`)
+
+    // Triage first (PDFium in the raster thread, §3.4.1): the coordinator keeps the class and
+    // stamps it on the recognised page.
+    t = now()
+    send({ triage: { src: 'selftest', pages: [0] } })
+    const tr = await wait('triaged', (m) => ('triaged' in m && m.triaged.done) || 'error' in m)
+    timingsMs.triage = now() - t
+    if (!('triaged' in tr)) throw new Error(`triage failed: ${errorOf(tr)}`)
+    const tp = received
+      .flatMap((m) => ('triaged' in m ? m.triaged.pages : []))
+      .find((p) => p.index === 0)
+    if (tp) {
+      triage = {
+        pageClass: tp.pageClass,
+        renderDpi: tp.renderDpi,
+        effectiveDpi: tp.effectiveDpi,
+        bitsPerPixel: tp.bitsPerPixel
+      }
+      if (tp.failure) triage.failure = tp.failure
+      if (tp.refused) triage.refused = tp.refused
+      if (tp.pageClass !== SELFTEST_PAGE_CLASS)
+        failures.push(
+          `triage class ${tp.pageClass ?? `none (${tp.failure ?? '-'})`}, expected ${SELFTEST_PAGE_CLASS}`
+        )
+    } else failures.push('no triage result for page 0')
 
     t = now()
     send({
@@ -290,6 +338,8 @@ export async function selftestSession(
         failures.push(`raster ${JSON.stringify(page.raster)}, expected ${w}x${h}`)
       if (page.words !== SELFTEST.expected.words)
         failures.push(`${page.words} words, expected ${SELFTEST.expected.words}`)
+      if (triage?.pageClass && page.pageClass !== triage.pageClass)
+        failures.push(`page stamped ${page.pageClass}, triage said ${triage.pageClass}`)
       // The exact replay (§3.9.3 1c): the same words at the same Float32 positions as under Node.
       if (!page.digestMatches) failures.push('recognised page differs from the recorded replay')
       if (!page.textMatches) failures.push('recognised text differs from the recorded replay')
@@ -315,6 +365,7 @@ export async function selftestSession(
     protocolVersion: OCR_PROTOCOL_VERSION,
     timingsMs,
     opened,
+    triage,
     page,
     jobDone,
     heartbeat: hb,
