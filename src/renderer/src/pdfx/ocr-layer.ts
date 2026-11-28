@@ -47,6 +47,7 @@ import {
   PDFRawStream,
   PDFRef,
   PDFStream,
+  type PDFContext,
   type PDFObject,
   type PDFPage
 } from 'pdf-lib'
@@ -442,24 +443,77 @@ function unbindFonts(page: PDFPage, candidates: PDFRef[]): number {
   return unbound
 }
 
-/** The page's own PDFx OCR fonts (resource names bound to a /PDFxOCR-GlyphLess Type0). */
-function ocrFontNames(page: PDFPage): string[] {
-  const ctx = page.node.context
-  const fontDict = page.node.Resources()?.lookupMaybe(PDFName.of('Font'), PDFDict)
+/** `value` resolved, when it is a dictionary (never throws on a wrong type: the file is untrusted). */
+function dictOf(ctx: PDFContext, value: PDFObject | undefined): PDFDict | undefined {
+  const v = value instanceof PDFRef ? ctx.lookup(value) : value
+  return v instanceof PDFDict ? v : undefined
+}
+
+/** The PDFx OCR fonts of a /Resources dict (resource names bound to a /PDFxOCR-GlyphLess Type0). */
+function ocrFontNamesIn(ctx: PDFContext, resources: PDFDict | undefined): string[] {
+  const fontDict = dictOf(ctx, resources?.get(PDFName.of('Font')))
   const out: string[] = []
   for (const [name, value] of fontDict?.entries() ?? []) {
-    const dict = value instanceof PDFRef ? ctx.lookupMaybe(value, PDFDict) : value
-    if (dict instanceof PDFDict && isOcrFontDict(dict)) out.push(name.decodeText())
+    const dict = dictOf(ctx, value)
+    if (dict && isOcrFontDict(dict)) out.push(name.decodeText())
   }
   return out
 }
 
+/** The page's own PDFx OCR fonts (resource names bound to a /PDFxOCR-GlyphLess Type0). */
+function ocrFontNames(page: PDFPage): string[] {
+  return ocrFontNamesIn(page.node.context, page.node.Resources())
+}
+
+/** Bounds on the Form XObject walk (`formScopes`): a crafted file can nest, fan out or cycle. */
+export const MAX_FORM_DEPTH = 8
+export const MAX_FORMS = 256
+
+/** A Form XObject reachable from a page, with the PDFx OCR font names its resources bind. */
+interface FormScope {
+  stream: PDFStream
+  fonts: string[]
+}
+
 /**
- * What PDFx OCR layer `page` already carries (a reopened PDFx export): its tagged streams, and
- * whether a PDFx OCR font is bound at all, which is also true of a layer whose streams a later
- * content rewrite merged into one (the tag is then gone, §3.7.6).
+ * The Form XObjects reachable from `page`'s resources, through each form's own /Resources
+ * /XObject, recursively: where a PDFx layer lands when a later tool wraps the page into a form
+ * (N-up, stamping, pdf-lib `embedPdf` + `drawPage`). A form without /Resources of its own uses those
+ * of what draws it. Bounded (MAX_FORM_DEPTH levels, MAX_FORMS forms) and cycle-safe (each form is
+ * visited once). Read-only.
  */
-export function existingOcrLayer(page: PDFPage): { streams: PDFStream[]; font: boolean } {
+function formScopes(page: PDFPage): FormScope[] {
+  const ctx = page.node.context
+  const out: FormScope[] = []
+  const seen = new Set<PDFStream>()
+  const walk = (resources: PDFDict | undefined, depth: number): void => {
+    const xobjects = dictOf(ctx, resources?.get(PDFName.of('XObject')))
+    for (const [, value] of xobjects?.entries() ?? []) {
+      if (out.length >= MAX_FORMS) return
+      const s = value instanceof PDFRef ? ctx.lookup(value) : value
+      if (!(s instanceof PDFStream) || seen.has(s)) continue
+      if (s.dict.get(PDFName.of('Subtype')) !== PDFName.of('Form')) continue
+      seen.add(s)
+      const own = dictOf(ctx, s.dict.get(PDFName.of('Resources'))) ?? resources
+      out.push({ stream: s, fonts: ocrFontNamesIn(ctx, own) })
+      if (depth < MAX_FORM_DEPTH) walk(own, depth + 1)
+    }
+  }
+  walk(page.node.Resources(), 1)
+  return out
+}
+
+/**
+ * What PDFx OCR layer `page` already carries (a reopened PDFx export): its tagged streams, whether
+ * a PDFx OCR font is bound on the page itself, which is also true of a layer whose streams a later
+ * content rewrite merged into one (the tag is then gone, §3.7.6), and the Form XObjects reachable
+ * from the page that bind one (`forms`: a layer a later tool wrapped into a form with the page).
+ */
+export function existingOcrLayer(page: PDFPage): {
+  streams: PDFStream[]
+  font: boolean
+  forms: PDFStream[]
+} {
   const ctx = page.node.context
   // Read-only: unlike `contentsList`, never registers a direct stream.
   const entry = page.node.get(PDFName.of('Contents'))
@@ -470,7 +524,10 @@ export function existingOcrLayer(page: PDFPage): { streams: PDFStream[]; font: b
     const s = r instanceof PDFRef ? ctx.lookup(r) : r
     if (isOcrLayerStream(s)) streams.push(s as PDFStream)
   }
-  return { streams, font: ocrFontNames(page).length > 0 }
+  const forms = formScopes(page)
+    .filter((f) => f.fonts.length > 0)
+    .map((f) => f.stream)
+  return { streams, font: ocrFontNames(page).length > 0, forms }
 }
 
 /** The page's resolved /Contents streams, in order (read-only: never registers anything). */
@@ -500,28 +557,37 @@ function streamText(s: PDFStream): string | null {
 const escapeRegExp = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 
 /**
- * Does `page` carry PDFx OCR text OUTSIDE its tagged layer streams: a layer whose streams a later
- * content rewrite merged into the page's other content (§3.7.6), which `dropOcrLayers` cannot
- * separate? True when an untagged content stream opens the `/PDFxOCR` marked content, or selects a
- * PDFx OCR font bound on the page (`/FOcr 12 Tf`). An undecodable untagged stream counts as merged
- * when an OCR font is bound (it cannot be proved clean). Read-only.
+ * Does `page` carry PDFx OCR text OUTSIDE its tagged layer streams, which `dropOcrLayers` cannot
+ * separate: a layer whose streams a later content rewrite merged into the page's other content
+ * (§3.7.6), or one a later tool wrapped into a Form XObject with the page (`formScopes`)? True when
+ * an untagged content stream or a reachable form opens the `/PDFxOCR` marked content, or selects a
+ * PDFx OCR font bound in its own resources (`/FOcr 12 Tf`). An undecodable stream counts when an
+ * OCR font is bound there (it cannot be proved clean). Read-only.
  */
 export function hasMergedOcrText(page: PDFPage): boolean {
-  const fonts = ocrFontNames(page)
-  // `/PDFxOCR <<…>> BDC` (an inline property list, as we and PDFium write it) or `/PDFxOCR /P0 BDC`
-  // (a /Properties resource): the operator, so a text string that merely spells the tag is no hit.
-  const mark = new RegExp(`/${OCR_MARK}\\s*(?:<<[^]*?>>|/[^\\s()<>\\[\\]{}/%]+)\\s*BDC`)
+  const untagged = pageContentStreams(page).filter((s) => !isOcrLayerStream(s))
+  if (carriesOcrText(untagged, ocrFontNames(page))) return true
+  return formScopes(page).some((f) => carriesOcrText([f.stream], f.fonts))
+}
+
+/**
+ * `/PDFxOCR <<…>> BDC` (an inline property list, as we and PDFium write it) or `/PDFxOCR /P0 BDC`
+ * (a /Properties resource): the operator, so a text string that merely spells the tag is no hit.
+ */
+const OCR_MARK_OPERATOR = new RegExp(`/${OCR_MARK}\\s*(?:<<[^]*?>>|/[^\\s()<>\\[\\]{}/%]+)\\s*BDC`)
+
+/** Does one of `streams` open the PDFx OCR mark, or select one of the OCR `fonts` (its resources)? */
+function carriesOcrText(streams: readonly PDFStream[], fonts: readonly string[]): boolean {
   const font = fonts.length
     ? new RegExp(`/(?:${fonts.map(escapeRegExp).join('|')})\\s+[-+.\\d]+\\s+Tf`)
     : null
-  for (const s of pageContentStreams(page)) {
-    if (isOcrLayerStream(s)) continue
+  for (const s of streams) {
     const text = streamText(s)
     if (text === null) {
       if (font) return true
       continue
     }
-    if (mark.test(text) || font?.test(text)) return true
+    if (OCR_MARK_OPERATOR.test(text) || font?.test(text)) return true
   }
   return false
 }

@@ -6,7 +6,16 @@
 import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
-import { PDFDocument, PDFName, PDFRawStream, StandardFonts, type PDFStream } from 'pdf-lib'
+import {
+  PDFArray,
+  PDFDict,
+  PDFDocument,
+  PDFName,
+  PDFRawStream,
+  StandardFonts,
+  type PDFRef,
+  type PDFStream
+} from 'pdf-lib'
 import { getDocument } from 'pdfjs-dist/legacy/build/pdf.mjs'
 import { beforeAll, describe, expect, it } from 'vitest'
 
@@ -38,7 +47,7 @@ import {
   isOcrLayerStream,
   pageContentStreams
 } from './ocr-layer'
-import { embeddedManifest } from './ocr-provenance'
+import { embeddedManifest, placeProvenance } from './ocr-provenance'
 import { redactPdf, stripOcrText, type PdfiumModule } from './redact'
 import {
   readManifest as readManifest113,
@@ -305,30 +314,83 @@ describe('.pdfx OCR provenance (format.ts `ocr`)', () => {
   )
 
   it('readOcrProvenance validates the untrusted record', () => {
+    // Global page indices: A = 0..1, B = 2, C = 3..6.
     const m = (ocr: unknown): PdfxManifest =>
-      ({ pdfx: '1.0', documents: [{ name: 'A', pages: 2 }, { name: 'B', pages: 1 }], ocr }) as PdfxManifest // prettier-ignore
+      ({ pdfx: '1.0', documents: [{ name: 'A', pages: 2 }, { name: 'B', pages: 1 }, { name: 'C', pages: 4 }], ocr }) as PdfxManifest // prettier-ignore
     expect(readOcrProvenance(null).size).toBe(0)
     expect(readOcrProvenance(m(undefined)).size).toBe(0)
     expect(readOcrProvenance(m({ v: 2, pages: [{ doc: 0, page: 0, engineId: 'x' }] })).size).toBe(0) // prettier-ignore
     expect(readOcrProvenance(m({ v: 1, pages: 'no' })).size).toBe(0)
+    const long = 'x'.repeat(256)
     const read = readOcrProvenance(m({
       v: 1,
       pages: [
         { doc: 1, page: 0, engineId: 'e', dataHashes: { eng: 'h' }, langs: ['eng'], pipelineVersion: 2 },
         { doc: 0, page: 1, engineId: 'e2', dataHashes: [1], langs: 'eng', pipelineVersion: -1 },
         { doc: 0, page: 2, engineId: 'off the doc' },
+        // Past doc 0's end onto a page nothing else claims (C's first page, global 3): rejected by
+        // the bounds check itself, not by the duplicate rule.
+        { doc: 0, page: 3, engineId: 'past the end' },
         { doc: 3, page: 0, engineId: 'no such doc' },
         { doc: 0, page: 0, engineId: '' },
         { doc: 1, page: 0, engineId: 'duplicate' },
         { doc: 0, page: 0.5, engineId: 'fraction' },
+        // At the bounds: 256 characters and 32 languages pass.
+        { doc: 0, page: 0, engineId: long, langs: Array(32).fill('eng'), dataHashes: { [long]: long } },
+        // Elements of the right container type but the wrong kind, or one past the bounds: dropped.
+        { doc: 2, page: 1, engineId: 'h', dataHashes: { eng: 7 }, langs: ['eng', 3] },
+        { doc: 2, page: 2, engineId: 'x'.repeat(257) },
+        { doc: 2, page: 3, engineId: 'l', dataHashes: { ['k'.repeat(257)]: 'h' }, langs: Array(33).fill('eng') },
         null,
         'x'
       ]
     })) // prettier-ignore
     expect([...read.entries()]).toEqual([
       [2, { doc: 1, page: 0, engineId: 'e', dataHashes: { eng: 'h' }, langs: ['eng'], pipelineVersion: 2 }], // prettier-ignore
-      [1, { doc: 0, page: 1, engineId: 'e2' }]
+      [1, { doc: 0, page: 1, engineId: 'e2' }],
+      [0, { doc: 0, page: 0, engineId: long, langs: Array(32).fill('eng'), dataHashes: { [long]: long } }], // prettier-ignore
+      [4, { doc: 2, page: 1, engineId: 'h' }],
+      [6, { doc: 2, page: 3, engineId: 'l' }]
     ])
+  })
+
+  it('placeProvenance maps an output ordinal to its (doc, page), at document boundaries too', () => {
+    const p = { engineId: 'e' }
+    expect([0, 1, 2, 3].map((o) => placeProvenance(p, o, [1, 2]))).toEqual([
+      { doc: 0, page: 0, engineId: 'e' },
+      { doc: 1, page: 0, engineId: 'e' },
+      { doc: 1, page: 1, engineId: 'e' },
+      null
+    ])
+  })
+
+  it("the first page of a later document is recorded as that document's page 0", async () => {
+    const store = new Map([[makePageKey('y', 1), { results: new Map([['c', oldOcr()]]), auto: 'c' }]]) // prettier-ignore
+    const layer = withOcrLayer(editLayer(), applyOcrSelections(store, undefined), { include: true, removed: new Map() }) // prettier-ignore
+    const out = await buildPdfx(
+      [
+        { name: 'A', pages: [exportPage(base, 'x', 0)] },
+        { name: 'B', pages: [exportPage(base, 'y', 1)] }
+      ],
+      'Set',
+      layer,
+      { pdfium: noPdfium }
+    )
+    const doc = await PDFDocument.load(out)
+    expect([tagged(doc, 0).length, tagged(doc, 1).length]).toEqual([0, 1])
+    expect(embeddedManifest(doc)?.ocr?.pages.map(({ doc, page }) => ({ doc, page }))).toEqual([{ doc: 1, page: 0 }]) // prettier-ignore
+  })
+
+  it('a result that bakes no layer (no word survives cleaning) records no provenance', async () => {
+    const ghost = pack(handPage([{ y: 200, size: 20, words: [{ t: 'Ghost', x: 20, w: 0 }] }], { engineId: 'test/ghost', langs: ['eng'] })) // prettier-ignore
+    const store = new Map([[makePageKey('z', 0), { results: new Map([['c', ghost]]), auto: 'c' }]])
+    const layer = withOcrLayer(editLayer(), applyOcrSelections(store, undefined), { include: true, removed: new Map() }) // prettier-ignore
+    // The page does reach the bake: the result has a word, it just cleans to nothing.
+    expect(layer.ocr?.has(makePageKey('z', 0))).toBe(true)
+    const out = await buildPdfx([{ name: 'Doc', pages: [exportPage(base, 'z', 0)] }], 'Doc', layer, { pdfium: noPdfium }) // prettier-ignore
+    const doc = await PDFDocument.load(out)
+    expect(tagged(doc)).toHaveLength(0)
+    expect(embeddedManifest(doc)?.ocr).toBeUndefined()
   })
 
   it.each([
@@ -345,6 +407,83 @@ describe('.pdfx OCR provenance (format.ts `ocr`)', () => {
       expect(embeddedManifest(await PDFDocument.load(removed))?.ocr).toBeUndefined()
     }
   )
+})
+
+// ---------------------------------------------------------------------------------------------
+
+describe('a kept layer keeps only a source record that still describes it', () => {
+  const by = (engineId: string, lang: string): PackedOcrPage =>
+    pack(handPage([{ y: 200, size: 20, words: [{ t: 'Alpha', x: 20, w: 60 }] }], { engineId, dataHashes: { [lang]: HASH_ENG }, langs: [lang], pipelineVersion: 3 })) // prettier-ignore
+  const recordOf = (engineId: string, lang: string): object => ({ engineId, dataHashes: { [lang]: HASH_ENG }, langs: [lang], pipelineVersion: 3 }) // prettier-ignore
+
+  /** A .pdfx of `base`'s two pages, page 0 recognised as `a`, page 1 as `b`. */
+  async function twoLayers(a: PackedOcrPage, b: PackedOcrPage): Promise<Uint8Array> {
+    const store = new Map([
+      [makePageKey('t', 0), { results: new Map([['c', a]]), auto: 'c' }],
+      [makePageKey('t', 1), { results: new Map([['c', b]]), auto: 'c' }]
+    ])
+    return exportAs('pdfx', [exportPage(base, 't', 0), exportPage(base, 't', 1)], editLayer(), store, { pdfium: noPdfium }) // prettier-ignore
+  }
+
+  /** The `ocr` record of `bytes` re-exported as .pdfx with no OCR choice (both layers kept). */
+  async function reexported(bytes: Uint8Array): Promise<unknown> {
+    const out = await exportAs('pdfx', [exportPage(bytes, 'r', 0), exportPage(bytes, 'r', 1)], editLayer(), new Map(), { pdfium: noPdfium }) // prettier-ignore
+    return embeddedManifest(await PDFDocument.load(out))?.ocr
+  }
+
+  /** `bytes` with its first two pages swapped in the page tree by "another tool", manifest kept. */
+  async function swapped(bytes: Uint8Array): Promise<Uint8Array> {
+    const doc = await PDFDocument.load(bytes)
+    const kids = doc.catalog.Pages().Kids()
+    const [a, b] = [kids.get(0), kids.get(1)]
+    kids.set(0, b)
+    kids.set(1, a)
+    return doc.save()
+  }
+
+  /** `bytes` with its embedded manifest replaced by `edit(manifest)`, the pages untouched. */
+  async function editedManifest(
+    bytes: Uint8Array,
+    edit: (m: PdfxManifest) => PdfxManifest
+  ): Promise<Uint8Array> {
+    const doc = await PDFDocument.load(bytes)
+    const tree = doc.catalog.lookup(PDFName.of('Names'), PDFDict).lookup(PDFName.of('EmbeddedFiles'), PDFDict) // prettier-ignore
+    const spec = tree.lookup(PDFName.of('Names'), PDFArray).lookup(1, PDFDict)
+    const ref = spec.lookup(PDFName.of('EF'), PDFDict).get(PDFName.of('F')) as PDFRef
+    const json = new TextEncoder().encode(JSON.stringify(edit(embeddedManifest(doc)!)))
+    doc.context.assign(ref, doc.context.flateStream(json, { Type: 'EmbeddedFile' }))
+    return doc.save()
+  }
+
+  const tampered = async (bytes: Uint8Array): Promise<boolean> =>
+    compareIntegrity(await integrityOf(bytes), embeddedManifest(await PDFDocument.load(bytes))!.integrity).tampered // prettier-ignore
+
+  it('control: an untouched source keeps both records', async () => {
+    const first = await twoLayers(by('test/a', 'eng'), by('test/b', 'deu'))
+    expect(await reexported(first)).toEqual({ v: 1, pages: [{ doc: 0, page: 0, ...recordOf('test/a', 'eng') }, { doc: 0, page: 1, ...recordOf('test/b', 'deu') }] }) // prettier-ignore
+  })
+
+  it("pages swapped by another tool, manifest kept: no page takes the other's record", async () => {
+    const moved = await swapped(await twoLayers(by('test/a', 'eng'), by('test/b', 'deu')))
+    expect(await tampered(moved)).toBe(true)
+    const doc = await PDFDocument.load(moved)
+    expect([layerEngines(doc, 0), layerEngines(doc, 1)]).toEqual([['test/b'], ['test/a']])
+    expect(await reexported(moved)).toEqual({ v: 1, pages: [{ doc: 0, page: 0, engineId: 'test/b' }, { doc: 0, page: 1, engineId: 'test/a' }] }) // prettier-ignore
+  })
+
+  it('the same engine on both swapped pages: the pdfx-canon/1 page hash alone drops the records', async () => {
+    const moved = await swapped(await twoLayers(by('test/a', 'eng'), by('test/a', 'deu')))
+    expect(await tampered(moved)).toBe(true)
+    expect(await reexported(moved)).toEqual({ v: 1, pages: [{ doc: 0, page: 0, engineId: 'test/a' }, { doc: 0, page: 1, engineId: 'test/a' }] }) // prettier-ignore
+  })
+
+  it('a record naming another engine than the layer (content untouched): only the layer engine is kept', async () => {
+    const first = await twoLayers(by('test/a', 'eng'), by('test/b', 'deu'))
+    const edited = await editedManifest(first, (m) => ({ ...m, ocr: { v: 1, pages: m.ocr!.pages.map((p) => (p.page === 0 ? { ...p, engineId: 'test/zzz' } : p)) } })) // prettier-ignore
+    // The manifest is outside the hash: the integrity check cannot see this edit.
+    expect(await tampered(edited)).toBe(false)
+    expect(await reexported(edited)).toEqual({ v: 1, pages: [{ doc: 0, page: 0, engineId: 'test/a' }, { doc: 0, page: 1, ...recordOf('test/b', 'deu') }] }) // prettier-ignore
+  })
 })
 
 // ---------------------------------------------------------------------------------------------
@@ -532,6 +671,168 @@ describe('the merged-stream fallback (no tagged stream; the PDFxOCR mark is stil
     await expect(
       exportAs('pdf', pages(), editLayer({ ocrSelect: new Map([[key, null]]) }), store(), { pdfium: noPdfium }) // prettier-ignore
     ).rejects.toThrow(/Export failed on page 1.*PDFium was loaded/)
+  })
+
+  it('the font alone identifies the layer: merged OCR text that lost its marks is found and removed', async () => {
+    // The merged page's content with every `/PDFxOCR … BDC` / `EMC` pair taken out: a rewrite that
+    // dropped the marked-content tags but kept the text in the bound PDFxOCR-GlyphLess font.
+    const doc = await PDFDocument.load(merged)
+    const page = doc.getPage(0)
+    const text = pageContentStreams(page).map((s) => new TextDecoder('latin1').decode(decodeStream(s))).join('\n') // prettier-ignore
+    const unmarked = text.replace(/\/PDFxOCR\s*(?:<<[^]*?>>|\/\w+)\s*BDC/g, '').replace(/\bEMC\b/g, '') // prettier-ignore
+    expect(unmarked).not.toBe(text)
+    expect(unmarked).not.toMatch(/PDFxOCR/)
+    page.node.set(PDFName.of('Contents'), doc.context.register(doc.context.flateStream(unmarked)))
+    const bytes = await doc.save()
+    expect(markedOcrObjects(bytes)).toBe(0)
+    const before = await PDFDocument.load(bytes)
+    expect(tagged(before)).toHaveLength(0)
+    expect(fontBound(before)).toBe(true)
+    expect(hasMergedOcrText(before.getPage(0))).toBe(true)
+    expect(await hits(bytes, 'Alpha')).toBe(1)
+    const { removed } = stripOcrText(pdfium, bytes, [0])
+    expect(removed.get(0)).toBeGreaterThanOrEqual(2)
+    const unmarkedPages = [exportPage(bytes, 'm', 0), exportPage(bytes, 'm', 1)]
+    const out = await exportAs('pdf', unmarkedPages, editLayer({ ocrSelect: new Map([[key, null]]) }), store()) // prettier-ignore
+    expect(await hits(out, 'Alpha')).toBe(0)
+    expect(await hits(out, 'Native')).toBe(1)
+    expect(fontBound(await PDFDocument.load(out))).toBe(false)
+    await noOcrBytes(out)
+  })
+
+  it('a strip that leaves OCR text behind fails the export (the check after the drop)', async () => {
+    // A PDFium that sees no mark and no font name: stripOcrText runs but removes nothing.
+    const blind = new Proxy(pdfium, {
+      get: (t, k, r) =>
+        k === 'FPDFPageObj_CountMarks' || k === 'FPDFFont_GetBaseFontName'
+          ? () => 0
+          : Reflect.get(t, k, r)
+    }) as unknown as PdfiumModule
+    expect(stripOcrText(blind, merged, [0]).removed.get(0)).toBe(0)
+    for (const kind of ['pdf', 'pdfx'] as const)
+      await expect(
+        exportAs(kind, pages(), editLayer({ ocrSelect: new Map([[key, null]]) }), store(), { pdfium: blind }) // prettier-ignore
+      ).rejects.toThrow(/Export failed on page 1.*could not remove the recognized text/)
+  })
+
+  it('a merged source after a page of another file: only that source is rewritten', async () => {
+    const otherDoc = await PDFDocument.create()
+    const font = await otherDoc.embedFont(StandardFonts.Helvetica)
+    otherDoc.addPage([400, 400]).drawText('Other page', { x: 20, y: 350, size: 18, font })
+    const other = await otherDoc.save()
+    const out = await exportAs('pdf', [exportPage(other, 'o', 0), exportPage(merged, 'm', 0)], editLayer({ ocrSelect: new Map([[key, null]]) }), store()) // prettier-ignore
+    expect([await hits(out, 'Other', 0), await hits(out, 'Native', 0)]).toEqual([1, 0])
+    expect([await hits(out, 'Native', 1), await hits(out, 'Other', 1), await hits(out, 'Alpha', 1)]).toEqual([1, 0, 0]) // prettier-ignore
+    expect(raster(out, DPI, 1).data).toEqual(raster(merged, DPI, 0).data)
+    await noOcrBytes(out)
+  })
+
+  it('a dropped page whose OCR font is still bound but drawn by nothing loses the binding', async () => {
+    // A rewrite that removed the layer's stream but left its font in the page's resources: no
+    // tagged stream and no text to strip, so neither pdf-lib's drop nor PDFium unbinds it.
+    const doc = await PDFDocument.load(await firstGeneration('pdf'))
+    const page = doc.getPage(0)
+    const contents = doc.context.lookup(page.node.get(PDFName.of('Contents'))) as PDFArray
+    page.node.set(PDFName.of('Contents'), doc.context.obj(contents.asArray().filter((r) => !isOcrLayerStream(doc.context.lookup(r))))) // prettier-ignore
+    const bytes = await doc.save()
+    const before = await PDFDocument.load(bytes)
+    expect([tagged(before).length, fontBound(before), hasMergedOcrText(before.getPage(0))]).toEqual([0, true, false]) // prettier-ignore
+    const out = await exportAs('pdf', [exportPage(bytes, 'f', 0)], editLayer({ ocrSelect: new Map([[makePageKey('f', 0), null]]) }), new Map(), { pdfium: noPdfium }) // prettier-ignore
+    expect(fontBound(await PDFDocument.load(out))).toBe(false)
+    expect(await hits(out, 'Native')).toBe(1)
+    await noOcrBytes(out)
+  })
+})
+
+// ---------------------------------------------------------------------------------------------
+
+describe('a layer another tool wrapped into a Form XObject with the page', () => {
+  const key = makePageKey('w', 0)
+  const store = (): Map<string, PageResults> =>
+    new Map([[key, { results: new Map([['cfg-new', newOcr()]]) }]])
+  const pagesOf = (bytes: Uint8Array): ExportPage[] => [exportPage(bytes, 'w', 0), exportPage(bytes, 'w', 1)] // prettier-ignore
+  /** Every page drawn from a Form XObject (pdf-lib embedPdf + drawPage, as N-up and stamping do). */
+  let wrapped: Uint8Array
+  /** Wrapped twice: the layer sits in a form inside a form. */
+  let nested: Uint8Array
+
+  async function wrapInForms(bytes: Uint8Array): Promise<Uint8Array> {
+    const src = await PDFDocument.load(bytes)
+    const doc = await PDFDocument.create()
+    for (const e of await doc.embedPdf(bytes, src.getPageIndices()))
+      doc.addPage([e.width, e.height]).drawPage(e)
+    return doc.save()
+  }
+
+  beforeAll(async () => {
+    wrapped = await wrapInForms(await firstGeneration('pdfx'))
+    nested = await wrapInForms(wrapped)
+  })
+
+  it('control: no tagged stream or font on the page; a form carries the layer (once or nested)', async () => {
+    for (const bytes of [wrapped, nested]) {
+      const doc = await PDFDocument.load(bytes)
+      expect([tagged(doc).length, fontBound(doc)]).toEqual([0, false])
+      expect(existingOcrLayer(doc.getPage(0)).forms).toHaveLength(1)
+      expect(hasMergedOcrText(doc.getPage(0))).toBe(true)
+      expect(hasMergedOcrText(doc.getPage(1))).toBe(false)
+      expect(await hits(bytes, 'Alpha')).toBe(1)
+    }
+    expect(stripOcrText(pdfium, wrapped, [0]).removed.get(0)).toBeGreaterThanOrEqual(2)
+  })
+
+  it.each(['pdf', 'pdfx'] as const)(
+    '%s, Replace: the old layer goes from the form, one new layer',
+    async (kind) => {
+      const out = await exportAs(kind, pagesOf(wrapped), editLayer({ ocrSelect: new Map([[key, 'cfg-new']]) }), store()) // prettier-ignore
+      expect(await hits(out, 'Alpha')).toBe(1)
+      expect(await hits(out, 'Beta')).toBe(1)
+      expect(await hits(out, 'Delta')).toBe(1)
+      expect(await hits(out, 'Native')).toBe(1)
+      const doc = await PDFDocument.load(out)
+      expect(tagged(doc)).toHaveLength(1)
+      expect(layerEngines(doc)).toEqual(['test/new'])
+      expect(hasMergedOcrText(doc.getPage(0))).toBe(false)
+      expect(existingOcrLayer(doc.getPage(0)).forms).toHaveLength(0)
+      expect(raster(out, DPI, 0).data).toEqual(raster(wrapped, DPI, 0).data)
+    }
+  )
+
+  it.each(['pdf', 'pdfx'] as const)(
+    '%s, Remove: no OCR text, mark or font left in the form; the page looks the same',
+    async (kind) => {
+      const out = await exportAs(kind, pagesOf(wrapped), editLayer({ ocrSelect: new Map([[key, null]]) }), store()) // prettier-ignore
+      expect(await hits(out, 'Alpha')).toBe(0)
+      expect(await hits(out, 'Beta')).toBe(0)
+      expect(await hits(out, 'Native')).toBe(1)
+      expect(await hits(out, 'Second', 1)).toBe(1)
+      const doc = await PDFDocument.load(out, { updateMetadata: false })
+      expect([tagged(doc).length, fontBound(doc)]).toEqual([0, false])
+      expect(existingOcrLayer(doc.getPage(0)).forms).toHaveLength(0)
+      expect(doc.getProducer()).not.toContain(OCR_PRODUCER_SUFFIX)
+      await noOcrBytes(out)
+      expect(raster(out, DPI, 0).data).toEqual(raster(wrapped, DPI, 0).data)
+    }
+  )
+
+  it('a form nested in a form, which PDFium does not rewrite: Replace and Remove fail the export', async () => {
+    // What PDFium can do there: nothing is removed (see stripOcrText).
+    expect(stripOcrText(pdfium, nested, [0]).removed.get(0)).toBe(0)
+    for (const kind of ['pdf', 'pdfx'] as const)
+      for (const choice of ['cfg-new', null])
+        await expect(
+          exportAs(kind, pagesOf(nested), editLayer({ ocrSelect: new Map([[key, choice]]) }), store()) // prettier-ignore
+        ).rejects.toThrow(/Export failed on page 1.*could not remove the recognized text/)
+  })
+
+  it('no choice: the wrapped layer is kept once, its engine read from the form, the output marked', async () => {
+    const out = await exportAs('pdf', pagesOf(wrapped), editLayer(), new Map(), { pdfium: noPdfium }) // prettier-ignore
+    expect(await hits(out, 'Alpha')).toBe(1)
+    const doc = await PDFDocument.load(out, { updateMetadata: false })
+    expect(doc.getProducer()).toContain(OCR_PRODUCER_SUFFIX)
+    const pdfx = await exportAs('pdfx', pagesOf(wrapped), editLayer(), new Map(), { pdfium: noPdfium }) // prettier-ignore
+    // The wrapper did not keep the source manifest: only the layer's own engine is known.
+    expect(embeddedManifest(await PDFDocument.load(pdfx))?.ocr).toEqual({ v: 1, pages: [{ doc: 0, page: 0, engineId: 'test/old' }] }) // prettier-ignore
   })
 })
 

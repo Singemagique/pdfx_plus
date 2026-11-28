@@ -1,7 +1,13 @@
 // OCR layer provenance in the .pdfx manifest (DESIGN.md §3.5.2, §3.7.6): which engine, language
 // data and pipeline produced the PDFx OCR layer baked into each page. Provenance only, never
 // words: the words are the layer itself, baked into the page content before computeIntegrity, so
-// the pdfx-canon/1 record covers them. The record types and the validating reader live in
+// the pdfx-canon/1 record covers the layer's content stream (its tokens: the glyph codes and their
+// placement). It does NOT cover what those codes read as: the text Find and copy return comes from
+// the OCR font's ToUnicode CMap, a font resource, and pdfx-canon/1 hashes no font (canonicalize.ts,
+// Scope), so the recognised words can be rewritten without tripping the tamper gate. Making them
+// tamper-evident needs the decoded ToUnicode of the PDFx OCR fonts in a future canon version; a
+// hash in this record would not help, since the manifest is outside the hash. The record types and
+// the validating reader live in
 // format.ts (`ManifestOcr`, `readOcrProvenance`); this module builds entries for build.ts and
 // reads a SOURCE .pdfx's manifest through pdf-lib, so a layer kept on re-export keeps its record.
 
@@ -18,6 +24,7 @@ import {
 } from 'pdf-lib'
 
 import type { PackedOcrPage } from '../../../shared/ocr/types'
+import { CANON_ALG, integrityOf, type IntegrityRecord } from './canonicalize'
 import { MANIFEST_NAME, readOcrProvenance, type ManifestOcrPage, type PdfxManifest } from './format'
 
 /** What an output page's layer is recorded as, before its (doc, page) position is known. */
@@ -95,10 +102,36 @@ export function embeddedManifest(doc: PDFDocument): PdfxManifest | null {
  * The provenance a SOURCE document records for its pages, by page index: what a layer kept from
  * that source on re-export is recorded as (validated, see `readOcrProvenance`). Empty for a source
  * that is not a .pdfx or records none.
+ *
+ * The manifest is outside the pdfx-canon/1 hash, so another tool can move, swap or rewrite pages
+ * and keep it: a record is only returned while the page still is the one it was written for. When
+ * the source carries a pdfx-canon/1 record, the page's hash is recomputed over `bytes` (the source
+ * as the export reads it) and a page whose hash differs from the recorded one loses its record (a
+ * hash that cannot be recomputed drops them all). Without such a record nothing can be proved, as
+ * on open (`compareIntegrity`); build.ts then still checks each record's engine against the one the
+ * layer's own property list names.
  */
-export function sourceProvenance(doc: PDFDocument): Map<number, OcrProvenance> {
+export async function sourceProvenance(
+  doc: PDFDocument,
+  bytes: Uint8Array
+): Promise<Map<number, OcrProvenance>> {
   const out = new Map<number, OcrProvenance>()
-  for (const [index, { doc: _d, page: _p, ...p }] of readOcrProvenance(embeddedManifest(doc)))
+  const manifest = embeddedManifest(doc)
+  const records = readOcrProvenance(manifest)
+  if (!records.size) return out
+  const integrity = manifest?.integrity as Partial<IntegrityRecord> | undefined
+  let hashes: readonly string[] | null = null
+  if (integrity?.canonAlg === CANON_ALG) {
+    try {
+      hashes = (await integrityOf(bytes)).pageHashes
+    } catch {
+      return out
+    }
+  }
+  const recorded: unknown[] = Array.isArray(integrity?.pageHashes) ? integrity.pageHashes : []
+  for (const [index, { doc: _d, page: _p, ...p }] of records) {
+    if (hashes && hashes[index] !== recorded[index]) continue
     out.set(index, p)
+  }
   return out
 }

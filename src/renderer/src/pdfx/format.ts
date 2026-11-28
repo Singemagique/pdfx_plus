@@ -31,8 +31,11 @@ export interface ManifestAttachment {
 /**
  * Provenance of the PDFx OCR text layer baked into one page (DESIGN.md §3.5.2, §3.7.6): which
  * engine, language data and pipeline produced it. PROVENANCE ONLY, never words: the words are the
- * layer itself, baked into the page content and so covered by `integrity`; this record, like the
- * rest of the manifest, is outside that hash.
+ * layer itself, baked into the page content. `integrity` covers the layer's content stream (its
+ * glyph codes and placement), but not the OCR font's ToUnicode that turns those codes into the text
+ * Find and copy return: like every font under pdfx-canon/1, it is outside the hash, so the words
+ * are not tamper-evident (ocr-provenance.ts). This record, like the rest of the manifest, is outside
+ * that hash too.
  */
 export interface ManifestOcrPage {
   /** Document index and page within it, as in `ManifestEdit`. */

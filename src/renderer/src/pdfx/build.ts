@@ -147,15 +147,14 @@ const UNKNOWN_OCR_ENGINE = 'unknown'
  * Keep or drop the PDFx OCR layer `page` already carries (a reopened PDFx export), and record what
  * remains, so the output is marked machine-generated exactly when it carries machine text (§3.7.1,
  * §3.7.7). `drop` (see `dropsSourceOcr`): the tagged streams go through pdf-lib, every other stream
- * byte-for-byte untouched (`dropOcrLayers`). A layer whose streams a later rewrite merged into the
- * page content has no tag; copyExportPages already removed it with PDFium (`stripMergedOcr`), so if
- * machine text is still found outside a tagged stream here, the export fails rather than carry a
- * layer the user removed (or two layers on one page). Returns the engines of a layer that remains
- * (empty when none does).
+ * byte-for-byte untouched (`dropOcrLayers`). A layer with no tag (its streams merged into the page
+ * content by a later rewrite, or wrapped into a Form XObject with the page) was already removed by
+ * PDFium in copyExportPages (`stripMergedOcr`), so if machine text is still found outside a tagged
+ * stream here (on the page or in a form it draws), the export fails rather than carry a layer the
+ * user removed (or two layers on one page). That check runs on EVERY dropping page, whatever the
+ * page seems to carry. Returns the engines of a layer that remains (empty when none does).
  */
 function passExistingOcr(page: PDFPage, drop: boolean, bake: OcrBake): string[] {
-  const before = existingOcrLayer(page)
-  if (!before.streams.length && !before.font) return []
   if (drop) {
     dropOcrLayers(page)
     if (hasMergedOcrText(page))
@@ -164,9 +163,11 @@ function passExistingOcr(page: PDFPage, drop: boolean, bake: OcrBake): string[] 
     if (existingOcrLayer(page).font) unbindOcrFonts(page)
   }
   const after = existingOcrLayer(page)
-  if (!after.streams.length && !after.font) return []
+  if (!after.streams.length && !after.font && !after.forms.length) return []
   const tagged = ocrLayerEngines(after.streams)
-  const engines = tagged.length ? tagged : ocrLayerEngines(pageContentStreams(page))
+  const engines = tagged.length
+    ? tagged
+    : ocrLayerEngines([...pageContentStreams(page), ...after.forms])
   const list = engines.length ? [...new Set(engines)] : [UNKNOWN_OCR_ENGINE]
   for (const e of list) bake.engines.add(e)
   return list
@@ -627,11 +628,11 @@ function mergedOcrStrip(
 /**
  * The merged-stream fallback of Replace / Remove (§3.7.6): a source page that must lose its PDFx OCR
  * layer (`strip.drops`) but carries that text outside a tagged stream (`hasMergedOcrText`: a later
- * rewrite merged the streams) gets it removed by PDFium (redact.ts `stripOcrText`) BEFORE the
- * pages are copied, and the source is reloaded from the rewritten bytes. Only those pages are
- * regenerated; a page whose layer is still tagged keeps the lossless pdf-lib drop. Like the
- * redaction pass, the rewrite replaces the whole source for every page copied from it. PDFium is
- * loaded only when such a page exists.
+ * rewrite merged the streams, or wrapped the page into a Form XObject) gets it removed by PDFium
+ * (redact.ts `stripOcrText`) BEFORE the pages are copied, and the source is reloaded from the
+ * rewritten bytes. Only those pages are regenerated; a page whose layer is still tagged keeps the
+ * lossless pdf-lib drop. Like the redaction pass, the rewrite replaces the whole source for every
+ * page copied from it. PDFium is loaded only when such a page exists.
  */
 async function stripMergedOcr(
   pages: ExportPage[],
@@ -746,13 +747,15 @@ export async function buildPdfx(
 
   // The one exception to clean pages: the OCR text layer is BAKED (DESIGN.md §3.7.2), so a
   // reopened .pdfx is searchable without re-recognition, and it is baked BEFORE computeIntegrity
-  // so the pdfx-canon/1 tamper hash covers it. Only those pages get private containers (a dropped
-  // source layer is unlinked by replacing containers, never mutating them). Rotation and crop stay
+  // so the pdfx-canon/1 tamper hash covers its content stream (not its font's ToUnicode, which no
+  // pdfx-canon/1 hash covers: see ocr-provenance.ts). Only those pages get private containers (a
+  // dropped source layer is unlinked by replacing containers, never mutating them). Rotation and crop stay
   // live mirror edits: words keep the source visual frame (intrinsic + view-origin matrices only),
   // and every word is kept (no crop drop). A layer a source page already carries is kept or
   // dropped as in buildPdf (`dropsSourceOcr`). Each page that ends up with a layer gets a
   // provenance record (engine, data hashes, languages, pipeline; never words): from the result
-  // baked now, or, for a kept layer, from the source .pdfx's own manifest.
+  // baked now, or, for a kept layer, from the source .pdfx's own manifest while it still describes
+  // that layer (`sourceProvenance`, and the engine check below).
   const bake = newOcrBake(output)
   const provenance: (OcrProvenance | undefined)[] = []
   const sourceRecords = new Map<string, Map<number, OcrProvenance>>()
@@ -764,10 +767,13 @@ export async function buildPdfx(
       if (ocrPage) isolateMutableContainers(page)
       const kept = passExistingOcr(page, dropsSourceOcr(edits, key), bake)
       if (kept.length) {
-        const { sourceKey, pageIndex } = ordered[i]
+        const { sourceKey, pageIndex, bytes } = ordered[i]
         let records = sourceRecords.get(sourceKey)
-        if (!records) sourceRecords.set(sourceKey, (records = sourceProvenance(sources.get(sourceKey)!))) // prettier-ignore
-        provenance[i] = records.get(pageIndex) ?? { engineId: kept[0] }
+        if (!records) sourceRecords.set(sourceKey, (records = await sourceProvenance(sources.get(sourceKey)!, bytes))) // prettier-ignore
+        // The source's record only while it names an engine of the layer that is actually there
+        // (its /Engine property lists); otherwise only that engine is known.
+        const record = records.get(pageIndex)
+        provenance[i] = record && kept.includes(record.engineId) ? record : { engineId: kept[0] }
       }
       if (!ocrPage) continue
       const intrinsic = ((page.getRotation().angle % 360) + 360) % 360
