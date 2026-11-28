@@ -104,7 +104,7 @@ const get = (o: unknown, ...path: string[]): unknown =>
  * none). The checks: exit status 0; report ok; a packaged build; the clean300 page matches its
  * recorded replay exactly (digest and text); every tripwire counter exactly 0 and every stub
  * intact; exactly 0 bytes on the utility process's stdout/stderr; the engine not loaded from the
- * asar; the crash phase ok; the shortcut check passed or was skipped (no handler on the branch);
+ * asar; the crash phase ok; the shortcut check passed with exactly one send (required, no skip);
  * and in unshare mode, the app's own namespace had only `lo`.
  */
 export function selftestProblems(report: unknown, run: SelftestRunFacts): string[] {
@@ -138,9 +138,12 @@ export function selftestProblems(report: unknown, run: SelftestRunFacts): string
       const f = get(report, 'crashPhase', 'failures')
       problems.push(`crash phase: ${(Array.isArray(f) ? f : ['no report']).join('; ')}`)
     }
+    // Required on every OS: a pass with exactly one 'recognize-text' send (no skip).
     const sc = get(report, 'shortcut', 'status')
-    if (sc !== 'pass' && sc !== 'skipped')
+    if (sc !== 'pass')
       problems.push(`shortcut: ${String(get(report, 'shortcut', 'message') ?? 'no report')}`)
+    else if (get(report, 'shortcut', 'sends') !== 1)
+      problems.push(`shortcut: ${String(get(report, 'shortcut', 'sends'))} sends, expected 1`)
   }
   if (run.mode === 'unshare' && !netnsOnlyLoopback(run.netnsLinks))
     problems.push(

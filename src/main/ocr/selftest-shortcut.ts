@@ -2,9 +2,9 @@
 // app's own window exactly as the app does (window.ts createWindow, with the toolkit's
 // watchWindowShortcuts attached on browser-window-created as index.ts attaches it, and the app
 // menu), keep it HIDDEN, send the Recognize Text chord with webContents.sendInputEvent and count the
-// `pdfx:menu` 'recognize-text' sends. The verdict (pass / skipped when the branch has no handler /
-// fail) is selftest.ts `shortcutVerdict`. Menu accelerators do not fire on a hidden window (PR0) and
-// not through sendInputEvent at all on macOS (PR0b), so only window.ts's handler can deliver it.
+// `pdfx:menu` 'recognize-text' sends. The verdict (pass / fail, required on every OS) is selftest.ts
+// `shortcutVerdict`. Menu accelerators do not fire on a hidden window (PR0) and not through
+// sendInputEvent at all on macOS (PR0b), so only window.ts's handler can deliver it.
 
 import { app, Menu, type BrowserWindow, type MenuItem } from 'electron'
 import { optimizer } from '@electron-toolkit/utils'
@@ -15,10 +15,10 @@ import { shortcutVerdict, type ShortcutReport } from './selftest'
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
 
-/** The design's item: id 'recognize-text' (the MenuAction), or its label "Recognize Text…". */
+/** menu.ts's Document item: id 'recognize-text' (the MenuAction), labelled "Recognize Text…". */
 function hasRecognizeItem(items: MenuItem[] | undefined): boolean {
   for (const i of items ?? []) {
-    if (i.id === 'recognize-text' || /^Recognize Text\b(?! on)/.test(i.label)) return true
+    if (i.id === 'recognize-text' && i.label === 'Recognize Text…') return true
     if (hasRecognizeItem(i.submenu?.items)) return true
   }
   return false

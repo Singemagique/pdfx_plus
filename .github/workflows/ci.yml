@@ -145,7 +145,8 @@ jobs:
       # unpacked tree: the utility process forked from the asar, the engine from resources/ocr, the
       # clean300 page matched exactly against its recorded replay, every tripwire at 0, nothing on
       # the child's stdout/stderr, a crash phase (a process.crash()ed child detected and respawned)
-      # and the Ctrl/Cmd+Shift+R check on a hidden window (skipped until the branch has its handler).
+      # and the Ctrl/Cmd+Shift+R check on a hidden window (required on all three OSes: Cmd on macOS,
+      # Ctrl elsewhere, exactly one 'recognize-text' send).
       # scripts/ocr-selftest-run.mjs asserts all of it and writes the reports.
       #
       # Linux needs the setuid chrome-sandbox the deb's after-install sets (Ubuntu restricts

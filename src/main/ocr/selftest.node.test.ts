@@ -135,19 +135,19 @@ describe('shortcutVerdict (Ctrl/Cmd+Shift+R on a hidden window, §3.8)', () => {
     expect(shortcutVerdict({ ...seen, wrongModifierSends: 0, keyDowns: 2 }).status).toBe('pass')
   })
 
-  it('is skipped, saying why, on a branch without the handler (before PR8)', () => {
+  it('is required: no handler and no menu item fails, it is never skipped', () => {
     const v = shortcutVerdict({ ...seen, menuItem: false, sends: 0 })
-    expect(v.status).toBe('skipped')
-    expect(v.message).toMatch(/no Ctrl\/Cmd\+Shift\+R handler on this branch .*PR8/)
+    expect(v.status).toBe('fail')
+    expect(v.message).toMatch(/no Recognize Text… item/)
+    expect(shortcutVerdict({ ...seen, menuItem: false }).status).toBe('fail')
   })
 
-  it('fails once the handler exists but the press is lost, doubled or fires on the wrong chord', () => {
+  it('fails when the press is lost, doubled or fires on the wrong chord', () => {
     expect(shortcutVerdict({ ...seen, sends: 0 }).message).toMatch(/0 time\(s\) for one press/)
     expect(shortcutVerdict({ ...seen, sends: 2 }).status).toBe('fail')
     expect(shortcutVerdict({ ...seen, keyDowns: 0 }).message).toMatch(/never reached/)
     expect(shortcutVerdict({ ...seen, loaded: false }).status).toBe('fail')
     expect(shortcutVerdict({ ...seen, wrongModifierSends: 1 }).message).toMatch(/darwin/)
-    // A handler without the menu item still counts as present.
     expect(shortcutVerdict({ ...seen, menuItem: false, sends: 2 }).status).toBe('fail')
   })
 })

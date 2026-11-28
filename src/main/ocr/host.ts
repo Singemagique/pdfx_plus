@@ -226,7 +226,7 @@ export async function runOcrSelftest(outArg: string | undefined): Promise<number
   const lastFatal = sup.lastFatal
   sup.teardown('selftest-done')
 
-  // The shortcut on a hidden app window (skipped, with the reason, on a branch without its handler).
+  // The shortcut on a hidden app window: required on every OS (window.ts's handler, menu.ts's item).
   let shortcut: ShortcutReport | { status: 'fail'; message: string }
   try {
     shortcut = await runShortcutCheck()
@@ -254,7 +254,7 @@ export async function runOcrSelftest(outArg: string | undefined): Promise<number
   }
 
   const failures = [...(report?.failures ?? []), ...(error ? [error] : [])]
-  if (shortcut.status === 'fail') failures.push(`shortcut: ${shortcut.message}`)
+  if (shortcut.status !== 'pass') failures.push(`shortcut: ${shortcut.message}`)
   if (crashError) failures.push(`crash phase: ${crashError}`)
   for (const f of crash?.failures ?? []) failures.push(`crash phase: ${f}`)
   if (supervisorState === 'fatal' && !failures.some((f) => f.startsWith('OCR became unavailable')))

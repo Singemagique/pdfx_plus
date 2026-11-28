@@ -23,7 +23,7 @@ interface Fixture {
   app: { isPackaged: boolean; ocrEngineInAsar: boolean }
   child: { stdio?: { bytes: number; lines: number } }
   crashPhase?: { ok: boolean; failures: string[] }
-  shortcut?: { status: string; message: string }
+  shortcut?: { status: string; message: string; sends?: number }
 }
 
 /** A passing report. */
@@ -35,7 +35,7 @@ const passing = (): Fixture => ({
   app: { isPackaged: true, ocrEngineInAsar: false },
   child: { stdio: { bytes: 0, lines: 0 } },
   crashPhase: { ok: true, failures: [] },
-  shortcut: { status: 'skipped', message: 'no handler on this branch' }
+  shortcut: { status: 'pass', message: 'reached the renderer once', sends: 1 }
 })
 const LO = '1: lo: <LOOPBACK> mtu 65536 qdisc noop state DOWN mode DEFAULT group default qlen 1000'
 const ok = (over: Partial<SelftestRunFacts> = {}): SelftestRunFacts => ({
@@ -46,11 +46,9 @@ const ok = (over: Partial<SelftestRunFacts> = {}): SelftestRunFacts => ({
 })
 
 describe('the packaged OCR self-test verdict', () => {
-  it('passes a clean report (shortcut passed or skipped), in every mode', () => {
+  it('passes a clean report (shortcut passed with one send), in every mode', () => {
     expect(selftestProblems(passing(), ok())).toEqual([])
-    const sc = passing()
-    sc.shortcut = { status: 'pass', message: 'reached the renderer once' }
-    expect(selftestProblems(sc, ok({ mode: 'xvfb' }))).toEqual([])
+    expect(selftestProblems(passing(), ok({ mode: 'xvfb' }))).toEqual([])
     expect(selftestProblems(passing(), ok({ mode: 'unshare', netnsLinks: LO }))).toEqual([])
   })
 
@@ -78,6 +76,21 @@ describe('the packaged OCR self-test verdict', () => {
       'shortcut fail',
       (r) => (r.shortcut = { status: 'fail', message: 'sent twice' }),
       /^shortcut: sent twice$/
+    ],
+    [
+      'shortcut skipped (it is required now)',
+      (r) => (r.shortcut = { status: 'skipped', message: 'no handler on this branch' }),
+      /^shortcut: no handler on this branch$/
+    ],
+    [
+      'shortcut pass with two sends',
+      (r) => (r.shortcut!.sends = 2),
+      /^shortcut: 2 sends, expected 1$/
+    ],
+    [
+      'shortcut pass without a send count',
+      (r) => delete r.shortcut!.sends,
+      /^shortcut: undefined sends/
     ],
     ['no shortcut', (r) => delete r.shortcut, /^shortcut: no report$/]
   ]

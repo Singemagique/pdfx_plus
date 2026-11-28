@@ -3,8 +3,9 @@
 // output in dist/, and fail unless it passed:
 //   exit code 0; the clean300 page matches the recorded replay exactly (digest and text); every
 //   tripwire counter 0 and every stub intact; 0 bytes on the utility process's stdout/stderr; the
-//   crash phase detected the crashed child and respawned it; the Ctrl/Cmd+Shift+R check passed or
-//   was skipped with its reason (no handler on the branch yet: PR8).
+//   crash phase detected the crashed child and respawned it; the Ctrl/Cmd+Shift+R check (REQUIRED on
+//   every OS: Cmd+Shift+R on macOS, Ctrl+Shift+R elsewhere) passed with exactly one 'recognize-text'
+//   send on pdfx:menu.
 //
 // Modes:
 //   direct   run the executable (Windows, macOS)
@@ -125,7 +126,14 @@ run.summary = report && {
   textMatches: report.page?.textMatches,
   tripwire: report.heartbeat?.tripwire,
   stdio: report.child?.stdio,
-  shortcut: report.shortcut && { status: report.shortcut.status, message: report.shortcut.message },
+  shortcut: report.shortcut && {
+    status: report.shortcut.status,
+    message: report.shortcut.message,
+    sends: report.shortcut.sends,
+    wrongModifierSends: report.shortcut.wrongModifierSends,
+    keyDowns: report.shortcut.keyDowns,
+    menuItem: report.shortcut.menuItem
+  },
   crashPhase: report.crashPhase && {
     ok: report.crashPhase.ok,
     firstExit: report.crashPhase.firstExit,
@@ -143,7 +151,7 @@ const line =
     ? ` · replay ${s.digestMatches && s.textMatches ? 'exact' : 'DIFFERS'} (${s.words} words)` +
       ` · tripwire ${JSON.stringify(s.tripwire)} · stdio ${s.stdio?.bytes ?? '?'} B` +
       ` · crash phase ${s.crashPhase?.ok ? `ok (${s.crashPhase.firstExit?.reason}, detected in ${s.crashPhase.detectMs} ms)` : 'FAIL'}` +
-      ` · shortcut ${s.shortcut?.status}: ${s.shortcut?.message}`
+      ` · shortcut ${s.shortcut?.status} (${s.shortcut?.sends ?? '?'} send(s)): ${s.shortcut?.message}`
     : '') +
   (mode === 'unshare' ? ` · app namespace links \`${run.netnsLinks ?? '(none recorded)'}\`` : '') +
   (run.corePattern ? ` · core_pattern \`${run.corePattern}\`` : '') +

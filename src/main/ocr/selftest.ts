@@ -2,8 +2,8 @@
 // port into the real utility process: open the embedded clean300 scan, triage it with PDFium in the
 // raster thread (it must be `scanned`), render it, recognise it with the real engine from
 // resources/ocr, and require the packed result (stamped with triage's class) to match the recorded
-// replay exactly (selftest-fixture.ts), then check every tripwire counter is 0. PR11 adds the
-// shortcut check and the 3-OS CI wiring.
+// replay exactly (selftest-fixture.ts), then check every tripwire counter is 0. The shortcut check
+// and the crash phase below run alongside it, on all three OSes in CI.
 //
 // This file is the session logic only (no Electron import), so it also runs in vitest against the
 // coordinator; host.ts `runOcrSelftest` wires it to the packaged app and writes the report.
@@ -405,28 +405,22 @@ export interface ShortcutObservation {
 }
 
 export interface ShortcutReport extends ShortcutObservation {
-  status: 'pass' | 'skipped' | 'fail'
+  status: 'pass' | 'fail'
   message: string
 }
 
 /**
- * Pass: exactly one 'recognize-text' per press (and none for the wrong modifier on darwin). Skipped,
- * with the reason, when the branch has no handler at all (no Recognize Text menu item and nothing
- * sent): PR8 adds it, and the check turns itself on then. Anything else fails.
+ * Required on every OS (window.ts has the handler, menu.ts the item): pass only on exactly one
+ * 'recognize-text' per press of the platform's chord (Cmd+Shift+R on darwin, Ctrl+Shift+R
+ * elsewhere), none for Ctrl+Shift+R on darwin, and the Document menu's Recognize Text… item
+ * present. Anything else fails; there is no skip.
  */
 export function shortcutVerdict(o: ShortcutObservation): ShortcutReport {
   const chord = 'Ctrl/Cmd+Shift+R'
   const seen = `the key reached the hidden window ${o.keyDowns} time(s)`
-  if (!o.menuItem && o.sends === 0 && !o.wrongModifierSends)
-    return {
-      ...o,
-      status: 'skipped',
-      message:
-        `no ${chord} handler on this branch (no Recognize Text menu item and no ` +
-        `'recognize-text' sent on pdfx:menu; PR8 adds both, and this check then runs); ${seen}`
-    }
   const fail = (why: string): ShortcutReport => ({ ...o, status: 'fail', message: why })
   if (!o.loaded) return fail(`the hidden window never loaded the renderer; ${seen}`)
+  if (!o.menuItem) return fail(`the application menu has no Recognize Text… item; ${seen}`)
   if (o.keyDowns === 0) return fail(`sendInputEvent never reached the hidden window`)
   if (o.sends !== 1)
     return fail(`${chord} sent 'recognize-text' ${o.sends} time(s) for one press, expected 1`)
