@@ -9,6 +9,7 @@ import {
   PAGE_REASONS,
   TRIAGE_WORD_LIMITS,
   parseFromOcr,
+  parseOcrToMain,
   parseToOcr,
   type TriagePage
 } from './protocol'
@@ -57,6 +58,15 @@ describe('triage messages', () => {
     }
     expect(parseFromOcr(triaged([failed], false))).toEqual(triaged([failed], false))
     expect(PAGE_REASONS).toContain('image-format')
+  })
+
+  it("main's activity message carries an optional triage flag", () => {
+    const a = { busy: false, done: 0, total: 0 }
+    expect(parseOcrToMain({ activity: a })).toEqual({ activity: a })
+    expect(parseOcrToMain({ activity: { ...a, triage: true } })).toEqual({
+      activity: { ...a, triage: true }
+    })
+    expect(() => parseOcrToMain({ activity: { ...a, triage: 1 } })).toThrow()
   })
 
   it('refuses unknown classes, keys, oversize words and out-of-range numbers', () => {

@@ -865,6 +865,37 @@ describe('idle, power and progress', () => {
     expect(ctx.children).toHaveLength(2)
   })
 
+  it('open triage holds off the idle kill, and the 3 minutes count from its end (PR4b)', async () => {
+    const ctx = setup()
+    const { wc, child } = await connected(ctx)
+    await vi.advanceTimersByTimeAsync(IDLE_KILL_MS - 1_000)
+    child.say({ activity: { busy: false, done: 0, total: 0, triage: true } })
+    await vi.advanceTimersByTimeAsync(IDLE_KILL_MS * 2)
+    expect(child.killed).toBe(false) // triaging: never idle-killed mid-triage
+    // Background work: no power blocker, no taskbar progress.
+    expect(ctx.blockers.started).toEqual([])
+    expect(ctx.progress.filter((p) => p.frac >= 0)).toEqual([])
+    child.say({ activity: { busy: false, done: 0, total: 0, triage: false } })
+    await vi.advanceTimersByTimeAsync(IDLE_KILL_MS - 1)
+    expect(child.killed).toBe(false)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(child.killed).toBe(true)
+    expect(wc.disconnects()).toEqual([{ reason: 'idle' }])
+  })
+
+  it('a batch that ends while triage is still open does not arm the idle kill', async () => {
+    const ctx = setup()
+    const { child } = await connected(ctx)
+    child.say({ activity: { busy: true, done: 0, total: 2, triage: true } })
+    child.say({ activity: { busy: false, done: 0, total: 0, triage: true } })
+    expect(ctx.blockers.stopped).toEqual([1])
+    await vi.advanceTimersByTimeAsync(IDLE_KILL_MS * 2)
+    expect(child.killed).toBe(false)
+    child.say({ activity: { busy: false, done: 0, total: 0, triage: false } })
+    await vi.advanceTimersByTimeAsync(IDLE_KILL_MS)
+    expect(child.killed).toBe(true)
+  })
+
   it('kills an idle process that was never used', async () => {
     const ctx = setup()
     const { child } = await connected(ctx)

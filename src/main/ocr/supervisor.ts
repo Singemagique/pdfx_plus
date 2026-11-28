@@ -49,7 +49,8 @@
 // - The port belongs to one webContents. Window closed, render-process-gone and a main-frame
 //   navigation (a reload) cancel everything and kill the process; every ocr.connect() gets a FRESH
 //   MessageChannelMain and a port is never reused.
-// - Idle kill after 3 minutes (WASM memory never shrinks; killing is how it returns to the OS).
+// - Idle kill after 3 minutes (WASM memory never shrinks; killing is how it returns to the OS),
+//   counted from the end of the last batch AND the last triage request: open triage holds it off.
 //   BELOW_NORMAL priority at spawn. The power blocker is held only while a batch runs; the taskbar
 //   progress follows the batch.
 
@@ -60,6 +61,7 @@ import {
   parseOcrToMain,
   type Heartbeat,
   type MainToOcr,
+  type OcrActivity,
   type OcrDisconnectReason,
   type OcrHostLimits,
   type OcrInit,
@@ -668,7 +670,7 @@ export class OcrSupervisor {
     owner.wc.postMessage(OCR_PORT_CHANNEL, null, [port1])
   }
 
-  private onActivity(a: { busy: boolean; done: number; total: number }): void {
+  private onActivity(a: OcrActivity): void {
     const wc = this.owner?.kind === 'wc' ? this.owner.wc : null
     if (a.busy) {
       this.clearIdle()
@@ -676,10 +678,13 @@ export class OcrSupervisor {
         this.blockerId = this.deps.powerSaveBlocker.start('prevent-app-suspension')
       if (wc && !wc.isDestroyed())
         this.deps.setProgress(wc, a.total > 0 ? Math.min(1, a.done / a.total) : 0)
-    } else {
-      this.endBatch()
-      this.armIdle()
+      return
     }
+    this.endBatch()
+    // Open triage is work too (background: no power blocker, no progress), so the idle kill waits
+    // for it and its IDLE_KILL_MS count starts again when the last triage request ends.
+    if (a.triage) this.clearIdle()
+    else this.armIdle()
   }
 
   private endBatch(): void {

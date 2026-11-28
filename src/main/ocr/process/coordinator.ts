@@ -21,7 +21,8 @@
 //         error, watchdog) → respawn and re-queue once, then `failed`; "Cannot enlarge memory"
 //         during a render or no headroom → recycle and retry once, then `too-large`. A page queued
 //         behind a failure carries on.
-// §3.3.5  Progress ≤ 10 Hz per job; activity (busy, done, total) to main for the power blocker.
+// §3.3.5  Progress ≤ 10 Hz per job; activity (busy, done, total) to main for the power blocker,
+//         and whether triage requests are open (which holds off main's idle kill).
 // §3.3.6  Work order: the focused page, then the rest of its source, then the other jobs in order.
 // §3.4.1  Triage requests go to the raster thread in chunks of TRIAGE_CHUNK pages, one PDFium task
 //         at a time with the renders, which go first (triage is background work). A chunk that
@@ -328,7 +329,9 @@ export class Coordinator {
   private lastFlush = -Infinity
   private flushTimer: ReturnType<typeof setTimeout> | null = null
   /** The last activity sent to main; starts idle so an idle process says nothing. */
-  private lastActivity = 'false:0:0'
+  private lastActivity = 'false:false:0:0'
+  /** Its `activityState()` part. */
+  private lastActivityState = 'false:false'
   private readonly heartbeatTimer: ReturnType<typeof setInterval>
   private disposed = false
 
@@ -566,10 +569,12 @@ export class Coordinator {
   private dropSource(src: string): void {
     this.sources.delete(src)
     // Its triage requests end with it (a chunk in flight is dropped when it answers).
+    const triages = this.triages.length
     for (let i = this.triages.length - 1; i >= 0; i--)
       if (this.triages[i].src === src) this.triages.splice(i, 1)
     if (this.raster) this.sendRaster(this.raster, { type: 'close', src })
     if (this.focus?.src === src) this.focus = null
+    if (this.triages.length !== triages) this.scheduleFlush()
   }
 
   private closeSource(src: string): void {
@@ -1244,6 +1249,7 @@ export class Coordinator {
       t.pending ??= []
       this.failTriage(t)
     }
+    this.scheduleFlush()
     this.toParent({
       fatal: {
         code: 'init',
@@ -1479,10 +1485,9 @@ export class Coordinator {
 
   private scheduleFlush(): void {
     if (this.disposed) return
-    // Busy ↔ idle transitions go to main at once (the power blocker and the taskbar follow them);
-    // counts within a batch ride the throttled flush.
-    const busy = this.jobs.size > 0
-    if (busy !== this.lastActivity.startsWith('true')) this.reportActivity()
+    // Busy ↔ idle transitions go to main at once (the power blocker and the taskbar follow them,
+    // and open triage holds off the idle kill); counts within a batch ride the throttled flush.
+    if (this.activityState() !== this.lastActivityState) this.reportActivity()
     if (this.flushTimer) return
     const wait = this.lastFlush + this.b.progressIntervalMs - Date.now()
     if (wait <= 0) {
@@ -1517,6 +1522,11 @@ export class Coordinator {
     this.reportActivity()
   }
 
+  /** Jobs open, and triage requests open: a change in either goes to main at once. */
+  private activityState(): string {
+    return `${this.jobs.size > 0}:${this.triages.length > 0}`
+  }
+
   private reportActivity(): void {
     let done = 0
     let total = 0
@@ -1525,10 +1535,12 @@ export class Coordinator {
       total += job.total
     }
     const busy = this.jobs.size > 0
-    const key = `${busy}:${done}:${total}`
+    const triage = this.triages.length > 0
+    const key = `${busy}:${triage}:${done}:${total}`
     if (key === this.lastActivity) return
     this.lastActivity = key
-    this.toParent({ activity: { busy, done, total } })
+    this.lastActivityState = this.activityState()
+    this.toParent({ activity: { busy, done, total, triage } })
   }
 
   private postHeartbeat(): void {

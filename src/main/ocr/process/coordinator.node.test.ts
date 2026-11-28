@@ -1100,7 +1100,7 @@ describe('progress, activity and heartbeat', () => {
     expect(jobDone(port)).toEqual([{ jobId: 'j', done: 40, failed: 0, cancelled: false }])
     const act = h.parent.of('activity') as Array<{ busy: boolean; done: number; total: number }>
     expect(act[0]).toMatchObject({ busy: true, total: 40 })
-    expect(act.at(-1)).toEqual({ busy: false, done: 0, total: 0 })
+    expect(act.at(-1)).toEqual({ busy: false, done: 0, total: 0, triage: false })
   })
 
   it('sums the tripwire counters of the process and of every thread, retired ones included', async () => {

@@ -396,3 +396,34 @@ describe('triage requests (§3.4.1)', () => {
     expect(triagedOf(port)).toEqual([])
   })
 })
+
+describe('triage activity (the idle kill)', () => {
+  it('tells main while triage requests are open', async () => {
+    let release: (() => void) | null = null
+    const { h, port } = await start({
+      rasterTriage: (msg, thread) => {
+        release = () => thread.reply(triaged(msg, thread))
+        return 'hang'
+      }
+    })
+    await open(port, 's1')
+    port.send({ triage: { src: 's1', pages: [0] } })
+    await settle()
+    expect(h.parent.of('activity')).toEqual([{ busy: false, done: 0, total: 0, triage: true }])
+    release!()
+    await settle(60)
+    expect(h.parent.of('activity').at(-1)).toEqual({
+      busy: false,
+      done: 0,
+      total: 0,
+      triage: false
+    })
+    // Closing a source with triage still open ends it too.
+    port.send({ triage: { src: 's1', pages: [1] } })
+    await settle()
+    expect(h.parent.of('activity').at(-1)).toMatchObject({ triage: true })
+    port.send({ close: 's1' })
+    await settle()
+    expect(h.parent.of('activity').at(-1)).toMatchObject({ triage: false })
+  })
+})

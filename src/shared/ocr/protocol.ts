@@ -315,6 +315,13 @@ export interface TripwireSelfCheck {
   failed: string[]
 }
 
+export interface OcrActivity {
+  busy: boolean
+  done: number
+  total: number
+  triage?: boolean
+}
+
 export type OcrToMain =
   | {
       ready: {
@@ -323,8 +330,12 @@ export type OcrToMain =
         selfCheck: TripwireSelfCheck
       }
     }
-  /** Batch state for the power blocker and the taskbar progress (≤ 10 Hz). */
-  | { activity: { busy: boolean; done: number; total: number } }
+  /**
+   * Batch state for the power blocker and the taskbar progress (≤ 10 Hz). `triage` says triage
+   * requests are open: background work that holds off the idle kill but takes no power blocker and
+   * shows no progress (absent = false).
+   */
+  | { activity: OcrActivity }
   | { heartbeat: Heartbeat }
   | { fatal: { code: OcrErrorCode; message: string } }
 
@@ -835,11 +846,7 @@ const ocrToMain = message<OcrToMain>(
         failed: array(apiName, 64)
       })
     }),
-    activity: object<{ busy: boolean; done: number; total: number }>({
-      busy: bool,
-      done: count,
-      total: count
-    }),
+    activity: object<OcrActivity>({ busy: bool, done: count, total: count }, { triage: bool }),
     heartbeat: object<Heartbeat>({
       tripwire: tripwireCounts,
       tripwireIntact: bool,
