@@ -1,4 +1,6 @@
-import { PDFDocument } from 'pdf-lib'
+import { PDFDocument, beginMarkedContent, endMarkedContent } from 'pdf-lib'
+
+import { IMAGE_IMPORT_PRODUCER, IMPORTED_IMAGE_MARK } from '../../../shared/ocr/triage'
 
 import { jpegOrientation } from './exif'
 import { embedPngFaithful } from './png-embed'
@@ -187,11 +189,22 @@ async function rasterToPng(bitmap: ImageBitmap): Promise<Uint8Array> {
   return new Uint8Array(await blob.arrayBuffer())
 }
 
+/**
+ * One page showing the image: fitted (aspect kept, centred) to `pageSize` when given — the
+ * neighbouring page on append, paste and drop — else a page of the image's own size in pt.
+ *
+ * It also writes the image-origin marker (DESIGN.md §3.4.1) itself, so every import path carries it
+ * with no call site having to remember: the document Producer is `PDFx image import` (loadSource
+ * reads it to set `PdfSource.origin = 'image'`), and the image is drawn inside
+ * `/PDFxImportedImage BMC … EMC`, which lives in the page content and so survives copyPages,
+ * .pdfx save and reopen, and export (OCR triage reads it).
+ */
 export async function imageToPdf(
   data: Uint8Array,
   pageSize?: { width: number; height: number }
 ): Promise<Uint8Array> {
   const doc = await PDFDocument.create()
+  doc.setProducer(IMAGE_IMPORT_PRODUCER)
   const tooLarge = new Error('Image is too large to import')
   let image
   if (isPng(data)) {
@@ -231,11 +244,13 @@ export async function imageToPdf(
   const height = image.height * scale
 
   const page = doc.addPage([pageWidth, pageHeight])
+  page.pushOperators(beginMarkedContent(IMPORTED_IMAGE_MARK))
   page.drawImage(image, {
     x: (pageWidth - width) / 2,
     y: (pageHeight - height) / 2,
     width,
     height
   })
+  page.pushOperators(endMarkedContent())
   return doc.save()
 }
