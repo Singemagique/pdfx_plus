@@ -27,16 +27,23 @@ import { getMainWindow } from '../window'
 import { langPacks, registerOcrLangs } from './lang-host'
 import {
   OcrSupervisor,
+  SERVICE_NAME,
   type ChildLike,
   type ProcessGoneDetails,
+  type SupervisorDeps,
   type WebContentsLike
 } from './supervisor'
 import {
   childTripwireFailures,
+  crashPhase,
   selftestSession,
+  type CrashPhaseReport,
   type SelftestPort,
-  type SelftestReport
+  type SelftestReport,
+  type ShortcutReport
 } from './selftest'
+import { OCR_SELFTEST_CRASH_ARG } from './process/selftest-arg'
+import { runShortcutCheck } from './selftest-shortcut'
 
 let supervisor: OcrSupervisor | null = null
 let speedLimit = 100
@@ -93,7 +100,13 @@ function hostLimits(): { onBattery: boolean; thermal: ThermalState; speedLimit: 
 }
 
 export function getOcrSupervisor(): OcrSupervisor {
-  supervisor ??= new OcrSupervisor({
+  supervisor ??= new OcrSupervisor(supervisorDeps())
+  return supervisor
+}
+
+/** The real Electron surfaces, for the app's supervisor (and the self-test's crash-phase one). */
+function supervisorDeps(over: Partial<SupervisorDeps> = {}): SupervisorDeps {
+  return {
     fork: (modulePath, args, options) =>
       utilityProcess.fork(modulePath, args, options) as unknown as ChildLike,
     modulePath: ocrProcessPath,
@@ -121,9 +134,9 @@ export function getOcrSupervisor(): OcrSupervisor {
     platform: process.platform,
     env: process.env,
     isPackaged: app.isPackaged,
-    log: (line) => console.warn(line)
-  })
-  return supervisor
+    log: (line) => console.warn(line),
+    ...over
+  }
 }
 
 /** The `ocr.connect()` IPC, power-limit forwarding and quit handling. Call once, after ready. */
@@ -212,7 +225,38 @@ export async function runOcrSelftest(outArg: string | undefined): Promise<number
   const supervisorState = sup.state
   const lastFatal = sup.lastFatal
   sup.teardown('selftest-done')
+
+  // The shortcut on a hidden app window (skipped, with the reason, on a branch without its handler).
+  let shortcut: ShortcutReport | { status: 'fail'; message: string }
+  try {
+    shortcut = await runShortcutCheck()
+  } catch (e) {
+    shortcut = { status: 'fail', message: e instanceof Error ? e.message : String(e) }
+  }
+  // A crashing child under a second supervisor: detected (exit, gone event or hang), respawned.
+  let crash: CrashPhaseReport | null = null
+  let crashError: string | null = null
+  try {
+    crash = await crashPhase(
+      new OcrSupervisor(
+        supervisorDeps({
+          serviceName: `${SERVICE_NAME}-selftest-crash`,
+          forkArgs: (n) => (n === 0 ? [OCR_SELFTEST_CRASH_ARG] : []),
+          // A stand-in owner, not a window.
+          setProgress: () => {},
+          onWindowClosed: () => () => {},
+          log: () => {}
+        })
+      )
+    )
+  } catch (e) {
+    crashError = e instanceof Error ? e.message : String(e)
+  }
+
   const failures = [...(report?.failures ?? []), ...(error ? [error] : [])]
+  if (shortcut.status === 'fail') failures.push(`shortcut: ${shortcut.message}`)
+  if (crashError) failures.push(`crash phase: ${crashError}`)
+  for (const f of crash?.failures ?? []) failures.push(`crash phase: ${f}`)
   if (supervisorState === 'fatal' && !failures.some((f) => f.startsWith('OCR became unavailable')))
     failures.push(
       lastFatal
@@ -220,6 +264,9 @@ export async function runOcrSelftest(outArg: string | undefined): Promise<number
         : 'OCR became unavailable (fatal)'
     )
   if (lastExit) failures.push(`the utility process exited unexpectedly (${lastExit.reason})`)
+  // §3.9.4 R3: the engine and the threads print nothing on the child's real stdout/stderr.
+  if (output.bytes > 0)
+    failures.push(`the utility process wrote ${output.bytes} byte(s) to its stdout/stderr`)
   // electron.net fully stubbed, and the child's own self-check saw every escape hatch trip
   // (process._linkedBinding('electron_common_net') among them), inside the child.
   failures.push(...childTripwireFailures(electronNet, selfCheck))
@@ -250,6 +297,8 @@ export async function runOcrSelftest(outArg: string | undefined): Promise<number
       electronNetStubbed: electronNet,
       tripwireSelfCheck: selfCheck
     },
+    shortcut,
+    crashPhase: crash,
     totalMs: Math.round(performance.now() - started)
   }
   writeFileSync(out, JSON.stringify(result, null, 2) + '\n')

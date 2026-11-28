@@ -6,7 +6,12 @@ import { describe, expect, it } from 'vitest'
 
 import type { Heartbeat } from '../../shared/ocr/protocol'
 import { Coordinator } from './process/coordinator'
-import { REQUIRED_CHILD_CHECKS, childTripwireFailures, selftestSession } from './selftest'
+import {
+  REQUIRED_CHILD_CHECKS,
+  childTripwireFailures,
+  selftestSession,
+  shortcutVerdict
+} from './selftest'
 import type { FromRaster } from './process/thread-messages'
 import { FakeParent, INIT, harness, settle, triaged } from './test-utils/fake-threads'
 import { portPair } from './test-utils/port-pair'
@@ -119,5 +124,30 @@ describe('childTripwireFailures (what the packaged self-test asks of the child r
       'no tripwire self-check from the utility process'
     ])
     expect(text(childTripwireFailures(['fetch'], all))).toMatch(/electron\.net stubs/)
+  })
+})
+
+describe('shortcutVerdict (Ctrl/Cmd+Shift+R on a hidden window, §3.8)', () => {
+  const seen = { menuItem: true, sends: 1, wrongModifierSends: null, keyDowns: 1, loaded: true }
+
+  it('passes on exactly one recognize-text per press', () => {
+    expect(shortcutVerdict(seen).status).toBe('pass')
+    expect(shortcutVerdict({ ...seen, wrongModifierSends: 0, keyDowns: 2 }).status).toBe('pass')
+  })
+
+  it('is skipped, saying why, on a branch without the handler (before PR8)', () => {
+    const v = shortcutVerdict({ ...seen, menuItem: false, sends: 0 })
+    expect(v.status).toBe('skipped')
+    expect(v.message).toMatch(/no Ctrl\/Cmd\+Shift\+R handler on this branch .*PR8/)
+  })
+
+  it('fails once the handler exists but the press is lost, doubled or fires on the wrong chord', () => {
+    expect(shortcutVerdict({ ...seen, sends: 0 }).message).toMatch(/0 time\(s\) for one press/)
+    expect(shortcutVerdict({ ...seen, sends: 2 }).status).toBe('fail')
+    expect(shortcutVerdict({ ...seen, keyDowns: 0 }).message).toMatch(/never reached/)
+    expect(shortcutVerdict({ ...seen, loaded: false }).status).toBe('fail')
+    expect(shortcutVerdict({ ...seen, wrongModifierSends: 1 }).message).toMatch(/darwin/)
+    // A handler without the menu item still counts as present.
+    expect(shortcutVerdict({ ...seen, menuItem: false, sends: 2 }).status).toBe('fail')
   })
 })

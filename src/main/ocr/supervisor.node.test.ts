@@ -29,6 +29,8 @@ import {
   type SupervisorDeps,
   type WebContentsLike
 } from './supervisor'
+import { CRASH_DETECT_SLACK_MS, crashPhase } from './selftest'
+import { OCR_SELFTEST_CRASH_ARG } from './process/selftest-arg'
 
 /**
  * What kill() does. 'win32' (PR0): 'exit' 0 at once and no child-process-gone. 'linux' (PR0b): the
@@ -1401,5 +1403,103 @@ describe('heartbeat', () => {
     child.say(bad)
     expect(ctx.logs.filter((l) => l.includes('TRIPWIRE'))).toHaveLength(1)
     expect(ctx.sup.lastHeartbeat?.tripwire.raster).toBe(1)
+  })
+})
+
+describe('the packaged self-test crash phase (selftest.ts crashPhase)', () => {
+  const NAME = `${SERVICE_NAME}-selftest-crash`
+  const crashCtx = (killMode: KillMode = 'win32'): Ctx & { args: string[][] } => {
+    const ctx = setup(
+      { serviceName: NAME, forkArgs: (n) => (n === 0 ? [OCR_SELFTEST_CRASH_ARG] : []) },
+      { killMode }
+    )
+    const args: string[][] = []
+    const fork = ctx.deps.fork
+    ctx.deps.fork = (m, a, o) => {
+      args.push(a)
+      return fork(m, a, o)
+    }
+    return { ...ctx, args }
+  }
+  /** Let crashPhase's 50 ms polling see what just happened. */
+  const poll = async (): Promise<void> => {
+    await vi.advanceTimersByTimeAsync(200)
+  }
+
+  it('forks the crash argument once, under its own service name, and ignores the other name', async () => {
+    const ctx = crashCtx()
+    const phase = crashPhase(ctx.sup, () => {})
+    await tick()
+    ctx.children[0].say(READY)
+    await poll()
+    expect(ctx.children[0].options.serviceName).toBe(NAME)
+    // The app supervisor's (late) gone event for its own child is not this one's.
+    ctx.gone({ reason: 'killed', exitCode: 9, name: SERVICE_NAME })
+    await tick()
+    expect(ctx.sup.state).toBe('running')
+    // Windows (PR0b): process.crash() → exit as the uint64 wrap, child-process-gone 'crashed' −36861.
+    ctx.children[0].exit(18446744073709515000)
+    ctx.gone({ reason: 'crashed', exitCode: -36861, name: NAME })
+    await vi.advanceTimersByTimeAsync(BACKOFF_MS[0] + 100)
+    ctx.children[1].say(READY)
+    await poll()
+    ctx.children[1].say(HB)
+    const r = await phase
+    expect(ctx.args).toEqual([[OCR_SELFTEST_CRASH_ARG], []])
+    expect(r).toMatchObject({
+      ok: true,
+      failures: [],
+      firstExit: { reason: 'crashed', exitCode: -36861 },
+      disconnects: ['crashed'],
+      spawnCount: 2,
+      respawned: true,
+      heartbeat: HB.heartbeat
+    })
+    // Disposed: the respawned child is killed and nothing respawns after.
+    expect(ctx.children[1].killed).toBe(true)
+  })
+
+  it('a crashed Linux child that never exits is caught by the liveness check as hung', async () => {
+    const ctx = crashCtx('linux')
+    const phase = crashPhase(ctx.sup, () => {})
+    await tick()
+    ctx.children[0].say(READY)
+    await poll()
+    ctx.children[0].hang() // PR0b: no exit, no child-process-gone, state D/S/I
+    await vi.advanceTimersByTimeAsync(LIVENESS_MS + BACKOFF_MS[0] + 1_000)
+    ctx.children[1].say(READY)
+    await poll()
+    ctx.children[1].say(HB)
+    const r = await phase
+    expect(r.failures).toEqual([])
+    expect(r.firstExit?.reason).toBe('hung')
+    expect(r.disconnects).toEqual(['crashed'])
+  })
+
+  it('fails when the child does not crash, or the respawned child trips the wire', async () => {
+    const quiet = crashCtx()
+    const p1 = crashPhase(quiet.sup, () => {})
+    await tick()
+    quiet.children[0].say(READY)
+    await vi.advanceTimersByTimeAsync(LIVENESS_MS + CRASH_DETECT_SLACK_MS + 1_000)
+    const r1 = await p1
+    expect(r1.ok).toBe(false)
+    expect(r1.failures).toContain('timed out waiting for the supervisor to notice the crash')
+
+    const dirty = crashCtx()
+    const p2 = crashPhase(dirty.sup, () => {})
+    await tick()
+    dirty.children[0].say(READY)
+    await poll()
+    dirty.children[0].exit(11) // macOS (PR0b)
+    await vi.advanceTimersByTimeAsync(GONE_GRACE_MS + BACKOFF_MS[0] + 100)
+    dirty.children[1].say(READY)
+    await poll()
+    dirty.children[1].say({
+      heartbeat: { ...HB.heartbeat, tripwire: { process: 1, raster: 0, recognize: 0 } }
+    })
+    const r2 = await p2
+    expect(r2.firstExit).toMatchObject({ reason: 'abnormal-exit', exitCode: 11 })
+    expect(r2.failures.join('\n')).toMatch(/network tripwire fired in the respawned child/)
   })
 })
