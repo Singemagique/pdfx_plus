@@ -10,7 +10,7 @@
 // The words are EXACTLY the ones Find and Copy Page Text use (ocr-find-supply.ts `filteredPage`):
 // the page's selected result (its Replace / Remove choice, else its auto result), minus every word
 // under a redaction or over an object the export's redaction pass will remove, and nothing at all
-// while that pass's report is pending (the fail-safe). A page with no recognised text this session
+// while that pass's report is pending (the fail-safe; the header then says it is updating). A page with no recognised text this session
 // shows the PDFx OCR layer its file already carries (a reopened export, saved-layer.ts), as Find
 // sees it: only while the page has no redaction and no Replace / Remove choice, since either drops
 // that layer from the export (and from Find). Those words carry no confidence: it is session-only.
@@ -60,7 +60,7 @@ export function useRecognizedTextShown(): boolean {
 // ---------------------------------------------------------------------------------------------
 // The supply (App connects its OCR Find supply once).
 
-type Supply = Pick<OcrFindSupply, 'filteredPage' | 'onChange'>
+type Supply = Pick<OcrFindSupply, 'filteredPage' | 'isPending' | 'onChange'>
 
 let supply: Supply | null = null
 let version = 0
@@ -113,8 +113,11 @@ export interface ShownWord {
 }
 
 export interface RecognizedTextView {
-  /** 'session': recognised while the file is open; 'saved': the file's own PDFx OCR layer. */
-  source: 'session' | 'saved' | 'none'
+  /**
+   * 'session': recognised while the file is open; 'saved': the file's own PDFx OCR layer;
+   * 'pending': recognised words held back until the redaction pass says what it removes.
+   */
+  source: 'session' | 'saved' | 'pending' | 'none'
   words: readonly ShownWord[]
   /** Indices into `words` of the low-confidence ones, in reading order. */
   low: readonly number[]
@@ -177,7 +180,7 @@ export function sessionWords(
   return out
 }
 
-/** The saved layer's runs as words: no confidence, so never underlined. */
+/** The saved layer's words: no confidence, so never underlined. */
 export const savedWords = (runs: readonly SavedRun[]): ShownWord[] =>
   runs.map((r) => ({ ...r, confCal: null, low: false }))
 
@@ -244,6 +247,7 @@ const plural = (n: number, one: string, many: string): string =>
 /** The header line: "Built-in engine · English, German · 3 low-confidence words". */
 export function headerText(view: RecognizedTextView): string {
   if (view.source === 'none') return 'No recognized text on this page'
+  if (view.source === 'pending') return 'Updating for redactions…'
   if (view.source === 'saved') return 'Recognized text saved in this file · confidence not kept'
   const parts = [engineLabel(view.engineId)]
   if (view.langs.length) parts.push(languageNames(view.langs))
@@ -274,8 +278,12 @@ export function useRecognizedText(
   const key = makePageKey(page.source.id, page.pageIndex)
   const v = useSyncExternalStore(subscribeSupply, supplyVersion)
   const { editLayer, ocrSelect } = useEdits()
-  const session = useMemo(
-    () => (enabled ? (supply?.filteredPage(key) ?? null) : null),
+  const { session, pending } = useMemo(
+    () => {
+      if (!enabled || !supply) return { session: null, pending: false }
+      const page = supply.filteredPage(key)
+      return { session: page, pending: !page && supply.isPending(key) }
+    },
     // `v` changes whenever the supply's answer may.
     [enabled, key, v]
   )
@@ -310,8 +318,9 @@ export function useRecognizedText(
         confidence: session.confSource !== 'none'
       })
     }
+    if (pending) return buildView('pending', [])
     if (savedAllowed && saved && saved.pdf === pdf && saved.index === index && saved.runs.length)
       return buildView('saved', inWindow(savedWords(saved.runs), crop))
     return buildView('none', [])
-  }, [enabled, session, savedAllowed, saved, pdf, index, page.height, wx, wy, ww, wh])
+  }, [enabled, session, pending, savedAllowed, saved, pdf, index, page.height, wx, wy, ww, wh])
 }

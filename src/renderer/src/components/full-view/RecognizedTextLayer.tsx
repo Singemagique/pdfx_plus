@@ -1,8 +1,9 @@
-import { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import type { PageEntry } from '../../types'
 import type { PageWindow } from '../../page-geometry'
 import { isEditableTarget } from '../../app/useKeyboardShortcuts'
+import { FullViewHeaderSlot } from './header-slot'
 import {
   headerText,
   SESSION_NOTE,
@@ -27,6 +28,21 @@ const REVEAL_MARGIN = 48
 
 const ASCENT = 0.8
 const DESCENT = 0.2
+
+/**
+ * The header is portalled out of the page, but React still bubbles its events through the page's
+ * tree: to FullViewPage's double-click zoom and FullViewPages' backdrop click (which closes full
+ * view) and drag handlers. They stop at the header.
+ */
+const stop = (e: React.SyntheticEvent): void => e.stopPropagation()
+const HEADER_EVENTS = {
+  onClick: stop,
+  onDoubleClick: stop,
+  onPointerDown: stop,
+  onPointerUp: stop,
+  onPointerMove: stop,
+  onPointerCancel: stop
+}
 
 /** Three decimals of a pt are plenty, and keep Float32 noise out of the markup. */
 const r3 = (v: number): number => Math.round(v * 1000) / 1000
@@ -54,7 +70,8 @@ function Word({ w }: { w: ShownWord }): React.JSX.Element {
  * Text use, so nothing a redaction hides — and a dotted underline under every word below the
  * calibrated underline threshold. `]` / `[` step through those (a focus ring, the page panned to
  * it when zoomed). Like FindHighlights it sits inside `.page-frame` (so it inherits the box's
- * rotate()/zoom) and under the overlay layer; the header is portalled out of the transformed box.
+ * rotate()/zoom), under the Find matches (they multiply over it and stay saturated) and under the
+ * overlay layer; the header is portalled out of the transformed box, into the full-view bar.
  */
 export function RecognizedTextLayer({
   page,
@@ -68,9 +85,19 @@ export function RecognizedTextLayer({
   const [focus, setFocus] = useState(-1)
   const svgRef = useRef<SVGSVGElement | null>(null)
 
-  // New words (a redaction, Replace, a crop): start stepping from the top again.
-  const words = view?.words
-  useEffect(() => setFocus(-1), [words])
+  // New low-confidence words (a redaction, Replace, a crop): start stepping from the top again.
+  // By content, not identity: a redacted page's words are a new array on every supply change
+  // (an edit elsewhere, another page's result), and those must not lose the user's place.
+  const lowSig = useMemo(
+    () =>
+      view
+        ? JSON.stringify(view.low.map((i) => [view.words[i].t, view.words[i].x, view.words[i].y]))
+        : '',
+    [view]
+  )
+  useEffect(() => setFocus(-1), [lowSig])
+  const slot = useContext(FullViewHeaderSlot)
+  const headerTarget = slot === undefined ? document.body : slot
 
   const lowCount = view?.low.length ?? 0
   useEffect(() => {
@@ -116,7 +143,7 @@ export function RecognizedTextLayer({
   if (!shown || !view) return null
   const focused = focus >= 0 && focus < view.low.length ? view.words[view.low[focus]] : null
   const header = (
-    <div className="ocr-text-header" role="status">
+    <div className="ocr-text-header" role="status" {...HEADER_EVENTS}>
       <div className="ocr-text-header-row">
         <span className="ocr-text-header-main">{headerText(view)}</span>
         {view.low.length > 0 && (
@@ -173,7 +200,7 @@ export function RecognizedTextLayer({
           })}
         </svg>
       )}
-      {createPortal(header, document.body)}
+      {headerTarget && createPortal(header, headerTarget)}
     </>
   )
 }

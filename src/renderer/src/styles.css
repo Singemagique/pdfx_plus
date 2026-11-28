@@ -856,8 +856,25 @@ body {
 }
 
 .full-title {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-size: 13px;
   font-weight: 600;
+}
+
+/* The current page's header (the recognized-text overlay's, header-slot.ts) between the title and
+   the close button: it takes the room the bar has, so a long title is never covered. The negative
+   margin keeps the two-line header from growing the bar. */
+.full-bar-slot {
+  flex: 1 1 0;
+  min-width: 0;
+  display: flex;
+  justify-content: center;
+  margin: -8px 0;
 }
 
 .full-bar .icon-btn {
@@ -964,8 +981,9 @@ body {
   box-shadow: 0 0 0 1.5px var(--find-ring-current);
 }
 
-/* "Show recognized text" (RecognizedTextLayer.tsx): read-only, over the Find matches and under the
-   overlay layer (z 2), so a redaction box still covers its area. Each word's box and text at 60%. */
+/* "Show recognized text" (RecognizedTextLayer.tsx): read-only, under the overlay layer (z 2), so a
+   redaction box still covers its area, and under the Find matches (same z, earlier in the DOM):
+   they multiply over it and keep their colour. Each word's box and text at 60%. */
 .ocr-text-layer {
   position: absolute;
   inset: 0;
@@ -1012,16 +1030,13 @@ body {
   vector-effect: non-scaling-stroke;
 }
 
-/* Its header: portalled to <body> (the page box is transformed), over full view (30), under the
-   find bar (40) and the dialogs. Centred in the full-view bar's row. */
+/* Its header: portalled into the full-view bar's slot (the page box is transformed). */
 .ocr-text-header {
-  position: fixed;
-  top: 8px;
-  left: 50%;
-  transform: translateX(-50%);
-  z-index: 35;
+  position: relative;
+  pointer-events: auto;
   -webkit-app-region: no-drag;
-  max-width: calc(100vw - 260px);
+  min-width: 0;
+  max-width: 100%;
   padding: 5px 12px 6px;
   border-radius: 10px;
   background: rgba(19, 19, 22, 0.86);

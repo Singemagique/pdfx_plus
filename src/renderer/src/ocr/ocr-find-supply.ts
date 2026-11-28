@@ -83,9 +83,17 @@ export interface OcrFindSupply {
    */
   redactionOutcome(pageKey: string): 'unknown' | 'pixels' | 'whole'
   /**
-   * Called whenever `filteredPage` or `redactionOutcome` may answer differently: new results or
-   * choices, a new edit layer, a removal report landing (the "Show recognized text" overlay and the
-   * scan-redaction note re-read on it). Listeners must be cheap and idempotent: it fires often.
+   * The page has recognised words that the fail-safe holds back only until the removal report
+   * for its source's current redactions is in (`filteredPage` is null meanwhile): the overlay
+   * says so instead of claiming the page has no text. False once the report is in, even when the
+   * pass failed (the words then stay out for good).
+   */
+  isPending(pageKey: string): boolean
+  /**
+   * Called whenever `filteredPage`, `isPending` or `redactionOutcome` may answer differently: new
+   * results or choices, a new edit layer, a removal report landing (the "Show recognized text"
+   * overlay and the scan-redaction note re-read on it). Listeners must be cheap and idempotent: it
+   * fires often.
    */
   onChange(listener: () => void): () => void
   dispose(): void
@@ -377,6 +385,9 @@ export function createOcrFindSupply(opts: OcrFindSupplyOptions): OcrFindSupply {
       const area = entry.width * entry.height
       const whole = pred.gone.some((b) => area > 0 && (b.w * b.h) / area >= WHOLE_SCAN_SHARE)
       return whole ? 'whole' : 'pixels'
+    },
+    isPending(pageKey) {
+      return pages.has(pageKey) && needsPrediction(pageKey)
     },
     onChange(listener) {
       changeListeners.add(listener)

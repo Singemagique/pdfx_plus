@@ -7,24 +7,29 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vite
 import { act, createElement, useEffect, useState, type ReactNode } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 
-const { savedRuns } = vi.hoisted(() => {
+const { savedRuns, findHits } = vi.hoisted(() => {
   // geometry.ts reads window.api.platform at import time.
   ;(window as unknown as { api: { platform: string } }).api = { platform: 'win32' }
-  return { savedRuns: { value: [] as unknown[] } }
+  return { savedRuns: { value: [] as unknown[] }, findHits: { value: [] as unknown[] } }
 })
 vi.mock('../PageView', () => ({ PageView: () => null }))
 vi.mock('../edit/OverlayLayer', () => ({ OverlayLayer: () => null }))
 vi.mock('../../ocr/saved-layer', () => ({
   readSavedLayer: vi.fn(async () => savedRuns.value)
 }))
+vi.mock('../../search/FindContext', () => ({ usePageHighlights: () => findHits.value }))
 
 import { FullViewPage } from './FullViewPage'
+import { FullViewPages } from './FullViewPages'
+import { FullViewChrome } from './FullViewChrome'
+import { FullViewHeaderSlot } from './header-slot'
 import { EditProvider, useEditStore, type EditStore } from '../../edit/EditProvider'
 import { makePageKey, type Overlay } from '../../edit/model'
 import {
   connectRecognizedText,
   headerText,
   isRecognizedTextShown,
+  sessionWords,
   setRecognizedTextShown,
   subscribeRecognizedTextShown,
   toggleRecognizedText,
@@ -52,6 +57,7 @@ import { defaultSettings } from '../../../../shared/settings'
 import { ENGINE_ID, PIPELINE_VERSION } from '../../../../shared/ocr/engine/tess-core'
 import { pack, type OcrWord, type PackedOcrPage } from '../../../../shared/ocr/types'
 import type { DocEntry, PageEntry } from '../../types'
+import type { View } from './geometry'
 
 const H = 792
 const LOW = UNDERLINE_THRESHOLD - 0.2
@@ -91,8 +97,9 @@ function ocrPage(
   })
 }
 
-// Three low-confidence words (one per line plus one more), one with no confidence, one exactly at
-// the threshold (not underlined: "under" the threshold).
+// Three low-confidence words (one per line plus one more), one with no confidence, one at the
+// threshold as written (not underlined; the exact boundary is pinned on sessionWords below, since
+// Float32 storage moves 0.6 up a hair).
 const PAGE = ocrPage([
   [
     ['Hello', 0.95],
@@ -122,6 +129,7 @@ let onEdits: ((s: EditStore) => void) | null = null
 function Harness(props: {
   interactive?: boolean
   zoomed?: boolean
+  isCurrent?: boolean
   panBy?: (dx: number, dy: number) => void
 }): ReactNode {
   const s = useEditStore()
@@ -131,7 +139,7 @@ function Harness(props: {
   const child = createElement(FullViewPage, {
     page,
     viewport: { w: 1200, h: 900 },
-    isCurrent: true,
+    isCurrent: props.isCurrent ?? true,
     view: { zoom: 1, x: 0, y: 0 },
     zoomed: props.zoomed ?? false,
     interactive: props.interactive ?? true,
@@ -150,15 +158,23 @@ let container: HTMLDivElement
 let root: Root
 let disconnect: (() => void) | null = null
 
-/** A supply stand-in: per-key pages, and a change signal. */
-function fakeSupply(pages: Map<string, PackedOcrPage | null>): {
+/** A supply stand-in: per-key pages, and a change signal. `fresh`: a new page object per call. */
+function fakeSupply(
+  pages: Map<string, PackedOcrPage | null>,
+  opts: { fresh?: boolean; pending?: Set<string> } = {}
+): {
   filteredPage: (k: string) => PackedOcrPage | null
+  isPending: (k: string) => boolean
   onChange: (l: () => void) => () => void
   fire: () => void
 } {
   const ls = new Set<() => void>()
   return {
-    filteredPage: (k) => pages.get(k) ?? null,
+    filteredPage: (k) => {
+      const p = pages.get(k) ?? null
+      return p && opts.fresh ? { ...p, wordGeom: p.wordGeom.slice() } : p
+    },
+    isPending: (k) => opts.pending?.has(k) ?? false,
     onChange: (l) => {
       ls.add(l)
       return () => void ls.delete(l)
@@ -294,6 +310,116 @@ describe('rendering', () => {
     expect(underlined()).toEqual(['wrld', 'tbe', '1ine'])
   })
 
+  it('the underline boundary: a word exactly at the threshold is not underlined, one below is', () => {
+    // Float32-exact values, so the comparison sees exactly what was stored.
+    const t = Math.fround(0.6)
+    const below = Math.fround(0.59)
+    const ws = sessionWords(
+      ocrPage([
+        [
+          ['at', t],
+          ['under', below],
+          ['none', null]
+        ]
+      ]),
+      H,
+      t
+    )
+    expect(ws.map((w) => [w.t, w.low])).toEqual([
+      ['at', false],
+      ['under', true],
+      ['none', false]
+    ])
+  })
+
+  it('a word with no text is neither drawn nor counted', async () => {
+    disconnect = connectRecognizedText(
+      fakeSupply(
+        new Map([
+          [
+            KEY,
+            ocrPage([
+              [
+                ['', LOW],
+                ['kept', LOW]
+              ]
+            ])
+          ]
+        ])
+      )
+    )
+    await render()
+    expect(texts()).toEqual(['kept'])
+    expect(headerMain()).toBe('Built-in engine · German, English · 1 low-confidence word')
+  })
+
+  it('a page recognised without word confidence says so, with no underline and no stepping', async () => {
+    const page0 = ocrPage(
+      [
+        [
+          ['plain', null],
+          ['words', null]
+        ]
+      ],
+      { confSource: 'none' }
+    )
+    disconnect = connectRecognizedText(fakeSupply(new Map([[KEY, page0]])))
+    await render()
+    expect(texts()).toEqual(['plain', 'words'])
+    expect(headerMain()).toBe('Built-in engine · German, English · confidence not available')
+    expect(underlined()).toEqual([])
+    expect(header()!.querySelector('.ocr-text-header-step')).toBeNull()
+  })
+
+  it('while the redaction report is pending, the header says it is updating (not "no text")', async () => {
+    const pending = new Set([KEY])
+    const fake = fakeSupply(new Map(), { pending })
+    disconnect = connectRecognizedText(fake)
+    await render()
+    expect(words()).toHaveLength(0)
+    expect(headerMain()).toBe('Updating for redactions…')
+    expect(header()!.querySelector('.ocr-text-header-step')).toBeNull()
+    pending.clear()
+    await act(async () => fake.fire())
+    expect(headerMain()).toBe('No recognized text on this page')
+  })
+
+  it('only the current page mounts the layer and its header', async () => {
+    disconnect = connectRecognizedText(fakeSupply(new Map([[KEY, PAGE]])))
+    await render({ isCurrent: false })
+    expect(container.querySelector('svg.ocr-text-layer')).toBeNull()
+    expect(document.body.querySelectorAll('.ocr-text-header')).toHaveLength(0)
+    await render({ isCurrent: true })
+    expect(document.body.querySelectorAll('.ocr-text-header')).toHaveLength(1)
+  })
+
+  it('does not ask the supply for words while hidden', async () => {
+    const fake = fakeSupply(new Map([[KEY, PAGE]]))
+    const spy = vi.spyOn(fake, 'filteredPage')
+    disconnect = connectRecognizedText(fake)
+    setRecognizedTextShown(false)
+    await render()
+    await act(async () => fake.fire())
+    expect(spy).not.toHaveBeenCalled()
+    await act(async () => setRecognizedTextShown(true))
+    expect(spy).toHaveBeenCalled()
+  })
+
+  it('sits under the Find matches, which multiply over it (same z-index, later in the page)', async () => {
+    findHits.value = [{ rect: { x: 72, y: 82, w: 30, h: 12 }, current: true }]
+    try {
+      disconnect = connectRecognizedText(fakeSupply(new Map([[KEY, PAGE]])))
+      await render()
+      const frame = container.querySelector('.page-frame')!
+      const layer = frame.querySelector('svg.ocr-text-layer')!
+      const find = frame.querySelector('.find-hl-layer')!
+      expect(find).not.toBeNull()
+      expect(layer.compareDocumentPosition(find) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    } finally {
+      findHits.value = []
+    }
+  })
+
   it('header: engine, languages, low-confidence count and the session-only note', async () => {
     disconnect = connectRecognizedText(fakeSupply(new Map([[KEY, PAGE]])))
     await render()
@@ -407,13 +533,62 @@ describe('stepping through low-confidence words', () => {
     expect(focusedWord()).toBeNull()
   })
 
-  it('a handled key is consumed; with no low-confidence word, ] is not', async () => {
+  it('a handled key is consumed', async () => {
+    disconnect = connectRecognizedText(fakeSupply(new Map([[KEY, PAGE]])))
+    await render()
+    for (const key of [']', '[']) {
+      const e = new KeyboardEvent('keydown', { key, cancelable: true })
+      await act(async () => void window.dispatchEvent(e))
+      expect(e.defaultPrevented).toBe(true)
+    }
+  })
+
+  it('with no low-confidence word, ] is not consumed', async () => {
     disconnect = connectRecognizedText(fakeSupply(new Map([[KEY, ocrPage([[['fine', 0.99]]])]])))
     await render()
     const e = new KeyboardEvent('keydown', { key: ']', cancelable: true })
     await act(async () => void window.dispatchEvent(e))
     expect(e.defaultPrevented).toBe(false)
     expect(stepText()).toBe('')
+  })
+
+  it('leaves alone a key with Meta, or one an earlier handler already took', async () => {
+    disconnect = connectRecognizedText(fakeSupply(new Map([[KEY, PAGE]])))
+    await render()
+    await press(']', { metaKey: true })
+    expect(focusedWord()).toBeNull()
+    const taken = (e: KeyboardEvent): void => e.preventDefault()
+    window.addEventListener('keydown', taken, { capture: true })
+    try {
+      await press(']', {}, document.body)
+      expect(focusedWord()).toBeNull()
+    } finally {
+      window.removeEventListener('keydown', taken, { capture: true })
+    }
+    await press(']')
+    expect(focusedWord()).toBe('wrld')
+  })
+
+  it('keeps its place when the supply changes without changing the words (a redacted page)', async () => {
+    // A redacted page's filtered words are a new object on every supply change.
+    const pages = new Map<string, PackedOcrPage | null>([[KEY, PAGE]])
+    const fake = fakeSupply(pages, { fresh: true })
+    disconnect = connectRecognizedText(fake)
+    await render()
+    await press(']')
+    await press(']')
+    expect(focusedWord()).toBe('tbe')
+    expect(stepText()).toBe('2 of 3')
+    // An edit elsewhere, another page's result: the same words come back as a new object.
+    await act(async () => fake.fire())
+    await act(async () => store.setCrop(makePageKey(scan.id, 5), { x: 0, y: 0, w: 10, h: 10 }))
+    expect(focusedWord()).toBe('tbe')
+    expect(stepText()).toBe('2 of 3')
+    // Different low-confidence words: from the top again.
+    pages.set(KEY, ocrPage([[['new', LOW]], [['set', LOW]]]))
+    await act(async () => fake.fire())
+    expect(focusedWord()).toBeNull()
+    expect(stepText()).toBe('Press ] or [ to step through them')
   })
 
   it('pans a zoomed page to bring a word off screen into view', async () => {
@@ -629,8 +804,10 @@ describe('redaction filtering through the real OCR store and Find supply', () =>
 
     await act(async () => store.addOverlay(overHello))
     await act(async () => settle())
-    // Fail-safe: while the pass's report is pending, no recognised word is shown at all.
+    // Fail-safe: while the pass's report is pending, no recognised word is shown at all, and the
+    // header says why rather than claiming the page has no text.
     expect(words()).toHaveLength(0)
+    expect(headerMain()).toBe('Updating for redactions…')
     // Pixel redaction applied: nothing removed whole; only the word under the box goes.
     await act(async () => {
       release(new Map([[KEY, []]]))
@@ -649,5 +826,109 @@ describe('redaction filtering through the real OCR store and Find supply', () =>
     await act(async () => settle())
     expect(words()).toHaveLength(0)
     expect(headerMain()).toBe('No recognized text on this page')
+  })
+})
+
+describe('the header inside full view', () => {
+  beforeEach(() => setRecognizedTextShown(true))
+
+  /** FullViewPages (the backdrop click closes full view) with the bar's header slot, as FullView. */
+  function Pages(props: { runClose: () => void; slot: HTMLElement | null }): ReactNode {
+    const s = useEditStore()
+    store = s
+    const [view, setView] = useState<View>({ zoom: 1, x: 0, y: 0 })
+    const pages = createElement(FullViewPages, {
+      scrollRef: { current: null },
+      drag: { current: null },
+      draggedRef: { current: false },
+      docs: [doc('d', [page])],
+      viewport: { w: 1200, h: 900 },
+      di: 0,
+      pi: 0,
+      view,
+      fit: { w: 612, h: 792 },
+      vw: 1200,
+      vh: 900,
+      zoomed: false,
+      interactive: true,
+      animating: false,
+      flip: null,
+      flipTransition: false,
+      renderVersion: 0,
+      setView,
+      resetView: () => {},
+      applyZoom: () => {},
+      runClose: props.runClose
+    })
+    return createElement(EditProvider, {
+      store: s,
+      children: createElement(FullViewHeaderSlot.Provider, { value: props.slot, children: pages })
+    })
+  }
+
+  it('clicking Hide (or anywhere on the header) does not close full view', async () => {
+    const slot = document.createElement('div')
+    document.body.appendChild(slot)
+    try {
+      disconnect = connectRecognizedText(fakeSupply(new Map([[KEY, PAGE]])))
+      const runClose = vi.fn()
+      await act(async () => root.render(createElement(Pages, { runClose, slot })))
+      // The header lands in the bar's slot, not loose in <body>.
+      expect(slot.querySelector('.ocr-text-header')).not.toBeNull()
+      const fire = (el: Element, type: string): void => {
+        const init = { bubbles: true, cancelable: true }
+        el.dispatchEvent(
+          type.startsWith('pointer') ? new PointerEvent(type, init) : new MouseEvent(type, init)
+        )
+      }
+      const note = slot.querySelector('.ocr-text-header-note')!
+      await act(async () => {
+        for (const type of ['pointerdown', 'pointerup', 'click', 'dblclick']) fire(note, type)
+      })
+      expect(runClose).not.toHaveBeenCalled()
+      expect(isRecognizedTextShown()).toBe(true)
+      const hide = slot.querySelector<HTMLButtonElement>('.ocr-text-header-hide')!
+      await act(async () => hide.click())
+      expect(runClose).not.toHaveBeenCalled()
+      expect(isRecognizedTextShown()).toBe(false)
+      // A click on the backdrop itself still closes.
+      await act(async () => fire(container.querySelector('.full-scroll')!, 'click'))
+      expect(runClose).toHaveBeenCalledTimes(1)
+    } finally {
+      slot.remove()
+    }
+  })
+
+  it('the bar gives the header a slot of its own between the title and the close button', async () => {
+    let slot: HTMLDivElement | null = null
+    await act(async () =>
+      root.render(
+        createElement(FullViewChrome, {
+          chromeOpacity: 1,
+          docName: 'Quarterly board meeting minutes - scanned archive copy 2024.pdf',
+          pi: 0,
+          pageCount: 1,
+          runClose: () => {},
+          navByKey: () => {},
+          headerSlotRef: (el) => void (slot = el)
+        })
+      )
+    )
+    const bar = container.querySelector('.full-bar')!
+    expect([...bar.children].map((e) => e.className)).toEqual([
+      'full-title',
+      'full-bar-slot',
+      'icon-btn'
+    ])
+    expect(slot).toBe(bar.children[1])
+    // A long title is cut with an ellipsis (styles.css): its full text stays in the tooltip.
+    expect(bar.children[0].getAttribute('title')).toMatch(/archive copy 2024\.pdf$/)
+  })
+
+  it('renders no header until the bar has given its slot', async () => {
+    disconnect = connectRecognizedText(fakeSupply(new Map([[KEY, PAGE]])))
+    await act(async () => root.render(createElement(Pages, { runClose: () => {}, slot: null })))
+    expect(document.body.querySelector('.ocr-text-header')).toBeNull()
+    expect(container.querySelector('svg.ocr-text-layer')).not.toBeNull()
   })
 })

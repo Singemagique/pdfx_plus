@@ -171,8 +171,10 @@ describe('Find supply', () => {
   it('a scanned page becomes findable when its results arrive', async () => {
     const r = await rig()
     expect(hits(r.engine, 'hello')).toEqual([])
+    expect(r.supply.isPending(r.key)).toBe(false)
     await recognise(r, ['hello', 'world'])
     expect(hits(r.engine, 'hello world')).toEqual([r.key])
+    expect(r.supply.isPending(r.key)).toBe(false)
     expect(r.supply.filteredPage(r.key)?.text).toBe('helloworld')
   })
 
@@ -221,6 +223,7 @@ describe('Find supply', () => {
     // Pending: even the word the box does not touch is held back.
     expect(hits(r.engine, 'world')).toEqual([])
     expect(r.supply.filteredPage(r.key)).toBeNull()
+    expect(r.supply.isPending(r.key)).toBe(true)
     expect(predict).toHaveBeenCalledTimes(1)
     // The predictor runs the pass on the redacted OCR'd page only.
     const [layer] = vi.mocked(predict).mock.calls[0]
@@ -228,6 +231,7 @@ describe('Find supply', () => {
     // Pixel redaction applied: nothing removed whole; only the word under the box goes.
     release(new Map([[r.key, []]]))
     await settle()
+    expect(r.supply.isPending(r.key)).toBe(false)
     expect(hits(r.engine, 'world')).toEqual([r.key])
     expect(hits(r.engine, 'hello')).toEqual([])
   })
@@ -240,6 +244,8 @@ describe('Find supply', () => {
     await settle()
     expect(hits(r.engine, 'world')).toEqual([])
     expect(r.supply.filteredPage(r.key)).toBeNull()
+    // Removed whole: not pending, simply none.
+    expect(r.supply.isPending(r.key)).toBe(false)
   })
 
   it('a failed prediction, or one with no entry for the page, keeps the words out (fail-safe)', async () => {
@@ -255,6 +261,8 @@ describe('Find supply', () => {
       r.supply.sync(r.docs, r.layer([overHello(r.key)]))
       await settle()
       expect(hits(r.engine, 'world')).toEqual([])
+      // The report is in (failed or empty): held back for good, not pending.
+      expect(r.supply.isPending(r.key)).toBe(false)
     }
     warn.mockRestore()
   })

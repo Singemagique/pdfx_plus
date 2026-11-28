@@ -98,19 +98,20 @@ export function FullViewPage(props: FullViewPageProps): React.JSX.Element {
             rotation={cssRotation}
             clip={windowFractions(frame)}
           />
-          {isCurrent && !animating && (
-            <FindHighlights
-              page={p}
-              box={fullFit}
-              window={frame.cropped ? frame.window : undefined}
-            />
-          )}
+          {/* Recognized text first: the Find matches (same z-index) multiply over it. */}
           {isCurrent && !animating && (
             <RecognizedTextLayer
               page={p}
               window={frame.cropped ? frame.window : undefined}
               active={interactive}
               panBy={props.panBy}
+            />
+          )}
+          {isCurrent && !animating && (
+            <FindHighlights
+              page={p}
+              box={fullFit}
+              window={frame.cropped ? frame.window : undefined}
             />
           )}
           {isCurrent && (
