@@ -42,17 +42,21 @@ export type JpxRefusal =
   // PDFium would still parse and decode them.
   | 'too-complex'
 
+/** Why triage could not classify a page (see `TriagePage.failure`). */
+export type TriageFailure = 'page-missing' | 'render' | 'too-large' | 'raster-crash'
+
 export interface TriagePage {
   /** 0-based page index in the source. */
   index: number
   /** The §3.4.1 class; null when triage could not read the page at all (`failure` says why). */
   pageClass: PageClass | null
   /**
-   * Set when the page could not be triaged: 'page-missing'; 'render' (PDFium refused the page, the
-   * pixel caps would leave it under 1 DPI, or the thread's result failed validation);
-   * 'raster-crash' (it killed the raster thread twice, or its source's triage was cut off).
+   * Set when the page could not be triaged: 'page-missing'; 'render' (PDFium refused the page, or
+   * the thread's result failed validation); 'too-large' (the pixel caps would leave it under 1 DPI:
+   * a recognize request for it ends `too-large` without a render); 'raster-crash' (it killed the
+   * raster thread twice, or its source's triage was cut off).
    */
-  failure?: 'page-missing' | 'render' | 'raster-crash'
+  failure?: TriageFailure
   /** Set when the page must not be rendered by PDFium (the JPX pre-check refused an image). */
   refused?: JpxRefusal
   /** The final render DPI after every cap (§3.4.3), or null for protected / failed pages. */

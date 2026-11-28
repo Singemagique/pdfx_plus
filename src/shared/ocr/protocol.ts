@@ -24,7 +24,7 @@
 // DOM-free and Electron-free (src/shared), so the preload, main, the utility process and vitest
 // Node all import the same file.
 
-import type { JpxRefusal, NativeWord, TriagePage } from './triage'
+import type { JpxRefusal, NativeWord, TriageFailure, TriagePage } from './triage'
 import type { OcrStatus, PackedOcrPage, PageClass } from './types'
 
 export const OCR_PROTOCOL_VERSION = 1
@@ -64,6 +64,18 @@ const _allRefusals: Exclude<JpxRefusal, (typeof JPX_REFUSALS)[number]> extends n
   : never = true
 void _allRefusals
 
+/** Every `TriagePage.failure`. */
+export const TRIAGE_FAILURES = [
+  'page-missing',
+  'render',
+  'too-large',
+  'raster-crash'
+] as const satisfies readonly TriageFailure[]
+const _allFailures: Exclude<TriageFailure, (typeof TRIAGE_FAILURES)[number]> extends never
+  ? true
+  : never = true
+void _allFailures
+
 /** Every `OcrStatus`, for the validator. Checked against the type both ways (below). */
 export const OCR_STATUSES = [
   'ok',
@@ -92,7 +104,8 @@ export const PAGE_REASONS = [
   'recognize-crash', // a recognize thread trapped twice on this page
   'watchdog', // the per-page recognize watchdog fired
   'source-too-large', // the source is over the 1.5 GB ceiling
-  'image-format' // triage's JPX pre-check refused an image on the page (§3.4.1)
+  'image-format', // triage's JPX pre-check refused an image on the page (§3.4.1)
+  'page-too-large' // triage found the pixel caps leave the page under 1 DPI (§3.3.3, §3.4.3)
 ] as const
 export type PageReason = (typeof PAGE_REASONS)[number]
 
@@ -710,7 +723,7 @@ const triagePage = object<TriagePage>(
     imageOrigin: bool
   },
   {
-    failure: oneOf(['page-missing', 'render', 'raster-crash'] as const),
+    failure: oneOf(TRIAGE_FAILURES),
     refused: oneOf(JPX_REFUSALS),
     nativeWords: array(nativeWord, TRIAGE_WORD_LIMITS.words)
   }

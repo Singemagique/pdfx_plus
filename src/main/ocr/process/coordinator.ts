@@ -29,7 +29,11 @@
 //         kills the thread is retried one page at a time, uncharged; a page that kills it twice is
 //         reported with `failure: 'raster-crash'`, and once TRIAGE_SOURCE_CRASH_PAGES pages of one
 //         source have, the rest of that source's triage is answered the same way without PDFium.
-//         Every page a thread returns is validated before it is forwarded.
+//         Every page a thread returns is validated before it is forwarded. The coordinator keeps
+//         each page's class and refusal: a recognized page is stamped with its triage class, and a
+//         recognize request for a page triage refused (`protected`, a refused JPX image, over the
+//         pixel caps) is answered `skipped-protected` / `failed` `image-format` / `too-large`
+//         without a render or the engine, whether triage answered before or after the request.
 
 import {
   ELECTRON_NET_MEMBERS,
@@ -177,7 +181,15 @@ interface Source {
   pageCount: number | null
   /** Pages of this source whose triage killed the raster thread twice on their own. */
   triageCrashedPages: number
+  /**
+   * What triage said about each page it answered for (the class, any refusal): a recognized page
+   * carries its class, and a page triage refused is answered without the engine. Only these
+   * fields are kept, never the native words.
+   */
+  triaged: Map<number, TriageVerdict>
 }
+
+type TriageVerdict = Pick<TriagePage, 'pageClass' | 'refused' | 'failure'>
 
 /** A renderer `triage` request (§3.4.1). */
 interface TriageTask {
@@ -537,7 +549,8 @@ export class Coordinator {
       lastUse: Date.now(),
       countPending: true,
       pageCount: null,
-      triageCrashedPages: 0
+      triageCrashedPages: 0,
+      triaged: new Map()
     }
     this.sources.set(src, source)
     this.evictOverBudget(src)
@@ -700,6 +713,44 @@ export class Coordinator {
     const finished = task.pending.length === 0
     if (finished) this.triages.splice(this.triages.indexOf(task), 1)
     this.toRenderer({ triaged: { src: task.src, pages, done: finished } })
+    this.noteTriaged(task.src, pages)
+  }
+
+  /**
+   * Keep what triage said about `pages` of `src`, and answer any page of it already waiting to be
+   * rendered or recognised that triage refuses (a recognize request can arrive before triage has
+   * answered, and renders go ahead of triage). A page already at a recognize thread is checked
+   * when its result comes back.
+   */
+  private noteTriaged(src: string, pages: TriagePage[]): void {
+    const source = this.sources.get(src)
+    if (!source) return
+    for (const p of pages) {
+      const v: TriageVerdict = { pageClass: p.pageClass }
+      if (p.refused) v.refused = p.refused
+      if (p.failure) v.failure = p.failure
+      source.triaged.set(p.index, v)
+    }
+    for (const t of [...this.tasks]) {
+      if (t.job.src !== src || (t.state !== 'queued' && t.state !== 'rendered')) continue
+      const refusal = this.triageRefusal(t)
+      if (refusal) this.finalize(t, refusal)
+    }
+  }
+
+  /**
+   * The result triage decides for a recognize request without the engine, or null (§3.4.1):
+   * a protected page is never recognised, a page whose image the JPX pre-check refused is never
+   * rendered by PDFium, and a page the pixel caps leave under 1 DPI is too large.
+   */
+  private triageRefusal(t: Task): PageResult | null {
+    const v = this.sources.get(t.job.src)?.triaged.get(t.req.index)
+    if (!v) return null
+    const none = { renderDpi: null, raster: null, recognition: null }
+    if (v.pageClass === 'protected') return { status: 'skipped-protected', ...none }
+    if (v.refused) return { status: 'failed', reason: 'image-format', ...none }
+    if (v.failure === 'too-large') return { status: 'too-large', reason: 'page-too-large', ...none }
+    return null
   }
 
   /**
@@ -800,14 +851,18 @@ export class Coordinator {
       job.tasks.add(t)
       this.tasks.add(t)
     })
-    if (missing)
-      for (const t of [...job.tasks])
+    for (const t of [...job.tasks]) {
+      // A page triage already refused is answered without a render or the engine.
+      const refusal = this.triageRefusal(t)
+      if (refusal) this.finalize(t, refusal)
+      else if (missing)
         this.finalize(t, {
           status: 'needs-language',
           renderDpi: null,
           raster: null,
           recognition: null
         })
+    }
     this.scheduleFlush()
     this.pump()
   }
@@ -1374,14 +1429,17 @@ export class Coordinator {
     if (m.type === 'result') {
       slot.pages++
       const raster = t.raster!
+      // Triage answered while the page was at the engine, and refuses it: its words are dropped.
+      const refusal = this.triageRefusal(t)
       let page: PackedOcrPage | null = null
       try {
-        page = this.toPage(t, m.result)
+        if (!refusal) page = this.toPage(t, m.result)
       } catch {
         // A mapping bug or an impossible engine result: this page fails, the thread is fine.
         page = null
       }
-      if (page)
+      if (refusal) this.finalize(t, refusal)
+      else if (page)
         this.finalize(t, {
           status: page.status,
           renderDpi: raster.dpi,
@@ -1418,9 +1476,9 @@ export class Coordinator {
       dataHashes,
       langs,
       pipelineVersion: PIPELINE_VERSION,
-      // Triage (PR4b) classifies pages; until the renderer sends a class, a page sent for
-      // recognition is treated as a scan.
-      pageClass: 'scanned',
+      // The class triage gave the page (§3.4.1). A page recognised without triage, or one triage
+      // could not classify, is treated as a scan.
+      pageClass: this.sources.get(t.job.src)?.triaged.get(t.req.index)?.pageClass ?? 'scanned',
       calibration: TESS_CORE7_PLACEHOLDER
     })
   }
