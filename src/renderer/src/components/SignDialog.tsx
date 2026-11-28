@@ -29,7 +29,7 @@ interface SignAppearanceOpts {
   signer?: { subject: string; issuer: string }
   /**
    * "Include recognized text (machine-generated, not reviewed)" (DESIGN.md §3.7.7, D7): bake the
-   * OCR text layer into the signed copy. Off unless set; the checkbox itself arrives with PR8.
+   * OCR text layer into the signed copy. Off unless the user ticks the box.
    */
   includeRecognizedText?: boolean
 }
@@ -72,8 +72,18 @@ interface SignDialogProps {
   hasSavedSignature: boolean
   /** Open the pad to draw (or redraw) a hand-drawn signature to include in the appearance. */
   onDrawSignature: () => void
+  /**
+   * Recognized text exists for the pages being signed (DESIGN.md §3.7.7, D7): show the "Include
+   * recognized text (machine-generated, not reviewed)" box, unticked by default.
+   */
+  recognizedTextAvailable?: boolean
   onClose: () => void
 }
+
+export const SIGN_OCR_COPY = {
+  label: 'Include recognized text (machine-generated, not reviewed)',
+  hint: 'Makes the signed copy searchable. The signature will also cover this text.'
+} as const
 
 /** Common Name out of an X.500 distinguished name, falling back to the whole string. */
 const cn = (dn: string): string => /CN=([^,]+)/i.exec(dn)?.[1].trim() ?? dn
@@ -112,6 +122,7 @@ export function SignDialog({
   onPlaceRequest,
   hasSavedSignature,
   onDrawSignature,
+  recognizedTextAvailable = false,
   onClose
 }: SignDialogProps): React.JSX.Element {
   const isWin = platform === 'win32'
@@ -124,6 +135,8 @@ export function SignDialog({
   const [tsaUrl, setTsaUrl] = useState('')
   const [ltv, setLtv] = useState(false)
   const [includeImage, setIncludeImage] = useState(true)
+  // D7: off by default, every time the dialog opens; the signature covers only what the signer saw.
+  const [includeText, setIncludeText] = useState(false)
   const fileRef = useRef<HTMLInputElement>(null)
 
   // Smart-card state.
@@ -233,7 +246,8 @@ export function SignDialog({
     name: name || undefined,
     tsaUrl: tsaUrl.trim() || undefined,
     ltv: ltv || undefined,
-    includeImage: !!placementLabel && hasSavedSignature && includeImage
+    includeImage: !!placementLabel && hasSavedSignature && includeImage,
+    includeRecognizedText: recognizedTextAvailable && includeText
   }
 
   // `busy` only engages once the export/signing IPC starts — on the card path that's after a
@@ -448,6 +462,20 @@ export function SignDialog({
           Embed long-term validation data (LTV · cert chain + OCSP/CRL). Needs network at signing;
           add a timestamp above for the strongest result.
         </label>
+
+        {recognizedTextAvailable && (
+          <div className="sign-ocr">
+            <label className="sign-check">
+              <input
+                type="checkbox"
+                checked={includeText}
+                onChange={(e) => setIncludeText(e.target.checked)}
+              />
+              {SIGN_OCR_COPY.label}
+            </label>
+            <p className="sign-module-hint">{SIGN_OCR_COPY.hint}</p>
+          </div>
+        )}
 
         <div className="sign-appearance">
           {placementLabel ? (

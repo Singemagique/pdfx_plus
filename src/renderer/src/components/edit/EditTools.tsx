@@ -3,6 +3,7 @@ import { useEdits, type ToolKind } from '../../edit/EditProvider'
 import { cssColor, newOverlayId, nextZ, type RGB, type ShapeKind } from '../../edit/model'
 import { prepareImageStamp, stampGeom } from '../../pdfx/images'
 import { visibleBox } from '../../page-geometry'
+import { OcrRedactionNote } from '../ocr/OcrRedactionNote'
 
 const SHAPE_KINDS: { kind: ShapeKind; label: string; icon: React.JSX.Element }[] = [
   { kind: 'rect', label: 'Rectangle', icon: <rect x="3" y="5" width="18" height="14" rx="1" /> },
@@ -341,6 +342,7 @@ export function EditTools(): React.JSX.Element {
           </button>
         </span>
       )}
+      {tool === 'redact' && currentPage && <OcrRedactionNote pageKey={currentPage.pageKey} />}
       {tool === 'crop' && (
         <span className="tool-swatches">
           <span className="tool-hint">Drag to crop</span>

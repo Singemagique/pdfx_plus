@@ -1084,3 +1084,79 @@ describe('flushOrConfirm', () => {
     await expect(a).resolves.toBe(false)
   })
 })
+
+describe('PR8 reads: page-state fields and notifications for the OCR surfaces', () => {
+  it('"Sideways — rotate?" is against the rotation the page was recognised at, and goes once turned', async () => {
+    const texts = new Map<string, ReturnType<typeof nativeText>>()
+    const s = scan('rot', 1, texts)
+    const { store, port } = rig({ texts })
+    const key = keyOf(s, 0)
+    store.syncEdits({ rotations: new Map([[key, 90]]) })
+    store.reconcile([doc('d', [pageOf(s, 0)])])
+    await settle()
+    answerTriage(port, 'scanned')
+    store.recognize([key])
+    await settle()
+    const r = port.recognizes()[0]
+    expect(r.pages[0].editRotation).toBe(90)
+    port.emit({
+      result: {
+        jobId: r.jobId,
+        src: r.src,
+        index: 0,
+        page: { ...okResult(recognisedPage(['x'])), rotateBy: 180 }
+      }
+    })
+    await settle()
+    expect(store.getPageState(key)?.rotateBy).toBe(180)
+    // Turned a quarter more: a quarter the other way is still left.
+    store.syncEdits({ rotations: new Map([[key, 180]]) })
+    expect(store.getPageState(key)?.rotateBy).toBe(90)
+    // Turned by exactly what was offered (the summary's [Rotate]): upright, no offer.
+    store.syncEdits({ rotations: new Map([[key, 270]]) })
+    expect(store.getPageState(key)?.rotateBy).toBeUndefined()
+  })
+
+  it('a rotation change notifies subscribers (the summary row must go)', async () => {
+    vi.useFakeTimers()
+    const { store } = rig()
+    const listener = vi.fn()
+    store.subscribe(listener)
+    store.syncEdits({ rotations: new Map([['k', 90]]) })
+    await vi.advanceTimersByTimeAsync(200)
+    expect(listener).toHaveBeenCalled()
+  })
+
+  it('loading the stored settings notifies (the dialog, menu and Sign defaults follow them)', async () => {
+    vi.useFakeTimers()
+    const { store } = rig({ settings: { 'ocr.includeInExports': false } })
+    const listener = vi.fn()
+    store.subscribe(listener)
+    await vi.advanceTimersByTimeAsync(200)
+    expect(listener).toHaveBeenCalled()
+    expect(store.settings()['ocr.includeInExports']).toBe(false)
+  })
+
+  it('scan / removed / triaged: an imported image is a scan before triage; Remove is "removed"', async () => {
+    const img = source('img', { origin: 'image', bytes: new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]) })
+    const { store, port } = rig({ settings: { 'ocr.autoRecognizeImports': false } })
+    const key = keyOf(img, 0)
+    const selections = new Map<string, string | null>()
+    store.syncEdits({
+      ocrSelect: selections,
+      selectOcr: (k, h) => {
+        selections.set(k, h)
+        store.syncEdits({ ocrSelect: new Map(selections) })
+      }
+    })
+    store.reconcile([doc('d', [pageOf(img, 0)])])
+    await settle()
+    expect(store.getPageState(key)).toMatchObject({ scan: true, triaged: false, removed: false })
+    store.prepare([key])
+    await settle()
+    answerTriage(port, 'text')
+    expect(store.getPageState(key)).toMatchObject({ scan: false, triaged: true })
+    store.remove([key])
+    expect(store.getPageState(key)?.removed).toBe(true)
+  })
+})

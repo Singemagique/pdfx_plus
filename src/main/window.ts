@@ -27,6 +27,38 @@ export function toggleDevTools(): void {
   else wc.openDevTools({ mode: 'detach' })
 }
 
+/**
+ * The main window's own shortcuts, handled before the page sees the key (`before-input-event`):
+ * - Ctrl+Shift+I / Alt+Cmd+I: developer tools;
+ * - Ctrl+Shift+R / Cmd+Shift+R: Recognize Text… (DESIGN.md §3.8). Not a menu accelerator: the
+ *   toolkit's watchWindowShortcuts preventDefaults every Ctrl/Cmd+R combination in packaged builds,
+ *   which blocks the menu accelerator too (PR0 measured 0 fires). This handler fires whatever the
+ *   toolkit did (Electron runs every listener), so the action arrives exactly once in dev and
+ *   packaged builds alike; the menu item shows the shortcut with `registerAccelerator: false`.
+ */
+export function onShortcutInput(
+  wc: Pick<Electron.WebContents, 'send'>,
+  event: { preventDefault: () => void },
+  input: Pick<Electron.Input, 'type' | 'code' | 'control' | 'meta' | 'shift' | 'alt'> & {
+    isAutoRepeat?: boolean
+  }
+): void {
+  if (input.type !== 'keyDown') return
+  const mod = process.platform === 'darwin' ? input.meta : input.control
+  if (input.code === 'KeyI') {
+    if (mod && (input.shift || input.alt)) {
+      event.preventDefault()
+      toggleDevTools()
+    }
+    return
+  }
+  if (input.code === 'KeyR' && mod && input.shift && !input.alt) {
+    event.preventDefault()
+    // A held key repeats keyDown: the dialog opens once per press.
+    if (!input.isAutoRepeat) wc.send('pdfx:menu', 'recognize-text')
+  }
+}
+
 export async function sendOpenPaths(paths: string[]): Promise<void> {
   if (!mainWindow || paths.length === 0) return
   const { files, skipped } = await readFilesReport(paths)
@@ -97,14 +129,8 @@ export function createWindow(): void {
     event.preventDefault()
   })
 
-  mainWindow.webContents.on('before-input-event', (event, input) => {
-    if (input.type !== 'keyDown' || input.code !== 'KeyI') return
-    const mod = process.platform === 'darwin' ? input.meta : input.control
-    if (mod && (input.shift || input.alt)) {
-      event.preventDefault()
-      toggleDevTools()
-    }
-  })
+  const wc = mainWindow.webContents
+  wc.on('before-input-event', (event, input) => onShortcutInput(wc, event, input))
 
   if (is.dev && process.env['ELECTRON_RENDERER_URL']) {
     mainWindow.loadURL(process.env['ELECTRON_RENDERER_URL'])

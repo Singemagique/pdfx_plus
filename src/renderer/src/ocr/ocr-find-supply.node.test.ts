@@ -505,3 +505,48 @@ describe('Find supply', () => {
     expect(write).not.toHaveBeenCalled()
   })
 })
+
+describe('redactionOutcome (the scan-redaction note, PR8)', () => {
+  it('unknown before a report; whole when the pass removes the scan; pixels when it does not', async () => {
+    const fullPage: FrameBox = { x: 0, y: 0, w: 612, h: 792 }
+    const whole = await rig({
+      predict: async () => new Map([[makePageKey('scan', 0), [fullPage]]])
+    })
+    await recognise(whole, ['hello', 'world'])
+    expect(whole.supply.redactionOutcome(whole.key)).toBe('unknown')
+    const changed = vi.fn()
+    whole.supply.onChange(changed)
+    whole.supply.sync(whole.docs, whole.layer([overHello(whole.key)]))
+    await settle()
+    expect(changed).toHaveBeenCalled()
+    expect(whole.supply.redactionOutcome(whole.key)).toBe('whole')
+
+    // Pixel redaction applied: only the glyph boxes under the box went, the scan stayed.
+    const small: FrameBox = { x: 70, y: 690, w: 40, h: 20 }
+    const pixels = await rig({ predict: async () => new Map([[makePageKey('scan', 0), [small]]]) })
+    await recognise(pixels, ['hello', 'world'])
+    pixels.supply.sync(pixels.docs, pixels.layer([overHello(pixels.key)]))
+    await settle()
+    expect(pixels.supply.redactionOutcome(pixels.key)).toBe('pixels')
+    // A moved redaction makes the report stale until the new one is in.
+    pixels.supply.sync(
+      pixels.docs,
+      pixels.layer([{ ...overHello(pixels.key), geom: { ...overHello(pixels.key).geom, x: 200 } }])
+    )
+    expect(pixels.supply.redactionOutcome(pixels.key)).toBe('unknown')
+  })
+
+  it('a failed pass reports nothing (unknown), never "pixels"', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const r = await rig({
+      predict: async () => {
+        throw new Error('pdfium')
+      }
+    })
+    await recognise(r, ['hello'])
+    r.supply.sync(r.docs, r.layer([overHello(r.key)]))
+    await settle()
+    expect(r.supply.redactionOutcome(r.key)).toBe('unknown')
+    warn.mockRestore()
+  })
+})

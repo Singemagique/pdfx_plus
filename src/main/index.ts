@@ -5,7 +5,7 @@ import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import { FALLBACK_BG } from './native/glass'
 import { collectFileArgs } from './file-intake'
 import { createWindow, getMainWindow, getRendererReady, sendOpenPaths } from './window'
-import { buildMenu } from './menu'
+import { buildMenu, registerMenuStateIpc } from './menu'
 import { registerIpc } from './register-ipc'
 import { registerOcr, runOcrSelftest } from './ocr/host'
 
@@ -85,6 +85,7 @@ if (OCR_SELFTEST) {
     )
 
     registerOcr()
+    registerMenuStateIpc()
     buildMenu()
     createWindow()
 

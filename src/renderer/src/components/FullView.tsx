@@ -20,6 +20,8 @@ interface FullViewProps {
   onClose: () => void
   /** Imperative navigation for Find (scroll to the page holding a match). */
   navRef?: React.Ref<FullViewNav>
+  /** Shown under the full-view bar (the OCR banner, DESIGN.md §3.8). */
+  banner?: React.ReactNode
 }
 
 export function FullView({
@@ -29,7 +31,8 @@ export function FullView({
   originRect,
   onActivePageChange,
   onClose,
-  navRef
+  navRef,
+  banner
 }: FullViewProps): React.JSX.Element {
   // The current page shows at its exported geometry (crop window, then rotation) — except while the
   // crop tool is on and the view is open, when it shows whole so the crop can be redrawn wider
@@ -155,6 +158,7 @@ export function FullView({
         pageCount={s.doc.pages.length}
         runClose={controls.runClose}
         navByKey={controls.navByKey}
+        banner={banner}
       />
     </div>
   )

@@ -8,6 +8,7 @@ interface FullViewChromeProps {
   pageCount: number
   runClose: () => void
   navByKey: (axis: 'x' | 'y', dir: 1 | -1) => void
+  banner?: React.ReactNode
 }
 
 export function FullViewChrome({
@@ -16,7 +17,8 @@ export function FullViewChrome({
   pi,
   pageCount,
   runClose,
-  navByKey
+  navByKey,
+  banner
 }: FullViewChromeProps): React.JSX.Element {
   return (
     <div className="full-chrome" style={{ opacity: chromeOpacity }}>
@@ -26,6 +28,7 @@ export function FullViewChrome({
           <CloseIcon size={16} />
         </button>
       </header>
+      {banner && <div className="full-banner-slot">{banner}</div>}
 
       <button
         className="full-nav prev"

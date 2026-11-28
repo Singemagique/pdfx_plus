@@ -1,6 +1,7 @@
 import { memo, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import type { DocEntry } from '../types'
 import { ChevronUpIcon, ChevronDownIcon, CloseIcon } from './icons'
+import { OcrDocChip } from './ocr/OcrDocChip'
 
 interface DocHeaderProps {
   doc: DocEntry
@@ -82,6 +83,7 @@ function DocHeaderImpl({
       <span className="doc-pages">
         {doc.pages.length} {doc.pages.length === 1 ? 'page' : 'pages'}
       </span>
+      <OcrDocChip docId={doc.id} />
       <div className="doc-actions">
         <button
           className="icon-btn"
