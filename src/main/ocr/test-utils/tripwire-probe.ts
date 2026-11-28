@@ -109,7 +109,14 @@ const cases: Case[] = [
   ['worker_threads.Worker', () => new Worker(new URL('data:text/javascript,0'))],
   // An absolute file nobody registered (it does not even exist).
   ['worker_threads.Worker', () => new Worker(join(dirname(SELF), 'not-a-thread-entry.js'))],
+  // The guard took over the original class's `constructor` slot too.
+  [
+    'worker_threads.Worker',
+    () => new (Worker.prototype.constructor as AnyCtor)('0', { eval: true })
+  ],
   ['worker_threads.allowThreadEntries', () => allowThreadEntries(['/anything.js'])],
+  // A program that does not exist, should the stub be missing (Windows refuses execve anyway).
+  ['process.execve', () => proc.execve(join(dirname(SELF), 'no-such-program'), ['x'], {})],
   ['child_process.spawn', () => cp.spawn(node, ['-e', '0'])],
   ['child_process.spawnSync', () => cp.spawnSync(node, ['-e', '0'])],
   ['child_process.exec', () => cp.exec(`"${node}" -e 0`)],
@@ -180,6 +187,39 @@ export interface ProbeReport {
   intactAfterTamper: boolean
   /** A registered thread entry still starts. */
   registeredWorker: string
+  /** Routes from the guarded Worker to a constructor that starts an unchecked thread (none). */
+  workerLeaks: string[]
+}
+
+/**
+ * The original Worker class must not be reachable from the guard: a `class extends Original` guard
+ * is its own way around (`Object.getPrototypeOf(Worker)` is the original). Each constructor found
+ * along these paths is tried with eval code; one that hands back a thread is a leak.
+ */
+function workerLeaks(): string[] {
+  const routes: Array<[string, unknown]> = [
+    ['Object.getPrototypeOf(Worker)', Object.getPrototypeOf(Worker)],
+    ['Worker.prototype.constructor', Worker.prototype.constructor],
+    [
+      'Object.getPrototypeOf(Worker.prototype).constructor',
+      (Object.getPrototypeOf(Worker.prototype) as { constructor?: unknown } | null)?.constructor
+    ]
+  ]
+  const leaks: string[] = []
+  for (const [route, C] of routes) {
+    if (typeof C !== 'function') continue
+    let w: { terminate?: () => unknown } | null = null
+    try {
+      w = new (C as AnyCtor)('0', { eval: true }) as { terminate?: () => unknown }
+    } catch {
+      // Not a way to a thread (a stub tripped, or not a constructor at all).
+    }
+    if (w && typeof w.terminate === 'function') {
+      leaks.push(route)
+      void w.terminate()
+    }
+  }
+  return leaks
 }
 
 async function registeredWorker(): Promise<string> {
@@ -241,7 +281,9 @@ async function run(): Promise<void> {
     dnsStubbed,
     tamper: tamperResults,
     intactAfterTamper: tripwireIntact(),
-    registeredWorker: await registeredWorker()
+    registeredWorker: await registeredWorker(),
+    // After `after` and `details` were read: the guarded route trips, which must not count there.
+    workerLeaks: workerLeaks()
   }
   if (parentPort) parentPort.postMessage(report)
   else process.stdout.write(JSON.stringify(report) + '\n')

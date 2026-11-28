@@ -24,8 +24,9 @@
 //   past everything). Node's own internals use internalBinding, which is not reachable from here;
 // - new realms and processes, which would start without this module: worker_threads.Worker only
 //   accepts the thread entries the coordinator registered with `allowThreadEntries` (never
-//   `eval: true`, a data: URL or any other file), and every child_process export plus
-//   ChildProcess.prototype.spawn is stubbed.
+//   `eval: true`, a data: URL or any other file, and no property path leads back to the original
+//   class), every child_process export plus ChildProcess.prototype.spawn is stubbed, and so is
+//   process.execve.
 //
 // Each realm has its own module instances, so a stub installed in the coordinator does not reach a
 // worker_thread (PR0 measured the same blindness for an fs spy). Every thread entry imports this
@@ -213,13 +214,26 @@ function checkWorker(filename: unknown, options: unknown): void {
   if (path === null || !threadEntries?.has(normalise(path))) trip(api)
 }
 
+/**
+ * A Worker constructor that checks first. Not `class extends Original`: a subclass's own prototype
+ * IS the original class (`Object.getPrototypeOf(Worker)`), so the guard would hand out the very
+ * constructor it guards. This one shares the original's prototype object (instanceof and every
+ * method still work), takes over its `constructor` slot, and inherits the original's statics from
+ * the original's parent, so no property path from the module leads back to the original.
+ */
 function guardedWorker(Original: typeof workerThreads.Worker): typeof workerThreads.Worker {
-  class Worker extends Original {
-    constructor(filename: string | URL, options?: workerThreads.WorkerOptions) {
-      checkWorker(filename, options)
-      super(filename, options)
-    }
-  }
+  const Worker = function Worker(
+    this: unknown,
+    filename: string | URL,
+    options?: workerThreads.WorkerOptions
+  ): workerThreads.Worker {
+    if (!new.target) throw new TypeError("Class constructor Worker cannot be invoked without 'new'")
+    checkWorker(filename, options)
+    return Reflect.construct(Original, [filename, options], new.target) as workerThreads.Worker
+  } as unknown as typeof workerThreads.Worker
+  Object.setPrototypeOf(Worker, Object.getPrototypeOf(Original))
+  Object.defineProperty(Worker, 'prototype', { value: Original.prototype, writable: false })
+  lock(Original.prototype, 'constructor', Worker)
   stubs.add(Worker)
   return Worker
 }
@@ -350,6 +364,9 @@ function install(): void {
   const proc = process as unknown as Record<string, unknown>
   lock(proc, 'binding', stub('process.binding'))
   lock(proc, 'dlopen', stub('process.dlopen'))
+  // Replaces this process with any program (Node 22.15+, macOS and Linux; Windows throws anyway),
+  // which would start without this module, like a child_process spawn.
+  lock(proc, 'execve', stub('process.execve'))
   const linked = proc._linkedBinding as ((name: string) => unknown) | undefined
   const guardedLinked = function linkedBinding(name: string): unknown {
     if (typeof name !== 'string' || !LINKED_BINDINGS_ALLOWED.has(name))

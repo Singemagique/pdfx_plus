@@ -44,6 +44,7 @@ const REQUIRED = [
   'process.dlopen',
   'worker_threads.Worker',
   'worker_threads.allowThreadEntries',
+  'process.execve',
   ...CHILD_PROCESS_FUNCTIONS.map((f) => `child_process.${f}`),
   'child_process.ChildProcess.spawn'
 ]
@@ -78,6 +79,8 @@ function expectAllTripped(report: ProbeReport, required: string[]): void {
 
   // The registered thread entry still starts: the Worker guard is an allow-list, not a ban.
   expect(report.registeredWorker).toBe('echo')
+  // And no property path from the guard leads back to the original, unchecked class.
+  expect(report.workerLeaks).toEqual([])
 }
 
 let processProbe: Bundled
