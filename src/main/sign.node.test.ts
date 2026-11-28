@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import forge from 'node-forge'
 import * as pkijs from 'pkijs'
 import * as asn1js from 'asn1js'
+import { PDFDocument } from 'pdf-lib'
 
 import { signPdf } from './sign'
 import { makeLocalTsa } from './tsa-local'
@@ -120,6 +121,17 @@ describe('signPdf', () => {
     expect(v.pades).toBe(true) // ETSI.CAdES.detached
     expect(v.digestMatches).toBe(true) // signature covers the actual bytes
     expect(v.signerCN).toBe(cn) // signed by our credential
+  })
+
+  it("keeps the exported Producer (the OCR layer's machine-generated marking) through signing", async () => {
+    const doc = await PDFDocument.load(await makePdf())
+    const producer = 'PDFX 1.0; text layer by PDFx OCR (machine-generated)'
+    doc.setProducer(producer)
+    const { p12 } = makeP12('pw')
+    const signed = await signPdf(await doc.save(), p12, { passphrase: 'pw' })
+    expect(verify(signed).digestMatches).toBe(true)
+    const reread = await PDFDocument.load(signed, { updateMetadata: false })
+    expect(reread.getProducer()).toBe(producer)
   })
 
   it('throws on a wrong passphrase (never returns a half-signed file)', async () => {

@@ -69,6 +69,54 @@ export interface OcrFontOptions {
   /** The TrueType program (default: the zero-area-contour glyph, `GLYPHLESS_TTF_ZERO_AREA`). */
   ttf?: Uint8Array
   bbox?: OcrFontBBox
+  /**
+   * A FontDescriptor + FontFile2 shared with other OCR fonts of the same document (`ttf` and
+   * `bbox` are then the program's). They hold no character data, so a document whose pages each
+   * have their OWN font (build.ts) stores the glyphless program once.
+   */
+  program?: OcrFontProgram
+}
+
+/**
+ * The character-free part of the OCR font, the FontDescriptor and its FontFile2, written at most
+ * once per document and shared by every OcrFontCache given it. Only the Type0 / CIDFontType2 /
+ * ToUnicode / CIDToGIDMap / W tables carry characters, and those stay per cache.
+ */
+export class OcrFontProgram {
+  private descriptor: PDFRef | null = null
+  readonly ttf: Uint8Array
+  readonly bbox: OcrFontBBox
+
+  constructor(
+    readonly doc: PDFDocument,
+    opts: Omit<OcrFontOptions, 'program'> = {}
+  ) {
+    this.ttf = opts.ttf ?? glyphlessTtf()
+    this.bbox = opts.bbox ?? 'em'
+  }
+
+  /** The FontDescriptor (with its FontFile2), registered on first use. */
+  descriptorRef(): PDFRef {
+    if (this.descriptor) return this.descriptor
+    const ctx = this.doc.context
+    const ttf = ctx.flateStream(this.ttf, { Length1: this.ttf.length })
+    const tess = this.bbox === 'tesseract'
+    this.descriptor = ctx.register(
+      ctx.obj({
+        Type: 'FontDescriptor',
+        FontName: OCR_FONT_NAME,
+        Flags: tess ? 5 : 4,
+        FontBBox: tess ? [0, 0, OCR_WIDE, 1000] : [0, -200, OCR_WIDE, 800],
+        ItalicAngle: 0,
+        Ascent: tess ? 1000 : 800,
+        Descent: tess ? -1 : -200,
+        CapHeight: tess ? 1000 : 700,
+        StemV: 80,
+        FontFile2: ctx.register(ttf)
+      })
+    )
+    return this.descriptor
+  }
 }
 
 export interface EncodedText {
@@ -150,7 +198,10 @@ export function widthsArray(
 }
 
 /**
- * The OCR font of ONE output document. Content streams reference its Type0 dictionary through
+ * One OCR font of an output document. build.ts gives every baked PAGE its own cache (sharing one
+ * `OcrFontProgram`), so a page never carries another page's characters in its ToUnicode: a page
+ * later deleted or redacted out of a reopened file cannot leave its text behind in the font of the
+ * pages that remain (§3.7.3 rule 5). Content streams reference its Type0 dictionary through
  * `ref()` as soon as they are built; `finalize(doc)` must run after the last page is baked and
  * before `save()` (and before `computeIntegrity` for `.pdfx`), and writes the dictionaries.
  */
@@ -160,15 +211,15 @@ export class OcrFontCache {
   private readonly streams = new Map<PDFRef, ReadonlySet<number>>()
   private fontRef: PDFRef | null = null
   private finalized = false
-  private readonly ttf: Uint8Array
-  private readonly bbox: OcrFontBBox
+  private readonly program: OcrFontProgram
 
   constructor(
     readonly doc: PDFDocument,
     opts: OcrFontOptions = {}
   ) {
-    this.ttf = opts.ttf ?? glyphlessTtf()
-    this.bbox = opts.bbox ?? 'em'
+    if (opts.program && opts.program.doc !== doc)
+      throw new Error('ocr-font: font program of another document')
+    this.program = opts.program ?? new OcrFontProgram(doc, opts)
   }
 
   /** The (still empty until `finalize`) Type0 font object every layer stream points at. */
@@ -297,21 +348,6 @@ export class OcrFontCache {
     const cpOf = (cid: number): number => this.cpOf[shown[cid - 1]]
     const wide = (cid: number): boolean => isWideCodePoint(cpOf(cid))
 
-    const ttf = ctx.flateStream(this.ttf, { Length1: this.ttf.length })
-    const tess = this.bbox === 'tesseract'
-    const descriptor = ctx.obj({
-      Type: 'FontDescriptor',
-      FontName: OCR_FONT_NAME,
-      Flags: tess ? 5 : 4,
-      FontBBox: tess ? [0, 0, OCR_WIDE, 1000] : [0, -200, OCR_WIDE, 800],
-      ItalicAngle: 0,
-      Ascent: tess ? 1000 : 800,
-      Descent: tess ? -1 : -200,
-      CapHeight: tess ? 1000 : 700,
-      StemV: 80,
-      FontFile2: ctx.register(ttf)
-    })
-
     const gidMap = new Uint8Array(2 * (used.length + 1))
     // Big-endian GIDs: 1 (narrow) or 2 (wide) for every used CID; only CID 0 stays GID 0.
     for (const cid of used) gidMap[2 * cid + 1] = wide(cid) ? GID_WIDE : GID_NARROW
@@ -329,7 +365,7 @@ export class OcrFontCache {
         Ordering: PDFString.of('Identity'),
         Supplement: 0
       }),
-      FontDescriptor: ctx.register(descriptor),
+      FontDescriptor: this.program.descriptorRef(),
       DW: OCR_NARROW,
       W: w,
       CIDToGIDMap: ctx.register(ctx.flateStream(gidMap))

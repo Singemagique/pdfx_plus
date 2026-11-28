@@ -2,7 +2,7 @@
 // signing routes, the PKCS#11 module-path check, the thumbprint format check and the input caps.
 // The handlers are only reachable through ipcMain, so this suite captures them at registration and
 // calls them directly. Each case is written so that DELETING its guard turns the test red.
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -22,6 +22,8 @@ const h = vi.hoisted(() => {
     window,
     /** Swapped per test so the "no window" branches can be exercised too. */
     mainWindow: { current: null as unknown },
+    /** app.getPath('userData'): a temp dir created in beforeAll (settings.json lands there). */
+    userData: { current: '' },
     showMessageBox: vi.fn(async () => ({ response: 1 })),
     showOpenDialog: vi.fn(async () => ({ canceled: true, filePaths: [] as string[] })),
     showSaveDialog: vi.fn(async () => ({ canceled: true, filePath: '' }))
@@ -29,6 +31,13 @@ const h = vi.hoisted(() => {
 })
 
 vi.mock('electron', () => ({
+  app: {
+    getPath: (name: string): string => {
+      if (name !== 'userData') throw new Error(`unexpected getPath(${name})`)
+      return h.userData.current
+    },
+    getLocale: (): string => 'de-DE'
+  },
   ipcMain: {
     handle: (channel: string, handler: Handler): void => {
       h.handlers.set(channel, handler)
@@ -103,6 +112,7 @@ const MODULE = process.platform === 'win32' ? 'C:\\pkcs11\\opensc.dll' : '/usr/l
 let pending: string[] = ['/pending/a.pdf']
 
 beforeAll(() => {
+  h.userData.current = mkdtempSync(join(tmpdir(), 'pdfx-ipc-userdata-'))
   registerIpc(
     () => pending,
     () => {
@@ -137,7 +147,9 @@ describe('registration', () => {
       'pdfx:sign-pdf-card',
       'pdfx:win-cert-list',
       'pdfx:sign-pdf-win-cert',
-      'pdfx:open-files'
+      'pdfx:open-files',
+      'pdfx:settings-get',
+      'pdfx:settings-set'
     ]) {
       expect(h.handlers.has(channel)).toBe(true)
     }
@@ -484,5 +496,50 @@ describe('unreadable files raise a notice', () => {
 
     expect(h.send).not.toHaveBeenCalled()
     warn.mockRestore()
+  })
+})
+
+describe('pdfx:settings-get / pdfx:settings-set', () => {
+  afterAll(() => {
+    rmSync(h.userData.current, { recursive: true, force: true })
+  })
+
+  it('answers the defaults (from the UI locale) before anything is saved', async () => {
+    await expect(invoke('pdfx:settings-get')).resolves.toEqual({
+      'ocr.languages': ['deu', 'eng'],
+      'ocr.autoRecognizeImports': true,
+      'ocr.autoRecognizeOpened': false,
+      'ocr.fixOrientation': true,
+      'ocr.includeInExports': true
+    })
+  })
+
+  it('refuses unknown keys and bad values without writing anything', async () => {
+    for (const bad of [
+      { 'ocr.tessdata': '/tmp' },
+      { 'ocr.includeInExports': 'no' },
+      { 'ocr.languages': ['eng', 'deu', 'fra', 'spa'] },
+      'ocr.languages',
+      null
+    ]) {
+      await expect(Promise.resolve().then(() => invoke('pdfx:settings-set', bad))).rejects.toThrow(
+        /invalid settings/
+      )
+    }
+    expect(existsSync(join(h.userData.current, 'settings.json'))).toBe(false)
+  })
+
+  it('persists a valid patch to userData/settings.json', async () => {
+    await expect(
+      invoke('pdfx:settings-set', { 'ocr.includeInExports': false })
+    ).resolves.toMatchObject({
+      'ocr.includeInExports': false,
+      'ocr.languages': ['deu', 'eng']
+    })
+    const onDisk = JSON.parse(readFileSync(join(h.userData.current, 'settings.json'), 'utf8'))
+    expect(onDisk['ocr.includeInExports']).toBe(false)
+    await expect(invoke('pdfx:settings-get')).resolves.toMatchObject({
+      'ocr.includeInExports': false
+    })
   })
 })

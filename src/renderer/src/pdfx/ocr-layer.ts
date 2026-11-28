@@ -39,10 +39,12 @@
 //   previous word's Tz is stretched to meet the next one when the gap is ≤ 2 em.
 
 import {
+  decodePDFRawStream,
   PDFArray,
   PDFBool,
   PDFDict,
   PDFName,
+  PDFRawStream,
   PDFRef,
   PDFStream,
   type PDFObject,
@@ -384,28 +386,90 @@ export function dropOcrLayers(page: PDFPage): number {
   if (!dropped) return 0
   // The old stream, or the old indirect /Contents array.
   if (entry instanceof PDFRef) candidates.push(entry)
+  unbindFonts(page, candidates)
+  deleteUnreachable(ctx, candidates)
+  return dropped
+}
+
+/**
+ * Unbind every PDFx OCR font (BaseFont /PDFxOCR-GlyphLess) from `page`'s own /Resources /Font,
+ * replacing (never mutating) the containers, and push what became unlinked onto `candidates`.
+ * Returns the number of fonts unbound.
+ */
+function unbindFonts(page: PDFPage, candidates: PDFRef[]): number {
+  const node = page.node
+  const ctx = node.context
   const resEntry = node.get(PDFName.of('Resources'))
   const resources = node.Resources()
   const fontEntry = resources?.get(PDFName.of('Font'))
   const fontDict = resources?.lookupMaybe(PDFName.of('Font'), PDFDict)
-  if (resources && fontDict) {
-    const own = fontDict.clone(ctx)
-    let unbound = 0
-    for (const [name, value] of fontDict.entries()) {
-      const dict = value instanceof PDFRef ? ctx.lookupMaybe(value, PDFDict) : value
-      if (dict instanceof PDFDict && isOcrFontDict(dict)) {
-        own.delete(name)
-        unbound++
-        if (value instanceof PDFRef) candidates.push(value)
-      }
-    }
-    if (unbound) {
-      const res = resources.clone(ctx)
-      res.set(PDFName.of('Font'), own)
-      node.set(PDFName.of('Resources'), res)
-      for (const e of [resEntry, fontEntry]) if (e instanceof PDFRef) candidates.push(e)
+  if (!resources || !fontDict) return 0
+  const own = fontDict.clone(ctx)
+  let unbound = 0
+  for (const [name, value] of fontDict.entries()) {
+    const dict = value instanceof PDFRef ? ctx.lookupMaybe(value, PDFDict) : value
+    if (dict instanceof PDFDict && isOcrFontDict(dict)) {
+      own.delete(name)
+      unbound++
+      if (value instanceof PDFRef) candidates.push(value)
     }
   }
-  deleteUnreachable(ctx, candidates)
-  return dropped
+  if (unbound) {
+    const res = resources.clone(ctx)
+    res.set(PDFName.of('Font'), own)
+    node.set(PDFName.of('Resources'), res)
+    for (const e of [resEntry, fontEntry]) if (e instanceof PDFRef) candidates.push(e)
+  }
+  return unbound
+}
+
+/** The page's own PDFx OCR fonts (resource names bound to a /PDFxOCR-GlyphLess Type0). */
+function ocrFontNames(page: PDFPage): string[] {
+  const ctx = page.node.context
+  const fontDict = page.node.Resources()?.lookupMaybe(PDFName.of('Font'), PDFDict)
+  const out: string[] = []
+  for (const [name, value] of fontDict?.entries() ?? []) {
+    const dict = value instanceof PDFRef ? ctx.lookupMaybe(value, PDFDict) : value
+    if (dict instanceof PDFDict && isOcrFontDict(dict)) out.push(name.decodeText())
+  }
+  return out
+}
+
+/**
+ * What PDFx OCR layer `page` already carries (a reopened PDFx export): its tagged streams, and
+ * whether a PDFx OCR font is bound at all, which is also true of a layer whose streams a later
+ * content rewrite merged into one (the tag is then gone, §3.7.6).
+ */
+export function existingOcrLayer(page: PDFPage): { streams: PDFStream[]; font: boolean } {
+  const ctx = page.node.context
+  // Read-only: unlike `contentsList`, never registers a direct stream.
+  const entry = page.node.get(PDFName.of('Contents'))
+  const resolved = entry instanceof PDFRef ? ctx.lookup(entry) : entry
+  const list = resolved instanceof PDFArray ? resolved.asArray() : [resolved]
+  const streams: PDFStream[] = []
+  for (const r of list) {
+    const s = r instanceof PDFRef ? ctx.lookup(r) : r
+    if (isOcrLayerStream(s)) streams.push(s as PDFStream)
+  }
+  return { streams, font: ocrFontNames(page).length > 0 }
+}
+
+/**
+ * The engine ids named by the BDC property lists of tagged layer `streams` (`/Engine (…)`, as
+ * `ocrLayerContent` writes it); empty when none can be read.
+ */
+export function ocrLayerEngines(streams: readonly PDFStream[]): string[] {
+  const out: string[] = []
+  for (const s of streams) {
+    let text: string
+    try {
+      const bytes = s instanceof PDFRawStream ? decodePDFRawStream(s).decode() : s.getContents()
+      text = new TextDecoder('latin1').decode(bytes)
+    } catch {
+      continue
+    }
+    for (const m of text.matchAll(/\/PDFxOCR\s*<<[^>]*?\/Engine\s*\(((?:\\.|[^\\)])*)\)/g))
+      out.push(m[1].replace(/\\(.)/g, '$1'))
+  }
+  return out
 }

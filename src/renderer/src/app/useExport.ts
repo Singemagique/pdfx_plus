@@ -1,4 +1,4 @@
-import { useCallback } from 'react'
+import { useCallback, useLayoutEffect, useRef } from 'react'
 import { zipSync } from 'fflate'
 import { buildPdf, buildPdfx, stripExtension } from '../pdfx/format'
 import type { EditLayer } from '../pdfx/build'
@@ -7,6 +7,8 @@ import { applyRedactedBytes, buildRedactedSources } from '../pdfx/redact-export'
 import { countRedactedOverlays } from '../pdfx/mirror'
 import { withSignatureAppearance, type AppearanceOptions } from '../pdfx/signature-appearance'
 import { summarizeDss, dssNote } from '../pdfx/dss-info'
+import { withOcrLayer } from '../pdfx/ocr-export'
+import { noOcrExportSource, type OcrExportSource } from '../ocr/export-source'
 import { makePageKey, type SignaturePlacement } from '../edit/model'
 import type { DocEntry } from '../types'
 
@@ -47,34 +49,72 @@ export function useExport(
   setBusy: (busy: boolean) => void,
   flash: (message: string) => void,
   signaturePlacement: SignaturePlacement | null,
-  savedSignature: Uint8Array | null
+  savedSignature: Uint8Array | null,
+  /** Recognised text for the invisible OCR layer (DESIGN.md §3.7.1): the OCR store (PR7b). */
+  ocr: OcrExportSource = noOcrExportSource
 ) {
+  // The collection and edit layer as of the LATEST render. The mid-job prompt (flushOrConfirm) is
+  // non-modal: while "Wait and export" waits, the user keeps editing, so a redaction drawn during
+  // the wait must reach the redaction pass, the OCR snapshot and the build. Every path therefore
+  // reads these after its last await before the work, never the values captured at the click.
+  const latest = useRef({ docs, editLayer })
+  useLayoutEffect(() => {
+    latest.current = { docs, editLayer }
+  }, [docs, editLayer])
+
   /**
-   * The shell every "save the collection somewhere" path shares: empty guard, save dialog, busy
-   * flag, redaction pre-pass, write, flash. Only the target name/filter and the byte-building step
-   * differ, so keeping them in one place is what makes the three paths provably consistent — the
-   * busy flag in particular must stay balanced (App drives its overlay off it), which the `finally`
-   * here guarantees for all of them at once. `build` receives the redacted sources and the chosen
-   * file's basename (the .pdfx path derives the collection name from it).
+   * The shell every "save the collection somewhere" path shares: empty guard, OCR flush-or-confirm,
+   * save dialog, busy flag, redaction pre-pass, OCR snapshot, write, flash. Only the target
+   * name/filter and the byte-building step differ, so keeping them in one place is what makes the
+   * three paths provably consistent — the busy flag in particular must stay balanced (App drives its
+   * overlay off it), which the `finally` here guarantees for all of them at once. `build` receives
+   * the redacted sources, the chosen file's basename (the .pdfx path derives the collection name
+   * from it) and the edit LAYER to bake: `editLayer` plus the recognised text when exports include
+   * it. Builds never capture `editLayer` themselves, so no path can bake a layer without the OCR,
+   * and receive the collection (`docs`) as of the moment the work starts (see `latest`).
    */
   const saveWith = useCallback(
     async (
       defaultName: string,
       filter: SaveFilter,
-      build: (redacted: RedactedSources, filename: string) => Promise<Uint8Array>
+      build: (
+        redacted: RedactedSources,
+        filename: string,
+        layer: EditLayer,
+        docs: DocEntry[]
+      ) => Promise<Uint8Array>
     ) => {
-      if (docs.length === 0) {
+      if (latest.current.docs.length === 0) {
         flash('Nothing to export')
         return
       }
+      // D7: the persistent "Include Recognized Text When Exporting" setting, read once per export.
+      const includeOcr = ocr.includeInExports()
+      // BEFORE the save dialog and before busy: a mid-job prompt is answered first, and waiting
+      // shows the OCR pill, never the App busy overlay. Cancel leaves everything untouched.
+      if (includeOcr && !(await ocr.flushOrConfirm(latest.current.docs))) return
       const path = await window.api.chooseSavePath(defaultName, filter)
       if (!path) return
       setBusy(true)
       try {
+        // What the collection is NOW, after every wait above (edits made meanwhile included).
+        const { docs, editLayer } = latest.current
+        if (docs.length === 0) {
+          flash('Nothing to export')
+          return
+        }
         const filename = path.split(/[\\/]/).pop() ?? defaultName
         // Redactions are applied destructively to the source bytes first (every export kind).
         const redacted = await buildRedactedSources(editLayer, docs)
-        const bytes = await build(redacted, filename)
+        // A COPY of the edit layer with the recognised text; pages with a redaction get none (the
+        // removed-object report that allows finer filtering arrives with PR3b). With the setting
+        // off, layers the sources already carry are dropped too (ocrPassthrough).
+        const layer = withOcrLayer(
+          editLayer,
+          includeOcr ? ocr.snapshotFor(docs, editLayer) : undefined,
+          { include: includeOcr }
+        )
+        const bytes = await build(redacted, filename, layer, docs)
         const saved = await window.api.writeFile(path, bytes)
         // Overlays a redaction covered are gone from the saved file — tell the user how many. Only
         // live pages count: a deleted page's overlays linger for undo but were never saved.
@@ -87,7 +127,7 @@ export function useExport(
         setBusy(false)
       }
     },
-    [docs, editLayer, flash, setBusy]
+    [flash, setBusy, ocr]
   )
 
   // .pdfx embeds the manifest that lets PDFx re-split the collection; a plain .pdf is a flat,
@@ -97,7 +137,7 @@ export function useExport(
       saveWith(
         `untitled.${kind}`,
         kind === 'pdfx' ? PDFX_FILTER : PDF_FILTER,
-        (redacted, filename) =>
+        (redacted, filename, layer, docs) =>
           kind === 'pdfx'
             ? buildPdfx(
                 docs.map((doc) => ({
@@ -105,37 +145,56 @@ export function useExport(
                   pages: applyRedactedBytes(doc.pages.map(toExportPage), redacted)
                 })),
                 stripExtension(filename).replace(/\.pdf$/i, ''),
-                editLayer
+                layer
               )
-            : buildPdf(flatExportPages(docs, redacted), editLayer)
+            : buildPdf(flatExportPages(docs, redacted), layer)
       ),
-    [docs, editLayer, saveWith]
+    [saveWith]
   )
 
   // Flatten everything (incl. redaction) into a plain PDF, ask `sign` (in the main process) to
   // cryptographically sign it, and save the signed copy. The editable project is untouched. `sign`
   // differs only by credential source (.p12 file vs. smart card); flattening + save are shared.
+  // `includeRecognizedText` is the Sign dialog's own "Include recognized text (machine-generated,
+  // not reviewed)" box (D7): off by default, and independent of the export setting, because the
+  // signature would cover machine text the signer never saw.
   const flattenAndSign = useCallback(
     async (
       sign: (flat: Uint8Array) => Promise<Uint8Array>,
       failHint: string,
-      appearance: AppearanceOptions | null
+      appearance: AppearanceOptions | null,
+      includeRecognizedText = false
     ): Promise<boolean> => {
-      if (docs.length === 0) {
+      if (latest.current.docs.length === 0) {
         flash('Nothing to sign')
         return false
       }
+      // Only when the box is ticked: the same mid-job prompt as export, before the save dialog.
+      if (includeRecognizedText && !(await ocr.flushOrConfirm(latest.current.docs))) return false
       const path = await window.api.chooseSavePath('signed.pdf', PDF_FILTER)
       if (!path) return false
       setBusy(true)
       try {
+        // What the collection is NOW, after the waits above (see `latest`).
+        const { docs, editLayer } = latest.current
+        if (docs.length === 0) {
+          flash('Nothing to sign')
+          return false
+        }
         // When a placement is set, splice the visible appearance into a copy of the edit layer so
         // the cryptographic signature (applied next, to the flattened bytes) covers it.
-        const layer =
+        const signedLayer =
           signaturePlacement && appearance
             ? await withSignatureAppearance(editLayer, signaturePlacement, appearance)
             : editLayer
-        const redacted = await buildRedactedSources(layer, docs)
+        const redacted = await buildRedactedSources(signedLayer, docs)
+        // Baked inside buildPdf, before sign(), so the signature covers the text when included.
+        // Unticked, a layer a reopened source already carries is dropped as well (ocrPassthrough).
+        const layer = withOcrLayer(
+          signedLayer,
+          includeRecognizedText ? ocr.snapshotFor(docs, editLayer) : undefined,
+          { include: includeRecognizedText }
+        )
         const flat = await buildPdf(
           flatExportPages(docs, redacted),
           layer,
@@ -157,7 +216,7 @@ export function useExport(
         setBusy(false)
       }
     },
-    [docs, editLayer, flash, setBusy, signaturePlacement]
+    [flash, setBusy, signaturePlacement, ocr]
   )
 
   // Build the visible-appearance options from the dialog opts (null when signing invisibly).
@@ -191,9 +250,11 @@ export function useExport(
         tsaUrl?: string
         includeImage?: boolean
         ltv?: boolean
+        /** The Sign dialog's "Include recognized text" box (D7, default off). */
+        includeRecognizedText?: boolean
       }
     ): Promise<boolean> => {
-      const { includeImage: _omit, ...sign } = opts
+      const { includeImage: _omit, includeRecognizedText = false, ...sign } = opts
       // When a visible appearance will be drawn, read the cert's identity (subject/issuer) so it can
       // show the standard "digitally signed by …" block. Best-effort — null falls back to generic.
       const signer = signaturePlacement
@@ -202,7 +263,8 @@ export function useExport(
       return flattenAndSign(
         (flat) => window.api.signPdf(flat, certBytes, sign),
         'Signing failed — check the certificate and passphrase',
-        appearanceOf({ ...opts, signer })
+        appearanceOf({ ...opts, signer }),
+        includeRecognizedText
       )
     },
     [flattenAndSign, appearanceOf, signaturePlacement]
@@ -224,9 +286,11 @@ export function useExport(
         tsaUrl?: string
         includeImage?: boolean
         ltv?: boolean
+        /** The Sign dialog's "Include recognized text" box (D7, default off). */
+        includeRecognizedText?: boolean
       }
     ): Promise<boolean> => {
-      const { includeImage: _omit, ...sign } = opts
+      const { includeImage: _omit, includeRecognizedText = false, ...sign } = opts
       // Read the card cert's identity for the appearance WITHOUT the PIN (cert objects are public), so
       // it doesn't trigger a second prompt. The pin is dropped before this call.
       const { pin: _pin, ...cardId } = card
@@ -236,7 +300,8 @@ export function useExport(
       return flattenAndSign(
         (flat) => window.api.signPdfWithCard(flat, card, sign),
         'Card signing failed — check the module path, PIN and that the card is inserted',
-        appearanceOf({ ...opts, signer })
+        appearanceOf({ ...opts, signer }),
+        includeRecognizedText
       )
     },
     [flattenAndSign, appearanceOf, signaturePlacement]
@@ -253,14 +318,17 @@ export function useExport(
         tsaUrl?: string
         includeImage?: boolean
         ltv?: boolean
+        /** The Sign dialog's "Include recognized text" box (D7, default off). */
+        includeRecognizedText?: boolean
         signer?: { subject: string; issuer: string }
       }
     ): Promise<boolean> => {
-      const { includeImage: _omit, signer: _sig, ...sign } = opts
+      const { includeImage: _omit, signer: _sig, includeRecognizedText = false, ...sign } = opts
       return flattenAndSign(
         (flat) => window.api.signPdfWithWindowsCert(flat, thumbprint, sign),
         'Signing failed — the card may have been removed or the PIN cancelled',
-        appearanceOf(opts)
+        appearanceOf(opts),
+        includeRecognizedText
       )
     },
     [flattenAndSign, appearanceOf]
@@ -269,7 +337,7 @@ export function useExport(
   // One flat PDF per document, zipped: same shell, different bytes.
   const exportZip = useCallback(
     () =>
-      saveWith('untitled.zip', ZIP_FILTER, async (redacted) => {
+      saveWith('untitled.zip', ZIP_FILTER, async (redacted, _filename, layer, docs) => {
         const entries: Record<string, Uint8Array> = {}
         const used = new Set<string>()
         for (const doc of docs) {
@@ -279,12 +347,12 @@ export function useExport(
           used.add(filename)
           entries[filename] = await buildPdf(
             applyRedactedBytes(doc.pages.map(toExportPage), redacted),
-            editLayer
+            layer
           )
         }
         return zipSync(entries)
       }),
-    [docs, editLayer, saveWith]
+    [saveWith]
   )
 
   return {
