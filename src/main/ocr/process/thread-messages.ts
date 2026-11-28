@@ -123,7 +123,7 @@ export type ToRecognize =
       editRotation?: Orientation
       /**
        * Tests only (the calibration run): the table the pipeline's own gates (Retry A) read, so a
-       * refit is not fed by the table it replaces. Default: the shipped TESS_CORE7.
+       * refit is not fed by the table it replaces. Default: the shipped TESS_CALIBRATION.
        */
       calibration?: CalibrationTable
       /** Tests only: pass 1 on the bitmap as given, no preprocessing (the PR5 replay cache). */

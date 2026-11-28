@@ -57,7 +57,7 @@ const THIRD_PARTY = [
   'node_modules/@embedpdf/pdfium/dist/index.cjs',
   // Not bundled but require()d by the recognize thread from resources/ocr (the same bytes, checked
   // against the manifest before the require).
-  'node_modules/tesseract.js-core/tesseract-core-simd-lstm.js'
+  'vendor/tesseract-core/5.5.5/tesseract-core-simd-lstm.js'
 ]
 
 const ESCAPE_MEMBERS = new Set(['binding', '_linkedBinding', 'dlopen'])

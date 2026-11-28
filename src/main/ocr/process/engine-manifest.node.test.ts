@@ -1,8 +1,8 @@
 // Packaging guards for the OCR engine (DESIGN.md §3.2.1, §3.2.4, §3.2.8): every electron-builder
 // `extraResources` source exists and, for the engine, has exactly the manifest's bytes; only the
 // simd-lstm core and the four 4.0.0_best_int languages are copied (nothing from the packages enters
-// the asar); every licence notice listed for the linked libraries is shipped; and the package.json
-// pins match.
+// the asar); every licence notice listed for the linked libraries is shipped; the package.json
+// pins match; and the core is the one build/ocr-core pins (EXPECTED.sha256, versions.env → engine id).
 
 import { createHash } from 'node:crypto'
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
@@ -10,6 +10,7 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 
+import { ENGINE_ID } from '../../../shared/ocr/engine/tess-core'
 import { BUNDLED_LANGS, ENGINE_CORE, ENGINE_DATA, RESOURCES_OCR_DIR } from './engine-manifest'
 
 const ROOT = fileURLToPath(new URL('../../../../', import.meta.url))
@@ -51,19 +52,13 @@ function extraResources(): ExtraResource[] {
   return out
 }
 
-/** Every notice §3.2.8 requires for tesseract-core-simd-lstm.wasm and the bundled data. */
+/**
+ * Every notice §3.2.8 requires for tesseract-core-simd-lstm.wasm (exactly what build/ocr-core links:
+ * `wasm-ld -v`) and the bundled data.
+ */
 const OCR_LICENCE_FILES = [
-  'tesseract.js-core-LICENSE.txt',
   'Tesseract-LICENSE.txt',
   'Leptonica-LICENSE.txt',
-  'libjpeg-LICENSE.txt',
-  'libpng-LICENSE.txt',
-  'libtiff-LICENSE.txt',
-  'libwebp-LICENSE.txt',
-  'libwebp-PATENTS.txt',
-  'giflib-LICENSE.txt',
-  'zlib-LICENSE.txt',
-  'openlibm-LICENSE.txt',
   'Emscripten-LICENSE.txt',
   'musl-LICENSE.txt',
   'libcxx-LICENSE.txt',
@@ -107,14 +102,46 @@ describe('OCR packaging', () => {
 
   it('the design pins (§3.2.1) are the manifest', () => {
     expect(ENGINE_CORE.wasm.sha256).toBe(
-      '34e8d50cac216427d86bf397d610fdd9f49492539bbcdfbfccc4eda20c810bea'
+      '018024fe00456ae346f15479252103813beae659e326922f7f4bee2387a7aa48'
     )
     expect(ENGINE_CORE.js.sha256).toBe(
-      'e48e2f02ddae3716c8dd24bf41cd290d4efa96892d689cdc4013c2545d63f469'
+      'afb73b41ad0c20677004dbc576543dbd1c02ded553266163a7d7bce794ef82fd'
     )
-    expect(ENGINE_CORE.wasm.bytes + ENGINE_CORE.js.bytes).toBe(2_946_872)
+    expect(ENGINE_CORE.wasm.bytes + ENGINE_CORE.js.bytes).toBe(1_721_814)
     expect(BUNDLED_LANGS).toEqual(['eng', 'deu', 'fra', 'spa'])
     expect(Object.values(ENGINE_DATA).reduce((n, d) => n + d.bytes, 0)).toBe(7_093_571)
+  })
+
+  it('is the core build/ocr-core reproduces, under the engine id its versions.env names', () => {
+    // EXPECTED.sha256 is what the ocr-core-build workflow requires a rebuild to produce.
+    const expected = new Map(
+      readFileSync(join(ROOT, 'build/ocr-core/EXPECTED.sha256'), 'utf8')
+        .trim()
+        .split(/\r?\n/)
+        .map((l) => {
+          const [hash, file] = l.split(/\s+\*?/)
+          return [file, hash] as const
+        })
+    )
+    expect(expected).toEqual(
+      new Map([
+        [ENGINE_CORE.js.file, ENGINE_CORE.js.sha256],
+        [ENGINE_CORE.wasm.file, ENGINE_CORE.wasm.sha256]
+      ])
+    )
+    const env = Object.fromEntries(
+      readFileSync(join(ROOT, 'build/ocr-core/versions.env'), 'utf8')
+        .split(/\r?\n/)
+        .filter((l) => /^[A-Z0-9_]+=/.test(l))
+        .map((l) => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1)])
+    ) as Record<string, string>
+    expect(ENGINE_ID).toBe(`tess-lstm/${env.TESSERACT_TAG}-pdfx.${env.PDFX_CORE_REVISION}/simd`)
+    expect(ENGINE_CORE.js.source).toBe(
+      `vendor/tesseract-core/${env.TESSERACT_TAG}/tesseract-core-simd-lstm.js`
+    )
+    expect(ENGINE_CORE.wasm.source).toBe(
+      `vendor/tesseract-core/${env.TESSERACT_TAG}/tesseract-core-simd-lstm.wasm`
+    )
   })
 
   it('ships every licence notice for the linked libraries and the data', () => {
@@ -147,13 +174,15 @@ describe('OCR packaging', () => {
       devDependencies: Record<string, string>
       resolutions?: Record<string, string>
     }
-    expect(pkg.devDependencies['tesseract.js-core']).toBe('7.0.0')
-    expect(pkg.resolutions?.['tesseract.js-core']).toBe('7.0.0')
+    // The core is vendored now (build/ocr-core): no tesseract.js-core package at all.
+    expect(pkg.devDependencies['tesseract.js-core']).toBeUndefined()
+    expect(pkg.resolutions?.['tesseract.js-core']).toBeUndefined()
     for (const l of BUNDLED_LANGS)
       expect(pkg.devDependencies[`@tesseract.js-data/${l}`]).toBe('1.0.0')
     expect(Object.keys(pkg.dependencies).filter((d) => /tesseract/.test(d))).toEqual([])
     const yml = readFileSync(join(ROOT, 'electron-builder.yml'), 'utf8')
     expect(yml).toContain("'!{THIRD_PARTY_NOTICES.md,build/licenses/**,bench/**,types/**}'")
+    expect(yml).toContain("- '!vendor/**'")
   })
 
   it('keeps every tsconfig*.json out of the asar (one glob, so a new project file cannot slip in)', () => {

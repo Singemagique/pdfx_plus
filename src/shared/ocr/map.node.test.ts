@@ -6,7 +6,7 @@ import { describe, expect, it } from 'vitest'
 
 import {
   RAW_THRESHOLDS,
-  TESS_CORE7_PLACEHOLDER,
+  TESS_CALIBRATION_PLACEHOLDER,
   assertCalibrationTable,
   calibrate
 } from './calibration'
@@ -44,7 +44,7 @@ const CTX: MapContext = {
   langs: ['eng'],
   pipelineVersion: PIPELINE_VERSION,
   pageClass: 'scanned',
-  calibration: TESS_CORE7_PLACEHOLDER
+  calibration: TESS_CALIBRATION_PLACEHOLDER
 }
 
 const word = (
@@ -362,7 +362,9 @@ describe('filter and text', () => {
       CTX
     )
     expect(low.status).toBe('low-confidence')
-    expect(low.meanConfCal).toBeLessThan(calibrate(TESS_CORE7_PLACEHOLDER, RAW_THRESHOLDS.flag)!)
+    expect(low.meanConfCal).toBeLessThan(
+      calibrate(TESS_CALIBRATION_PLACEHOLDER, RAW_THRESHOLDS.flag)!
+    )
   })
 
   it('char edges: n + 1 cumulative boundaries from the cinfo gaps, only for unchanged text', () => {
@@ -404,7 +406,7 @@ describe('filter and text', () => {
       CTX
     )
     expect(p.meanConfCal).toBeCloseTo((0.7 * 10 + 0.32 * 3) / 13, 9)
-    expect(calibrate(TESS_CORE7_PLACEHOLDER, RAW_THRESHOLDS.flag)).toBeCloseTo(0.6, 9)
+    expect(calibrate(TESS_CALIBRATION_PLACEHOLDER, RAW_THRESHOLDS.flag)).toBeCloseTo(0.6, 9)
     expect(p.status).toBe('ok')
     // Swap the confidences and the same rule flags it: (0.32·10 + 0.7·3) / 13 = 0.408.
     const q = mapRawOcrPage(
@@ -431,16 +433,16 @@ describe('filter and text', () => {
 
 describe('calibration placeholder', () => {
   it('is a valid 21-point monotone table marked as a placeholder', () => {
-    expect(TESS_CORE7_PLACEHOLDER.points).toHaveLength(21)
-    expect(TESS_CORE7_PLACEHOLDER.placeholder).toBe(true)
-    expect(() => assertCalibrationTable(TESS_CORE7_PLACEHOLDER)).not.toThrow()
-    expect(calibrate(TESS_CORE7_PLACEHOLDER, null)).toBeNull()
-    expect(calibrate(TESS_CORE7_PLACEHOLDER, 72.5)).toBeCloseTo(0.725, 9)
-    expect(calibrate(TESS_CORE7_PLACEHOLDER, -3)).toBe(0)
-    expect(calibrate(TESS_CORE7_PLACEHOLDER, 140)).toBe(1)
+    expect(TESS_CALIBRATION_PLACEHOLDER.points).toHaveLength(21)
+    expect(TESS_CALIBRATION_PLACEHOLDER.placeholder).toBe(true)
+    expect(() => assertCalibrationTable(TESS_CALIBRATION_PLACEHOLDER)).not.toThrow()
+    expect(calibrate(TESS_CALIBRATION_PLACEHOLDER, null)).toBeNull()
+    expect(calibrate(TESS_CALIBRATION_PLACEHOLDER, 72.5)).toBeCloseTo(0.725, 9)
+    expect(calibrate(TESS_CALIBRATION_PLACEHOLDER, -3)).toBe(0)
+    expect(calibrate(TESS_CALIBRATION_PLACEHOLDER, 140)).toBe(1)
     let prev = -1
     for (let r = 0; r <= 100; r += 0.5) {
-      const p = calibrate(TESS_CORE7_PLACEHOLDER, r)!
+      const p = calibrate(TESS_CALIBRATION_PLACEHOLDER, r)!
       expect(p).toBeGreaterThanOrEqual(prev)
       prev = p
     }

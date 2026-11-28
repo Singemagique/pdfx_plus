@@ -104,7 +104,7 @@ const TAN_1DEG = 0.017455064928217585
  * 4–12%. PR6 refit it on the calibration sweep (5 seeds × 15 presets × Helvetica, Times, Courier,
  * DejaVu Serif; 41,945 words): median word-box IoU 0.852 at 0.50, 0.882 at 0.56, a flat maximum
  * of 0.893–0.894 at 0.59–0.61 [measured, `node scripts/ocr-calibrate.mjs --seeds 1,2,3,4,5`; the
- * numbers are the committed calibration/tess-core7-simd.json's `fit.sizeFactor`]. 0.56 is taken
+ * numbers are the committed calibration/tess-simd.json's `fit.sizeFactor`]. 0.56 is taken
  * rather than the maximum: it keeps a larger em box (the redaction footprint relies on the box
  * covering the ink; a bigger factor shrinks it), it makes the box match Helvetica's own
  * ascent..descent (0.523 em x-height plus the ~1 px anti-aliasing PR0 measured), and it already

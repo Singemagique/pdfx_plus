@@ -2,7 +2,8 @@
 // ocr_caption, ocr_textfloat), recorded once into the replay cache so the hOCR parser is tested on
 // REAL engine output (tier 0) without running the engine. Test-only, DOM-free.
 //
-// Which layout yields which class was found by trial against tesseract.js-core 7.0.0 (PR5):
+// Which layout yields which class was found by trial against tesseract.js-core 7.0.0 (PR5; the
+// recorded entries are re-recorded with each new core, build/ocr-core):
 // - ocr_header: a 16 pt line between two 2-column blocks of 10 pt text (Letter);
 // - ocr_caption: an 8 pt line under a grey picture box (Letter);
 // - ocr_textfloat: PR0's `twocol10` page (A4, bold 18 pt title, bold 12 pt section headings, two

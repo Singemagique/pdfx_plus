@@ -6,12 +6,12 @@ import { describe, expect, it } from 'vitest'
 import {
   CAL_THRESHOLDS,
   RAW_THRESHOLDS,
-  TESS_CORE7,
+  TESS_CALIBRATION,
   assertCalibrationTable,
   calibrate,
   thresholdsFor
 } from './calibration'
-import fitted from './calibration/tess-core7-simd.json'
+import fitted from './calibration/tess-simd.json'
 import {
   CALIBRATION_RAW,
   expectedCalibrationError,
@@ -66,21 +66,21 @@ describe('isotonic fit (pool-adjacent-violators)', () => {
 
 describe('the committed table (scripts/ocr-calibrate.mjs)', () => {
   it('is a real fit for this engine: 21 monotone points, not the placeholder', () => {
-    expect(TESS_CORE7.engineId).toBe(ENGINE_ID)
-    expect(TESS_CORE7.placeholder).toBe(false)
-    expect(TESS_CORE7.points.map(([r]) => r)).toEqual(CALIBRATION_RAW)
-    expect(() => assertCalibrationTable(TESS_CORE7)).not.toThrow()
+    expect(TESS_CALIBRATION.engineId).toBe(ENGINE_ID)
+    expect(TESS_CALIBRATION.placeholder).toBe(false)
+    expect(TESS_CALIBRATION.points.map(([r]) => r)).toEqual(CALIBRATION_RAW)
+    expect(() => assertCalibrationTable(TESS_CALIBRATION)).not.toThrow()
     expect(fitted.fit.words).toBeGreaterThan(10_000)
     // The real corpus is not committed yet: the fit says so.
     expect(fitted.fit.real).toMatch(/^absent/)
   })
 
   it('re-derives the UI thresholds from the curve at the raw anchors', () => {
-    expect(CAL_THRESHOLDS).toEqual(thresholdsFor(TESS_CORE7))
-    expect(CAL_THRESHOLDS.retry).toBeCloseTo(calibrate(TESS_CORE7, RAW_THRESHOLDS.retry)!, 2)
-    expect(CAL_THRESHOLDS.flag).toBeCloseTo(calibrate(TESS_CORE7, RAW_THRESHOLDS.flag)!, 2)
+    expect(CAL_THRESHOLDS).toEqual(thresholdsFor(TESS_CALIBRATION))
+    expect(CAL_THRESHOLDS.retry).toBeCloseTo(calibrate(TESS_CALIBRATION, RAW_THRESHOLDS.retry)!, 2)
+    expect(CAL_THRESHOLDS.flag).toBeCloseTo(calibrate(TESS_CALIBRATION, RAW_THRESHOLDS.flag)!, 2)
     expect(CAL_THRESHOLDS.underline).toBeCloseTo(
-      calibrate(TESS_CORE7, RAW_THRESHOLDS.underline)!,
+      calibrate(TESS_CALIBRATION, RAW_THRESHOLDS.underline)!,
       2
     )
     expect(CAL_THRESHOLDS.underline).toBeLessThanOrEqual(CAL_THRESHOLDS.flag)

@@ -12,41 +12,41 @@ below. Each licence text is installed next to this file, in `resources/licenses/
 
 ## Text recognition (OCR)
 
-Text recognition runs the Tesseract OCR engine compiled to WebAssembly by
-[tesseract.js-core](https://github.com/naptha/tesseract.js-core) 7.0.0. PDFx ships only
-`tesseract-core-simd-lstm.js` and `tesseract-core-simd-lstm.wasm` (in `resources/ocr/`), loaded by
-PDFx's own loader.
+Text recognition runs the [Tesseract](https://github.com/tesseract-ocr/tesseract) OCR engine with
+[Leptonica](https://github.com/DanBloomberg/leptonica), compiled to WebAssembly by PDFx itself from
+the upstream sources (`build/ocr-core/` in the source repository: pinned versions, the build
+script and the exact flags). PDFx ships only `tesseract-core-simd-lstm.js` and
+`tesseract-core-simd-lstm.wasm` (in `resources/ocr/`), loaded by PDFx's own loader; the
+JavaScript bindings are PDFx's own.
 
-[tesseract.js](https://github.com/naptha/tesseract.js) (Apache-2.0) is not a dependency and none
-of its code ships, but PDFx's loader follows the API usage of its worker script, and we gratefully
-credit it as the reference.
+**Modified files (Apache-2.0 §4(b)):** PDFx's build applies two patches to Tesseract 5.5.5, both in
+`build/ocr-core/patches/`: `src/arch/simddetect.cpp` (SIMD selection without CPUID under
+WebAssembly) and `src/arch/intsimdmatrixsse.cpp` (a WebAssembly SIMD128 matrix kernel). No other
+source file is changed.
 
-The libraries below are statically linked into `tesseract-core-simd-lstm.wasm`. The list comes from
-the tesseract.js-core `v7.0.0` build scripts (`build.sh`, `build-scripts/*.sh`, and the WebAssembly
-link line in the Tesseract fork's `CMakeLists.txt`); each licence text was taken from the upstream
-repository at the exact submodule commit that tag pins.
+[tesseract.js](https://github.com/naptha/tesseract.js) and
+[tesseract.js-core](https://github.com/naptha/tesseract.js-core) (both Apache-2.0) are not
+dependencies and none of their code ships, but PDFx's loader follows the API usage of tesseract.js's
+worker script and its build follows tesseract.js-core 7.0.0's configuration, and we gratefully credit
+them as the reference.
 
-| Component                              | Licence                            | Source (commit)                                | File                                         |
-| -------------------------------------- | ---------------------------------- | ---------------------------------------------- | -------------------------------------------- |
-| tesseract.js-core                      | Apache-2.0                         | npm `tesseract.js-core@7.0.0`                  | `tesseract.js-core-LICENSE.txt`              |
-| Tesseract OCR (Balearica fork)         | Apache-2.0                         | github.com/Balearica/tesseract `2a9c1c49`      | `Tesseract-LICENSE.txt`                      |
-| Leptonica                              | BSD-2-Clause (Leptonica licence)   | github.com/DanBloomberg/leptonica `4af068b5`   | `Leptonica-LICENSE.txt`                      |
-| libjpeg (IJG)                          | IJG licence (in the README)        | github.com/LuaDist/libjpeg `6c0fcb8d`          | `libjpeg-LICENSE.txt`                        |
-| libpng                                 | libpng licence                     | github.com/glennrp/libpng `a37d4836`           | `libpng-LICENSE.txt`                         |
-| libtiff (and libtiffxx)                | libtiff licence                    | gitlab.com/libtiff/libtiff `b51bb157`          | `libtiff-LICENSE.txt`                        |
-| libwebp (with libwebpdecoder/demux)    | BSD-3-Clause, plus a patent grant  | github.com/webmproject/libwebp `20ef03ee`      | `libwebp-LICENSE.txt`, `libwebp-PATENTS.txt` |
-| giflib                                 | MIT                                | github.com/mirrorer/giflib `fa376720`          | `giflib-LICENSE.txt`                         |
-| zlib                                   | zlib licence (in the README)       | github.com/madler/zlib `21767c65`              | `zlib-LICENSE.txt`                           |
-| openlibm                               | MIT / BSD / ISC (see file)         | github.com/JuliaMath/openlibm `ae2d9169`       | `openlibm-LICENSE.txt`                       |
-| Emscripten runtime and libraries       | MIT or University of Illinois/NCSA | github.com/emscripten-core/emscripten `4.0.15` | `Emscripten-LICENSE.txt`                     |
-| musl libc (as bundled by Emscripten)   | MIT                                | emscripten `4.0.15` `system/lib/libc/musl`     | `musl-LICENSE.txt`                           |
-| libc++ (as bundled by Emscripten)      | Apache-2.0 WITH LLVM-exception     | emscripten `4.0.15` `system/lib/libcxx`        | `libcxx-LICENSE.txt`                         |
-| libc++abi (as bundled by Emscripten)   | Apache-2.0 WITH LLVM-exception     | emscripten `4.0.15` `system/lib/libcxxabi`     | `libcxxabi-LICENSE.txt`                      |
-| compiler-rt (as bundled by Emscripten) | Apache-2.0 WITH LLVM-exception     | emscripten `4.0.15` `system/lib/compiler-rt`   | `compiler-rt-LICENSE.txt`                    |
+The libraries below are statically linked into `tesseract-core-simd-lstm.wasm` (the linker's own
+list, `wasm-ld -v`). Leptonica is built without any image-format library (no zlib, libpng,
+libjpeg, libtiff, giflib, libwebp or OpenJPEG), so none of those is part of the engine.
 
-The Emscripten version is the one `build-with-docker.sh` pins at that tag (`EM_VERSION=4.0.15`).
-Emscripten's default allocator (dlmalloc) is public domain. The build also embeds Tesseract's own
-`pdf.ttf` (part of Tesseract, Apache-2.0).
+| Component                               | Licence                            | Source                                                  | File                      |
+| --------------------------------------- | ---------------------------------- | ------------------------------------------------------- | ------------------------- |
+| Tesseract OCR 5.5.5 (with PDFx patches) | Apache-2.0                         | github.com/tesseract-ocr/tesseract `5.5.5` (`4292f689`) | `Tesseract-LICENSE.txt`   |
+| Leptonica 1.87.0                        | BSD-2-Clause (Leptonica licence)   | github.com/DanBloomberg/leptonica `1.87.0`              | `Leptonica-LICENSE.txt`   |
+| Emscripten runtime and libraries        | MIT or University of Illinois/NCSA | github.com/emscripten-core/emscripten `4.0.15`          | `Emscripten-LICENSE.txt`  |
+| musl libc (as bundled by Emscripten)    | MIT                                | emscripten `4.0.15` `system/lib/libc/musl`              | `musl-LICENSE.txt`        |
+| libc++ (as bundled by Emscripten)       | Apache-2.0 WITH LLVM-exception     | emscripten `4.0.15` `system/lib/libcxx`                 | `libcxx-LICENSE.txt`      |
+| libc++abi (as bundled by Emscripten)    | Apache-2.0 WITH LLVM-exception     | emscripten `4.0.15` `system/lib/libcxxabi`              | `libcxxabi-LICENSE.txt`   |
+| compiler-rt (as bundled by Emscripten)  | Apache-2.0 WITH LLVM-exception     | emscripten `4.0.15` `system/lib/compiler-rt`            | `compiler-rt-LICENSE.txt` |
+
+The Tesseract and Leptonica licence texts are the files in those exact source archives. The
+Emscripten version is the one the build image is pinned to. Emscripten's default allocator
+(dlmalloc) is public domain. Tesseract 5.5.5 ships no NOTICE file.
 
 ### Language data
 

@@ -4,19 +4,19 @@
 // PR6 fits it offline: `scripts/ocr-calibrate.mjs` runs the synthetic sweep (seeds × presets ×
 // fonts) through the real engine and pipeline, labels each recognised word correct or not against
 // the ground truth, fits an isotonic regression of correctness on raw confidence and writes the
-// 21 points to `calibration/tess-core7-simd.json`. The maintainers' real corpus (§3.9.1) does not
+// 21 points to `calibration/tess-simd.json`. The maintainers' real corpus (§3.9.1) does not
 // exist yet; the script takes it as a second input when it does (see the script's header).
 //
 // The thresholds are expressed in P(correct) (`CAL_THRESHOLDS`), read off the fitted curve at the
 // raw anchors the design names (retry ≈ raw 70, page flag ≈ raw 60, word underline ≈ raw 50). A
 // future engine ships its own table and keeps the same P thresholds, so the UI means the same.
 
-import fitted from './calibration/tess-core7-simd.json'
+import fitted from './calibration/tess-simd.json'
 import { ENGINE_ID } from './engine/tess-core'
 import type { CalibrationTable } from './engine/types'
 
 /** The uncalibrated stand-in (p = raw / 100), kept for tests and as the shape reference. */
-export const TESS_CORE7_PLACEHOLDER: CalibrationTable = {
+export const TESS_CALIBRATION_PLACEHOLDER: CalibrationTable = {
   engineId: ENGINE_ID,
   placeholder: true,
   points: Array.from({ length: 21 }, (_, i) => [i * 5, i / 20] as const)
@@ -73,7 +73,7 @@ function load(f: CalibrationFile): CalibrationTable {
 }
 
 /** The table every OcrPage's `confCal` comes from. */
-export const TESS_CORE7: CalibrationTable = load(fitted as unknown as CalibrationFile)
+export const TESS_CALIBRATION: CalibrationTable = load(fitted as unknown as CalibrationFile)
 
 /** The UI thresholds in P(correct), re-derived from a table at the raw anchors (2 decimals). */
 export function thresholdsFor(t: CalibrationTable): {
@@ -93,4 +93,4 @@ export function thresholdsFor(t: CalibrationTable): {
  * The thresholds the pipeline and the UI compare `confCal` against: below `retry` the page gets
  * Retry A, below `flag` it is reported Low confidence, below `underline` a word is underlined.
  */
-export const CAL_THRESHOLDS = thresholdsFor(TESS_CORE7)
+export const CAL_THRESHOLDS = thresholdsFor(TESS_CALIBRATION)
