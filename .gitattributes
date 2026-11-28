@@ -13,3 +13,7 @@
 *.ico binary
 *.pdf binary
 *.pdfx binary
+
+# The vendored Tesseract WebAssembly core is pinned by SHA-256 (build/ocr-core/EXPECTED.sha256 and
+# src/main/ocr/process/engine-manifest.ts): never let line-ending normalisation touch its .js glue.
+vendor/tesseract-core/** binary

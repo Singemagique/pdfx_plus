@@ -1,0 +1,17 @@
+// The whole JavaScript surface of the PDFx Tesseract core: exactly what
+// src/shared/ocr/engine/tess-core.ts calls (TessApi), and nothing else.
+// Generated into glue.cpp / glue.js by Emscripten's tools/webidl_binder.py.
+
+[NoDelete]
+interface ETEXT_DESC {
+};
+
+interface TessBaseAPI {
+  void TessBaseAPI();
+  boolean SetVariable([Const] DOMString name, [Const] DOMString value);
+  long Init([Const] DOMString datapath, [Const] DOMString language, long oem);
+  boolean SetImageFile(long exif, float angle);
+  long Recognize(ETEXT_DESC monitor);
+  [Const] DOMString GetHOCRText(long page_number);
+  void End();
+};

@@ -1,0 +1,33 @@
+--- a/src/arch/simddetect.cpp
++++ b/src/arch/simddetect.cpp
+@@ -43,7 +43,8 @@
+ 
+ #endif
+ 
+-#if defined(HAVE_AVX) || defined(HAVE_AVX2) || defined(HAVE_FMA) || defined(HAVE_SSE4_1)
++// PDFx: WebAssembly has no CPUID; see the __EMSCRIPTEN__ branch in the constructor.
++#if !defined(__EMSCRIPTEN__) && (defined(HAVE_AVX) || defined(HAVE_AVX2) || defined(HAVE_FMA) || defined(HAVE_SSE4_1))
+ // See https://en.wikipedia.org/wiki/CPUID.
+ #  define HAS_CPUID
+ #endif
+@@ -401,6 +402,20 @@
+ #  endif
+ #endif
+ 
++#if defined(__EMSCRIPTEN__)
++  // PDFx: a WebAssembly build has exactly the x86 subsets it was compiled for (-msimd128 plus
++  // -msse4.1 / -mavx / -mavx2, which Emscripten lowers to SIMD128); there is nothing to detect.
++#  if defined(HAVE_SSE4_1)
++  sse_available_ = true;
++#  endif
++#  if defined(HAVE_AVX)
++  avx_available_ = true;
++#  endif
++#  if defined(HAVE_AVX2)
++  avx2_available_ = true;
++#  endif
++#endif
++
+   // Select code for calculation of dot product based on autodetection.
+   if (false) {
+     // This is a dummy to support conditional compilation.

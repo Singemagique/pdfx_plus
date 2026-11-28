@@ -1,0 +1,4 @@
+# Prettier also honours .gitignore. Everything else it checks (`yarn format:check`) except:
+
+# The vendored, minified Emscripten glue of the Tesseract core (build/ocr-core): byte-pinned.
+vendor/
