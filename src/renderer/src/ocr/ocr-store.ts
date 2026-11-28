@@ -129,6 +129,11 @@ export interface OcrPageState {
   skip?: 'protected' | 'has-text' | 'ours' | 'blank'
   /** The page looks sideways: the extra clockwise turn it needs (§3.4.5). */
   rotateBy?: 90 | 180 | 270
+  /**
+   * `needs-language`: the languages the request asked for (the summary row names the missing ones
+   * and offers [Download], PR9).
+   */
+  langs?: readonly string[]
   /** Recognised text this page currently exports / searches (its choice, or its auto result). */
   hasText: boolean
   meanConfCal: number | null
@@ -209,6 +214,8 @@ interface PageRec {
     rotateBy?: 90 | 180 | 270
     /** The edit rotation the page had when `rotateBy` was measured (the request's). */
     editRotation?: 0 | 90 | 180 | 270
+    /** `needs-language`: the request's languages. */
+    langs?: readonly string[]
   }
   skip?: OcrPageState['skip']
   /** Crashes this page was in flight for (§3.3.2: two → failed, never retried). */
@@ -633,6 +640,7 @@ export function createOcrStore(opts: OcrStoreOptions): OcrStore {
       if (left) state.rotateBy = left
     }
     if (r.skip) state.skip = r.skip
+    if (r.last?.langs && state.status === 'needs-language') state.langs = r.last.langs
     return state
   }
 
@@ -647,7 +655,8 @@ export function createOcrStore(opts: OcrStoreOptions): OcrStore {
       a.meanConfCal === b.meanConfCal &&
       a.scan === b.scan &&
       a.removed === b.removed &&
-      a.triaged === b.triaged
+      a.triaged === b.triaged &&
+      (a.langs ?? []).join('+') === (b.langs ?? []).join('+')
     )
   }
 
@@ -1445,6 +1454,7 @@ export function createOcrStore(opts: OcrStoreOptions): OcrStore {
         r.last.rotateBy = page.rotateBy
         r.last.editRotation = w?.sentRotation ?? 0
       }
+      if (page.status === 'needs-language') r.last.langs = j.batch.config.langs
       if (page.status === 'skipped-protected') r.skip = 'protected'
       if (page.recognition && RECOGNISED.has(page.status)) {
         r.results.set(j.batch.config.hash, page.recognition)

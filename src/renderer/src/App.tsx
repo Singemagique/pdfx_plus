@@ -24,6 +24,7 @@ import { CloseIcon } from './components/icons'
 import type { FullViewNav } from './components/full-view/use-full-view-controls'
 import { OcrExportPrompt } from './components/OcrExportPrompt'
 import { createOcrStore } from './ocr/ocr-store'
+import { createLangPacks } from './ocr/lang-packs'
 import { createOcrFindSupply } from './ocr/ocr-find-supply'
 import { OcrUiProvider, type OcrActions, type OcrDialogRequest } from './ocr/OcrContext'
 import {
@@ -234,6 +235,10 @@ export default function App(): React.JSX.Element {
     })
   )
   const [ocrSupply] = useState(() => createOcrFindSupply({ store: ocrStore, text: find.text }))
+  // Downloadable languages (PR9): the list comes from main; nothing downloads without consent.
+  const [langPacks] = useState(() =>
+    createLangPacks(window.api.ocrLangs ?? null, (t) => window.api.writeClipboardText(t))
+  )
   const { ocrSelect, selectOcr, editLayer } = editStore
   // After useFind's own effects (declared above, so they run first): the engine knows the page
   // keys before anything is supplied for them.
@@ -296,8 +301,8 @@ export default function App(): React.JSX.Element {
     [ocrStore, flash, rotatePage]
   )
   const ocrValue = useMemo(
-    () => ({ store: ocrStore, supply: ocrSupply, actions: ocrActions }),
-    [ocrStore, ocrSupply, ocrActions]
+    () => ({ store: ocrStore, supply: ocrSupply, actions: ocrActions, langs: langPacks }),
+    [ocrStore, ocrSupply, ocrActions, langPacks]
   )
 
   /** The Document menu's commands (§3.8): the page in view, else the selected page. */

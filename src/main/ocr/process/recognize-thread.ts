@@ -22,6 +22,8 @@ const port = parentPort
 if (!port) throw new Error('recognize-thread must run in a worker_thread')
 
 let assets: EngineAssets | null = null
+/** `add-data` that arrived before `init` (the coordinator queues it behind init; belt and braces). */
+const early: Record<string, SharedArrayBuffer> = {}
 let factory: TessFactory | null = null
 let tess: Tess | null = null
 let tessKey = ''
@@ -48,8 +50,14 @@ async function engineFor(langs: readonly string[]): Promise<Tess> {
 }
 
 async function handle(msg: ToRecognize): Promise<void> {
+  if (msg.type === 'add-data') {
+    // Checked by the coordinator; checked again (gz and raw) when an engine is built from it.
+    if (assets) assets = { ...assets, data: { ...assets.data, ...msg.data } }
+    else Object.assign(early, msg.data)
+    return
+  }
   if (msg.type === 'init') {
-    assets = msg.engine
+    assets = { ...msg.engine, data: { ...msg.engine.data, ...early } }
     // SHA-checked here, in the realm that runs it, immediately before the require.
     factory = loadGlue(assets.coreDir)
     post({ type: 'ready', tripwire: tripwireCount(), selfCheckFailed: tripwireSelfCheck().failed })

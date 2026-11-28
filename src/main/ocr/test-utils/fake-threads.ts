@@ -167,6 +167,8 @@ export type RecognizeScript = (
 export class FakeRecognizer extends FakeWorker<ToRecognize, FromRecognize> {
   readonly jobs: RecognizeMsg[] = []
   initModule: EngineAssets | null = null
+  /** The languages each `add-data` message brought (PR9). */
+  readonly addedData: string[][] = []
   private readyHeld = false
 
   constructor(
@@ -182,6 +184,10 @@ export class FakeRecognizer extends FakeWorker<ToRecognize, FromRecognize> {
       this.initModule = msg.engine
       if (this.holdReady) this.readyHeld = true
       else this.sayReady()
+      return
+    }
+    if (msg.type === 'add-data') {
+      this.addedData.push(Object.keys(msg.data))
       return
     }
     this.jobs.push(msg)

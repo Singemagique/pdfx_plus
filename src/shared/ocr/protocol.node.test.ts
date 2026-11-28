@@ -344,6 +344,9 @@ describe('main ⇄ coordinator', () => {
       },
       { port: {} },
       { limits: { ...limits, onBattery: true, divisor: 4 } },
+      {
+        languages: { tessdata: { rus: `${dir}rus.traineddata.gz`, jpn: `${dir}jpn.traineddata` } }
+      },
       { heartbeat: {} },
       { shutdown: {} }
     ]
@@ -353,13 +356,27 @@ describe('main ⇄ coordinator', () => {
   it('rejects a relative or foreign init path and payload on the empty messages', () => {
     for (const p of ['pdfium.wasm', './pdfium.wasm', '/app/evil.wasm', '/app/pdfium.wasm\0'])
       rejects(() => parseMainToOcr({ init: { limits, paths: { pdfiumWasm: p, ...engine } } }))
-    // The engine paths: absolute, and each language only its own <lang>.traineddata.gz.
+    // The engine paths: absolute, and each language only its own <lang>.traineddata.gz or (PR9,
+    // Install from file… keeps a raw file that matched) <lang>.traineddata.
+    expect(
+      parseMainToOcr({
+        init: {
+          limits,
+          paths: {
+            pdfiumWasm: wasm,
+            ocrCore: engine.ocrCore,
+            tessdata: { eng: `${dir}eng.traineddata` }
+          }
+        }
+      })
+    ).toMatchObject({ init: { paths: { tessdata: { eng: `${dir}eng.traineddata` } } } })
     for (const tessdata of [
       { eng: 'eng.traineddata.gz' },
       { eng: `${dir}deu.traineddata.gz` },
       { eng: `${dir}xeng.traineddata.gz` },
       { 'e/g': `${dir}e/g.traineddata.gz` },
-      { eng: `${dir}eng.traineddata` }
+      { eng: `${dir}eng.traineddata.gz.part` },
+      { eng: `${dir}eng.gz` }
     ])
       rejects(() =>
         parseMainToOcr({

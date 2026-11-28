@@ -62,6 +62,12 @@ const THIRD_PARTY = [
 
 const ESCAPE_MEMBERS = new Set(['binding', '_linkedBinding', 'dlopen'])
 
+/**
+ * Data the process bundle compiles in from outside its folder (no code, so no import and nothing to
+ * scan): the downloadable-language catalogue, whose hashes the engine checks (PR9).
+ */
+const DATA_FILES = ['src/main/ocr/lang-manifest.json']
+
 /** `e` without the TypeScript wrappers that do not change its value: (e), e as T, <T>e, e!, e satisfies T. */
 function unwrap(e: ts.Expression): ts.Expression {
   for (;;) {
@@ -250,7 +256,8 @@ function bundleClosure(): { files: string[]; unresolved: string[] } {
       const hit = RESOLVE_SUFFIXES.map((s) => base + s).find(
         (p) => existsSync(p) && statSync(p).isFile()
       )
-      if (hit) queue.push(hit)
+      if (hit && hit.endsWith('.json')) seen.add(hit)
+      else if (hit) queue.push(hit)
       else unresolved.push(`${rel(file)} → ${spec}`)
     }
   }
@@ -260,11 +267,21 @@ function bundleClosure(): { files: string[]; unresolved: string[] } {
 describe('src/main/ocr/process/** source bans', () => {
   const closure = bundleClosure()
   // The folder (anything in it may be bundled later) plus whatever its bundles reach outside it.
-  const files = [...new Set([...sourceFiles(PROCESS_DIR), ...closure.files])]
+  const files = [...new Set([...sourceFiles(PROCESS_DIR), ...closure.files])].filter(
+    (f) => !f.endsWith('.json')
+  )
 
   it('covers the process and thread entries and the shared modules their bundles reach', () => {
     const names = files.map(rel)
     for (const e of [...ENTRIES, TRIPWIRE]) expect(names).toContain(e)
+    // Downloads are main's (lang-packs.ts, lang-host.ts): the process never bundles them.
+    expect(names.filter((n) => /\/lang-(packs|host)\.ts$/.test(n))).toEqual([])
+    // The only data from outside: the language catalogue (JSON, no code).
+    expect(closure.files.map(rel).filter((n) => n.endsWith('.json'))).toEqual(
+      expect.arrayContaining(DATA_FILES)
+    )
+    for (const n of closure.files.map(rel).filter((n) => n.endsWith('.json')))
+      expect(n.startsWith('src/shared/') || DATA_FILES.includes(n), n).toBe(true)
     // Not vacuous: the protocol (and the PR2 types it re-exports) run in the process too.
     expect(names).toContain('src/shared/ocr/protocol.ts')
     expect(names).toContain('src/shared/ocr/types.ts')
@@ -302,11 +319,13 @@ describe('src/main/ocr/process/** source bans', () => {
 
   it('stays inside its own folder and src/shared (no path back into main, preload or renderer)', () => {
     const allowed = [resolve(PROCESS_DIR), resolve(REPO_ROOT, 'src/shared')]
+    const data = DATA_FILES.map((d) => resolve(REPO_ROOT, d))
     const problems: string[] = []
     for (const file of files) {
       for (const spec of specifiers(readFileSync(file, 'utf8'), file)) {
         if (!spec.startsWith('.')) continue
         const target = resolve(dirname(file), spec.split('?')[0])
+        if (data.includes(target)) continue
         if (
           !allowed.some(
             (a) =>

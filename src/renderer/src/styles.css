@@ -2270,6 +2270,144 @@ button.ocr-chip:hover {
   color: var(--ink-faint);
 }
 
+/* PR9: with the Download group (31 languages) the list gets room for seven or eight rows, kept
+   short enough that the dialog still fits a 1080p window without its own scrollbar (which would
+   narrow the rows and wrap the names). */
+.ocr-picker-list.ocr-picker-list-tall {
+  max-height: min(32vh, 300px);
+}
+
+/* A language option: name and download size/host on one line, the CJK note under them. */
+.ocr-picker-list button[role='option'] {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+/* When the name and the size/host don't fit side by side (a narrow dialog), the size/host moves
+   under the name rather than the name wrapping. */
+.ocr-picker-row {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 1px 10px;
+}
+
+.ocr-picker-detail {
+  margin-left: auto;
+}
+
+.ocr-picker-note,
+.ocr-picker-detail {
+  color: var(--ink-soft);
+  font-size: 11.5px;
+}
+
+.ocr-picker-detail {
+  flex: none;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+/* A chosen language that isn't installed: marked, with its own [Download]. */
+.ocr-lang-chip.ocr-lang-chip-missing {
+  background: rgba(255, 196, 0, 0.12);
+  border-color: rgba(255, 196, 0, 0.55);
+}
+
+.ocr-lang-chip-note {
+  color: var(--ink-soft);
+}
+
+.ocr-lang-chip .ocr-lang-chip-download {
+  margin-left: 2px;
+  font-size: 12px;
+}
+
+.ocr-lang-missing {
+  color: var(--ink-soft);
+}
+
+/* The manual route in a download prompt: the file's address, Copy link, Install from file…. */
+.ocr-lang-manual {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.ocr-lang-url {
+  display: block;
+  padding: 6px 8px;
+  border: 1px solid var(--hairline);
+  border-radius: 6px;
+  background: var(--group-bg);
+  font-size: 11px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+  user-select: all;
+}
+
+.ocr-lang-manual-actions {
+  display: flex;
+  gap: 14px;
+}
+
+.ocr-picker-footer {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 4px 8px 0;
+  border-top: 1px solid var(--hairline);
+}
+
+.ocr-picker-footer .sign-link {
+  align-self: flex-start;
+  padding-top: 4px;
+}
+
+/* The consent / progress for one language download (picker and summary row). */
+.ocr-lang-prompt {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 4px;
+  font-size: 12.5px;
+}
+
+.ocr-lang-prompt-text {
+  margin: 0;
+  line-height: 1.45;
+}
+
+.ocr-lang-prompt-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.ocr-lang-progress {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--hairline);
+  overflow: hidden;
+}
+
+.ocr-lang-progress > div {
+  height: 100%;
+  background: var(--select);
+  transition: width 120ms linear;
+}
+
+.ocr-summary-prompt {
+  grid-column: 1 / -1;
+  margin-top: 4px;
+  padding: 6px;
+  border: 1px solid var(--hairline);
+  border-radius: 8px;
+  background: var(--group-bg);
+}
+
 .ocr-privacy {
   display: flex;
   flex-direction: column;

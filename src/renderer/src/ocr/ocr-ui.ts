@@ -4,6 +4,13 @@
 // summary popover can never disagree about which pages are "scanned and not recognised yet" or
 // which ones "need attention".
 
+import {
+  CJK_SCRIPTS,
+  langFileName,
+  type LangDownloadError,
+  type LangInstallResult,
+  type LangPackInfo
+} from '../../../shared/ocr/lang-packs'
 import { OCR_LIMITS } from '../../../shared/ocr/protocol'
 import { BUNDLED_LANGUAGES } from '../../../shared/settings'
 import { makePageKey } from '../edit/model'
@@ -45,7 +52,7 @@ export const ISSUE_COPY: Record<OcrIssueKind, string> = {
   'too-large': 'This page is too large for text recognition.',
   'user-unit': 'Unsupported page units',
   'image-format': 'This page’s image format isn’t supported for text recognition yet',
-  // The missing language is not reported per page yet; the Download action is PR9's.
+  // The generic row; the summary names the missing languages and offers [Download] (PR9).
   'needs-language': 'Needs language data that isn’t installed',
   timeout: 'Took too long and was skipped',
   oom: 'Couldn’t recognize (out of memory)',
@@ -406,10 +413,176 @@ const NATIVE: Record<string, [native: string, english: string]> = {
   spa: ['Español', 'Spanish']
 }
 
+/** Catalogue names main reported (lang-packs.ts registers them when the list arrives). */
+const CATALOGUE_NAMES = new Map<string, [native: string, english: string]>()
+
+/** Remember the catalogue's names, so chips and summary rows can name a downloaded language. */
+export function registerLangNames(
+  list: ReadonlyArray<Pick<LangPackInfo, 'code' | 'nativeName' | 'name'>>
+): void {
+  for (const l of list) CATALOGUE_NAMES.set(l.code, [l.nativeName, l.name])
+}
+
+const names = (code: string): [string, string] | undefined =>
+  Object.hasOwn(NATIVE, code) ? NATIVE[code] : CATALOGUE_NAMES.get(code)
+
 export function langLabel(code: string): string {
-  const n = NATIVE[code]
+  const n = names(code)
   if (!n) return code
   return n[0] === n[1] ? n[0] : `${n[0]} — ${n[1]}`
+}
+
+/** The English name ("Russian"), for sentences; the code when PDFx does not know it. */
+export function langName(code: string): string {
+  return names(code)?.[1] ?? code
+}
+
+/** Tesseract's CJK ceiling, said plainly (§3.2.5 "Quality labels"). */
+export const CJK_NOTE = '(printed text; photos may be less accurate)'
+
+/** "2.7 MB" (decimal megabytes, one decimal, as the design writes sizes). */
+export function formatSize(bytes: number): string {
+  const mb = bytes / 1_000_000
+  return `${mb < 0.1 ? mb.toFixed(2) : mb.toFixed(1)} MB`
+}
+
+/** A catalogue language as the picker lists it. */
+export interface LangOption extends LangInfo {
+  /** CJK: carries CJK_NOTE. */
+  cjk: boolean
+  /** Download group: "2.7 MB from cdn.jsdelivr.net". */
+  detail?: string
+}
+
+/** "Downloading… 10%" (a picker row while that language downloads). */
+export function downloadingCopy(progress: { received: number; total: number }): string {
+  const pct = progress.total > 0 ? Math.floor((100 * progress.received) / progress.total) : 0
+  return `Downloading… ${pct}%`
+}
+
+export function langOption(
+  p: LangPackInfo,
+  progress?: { received: number; total: number }
+): LangOption {
+  const label = p.nativeName === p.name ? p.name : `${p.nativeName} — ${p.name}`
+  const detail =
+    p.state === 'installed'
+      ? undefined
+      : progress
+        ? downloadingCopy(progress)
+        : `${formatSize(p.bytes)} from ${p.host}`
+  return { code: p.code, label, cjk: CJK_SCRIPTS.has(p.script), ...(detail ? { detail } : {}) }
+}
+
+/** The CJK quality note as a sentence, for the consent (§3.2.5 "Quality labels"). */
+export const CJK_CONSENT_NOTE = 'Works best on printed text; photos may be less accurate.'
+
+/** The consent asked before any request (§3.2.5 "Consent wording"). */
+export function consentCopy(
+  p: Pick<LangPackInfo, 'name' | 'bytes' | 'host'> & { script?: LangPackInfo['script'] }
+): string {
+  const base = `Download ${p.name} language data (${formatSize(p.bytes)}) from ${p.host}? It’s stored on this computer and used offline after that.`
+  return p.script && CJK_SCRIPTS.has(p.script) ? `${base} ${CJK_CONSENT_NOTE}` : base
+}
+
+/**
+ * The way round a download this computer can't make (offline, a proxy sign-in): which file, from
+ * where, and what to do with it. The address is the catalogue's (main's compiled list).
+ */
+export function manualCopy(p: Pick<LangPackInfo, 'code'>): string {
+  return `Or get ${langFileName(p.code)} on another computer from the address below, then use Install from file…`
+}
+
+/** §3.2.5 "Offline wording" / §3.8 "Errors". */
+export function offlineCopy(name: string): string {
+  return `Connect to the internet once to add ${name}, or choose a language that’s already installed.`
+}
+
+/** Install from file… refused a file (§3.2.5). */
+export const INSTALL_REFUSED =
+  'This file isn’t one of the language files PDFx knows. PDFx 1.1.4 only installs its own language files.'
+
+/** Install from file… refused a file, with nothing more specific to point at (the picker footer). */
+export const INSTALL_REFUSED_HINT =
+  'Each language has its own <code>.traineddata.gz file; when a download can’t finish, PDFx names the file and where to get it.'
+
+/** Download errors that get the manual route (the file, its address, Install from file…). */
+export const MANUAL_ROUTE_ERRORS: ReadonlySet<LangDownloadError> = new Set([
+  'offline',
+  'proxy-auth',
+  'timeout',
+  'http'
+])
+
+/** What a download that did not finish says (never a path, never a server message). */
+export function downloadErrorCopy(
+  error: LangDownloadError,
+  p: Pick<LangPackInfo, 'code' | 'name'>
+): string {
+  const name = p.name
+  switch (error) {
+    case 'offline':
+      return offlineCopy(name)
+    case 'timeout':
+      return `The download of ${name} language data stopped responding. Try again, or choose a language that’s already installed.`
+    case 'proxy-auth':
+      return `Your network’s proxy asks for a sign-in PDFx can’t give. Get ${langFileName(p.code)} on another computer from the address below, then use Install from file…`
+    case 'http':
+      return `The server couldn’t provide ${name} language data right now. Try again later.`
+    case 'verify':
+      return `The downloaded ${name} language data didn’t match what PDFx expects, so it was deleted. Try again.`
+    case 'disk':
+      return `PDFx couldn’t save ${name} language data on this computer (is the disk full?).`
+    case 'unknown-language':
+      return `PDFx doesn’t offer ${name} language data.`
+    case 'cancelled':
+      return 'Download stopped.'
+  }
+}
+
+/**
+ * What Install from file… says when it did not install (null: nothing to say). `forLang`: the
+ * language the user is getting (a download prompt), so a refusal names the file it needs.
+ */
+export function installErrorCopy(
+  r: LangInstallResult,
+  forLang?: Pick<LangPackInfo, 'code' | 'name'>
+): string | null {
+  if (r.ok || r.error === 'cancelled') return null
+  if (r.error === 'unreadable') return 'PDFx couldn’t read that file.'
+  if (r.error === 'disk') return 'PDFx couldn’t save the language data on this computer.'
+  const refused =
+    r.error === 'too-large' ? `${INSTALL_REFUSED} (It is 100 MB or larger.)` : INSTALL_REFUSED
+  const hint = forLang
+    ? `${forLang.name} needs ${langFileName(forLang.code)}, from the address above.`
+    : INSTALL_REFUSED_HINT
+  return `${refused} ${hint}`
+}
+
+/** The summary row for a page needing languages that aren't installed (§3.8 "Summary popover"). */
+export function needsLanguageCopy(missing: readonly string[]): string {
+  if (missing.length === 0) return ISSUE_COPY['needs-language']
+  const list = missing.map(langName)
+  const named = list.length === 1 ? list[0] : `${list.slice(0, -1).join(', ')} and ${list.at(-1)}`
+  return `Needs ${named} language data`
+}
+
+/** The dialog's warning for chosen languages that are neither bundled nor installed. */
+export function notInstalledCopy(missing: readonly string[]): string {
+  const list = missing.map(langName)
+  const named = list.length === 1 ? list[0] : `${list.slice(0, -1).join(', ')} and ${list.at(-1)}`
+  const which = list.length === 1 ? 'the language' : 'those languages'
+  return `${named} language data isn’t installed yet. Download it, or remove ${which}, before recognizing.`
+}
+
+/** The page's languages that are neither bundled nor installed. */
+export function missingLangs(
+  langs: readonly string[] | undefined,
+  installed: ReadonlySet<string>
+): string[] {
+  return (langs ?? []).filter(
+    (l) => !(BUNDLED_LANGUAGES as readonly string[]).includes(l) && !installed.has(l)
+  )
 }
 
 /** The Included group: the languages bundled with the app (D1). */

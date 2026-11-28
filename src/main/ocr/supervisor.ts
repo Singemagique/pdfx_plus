@@ -413,6 +413,15 @@ export class OcrSupervisor {
     this.disposed = true
   }
 
+  /**
+   * Languages main verified after the child started (PR9: a download, Install from file…, or the
+   * startup check of the installed files). A child that has not had its `init` yet gets them in it,
+   * since `init()` is read fresh then; a running one is told now. Paths only ever come from main.
+   */
+  setLanguages(tessdata: Record<string, string>): void {
+    if (this.gen?.alive && this.gen.ready) this.post({ languages: { tessdata } })
+  }
+
   /** Battery / thermal / speed-limit changes from powerMonitor. */
   setLimits(limits: Omit<OcrHostLimits, 'divisor'>): void {
     this.limits = limits

@@ -100,6 +100,11 @@ export interface EngineAssets {
 
 export type ToRecognize =
   | { type: 'init'; engine: EngineAssets }
+  /**
+   * More verified languages for a live thread (PR9: a download or Install from file… finished).
+   * Merged into its assets; an engine is only ever built for the languages a page asks for.
+   */
+  | { type: 'add-data'; data: Record<string, SharedArrayBuffer> }
   | {
       type: 'recognize'
       taskId: number
