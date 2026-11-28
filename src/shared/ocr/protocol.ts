@@ -24,26 +24,18 @@
 // DOM-free and Electron-free (src/shared), so the preload, main, the utility process and vitest
 // Node all import the same file.
 
+import type { OcrStatus, PageClass } from './types'
+
 export const OCR_PROTOCOL_VERSION = 1
 
 // ---------------------------------------------------------------------------------------------
-// Shared vocabulary.
-//
-// PageClass and PageStatus belong in src/shared/ocr/types.ts, which PR2 owns. They live here until
-// that file lands; PR2 moves them and this file re-exports them.
+// Shared vocabulary. The page class and status types belong to the result model (types.ts, §3.5.1);
+// this file re-exports them and adds the runtime list its validator needs.
 
-export type PageClass =
-  | 'scanned'
-  | 'near-scanned'
-  | 'ocr-ours'
-  | 'ocr-foreign'
-  | 'broken-text'
-  | 'mixed'
-  | 'text'
-  | 'blank'
-  | 'protected'
+export type { OcrStatus, PageClass }
 
-export const PAGE_STATUSES = [
+/** Every `OcrStatus`, for the validator. Checked against the type both ways (below). */
+export const OCR_STATUSES = [
   'ok',
   'low-confidence',
   'no-text',
@@ -53,8 +45,11 @@ export const PAGE_STATUSES = [
   'skipped-has-text',
   'skipped-protected',
   'needs-language'
-] as const
-export type PageStatus = (typeof PAGE_STATUSES)[number]
+] as const satisfies readonly OcrStatus[]
+// A status added to types.ts but not here fails to compile (the list must be complete).
+const _allStatuses: Exclude<OcrStatus, (typeof OCR_STATUSES)[number]> extends never ? true : never =
+  true
+void _allStatuses
 
 /** Why a page ended `failed`, `too-large` or `timeout` (machine-readable; the UI picks the copy). */
 export const PAGE_REASONS = [
@@ -169,7 +164,7 @@ export interface StubRecognition {
 }
 
 export interface PageResult {
-  status: PageStatus
+  status: OcrStatus
   reason?: PageReason
   /** The DPI the page was rasterised at (after the pixel caps), or null if it never rendered. */
   renderDpi: number | null
@@ -255,6 +250,12 @@ export interface TripwireCounts {
   raster: number
   recognize: number
 }
+
+/**
+ * The coordinator posts a heartbeat this often, busy or idle, from the moment it starts. Main's
+ * liveness check counts on it: a child that says nothing for several of these is hung (§3.3.2).
+ */
+export const OCR_HEARTBEAT_INTERVAL_MS = 5_000
 
 export interface Heartbeat {
   tripwire: TripwireCounts
@@ -510,7 +511,7 @@ const stubRecognition = object<StubRecognition>({
 
 const pageResult = object<PageResult>(
   {
-    status: oneOf(PAGE_STATUSES),
+    status: oneOf(OCR_STATUSES),
     renderDpi: (x, path) => (x === null ? null : num(0, 10_000, { minExclusive: true })(x, path)),
     raster: (x, path) =>
       x === null

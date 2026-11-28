@@ -9,21 +9,33 @@ import { EventEmitter } from 'node:events'
 import { PassThrough } from 'node:stream'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { OCR_HEARTBEAT_INTERVAL_MS } from '../../shared/ocr/protocol'
 import {
   BACKOFF_MS,
   ByteRing,
   GONE_GRACE_MS,
   IDLE_KILL_MS,
   LATE_GONE_MS,
+  LIVENESS_MS,
+  MAX_RESPAWNS,
   OcrSupervisor,
   RING_BYTES,
   SERVICE_NAME,
+  signedExitCode,
   type ChildLike,
   type ForkOptions,
   type ProcessGoneDetails,
   type SupervisorDeps,
   type WebContentsLike
 } from './supervisor'
+
+/**
+ * What kill() does. 'win32' (PR0): 'exit' 0 at once and no child-process-gone. 'linux' (PR0b): the
+ * process is reaped ~2 s later and 'exit' reports 0 (a crashed or OOM child included); any
+ * child-process-gone ('killed' 9/15, sometimes) is up to the test.
+ */
+type KillMode = 'win32' | 'linux'
+const LINUX_REAP_MS = 2_100
 
 class FakeChild extends EventEmitter implements ChildLike {
   pid: number | undefined
@@ -37,10 +49,17 @@ class FakeChild extends EventEmitter implements ChildLike {
   killCalls = 0
   /** Posts that reached this child after it exited (the alive flag must keep this at 0). */
   postsAfterExit = 0
+  /**
+   * The coordinator heartbeats every OCR_HEARTBEAT_INTERVAL_MS from its first moment; a hung child
+   * (PR0b Linux: state D after a crash or V8 OOM) says nothing at all.
+   */
+  responsive = true
+  private beat: ReturnType<typeof setInterval> | null = null
 
   constructor(
     readonly modulePath: string,
-    readonly options: ForkOptions
+    readonly options: ForkOptions,
+    readonly killMode: KillMode = 'win32'
   ) {
     super()
   }
@@ -51,6 +70,16 @@ class FakeChild extends EventEmitter implements ChildLike {
     this.spawned = true
     this.pid = 4242
     this.emit('spawn')
+    if (this.exited) return
+    this.beat = setInterval(() => {
+      if (this.responsive && !this.exited) this.say(HB)
+    }, OCR_HEARTBEAT_INTERVAL_MS)
+    ;(this.beat as { unref?: () => void }).unref?.()
+  }
+
+  /** Stop answering, without exiting (the Linux hang). */
+  hang(): void {
+    this.responsive = false
   }
 
   postMessage(msg: unknown, transfer?: unknown[]): void {
@@ -66,9 +95,12 @@ class FakeChild extends EventEmitter implements ChildLike {
     // Electron 38 UtilityProcessWrapper::Kill(): returns false and does nothing while pid_ is
     // still null, i.e. before the process launched ('spawn').
     if (!this.spawned || this.exited) return false
+    if (this.killed) return true
     this.killed = true
-    // Windows (PR0): our own kill() → 'exit' with code 0, and NO child-process-gone.
-    queueMicrotask(() => this.exit(0))
+    // Windows (PR0): our own kill() → 'exit' with code 0, and NO child-process-gone. Linux (PR0b):
+    // the same 0, about 2 s later.
+    if (this.killMode === 'win32') queueMicrotask(() => this.exit(0))
+    else setTimeout(() => this.exit(0), LINUX_REAP_MS)
     return true
   }
 
@@ -80,6 +112,8 @@ class FakeChild extends EventEmitter implements ChildLike {
   exit(code: number): void {
     if (this.exited) return
     this.exited = true
+    if (this.beat) clearInterval(this.beat)
+    this.beat = null
     this.emit('exit', code)
   }
 
@@ -172,7 +206,7 @@ const HB = {
 
 function setup(
   over: Partial<SupervisorDeps> = {},
-  { manualLaunch = false }: { manualLaunch?: boolean } = {}
+  { manualLaunch = false, killMode = 'win32' }: { manualLaunch?: boolean; killMode?: KillMode } = {}
 ): Ctx {
   const children: FakeChild[] = []
   let goneListener: (d: ProcessGoneDetails) => void = () => {}
@@ -194,7 +228,7 @@ function setup(
   }
   const deps: SupervisorDeps = {
     fork: (modulePath, _args, options) => {
-      const c = new FakeChild(modulePath, options)
+      const c = new FakeChild(modulePath, options, killMode)
       children.push(c)
       if (!manualLaunch) queueMicrotask(() => c.launch())
       return c
@@ -322,11 +356,28 @@ describe('spawning', () => {
     expect(ctx.priorities).toEqual([4242])
   })
 
-  it('passes no environment at all off Windows', async () => {
-    const ctx = setup({ platform: 'linux', env: { HOME: '/home/u', http_proxy: 'x' } })
-    const { child } = await connected(ctx)
-    expect(child.options.env).toEqual({})
-  })
+  // What WE pass. The child's real environment is more on these OSes (Electron adds
+  // DBUS_SESSION_BUS_ADDRESS on linux and __CF_USER_TEXT_ENCODING on darwin; PR0b), so these tests
+  // assert the fork options only, and nothing in the child reads its env (ocr-source-bans).
+  for (const [platform, extra] of [
+    ['linux', { DBUS_SESSION_BUS_ADDRESS: 'unix:path=/run/user/1000/bus' }],
+    ['darwin', { __CF_USER_TEXT_ENCODING: '0x1F5:0x0:0x0' }]
+  ] as const) {
+    it(`passes no environment at all on ${platform}, not even what Electron adds itself`, async () => {
+      const ctx = setup({
+        platform,
+        env: { HOME: '/home/u', http_proxy: 'x', SystemRoot: 'C:\\Windows', ...extra }
+      })
+      const { child } = await connected(ctx)
+      expect(child.options.env).toEqual({})
+      // A fresh object per fork: nothing the child (or Electron) does to one reaches the next.
+      child.options.env.LEAK = '1'
+      ctx.sup.teardown('test')
+      await vi.advanceTimersByTimeAsync(LINUX_REAP_MS)
+      await connected(ctx)
+      expect(ctx.children[1].options.env).toEqual({})
+    })
+  }
 
   it('sends init on ready, then a port; never posts before ready', async () => {
     const ctx = setup()
@@ -928,6 +979,239 @@ describe('the tripwire self-check', () => {
       failed: ['process.binding']
     })
     expect(ctx.logs.filter((l) => l.includes('self-check FAILED'))).toHaveLength(1)
+  })
+})
+
+describe('liveness: a hung child (PR0b, Linux: no exit, no child-process-gone)', () => {
+  it('a running child that goes silent is killed after LIVENESS_MS and treated as a crash', async () => {
+    const ctx = setup({}, { killMode: 'linux' })
+    const { wc, child } = await connected(ctx)
+    child.say({ activity: { busy: true, done: 1, total: 4 } })
+    child.hang()
+    await vi.advanceTimersByTimeAsync(LIVENESS_MS - 1)
+    expect(child.killCalls).toBe(0)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(child.killCalls).toBe(1)
+    expect(ctx.sup.lastExit).toMatchObject({ reason: 'hung', exitCode: -1 })
+    expect(ctx.logs.filter((l) => l.includes('hung'))).toHaveLength(1)
+    // Mid-batch: the blocker and the taskbar progress are released with it.
+    expect(ctx.blockers.stopped).toEqual([1])
+    expect(ctx.progress.at(-1)).toEqual({ wc: wc.id, frac: -1 })
+    // The renderer's crash/Resume path, and the crash backoff.
+    expect(wc.disconnects()).toEqual([{ reason: 'crashed' }])
+    expect(ctx.sup.state).toBe('backoff')
+    await vi.advanceTimersByTimeAsync(BACKOFF_MS[0])
+    expect(ctx.children).toHaveLength(2)
+    ctx.children[1].say(READY)
+    await tick()
+    expect(wc.ports).toHaveLength(2)
+    // Linux reaps the hung child ~2 s after kill() and reports exit 0, then (sometimes) 'killed'.
+    await vi.advanceTimersByTimeAsync(LINUX_REAP_MS)
+    expect(child.exited).toBe(true)
+    ctx.gone({ reason: 'killed', exitCode: 9 })
+    await vi.advanceTimersByTimeAsync(60_000)
+    // None of that is a second verdict, nor pinned on the healthy successor.
+    expect(ctx.sup.state).toBe('running')
+    expect(ctx.sup.lastExit).toMatchObject({ reason: 'hung' })
+    expect(wc.disconnects()).toEqual([{ reason: 'crashed' }])
+    expect(ctx.children).toHaveLength(2)
+    expect(ctx.children[1].orphanable).toBe(true)
+  })
+
+  it('any message resets the clock, busy or idle; silence alone counts', async () => {
+    const ctx = setup()
+    const { child } = await connected(ctx)
+    child.hang()
+    // No heartbeats, but activity every 4 s for a minute keeps it alive.
+    for (let t = 0; t < 60_000; t += 4_000) {
+      child.say({ activity: { busy: true, done: t / 4_000, total: 100 } })
+      await vi.advanceTimersByTimeAsync(4_000)
+    }
+    // Even a malformed message proves its event loop runs.
+    child.say({ nonsense: true })
+    await vi.advanceTimersByTimeAsync(LIVENESS_MS - 1)
+    expect(child.killCalls).toBe(0)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(child.killed).toBe(true)
+    expect(ctx.sup.lastExit).toMatchObject({ reason: 'hung' })
+  })
+
+  it('an idle, healthy child that keeps heartbeating is never killed as hung', async () => {
+    const ctx = setup()
+    const { child } = await connected(ctx)
+    await vi.advanceTimersByTimeAsync(IDLE_KILL_MS - 1)
+    expect(child.killCalls).toBe(0)
+    expect(ctx.sup.lastExit).toBeNull()
+  })
+
+  it('a child that hangs before its first message is hung too, and killed once it launches', async () => {
+    const ctx = setup({}, { manualLaunch: true })
+    const wc = new FakeWebContents()
+    ctx.sup.connect(wc)
+    await tick()
+    const first = ctx.children[0]
+    await vi.advanceTimersByTimeAsync(LIVENESS_MS)
+    // kill() before 'spawn' is a no-op in Electron 38; it is still classified and replaced.
+    expect(first.killCalls).toBe(1)
+    expect(ctx.sup.lastExit).toMatchObject({ reason: 'hung' })
+    expect(wc.disconnects()).toEqual([{ reason: 'crashed' }])
+    first.launch()
+    await tick()
+    expect(first.killed).toBe(true)
+    await vi.advanceTimersByTimeAsync(BACKOFF_MS[0])
+    expect(ctx.children).toHaveLength(2)
+  })
+
+  it('a child that launched but never says ready is hung', async () => {
+    const ctx = setup()
+    const wc = new FakeWebContents()
+    ctx.sup.connect(wc)
+    await tick()
+    ctx.children[0].hang()
+    await vi.advanceTimersByTimeAsync(LIVENESS_MS)
+    expect(ctx.children[0].killed).toBe(true)
+    expect(ctx.sup.lastExit).toMatchObject({ reason: 'hung' })
+  })
+
+  it('hangs count toward the 3-in-60-s respawn cap', async () => {
+    const ctx = setup()
+    const { wc } = await connected(ctx)
+    for (let i = 0; i <= MAX_RESPAWNS; i++) {
+      ctx.children.at(-1)!.hang()
+      await vi.advanceTimersByTimeAsync(LIVENESS_MS)
+      if (i < MAX_RESPAWNS) {
+        await vi.advanceTimersByTimeAsync(BACKOFF_MS[i])
+        ctx.children.at(-1)!.say(READY)
+        await tick()
+      }
+    }
+    expect(ctx.children).toHaveLength(MAX_RESPAWNS + 1)
+    expect(ctx.sup.state).toBe('crash-loop')
+    expect(wc.disconnects().at(-1)).toEqual({ reason: 'crash-loop' })
+  })
+
+  it('main stalling (the timer fires late) re-arms instead of killing a child it did not hear', async () => {
+    const ctx = setup()
+    const { child } = await connected(ctx)
+    child.hang()
+    await vi.advanceTimersByTimeAsync(LIVENESS_MS - 1_000)
+    // Main blocks for a minute: wall time moves, no timer runs, the child's messages queue up.
+    vi.setSystemTime(Date.now() + 60_000)
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(child.killCalls).toBe(0)
+    // The queued heartbeat is delivered once main runs again.
+    child.say(HB)
+    await vi.advanceTimersByTimeAsync(LIVENESS_MS - 1)
+    expect(child.killCalls).toBe(0)
+    // Silent for a whole window with main running: hung.
+    await vi.advanceTimersByTimeAsync(1)
+    expect(child.killCalls).toBe(1)
+  })
+
+  it('the window is injectable', async () => {
+    const ctx = setup({ livenessMs: 1_000 })
+    const { child } = await connected(ctx)
+    child.hang()
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(child.killed).toBe(true)
+  })
+})
+
+describe('Linux exits and kills (PR0b)', () => {
+  it("a 'killed' child-process-gone for a child we killed is not pinned on its successor", async () => {
+    const ctx = setup({}, { killMode: 'linux' })
+    const { wc, child } = await connected(ctx)
+    // Reload, then the renderer connects again at once: a new child comes up while the old one is
+    // still being reaped.
+    wc.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false })
+    ctx.sup.connect(wc)
+    await tick()
+    ctx.children[1].say(READY)
+    await tick()
+    await vi.advanceTimersByTimeAsync(LINUX_REAP_MS)
+    expect(child.exited).toBe(true)
+    ctx.gone({ reason: 'killed', exitCode: 9 })
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(ctx.sup.state).toBe('running')
+    expect(ctx.sup.lastExit).toBeNull()
+    expect(wc.disconnects()).toEqual([])
+    expect(ctx.children[1].orphanable).toBe(true)
+    expect(ctx.children[1].killCalls).toBe(0)
+  })
+
+  it("the same for 'killed' 15 arriving before the killed child's exit", async () => {
+    const ctx = setup({}, { killMode: 'linux' })
+    const { wc } = await connected(ctx)
+    const b = new FakeWebContents()
+    ctx.sup.connect(b) // owner change: kill the old child, start a new one
+    await tick()
+    ctx.children[1].say(READY)
+    await tick()
+    ctx.gone({ reason: 'killed', exitCode: 15 })
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(ctx.sup.state).toBe('running')
+    expect(b.disconnects()).toEqual([])
+    expect(wc.disconnects()).toEqual([])
+    expect(ctx.children[1].orphanable).toBe(true)
+  })
+
+  it('a gone event that never gets its exit: the child is killed as well as classified', async () => {
+    const ctx = setup({}, { killMode: 'linux' })
+    const { wc, child } = await connected(ctx)
+    ctx.gone({ reason: 'crashed', exitCode: 11 })
+    await vi.advanceTimersByTimeAsync(GONE_GRACE_MS)
+    expect(ctx.sup.lastExit).toMatchObject({ reason: 'crashed', exitCode: 11 })
+    expect(child.killCalls).toBe(1)
+    expect(wc.disconnects()).toEqual([{ reason: 'crashed' }])
+    await vi.advanceTimersByTimeAsync(BACKOFF_MS[0])
+    ctx.children[1].say(READY)
+    await tick()
+    // Its exit 0 (the reap) changes nothing.
+    await vi.advanceTimersByTimeAsync(LINUX_REAP_MS)
+    expect(ctx.sup.state).toBe('running')
+    expect(ctx.children.filter((c) => c.orphanable)).toEqual([ctx.children[1]])
+  })
+
+  it('a child that exits 0 by itself is still a crash (Linux exit codes do not tell)', async () => {
+    const ctx = setup({ platform: 'linux', env: {} })
+    const { wc, child } = await connected(ctx)
+    child.exit(0)
+    await vi.advanceTimersByTimeAsync(GONE_GRACE_MS)
+    expect(ctx.sup.lastExit).toMatchObject({ reason: 'clean-exit', exitCode: 0 })
+    expect(wc.disconnects()).toEqual([{ reason: 'crashed' }])
+    expect(ctx.sup.state).toBe('backoff')
+  })
+})
+
+describe('exit codes', () => {
+  it('maps unsigned exit codes back to signed', () => {
+    expect(signedExitCode(0)).toBe(0)
+    expect(signedExitCode(134)).toBe(134)
+    expect(signedExitCode(-36861)).toBe(-36861)
+    expect(signedExitCode(3221225477)).toBe(-1073741819) // 0xC0000005
+    expect(signedExitCode(0xffff7003)).toBe(-36861)
+    // Windows process.crash(): 'exit' reports the uint64 wrap of −36861 as a double (PR0b).
+    const wrapped = 18446744073709515000
+    expect(Math.abs(signedExitCode(wrapped) - -36861)).toBeLessThanOrEqual(1024)
+    expect(signedExitCode(NaN)).toBe(-1)
+  })
+
+  it('a bare Windows crash exit (no gone event) reports a signed code', async () => {
+    const ctx = setup()
+    const { child } = await connected(ctx)
+    child.exit(18446744073709515000)
+    await vi.advanceTimersByTimeAsync(GONE_GRACE_MS)
+    expect(ctx.sup.lastExit?.reason).toBe('abnormal-exit')
+    expect(ctx.sup.lastExit?.exitCode).toBe(-36864)
+  })
+
+  it("prefers child-process-gone's exact code over the 'exit' code", async () => {
+    const ctx = setup()
+    const { child } = await connected(ctx)
+    child.exit(18446744073709515000)
+    ctx.gone({ reason: 'crashed', exitCode: -36861 })
+    await tick()
+    expect(ctx.sup.lastExit).toMatchObject({ reason: 'crashed', exitCode: -36861 })
   })
 })
 

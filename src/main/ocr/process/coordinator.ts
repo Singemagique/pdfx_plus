@@ -16,7 +16,8 @@
 //         between documents once its heap passes 1.2 GB.
 // §3.3.4  Cancel drops queued pages and terminates busy recognize threads. Recognize watchdog →
 //         terminate, page `timeout`. A recognize trap/OOM → respawn, re-queue once, then `failed`;
-//         an OOM-shaped error halves n for the session. Raster: any fatal (RuntimeError, thread
+//         an OOM-shaped error, or ERR_WORKER_OUT_OF_MEMORY from the thread's V8 heap cap (budget.ts
+//         THREAD_RESOURCE_LIMITS), halves n for the session. Raster: any fatal (RuntimeError, thread
 //         error, watchdog) → respawn and re-queue once, then `failed`; "Cannot enlarge memory"
 //         during a render or no headroom → recycle and retry once, then `too-large`. A page queued
 //         behind a failure carries on.
@@ -39,8 +40,8 @@ import {
   type TripwireSelfCheck
 } from '../../../shared/ocr/protocol'
 import {
-  DEFAULT_BUDGETS,
   concurrency,
+  defaultBudgets,
   rasterWatchdogMs,
   recognizeWatchdogMs,
   type Budgets,
@@ -95,6 +96,8 @@ export interface CoordinatorDeps {
   selfCheck(): TripwireSelfCheck
   rss(): number
   exit(code: number): void
+  /** `process.platform` (PER_WORKER depends on it); tests pass another. */
+  platform?: string
   budgets?: Partial<Budgets>
 }
 
@@ -197,6 +200,20 @@ export function isOomShaped(name: string, message: string): boolean {
   )
 }
 
+/**
+ * A thread's 'error' event that is memory exhaustion: the V8 heap cap (`threadOptions`) gives
+ * ERR_WORKER_OUT_OF_MEMORY ("Worker terminated due to reaching memory limit: JS heap out of
+ * memory"); a WASM-side failure arrives OOM-shaped.
+ */
+export function isThreadOom(err: unknown): boolean {
+  const e = (err ?? {}) as { name?: unknown; message?: unknown; code?: unknown }
+  if (e.code === 'ERR_WORKER_OUT_OF_MEMORY') return true
+  return isOomShaped(
+    typeof e.name === 'string' ? e.name : 'Error',
+    typeof e.message === 'string' ? e.message : ''
+  )
+}
+
 export class Coordinator {
   private readonly b: Budgets
   private limits: OcrHostLimits = DEFAULT_LIMITS
@@ -237,10 +254,11 @@ export class Coordinator {
   private disposed = false
 
   constructor(private readonly deps: CoordinatorDeps) {
+    const base = defaultBudgets(deps.platform ?? process.platform)
     this.b = {
-      ...DEFAULT_BUDGETS,
+      ...base,
       ...deps.budgets,
-      raster: { ...DEFAULT_BUDGETS.raster, ...deps.budgets?.raster }
+      raster: { ...base.raster, ...deps.budgets?.raster }
     }
     deps.parent.on('message', (e) => this.guard(() => this.onParent(e.data, e.ports), false))
     this.heartbeatTimer = setInterval(() => this.postHeartbeat(), this.b.heartbeatIntervalMs)
@@ -695,6 +713,9 @@ export class Coordinator {
     }
     this.raster = slot
     worker.on('message', (m) => this.guard(() => this.onRaster(slot, m as FromRaster)))
+    // A V8 OOM under the heap cap (ERR_WORKER_OUT_OF_MEMORY) is a raster fatal like any other: the
+    // page is re-rendered once in a fresh thread, then `failed`. It does not halve n: n counts
+    // recognize threads, and this heap is the raster isolate's own.
     worker.on('error', () => this.guard(() => this.onRasterDeath(slot)))
     worker.on('exit', () => this.guard(() => this.onRasterDeath(slot)))
     void this.pdfiumModule.then(
@@ -948,10 +969,9 @@ export class Coordinator {
     }
     this.recognizers.push(slot)
     worker.on('message', (m) => this.guard(() => this.onRecognize(slot, m as FromRecognize)))
-    worker.on('error', (e) =>
-      this.guard(() => this.onRecognizeDeath(slot, e?.name ?? 'Error', e?.message ?? ''))
-    )
-    worker.on('exit', () => this.guard(() => this.onRecognizeDeath(slot, 'Exit', '')))
+    // A V8 OOM under the heap cap is an 'error' (ERR_WORKER_OUT_OF_MEMORY) and then an 'exit'.
+    worker.on('error', (e) => this.guard(() => this.onRecognizeDeath(slot, isThreadOom(e))))
+    worker.on('exit', () => this.guard(() => this.onRecognizeDeath(slot, false)))
     void this.engineModule.then(
       (engine) => {
         if (!slot.dead) worker.postMessage({ type: 'init', engine } satisfies ToRecognize)
@@ -1041,13 +1061,15 @@ export class Coordinator {
     this.pump()
   }
 
-  private onRecognizeDeath(slot: RecognizeSlot, name: string, message: string): void {
+  private onRecognizeDeath(slot: RecognizeSlot, oom: boolean): void {
     if (slot.dead) return
     if (!slot.ready) this.startFailures.recognize++
     const t = slot.task
     slot.task = null
     this.retireRecognizer(slot)
-    if (t) this.recognizeFailure(t, isOomShaped(name, message))
+    // A thread OOM: halve n for the session, re-queue the page once, then `failed`.
+    if (t) this.recognizeFailure(t, oom)
+    else if (oom) this.localDivisor *= 2
     this.pump()
   }
 

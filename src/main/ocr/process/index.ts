@@ -16,6 +16,7 @@ import { availableParallelism, totalmem } from 'node:os'
 import { Worker } from 'node:worker_threads'
 import rasterThreadPath from './raster-thread?modulePath'
 import recognizeThreadPath from './recognize-thread?modulePath'
+import { threadOptions } from './budget'
 import { Coordinator, type ParentLike, type WorkerLike } from './coordinator'
 import { STUB_ENGINE_WASM } from './stub-engine'
 
@@ -32,8 +33,9 @@ if (!parent) throw new Error('the OCR coordinator must run in an Electron utilit
 process.exitCode = 0
 
 function spawn(path: string): WorkerLike {
-  // stdout/stderr of the threads go to this process's pipes, which the supervisor drains.
-  return new Worker(path)
+  // stdout/stderr of the threads go to this process's pipes, which the supervisor drains. The heap
+  // caps turn a thread's V8 OOM into ERR_WORKER_OUT_OF_MEMORY instead of a dead or hung process.
+  return new Worker(path, threadOptions())
 }
 
 const availableMemory = (): number => {

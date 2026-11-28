@@ -7,9 +7,23 @@
 import { EventEmitter } from 'node:events'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import type { FromOcr, Heartbeat, PageResult } from '../../../shared/ocr/protocol'
-import { concurrency, recognizeWatchdogMs, rasterWatchdogMs } from './budget'
-import { Coordinator, isOomShaped } from './coordinator'
+import {
+  OCR_HEARTBEAT_INTERVAL_MS,
+  type FromOcr,
+  type Heartbeat,
+  type PageResult
+} from '../../../shared/ocr/protocol'
+import {
+  DEFAULT_BUDGETS,
+  THREAD_RESOURCE_LIMITS,
+  concurrency,
+  defaultBudgets,
+  perWorkerBudget,
+  rasterWatchdogMs,
+  recognizeWatchdogMs,
+  threadOptions
+} from './budget'
+import { Coordinator, isOomShaped, isThreadOom } from './coordinator'
 import {
   FakePort,
   FakeRaster,
@@ -121,6 +135,65 @@ describe('budgets', () => {
     expect(concurrency(sys, LIMITS, b, 4)).toBe(1)
     // PER_WORKER is injectable: a larger budget lowers n.
     expect(concurrency(sys, LIMITS, { ...b, perWorker: 2 * GiB })).toBe(1)
+  })
+
+  it('PER_WORKER is 256 MiB on win32 and 320 MiB on linux and darwin; BIG stays 384 MiB', () => {
+    const MiB = 2 ** 20
+    expect(perWorkerBudget('win32')).toBe(256 * MiB)
+    expect(perWorkerBudget('linux')).toBe(320 * MiB)
+    expect(perWorkerBudget('darwin')).toBe(320 * MiB)
+    // Unmeasured platforms get the conservative (larger) budget.
+    expect(perWorkerBudget('freebsd')).toBe(320 * MiB)
+    for (const p of ['win32', 'linux', 'darwin']) {
+      expect(defaultBudgets(p).perWorkerBig).toBe(384 * MiB)
+      expect(defaultBudgets(p).perWorker).toBe(perWorkerBudget(p))
+    }
+    expect(DEFAULT_BUDGETS.perWorker).toBe(perWorkerBudget(process.platform))
+    // What it changes: a 4 GiB machine runs 3 threads on Windows, 2 on Linux/macOS.
+    const sys = { totalmem: 4 * GiB, availableMemory: 2 * GiB, cpus: 8 }
+    expect(concurrency(sys, LIMITS, defaultBudgets('win32'))).toBe(3)
+    expect(concurrency(sys, LIMITS, defaultBudgets('linux'))).toBe(2)
+    expect(concurrency(sys, LIMITS, defaultBudgets('darwin'))).toBe(2)
+  })
+
+  it('the coordinator budgets for the platform it runs on', async () => {
+    for (const [platform, n] of [
+      ['win32', 3],
+      ['linux', 2],
+      ['darwin', 2]
+    ] as const) {
+      const h = harness()
+      const c = new Coordinator({
+        ...h.deps,
+        platform,
+        system: () => ({ totalmem: 4 * GiB, availableMemory: 2 * GiB, cpus: 8 })
+      })
+      live.push(c)
+      expect(c.snapshot().concurrency, platform).toBe(n)
+    }
+  })
+
+  it('every thread gets V8 heap caps (a thread OOM must not take the process down)', () => {
+    expect(THREAD_RESOURCE_LIMITS).toEqual({
+      maxOldGenerationSizeMb: 256,
+      maxYoungGenerationSizeMb: 48,
+      stackSizeMb: 4
+    })
+    const a = threadOptions()
+    expect(a).toEqual({ resourceLimits: THREAD_RESOURCE_LIMITS })
+    // A fresh object each time: nothing a caller does to one changes the next thread's caps.
+    a.resourceLimits.maxOldGenerationSizeMb = 1
+    expect(threadOptions().resourceLimits.maxOldGenerationSizeMb).toBe(256)
+    // The whole heap stays inside PER_WORKER_BIG, so a runaway thread fails before it eats the
+    // budget of the one big page.
+    const heapMb =
+      THREAD_RESOURCE_LIMITS.maxOldGenerationSizeMb +
+      THREAD_RESOURCE_LIMITS.maxYoungGenerationSizeMb
+    expect(heapMb * 2 ** 20).toBeLessThan(DEFAULT_BUDGETS.perWorkerBig)
+  })
+
+  it('heartbeats at the interval main checks liveness against', () => {
+    expect(DEFAULT_BUDGETS.heartbeatIntervalMs).toBe(OCR_HEARTBEAT_INTERVAL_MS)
   })
 
   it('sizes the watchdogs from the page area', () => {
@@ -602,6 +675,90 @@ describe('recognize failure policy (§3.3.4)', () => {
     await settle(80)
     expect(c.snapshot().concurrency).toBe(2)
     expect(results(port).every((r) => r.page.status === 'ok')).toBe(true)
+  })
+
+  /** What a thread under `threadOptions()` emits when its V8 heap cap is reached (Node 24, PR0b). */
+  const workerOom = (): Error =>
+    Object.assign(
+      new Error('Worker terminated due to reaching memory limit: JS heap out of memory'),
+      { code: 'ERR_WORKER_OUT_OF_MEMORY' }
+    )
+
+  it('a recognize thread OOM (ERR_WORKER_OUT_OF_MEMORY): halve n, re-queue once, then failed', async () => {
+    const { h, c, port } = await start({
+      threads: 4,
+      recognize: (m, t) => {
+        if (m.taskId === 1) {
+          t.crash(workerOom())
+          return 'hang'
+        }
+        return recognized(m, t)
+      }
+    })
+    expect(c.snapshot().concurrency).toBe(4)
+    await open(port, 's')
+    recognize(port, 'j', 's', [0, 1, 2])
+    await settle(120)
+    const byIndex = Object.fromEntries(results(port).map((r) => [r.index, r.page]))
+    // Task 1 (page 0) OOMs every time: re-rendered once, then failed. The others carry on.
+    expect(byIndex[0]).toMatchObject({ status: 'failed', reason: 'recognize-crash' })
+    expect(byIndex[1].status).toBe('ok')
+    expect(byIndex[2].status).toBe('ok')
+    expect(h.rasters[0].renders.filter((r) => r.index === 0)).toHaveLength(2)
+    // One OOM per attempt: 4 → 2 → 1. The process is still serving (no fatal to main).
+    expect(c.snapshot().concurrency).toBe(1)
+    expect(h.parent.of('fatal')).toEqual([])
+    expect(jobDone(port)).toEqual([{ jobId: 'j', done: 2, failed: 1, cancelled: false }])
+  })
+
+  it('a recognize thread OOM is recognised by its code, whatever the message says', async () => {
+    let first = true
+    const { c, port } = await start({
+      threads: 2,
+      recognize: (m, t) => {
+        if (first) {
+          first = false
+          t.crash(Object.assign(new Error('x'), { code: 'ERR_WORKER_OUT_OF_MEMORY' }))
+          return 'hang'
+        }
+        return recognized(m, t)
+      }
+    })
+    await open(port, 's')
+    recognize(port, 'j', 's', [0, 1])
+    await settle(120)
+    expect(c.snapshot().concurrency).toBe(1)
+    expect(results(port).every((r) => r.page.status === 'ok')).toBe(true)
+  })
+
+  it('a raster thread OOM is a raster fatal: re-rendered once, then failed; n is unchanged', async () => {
+    const { h, c, port } = await start({
+      threads: 2,
+      raster: (m, t) => {
+        if (m.index === 0) {
+          t.crash(workerOom())
+          return 'hang'
+        }
+        return rendered(m, t)
+      }
+    })
+    await open(port, 's')
+    recognize(port, 'j', 's', [0, 1])
+    await settle(150)
+    const byIndex = Object.fromEntries(results(port).map((r) => [r.index, r.page]))
+    expect(byIndex[0]).toMatchObject({ status: 'failed', reason: 'raster-crash' })
+    expect(byIndex[1].status).toBe('ok')
+    expect(h.rasters.length).toBeGreaterThanOrEqual(3)
+    expect(c.snapshot().concurrency).toBe(2)
+    expect(h.parent.of('fatal')).toEqual([])
+  })
+
+  it('recognises thread OOM errors', () => {
+    expect(isThreadOom(workerOom())).toBe(true)
+    expect(isThreadOom({ code: 'ERR_WORKER_OUT_OF_MEMORY' })).toBe(true)
+    expect(isThreadOom(new RangeError('Invalid array length'))).toBe(true)
+    expect(isThreadOom(new Error('thread crashed'))).toBe(false)
+    expect(isThreadOom(undefined)).toBe(false)
   })
 
   it('the watchdog terminates a stuck thread and marks the page timeout', async () => {

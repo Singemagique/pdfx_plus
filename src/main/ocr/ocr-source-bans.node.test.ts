@@ -10,6 +10,9 @@
 // reach the network, or a realm without the tripwire, with no import at all. And the third-party
 // code bundled into these threads (the PDFium glue; PR5 adds the Tesseract glue to THIRD_PARTY) is
 // scanned for the same, since our rules do not apply to it at build time.
+//
+// Two robustness rules from PR0b ride along: every thread is started with the V8 heap caps
+// (`threadOptions()`), and nothing in the process reads its environment (which Electron extends).
 
 import { readdirSync, readFileSync } from 'node:fs'
 import { dirname, join, relative, resolve } from 'node:path'
@@ -85,6 +88,74 @@ function escapeHatches(source: string, file: string): string[] {
       )
         at(n, 'Worker eval')
     }
+    ts.forEachChild(n, visit)
+  }
+  visit(sf)
+  return out
+}
+
+/**
+ * `new …Worker(…)` calls whose options are not `threadOptions()` (budget.ts): every thread of the
+ * utility process needs the V8 heap caps, or one thread's OOM kills (Windows) or hangs (Linux) the
+ * whole process (PR0b §f). Returns `line:column` entries.
+ */
+function workersWithoutHeapCaps(source: string, file: string): string[] {
+  const sf = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true)
+  const out: string[] = []
+  const visit = (n: ts.Node): void => {
+    if (ts.isNewExpression(n) && /(^|\.)Worker$/.test(n.expression.getText(sf))) {
+      const options = n.arguments?.[1]
+      const capped =
+        !!options &&
+        ts.isCallExpression(options) &&
+        options.expression.getText(sf) === 'threadOptions' &&
+        options.arguments.length === 0
+      if (!capped) {
+        const { line, character } = sf.getLineAndCharacterOfPosition(n.getStart(sf))
+        out.push(`${line + 1}:${character + 1}`)
+      }
+    }
+    ts.forEachChild(n, visit)
+  }
+  visit(sf)
+  return out
+}
+
+/**
+ * Reads of the process environment (`process.env`, dotted or bracketed). The child's env is not
+ * ours to know: we pass SystemRoot on win32 only, and Electron adds DBUS_SESSION_BUS_ADDRESS on
+ * linux and __CF_USER_TEXT_ENCODING on darwin (PR0b), so nothing in the process may depend on it.
+ */
+function envReads(source: string, file: string): string[] {
+  const sf = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true)
+  const out: string[] = []
+  const at = (n: ts.Node): void => {
+    const { line, character } = sf.getLineAndCharacterOfPosition(n.getStart(sf))
+    out.push(`${line + 1}:${character + 1}`)
+  }
+  const visit = (n: ts.Node): void => {
+    if (
+      (ts.isPropertyAccessExpression(n) || ts.isElementAccessExpression(n)) &&
+      ts.isIdentifier(n.expression) &&
+      n.expression.text === 'process'
+    ) {
+      const member = ts.isPropertyAccessExpression(n)
+        ? n.name.text
+        : ts.isStringLiteralLike(n.argumentExpression)
+          ? n.argumentExpression.text
+          : null
+      if (member === 'env') at(n)
+    }
+    // const { env } = process
+    if (
+      ts.isVariableDeclaration(n) &&
+      n.initializer &&
+      ts.isIdentifier(n.initializer) &&
+      n.initializer.text === 'process' &&
+      ts.isObjectBindingPattern(n.name) &&
+      n.name.elements.some((e) => (e.propertyName ?? e.name).getText(sf) === 'env')
+    )
+      at(n)
     ts.forEachChild(n, visit)
   }
   visit(sf)
@@ -213,6 +284,39 @@ describe('src/main/ocr/process/** source bans', () => {
     // The scan is not vacuous: it does find what it bans.
     const sample = "x = process.binding('tcp_wrap'); require('node:http'); new W(c, { eval: !0 })"
     expect(banned.flatMap((re) => [...sample.matchAll(re)].map((m) => m[0]))).toHaveLength(3)
+  })
+
+  it('starts every thread with the V8 heap caps (threadOptions)', () => {
+    const problems: string[] = []
+    let workers = 0
+    for (const file of files) {
+      const r = rel(file)
+      if (r === TRIPWIRE) continue
+      const src = readFileSync(file, 'utf8')
+      workers += (src.match(/new Worker\(/g) ?? []).length
+      for (const p of workersWithoutHeapCaps(src, r)) problems.push(`${r}:${p}`)
+    }
+    expect(problems).toEqual([])
+    // Not vacuous: the process does start its threads somewhere in here.
+    expect(workers).toBeGreaterThan(0)
+    const scan = (s: string): number => workersWithoutHeapCaps(s, 'x.ts').length
+    expect(scan('new Worker(path, threadOptions())')).toBe(0)
+    expect(scan('new Worker(path)')).toBe(1)
+    expect(scan('new wt.Worker(path, { resourceLimits: {} })')).toBe(1)
+    expect(scan('new Worker(path, threadOptions(other))')).toBe(1)
+  })
+
+  it("never reads the process environment (Electron adds its own variables to the child's)", () => {
+    const problems: string[] = []
+    for (const file of files) {
+      const r = rel(file)
+      for (const p of envReads(readFileSync(file, 'utf8'), r)) problems.push(`${r}:${p}`)
+    }
+    expect(problems).toEqual([])
+    expect(envReads('const a = process.env.HOME', 'x.ts')).toHaveLength(1)
+    expect(envReads("const a = process['env']", 'x.ts')).toHaveLength(1)
+    expect(envReads('const { env } = process', 'x.ts')).toHaveLength(1)
+    expect(envReads('const { platform } = process', 'x.ts')).toHaveLength(0)
   })
 
   it('makes the tripwire the first import of every process and thread entry', () => {

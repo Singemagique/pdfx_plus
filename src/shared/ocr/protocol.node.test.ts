@@ -4,7 +4,9 @@
 
 import { describe, expect, it } from 'vitest'
 
+import type { OcrStatus } from './types'
 import {
+  OCR_STATUSES,
   OcrError,
   parseFromOcr,
   parseMainToOcr,
@@ -205,6 +207,26 @@ describe('parseFromOcr (coordinator → renderer)', () => {
       { error: { code: 'not-open', message: 'no such source', src: 's1' } }
     ]
     for (const m of good) expect(parseFromOcr(m)).toEqual(m)
+  })
+
+  it("accepts every OcrStatus of the result model (types.ts) and nothing PR2's model lacks", () => {
+    // The type-level half (a status missing from the list fails to compile) is in protocol.ts.
+    const all: OcrStatus[] = [
+      'ok',
+      'low-confidence',
+      'no-text',
+      'timeout',
+      'failed',
+      'too-large',
+      'skipped-has-text',
+      'skipped-protected',
+      'needs-language'
+    ]
+    expect([...OCR_STATUSES].sort()).toEqual([...all].sort())
+    for (const status of OCR_STATUSES)
+      expect(
+        parseFromOcr({ result: { jobId: 'j1', src: 's1', index: 0, page: { ...result, status } } })
+      ).toMatchObject({ result: { page: { status } } })
   })
 
   it('rejects unknown statuses, reasons and error codes', () => {

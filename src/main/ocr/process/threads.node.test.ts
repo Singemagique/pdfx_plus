@@ -12,7 +12,8 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { PDFDocument, degrees, rgb } from 'pdf-lib'
 
 import type { FromOcr, Heartbeat, PageResult } from '../../../shared/ocr/protocol'
-import { Coordinator } from './coordinator'
+import { THREAD_RESOURCE_LIMITS, threadOptions } from './budget'
+import { Coordinator, isThreadOom } from './coordinator'
 import { DEFAULT_RASTER_LIMITS } from './raster-core'
 import { STUB_ENGINE_WASM } from './stub-engine'
 import type { FromRaster, ToRaster } from './thread-messages'
@@ -54,8 +55,9 @@ beforeAll(async () => {
   parent = new FakeParent()
   coordinator = new Coordinator({
     parent,
-    spawnRaster: () => new Worker(raster.file),
-    spawnRecognize: () => new Worker(recognize.file),
+    // The production heap caps: the real threads must work under them.
+    spawnRaster: () => new Worker(raster.file, threadOptions()),
+    spawnRecognize: () => new Worker(recognize.file, threadOptions()),
     loadPdfium: async () => WebAssembly.compile(await readFile(PDFIUM_WASM_PATH)),
     loadEngine: async () => WebAssembly.compile(STUB_ENGINE_WASM),
     system: () => ({
@@ -243,5 +245,59 @@ describe('the raster thread entry itself (PDFium shimmed)', () => {
       taskId: 2,
       error: 'raster module poisoned'
     })
+  }, 30_000)
+})
+
+describe('the thread heap caps (budget.ts threadOptions, PR0b §f)', () => {
+  // Real worker_threads with the production options. The code strings are test-only threads
+  // (`eval: true` is banned in the shipped sources, not here).
+  function run(code: string): Promise<{ message?: unknown; error?: Error; exit: number }> {
+    return new Promise((resolve) => {
+      const w = new Worker(code, { eval: true, ...threadOptions() })
+      let message: unknown
+      let error: Error | undefined
+      w.on('message', (m) => (message = m))
+      w.on('error', (e) => (error = e))
+      w.on('exit', (exit) => resolve({ message, error, exit }))
+    })
+  }
+
+  it('applies them: the thread sees a heap limit of old + young', async () => {
+    const r = await run(
+      "const v = require('v8'); require('worker_threads').parentPort.postMessage(v.getHeapStatistics().heap_size_limit); process.exit(0)"
+    )
+    const limitMb = (r.message as number) / 2 ** 20
+    expect(limitMb).toBe(
+      THREAD_RESOURCE_LIMITS.maxOldGenerationSizeMb +
+        THREAD_RESOURCE_LIMITS.maxYoungGenerationSizeMb
+    )
+  })
+
+  it('a JS-heap runaway is ERR_WORKER_OUT_OF_MEMORY, a thread OOM to the coordinator; this process lives', async () => {
+    const r = await run('const a = []; for (;;) a.push({ x: new Array(64).fill(Math.random()) })')
+    expect(r.error).toMatchObject({ code: 'ERR_WORKER_OUT_OF_MEMORY' })
+    expect(isThreadOom(r.error)).toBe(true)
+    expect(r.exit).toBe(1)
+    // The parent (here: vitest; in production: the utility process) carries on.
+    const again = await run("require('worker_threads').parentPort.postMessage('alive')")
+    expect(again.message).toBe('alive')
+  }, 30_000)
+
+  it('does not cap the WASM memories or buffers the engines need (they live outside the V8 heap)', async () => {
+    // 512 MiB of WASM memory (more than the whole heap cap) plus 256 MiB of ArrayBuffers, and a
+    // 20,000-frame recursion on the default 4 MB stack.
+    const r = await run(
+      [
+        'const keep = []',
+        'for (let i = 0; i < 2; i++) { const b = new ArrayBuffer(128 * 2 ** 20); new Uint8Array(b).fill(1); keep.push(b) }',
+        'const m = new WebAssembly.Memory({ initial: 8192 })',
+        'new Uint8Array(m.buffer).fill(2)',
+        'const depth = (n) => (n ? 1 + depth(n - 1) : 0)',
+        "require('worker_threads').parentPort.postMessage({ wasmMb: m.buffer.byteLength / 2 ** 20, buffers: keep.length, depth: depth(20000) })",
+        'process.exit(0)'
+      ].join('\n')
+    )
+    expect(r.error).toBeUndefined()
+    expect(r.message).toEqual({ wasmMb: 512, buffers: 2, depth: 20000 })
   }, 30_000)
 })
