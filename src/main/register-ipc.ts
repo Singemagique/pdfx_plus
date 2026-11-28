@@ -1,4 +1,4 @@
-import { ipcMain, dialog, clipboard } from 'electron'
+import { app, ipcMain, dialog, clipboard } from 'electron'
 import { basename, isAbsolute } from 'path'
 import { writeFile } from 'fs/promises'
 import { markupToPdf } from './markup'
@@ -18,8 +18,16 @@ import {
 import { clipboardFilePaths } from './clipboard'
 import { readResource } from './resource'
 import { getMainWindow, setRendererReady, sendOpenPaths } from './window'
+import { SettingsStore, type Settings } from './settings'
 
 const MAX_WRITE_BYTES = 1024 * 1024 * 1024 // 1 GiB cap on a single IPC write
+
+// Created on first use, after index.ts has applied the PDFX_USER_DATA override to userData.
+let settingsStore: SettingsStore | null = null
+function settings(): SettingsStore {
+  settingsStore ??= new SettingsStore(app.getPath('userData'), app.getLocale())
+  return settingsStore
+}
 
 /** Push a short user-facing message to the renderer's toast. No window → nothing to tell. */
 function sendNotice(message: string): void {
@@ -377,4 +385,12 @@ export function registerIpc(getPending: () => string[], clearPending: () => void
     if (result.canceled) return []
     return readFilesNotifying(result.filePaths)
   })
+
+  // App settings (userData/settings.json). The patch is schema-checked in main: unknown keys and
+  // invalid values are refused, never written (DESIGN.md §3.5.2).
+  ipcMain.handle('pdfx:settings-get', (): Promise<Settings> => settings().get())
+  ipcMain.handle(
+    'pdfx:settings-set',
+    (_event, patch: unknown): Promise<Settings> => settings().set(patch)
+  )
 }
