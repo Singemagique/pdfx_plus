@@ -8,7 +8,10 @@
 // drop that §3.7.3 rule 2 prescribes when the removed-object extent is unknown: a page with ANY
 // redaction overlay, or with ANY entry in the redaction pass's removed report, gets no OCR layer
 // at all. The font tables are built only from what is baked (ocr-font.ts `finalize`), so such a
-// page's characters cannot survive in a ToUnicode CMap either.
+// page's characters cannot survive in a ToUnicode CMap either. A layer the SOURCE already carries
+// (a reopened PDFx export) goes the same way on a redacted page: the redaction pass removes all of
+// its text and unbinds its font (redact-export.ts), and every baked page has its own font
+// (build.ts), so no other page's font holds the redacted page's characters.
 
 import type { Overlay } from '../edit/model'
 import { bcp47FromTesseract } from '../../../shared/ocr/lang'
@@ -50,22 +53,33 @@ export function ocrAllowed(
 }
 
 /**
+ * What an export does with a PDFx OCR layer a SOURCE page already carries (a reopened PDFx export,
+ * `ocr-ours` in §3.7.6): `keep` it (it is then marked machine-generated like a new one) or `drop`
+ * it. `drop` is what "Include Recognized Text When Exporting" off and an unticked Sign box mean:
+ * the output carries no machine text at all (D7). A redacted page loses its layer either way (the
+ * redaction pass, redact-export.ts).
+ */
+export type OcrPassthrough = 'keep' | 'drop'
+
+/**
  * A COPY of `editLayer` carrying the recognised pages an export may bake (`ocr`), like
  * `withSignatureAppearance`: EditProvider's memoised `editLayer` never changes because of OCR.
  * Pages that `ocrAllowed` refuses, and pages without words, are left out; with nothing left (or
- * `ocr` undefined: the setting or the Sign checkbox is off) the copy has no `ocr` at all, whatever
- * `editLayer` carried.
+ * `ocr` undefined: no results, or the setting or the Sign checkbox is off) the copy has no `ocr`
+ * at all, whatever `editLayer` carried. `include` is that setting or checkbox: it decides whether
+ * layers already in the sources are kept (`ocrPassthrough`).
  */
 export function withOcrLayer(
   editLayer: EditLayer,
   ocr: ReadonlyMap<string, PackedOcrPage> | undefined,
-  removed?: RemovedReport
+  opts: { include: boolean; removed?: RemovedReport }
 ): EditLayer {
-  const { ocr: _previous, ...base } = editLayer
-  if (!ocr) return base
+  const { ocr: _previous, ...rest } = editLayer
+  const base: EditLayer = { ...rest, ocrPassthrough: opts.include ? 'keep' : 'drop' }
+  if (!ocr || !opts.include) return base
   const kept = new Map<string, PackedOcrPage>()
   for (const [key, page] of ocr)
-    if (wordCount(page) > 0 && ocrAllowed(editLayer, key, removed)) kept.set(key, page)
+    if (wordCount(page) > 0 && ocrAllowed(editLayer, key, opts.removed)) kept.set(key, page)
   return kept.size ? { ...base, ocr: kept } : base
 }
 

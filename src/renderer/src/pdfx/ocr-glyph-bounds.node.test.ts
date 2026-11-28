@@ -209,13 +209,14 @@ describe.each(BBOXES)('FontBBox %s', (bbox) => {
     }
   )
 
-  it('KNOWN GAP for PR3b: after redactPdf the document-wide OCR ToUnicode still maps "word"', async () => {
-    // redactPdf removes the word's text objects, but the OCR font is ONE document-wide Type0 whose
-    // ToUnicode, /W and CIDToGIDMap were written for every character baked (OcrFontCache), and a
-    // PDFium pass cannot trim them. "w", "o" and "d" occur only in "word", so this violates
-    // §3.7.3 rule 5 on the "re-redacting a reopened OCR'd PDF" fixture. PR3b's 1.1.4 redaction
-    // path must rebuild or trim the PDFxOCR-GlyphLess tables from the CIDs still shown (or drop
-    // and re-bake the layer); when it does, these expectations flip to `not.toContain`.
+  it('per-word redactPdf leaves the OCR ToUnicode mapping "word" (why the export passes dropOcrText)', async () => {
+    // Per-word removal takes the word's text objects, but the page's OCR font keeps the ToUnicode,
+    // /W and CIDToGIDMap written for every character baked (OcrFontCache), and a PDFium pass
+    // cannot trim them. "w", "o" and "d" occur only in "word", so this alone would violate §3.7.3
+    // rule 5 on the "re-redacting a reopened OCR'd PDF" fixture. The export's redaction pass
+    // (redact-export.ts) therefore passes `dropOcrText`, which removes the page's whole OCR layer
+    // and with it the font (ocr-export.node.test.ts "a reopened OCR'd export"). A finer rule (trim
+    // the tables to the CIDs still shown, or drop and re-bake) is PR3b's to choose.
     const baked = await bakeLayer(blank, [PAGE], { ttf: VARIANTS['zero-area'], bbox })
     const out = redactPdf(pdfium, baked.bytes, [{ pageIndex: 0, rects: [X_HEIGHT_BOX] }])
     expect(pdfiumProbe(pdfium, out).text).not.toContain('word')

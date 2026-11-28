@@ -3,7 +3,9 @@ import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { useExport } from './useExport'
-import { makePageKey, type Overlay } from '../edit/model'
+import { makePageKey, type Overlay, type SignaturePlacement } from '../edit/model'
+import { buildRedactedSources } from '../pdfx/redact-export'
+import { withSignatureAppearance } from '../pdfx/signature-appearance'
 import type { EditLayer } from '../pdfx/build'
 import { buildPdf, buildPdfx } from '../pdfx/format'
 import type { OcrExportSource } from '../ocr/export-source'
@@ -84,6 +86,8 @@ let container: HTMLDivElement
 let chooseSavePath: ReturnType<typeof vi.fn>
 let writeFile: ReturnType<typeof vi.fn>
 let signPdf: ReturnType<typeof vi.fn>
+let signPdfWithCard: ReturnType<typeof vi.fn>
+let signPdfWithWindowsCert: ReturnType<typeof vi.fn>
 
 beforeEach(() => {
   vi.clearAllMocks()
@@ -93,8 +97,18 @@ beforeEach(() => {
   chooseSavePath = vi.fn(async (defaultName: string) => `/out/${defaultName}`)
   writeFile = vi.fn(async (path: string) => path.split('/').pop())
   signPdf = vi.fn(async () => new Uint8Array([4]))
+  signPdfWithCard = vi.fn(async () => new Uint8Array([5]))
+  signPdfWithWindowsCert = vi.fn(async () => new Uint8Array([6]))
   Object.defineProperty(window, 'api', {
-    value: { chooseSavePath, writeFile, signPdf },
+    value: {
+      chooseSavePath,
+      writeFile,
+      signPdf,
+      signPdfWithCard,
+      signPdfWithWindowsCert,
+      p12CertInfo: vi.fn(async () => null),
+      cardCertInfo: vi.fn(async () => null)
+    },
     configurable: true,
     writable: true
   })
@@ -105,10 +119,15 @@ afterEach(async () => {
   container.remove()
 })
 
+type Api = ReturnType<typeof useExport>
 interface Exports {
   exportCollection: (kind: 'pdfx' | 'pdf') => Promise<void>
   exportZip: () => Promise<void>
-  signAndExport: ReturnType<typeof useExport>['signAndExport']
+  signAndExport: Api['signAndExport']
+  signWithCardAndExport: Api['signWithCardAndExport']
+  signWithWindowsCertAndExport: Api['signWithWindowsCertAndExport']
+  /** Render the same mounted hook again with a new collection / edit layer (no new handles). */
+  rerender: (docs: DocEntry[], edits: EditLayer) => Promise<void>
 }
 
 /** Mount useExport in a throwaway component and hand back its save and sign entry points. */
@@ -117,23 +136,29 @@ async function mountExport(
   edits: EditLayer,
   setBusy: (busy: boolean) => void,
   flash: (message: string) => void,
-  ocr?: OcrExportSource
+  ocr?: OcrExportSource,
+  placement: SignaturePlacement | null = null
 ): Promise<Exports> {
-  let captured: Exports | null = null
-  const Harness = (): null => {
-    const api = useExport(docs, edits, setBusy, flash, null, null, ocr)
-    captured = {
+  let captured: Omit<Exports, 'rerender'> | null = null
+  const Harness = (props: { docs: DocEntry[]; edits: EditLayer }): null => {
+    const api = useExport(props.docs, props.edits, setBusy, flash, placement, null, ocr)
+    // The FIRST render's handles: what a click made before a later render would call.
+    captured ??= {
       exportCollection: api.exportCollection,
       exportZip: api.exportZip,
-      signAndExport: api.signAndExport
+      signAndExport: api.signAndExport,
+      signWithCardAndExport: api.signWithCardAndExport,
+      signWithWindowsCertAndExport: api.signWithWindowsCertAndExport
     }
     return null
   }
-  await act(async () => {
-    root.render(createElement(Harness))
-  })
+  const render = async (d: DocEntry[], e: EditLayer): Promise<void> =>
+    act(async () => {
+      root.render(createElement(Harness, { docs: d, edits: e }))
+    })
+  await render(docs, edits)
   if (!captured) throw new Error('useExport never produced its handles')
-  return captured
+  return { ...(captured as Omit<Exports, 'rerender'>), rerender: render }
 }
 
 /** A page carrying one highlight under a redaction and, optionally, more of the same. */
@@ -273,6 +298,8 @@ describe('every save path shares the same shell', () => {
       })
       const built = builtLayer(name)
       expect(built.ocr?.get(KEY)).toBe(OCR_PAGE)
+      // Layers a reopened source already carries are kept (and marked) too.
+      expect(built.ocrPassthrough).toBe('keep')
       // A copy: EditProvider's memoised layer never gains an `ocr`.
       expect(built).not.toBe(edits)
       expect(edits.ocr).toBeUndefined()
@@ -289,6 +316,8 @@ describe('every save path shares the same shell', () => {
         await run(handles)
       })
       expect(builtLayer(name).ocr).toBeUndefined()
+      // ...and the layers a reopened source already carries are dropped (D7).
+      expect(builtLayer(name).ocrPassthrough).toBe('drop')
       // Not asked mid-job either (§3.8 "Export mid-job").
       expect(ocr.flushOrConfirm).not.toHaveBeenCalled()
       expect(ocr.snapshotFor).not.toHaveBeenCalled()
@@ -302,6 +331,8 @@ describe('every save path shares the same shell', () => {
       await handles.signAndExport(CERT, { passphrase: 'pw' })
     })
     expect(builtLayer('sign').ocr).toBeUndefined()
+    // The signature never covers machine text unasked, a source's own PDFx layer included.
+    expect(builtLayer('sign').ocrPassthrough).toBe('drop')
     expect(ocr.flushOrConfirm).not.toHaveBeenCalled()
     expect(ocr.snapshotFor).not.toHaveBeenCalled()
   })
@@ -313,6 +344,7 @@ describe('every save path shares the same shell', () => {
       await handles.signAndExport(CERT, { passphrase: 'pw', includeRecognizedText: true })
     })
     expect(builtLayer('sign').ocr?.get(KEY)).toBe(OCR_PAGE)
+    expect(builtLayer('sign').ocrPassthrough).toBe('keep')
     expect(signPdf).toHaveBeenCalledWith(expect.any(Uint8Array), CERT, { passphrase: 'pw' })
   })
 
@@ -367,6 +399,90 @@ describe('every save path shares the same shell', () => {
         await run(handles)
       })
       expect(builtLayer(name).ocr).toBeUndefined()
+    }
+  )
+
+  it.each(ocrPaths)(
+    '%s: a redaction drawn while flushOrConfirm waits reaches the redaction pass and the layer',
+    async (name, run) => {
+      let release: (go: boolean) => void = () => {}
+      const ocr = fakeOcr()
+      ocr.flushOrConfirm.mockImplementation(() => new Promise<boolean>((r) => (release = r)))
+      const handles = await mountExport(oneDoc(), layer(), vi.fn(), vi.fn(), ocr)
+      let done: Promise<unknown> = Promise.resolve()
+      await act(async () => {
+        done = run(handles)
+      })
+      expect(chooseSavePath).not.toHaveBeenCalled()
+      // "Wait and export" is non-modal: the user boxes the page out and adds a document meanwhile.
+      const later: DocEntry[] = [...oneDoc(), { id: 'd2', name: 'B', pages: [page()] }]
+      await handles.rerender(later, layer([redaction(0)]))
+      await act(async () => {
+        release(true)
+        await done
+      })
+      const [passLayer, passDocs] = vi.mocked(buildRedactedSources).mock.calls[0]
+      expect(passLayer.overlays.get(KEY)?.filter((o) => o.type === 'redaction')).toHaveLength(1)
+      expect(passDocs).toHaveLength(2)
+      // The fail-safe sees the new redaction too: the page gets no recognised text.
+      if (name === 'zip') {
+        expect(buildPdf).toHaveBeenCalledTimes(2)
+        expect(vi.mocked(buildPdf).mock.calls[0][1]?.ocr).toBeUndefined()
+      } else {
+        expect(builtLayer(name).ocr).toBeUndefined()
+        expect(builtLayer(name).overlays.get(KEY)).toHaveLength(1)
+      }
+      if (name === 'pdfx') expect(vi.mocked(buildPdfx).mock.calls[0][0]).toHaveLength(2)
+      if (name === 'pdf') expect(vi.mocked(buildPdf).mock.calls[0][0]).toHaveLength(2)
+    }
+  )
+})
+
+describe('sign paths', () => {
+  const PLACEMENT = { pageKey: KEY, x: 10, y: 10, w: 100, h: 40 } as unknown as SignaturePlacement
+  const MARKER = highlight(7, geom(10, 10, 100, 40))
+
+  it.each([true, false])(
+    'the build bakes the signature appearance (recognised text included: %s)',
+    async (include) => {
+      vi.mocked(withSignatureAppearance).mockImplementation(async (edits) => ({
+        ...edits,
+        overlays: new Map([[KEY, [MARKER]]])
+      }))
+      const handles = await mountExport(oneDoc(), layer(), vi.fn(), vi.fn(), fakeOcr(), PLACEMENT)
+      await act(async () => {
+        await handles.signAndExport(CERT, { passphrase: 'pw', includeRecognizedText: include })
+      })
+      expect(withSignatureAppearance).toHaveBeenCalledTimes(1)
+      const built = builtLayer('sign')
+      expect(built.overlays.get(KEY)).toEqual([MARKER])
+      expect(built.ocr?.get(KEY)).toBe(include ? OCR_PAGE : undefined)
+    }
+  )
+
+  const CARD = { modulePath: '/lib/p11.so', pin: '1234' }
+  const signers: Array<
+    [string, (e: Exports, include: boolean) => Promise<unknown>, () => unknown[]]
+  > = [
+    ['card', (e, include) => e.signWithCardAndExport(CARD, { reason: 'r', includeImage: true, includeRecognizedText: include }), () => signPdfWithCard.mock.calls[0]], // prettier-ignore
+    ['windows', (e, include) => e.signWithWindowsCertAndExport('AB12', { reason: 'r', includeImage: true, includeRecognizedText: include }), () => signPdfWithWindowsCert.mock.calls[0]] // prettier-ignore
+  ]
+
+  it.each(signers)(
+    '%s: the box decides the layer, and the flag never reaches the signer',
+    async (_name, run, signerCall) => {
+      for (const include of [true, false]) {
+        vi.clearAllMocks()
+        const handles = await mountExport(oneDoc(), layer(), vi.fn(), vi.fn(), fakeOcr())
+        await act(async () => {
+          await run(handles, include)
+        })
+        const built = builtLayer('sign')
+        expect(built.ocr?.get(KEY)).toBe(include ? OCR_PAGE : undefined)
+        expect(built.ocrPassthrough).toBe(include ? 'keep' : 'drop')
+        const options = signerCall()[2] as Record<string, unknown>
+        expect(options).toEqual({ reason: 'r' })
+      }
     }
   )
 })

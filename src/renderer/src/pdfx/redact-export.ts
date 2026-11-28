@@ -77,7 +77,15 @@ export async function buildRedactedSources(
       })
       pageRedactions.push({ pageIndex, rects })
     }
-    if (sourceBytes) out.set(sourceKey, redactPdf(pdfium, sourceBytes, pageRedactions))
+    if (!sourceBytes) continue
+    // OCR fail-safe for reopened OCR'd files (DESIGN.md §3.7.3 rules 2 and 5): a redacted page
+    // loses its WHOLE PDFx OCR layer, not just the words under the box. Removing only those words
+    // would leave their characters in the layer font's ToUnicode, which copyPages carries into the
+    // export with the page. With no text object left in the font, FPDFPage_GenerateContent drops
+    // the page's /FOcr resource and the no-incremental save writes no orphaned font [measured,
+    // tmp probe; pinned by ocr-export.node.test.ts "a reopened OCR'd export": no OCR font is
+    // bound on the redacted page and the raw-bytes oracle finds no redacted character].
+    out.set(sourceKey, redactPdf(pdfium, sourceBytes, pageRedactions, { dropOcrText: true }))
   }
   return out
 }

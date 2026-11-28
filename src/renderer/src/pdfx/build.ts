@@ -27,9 +27,15 @@ import { serializeMirror, stripRedactedOverlays } from './mirror'
 import { computeIntegrity } from './canonicalize'
 import type { PackedOcrPage } from '../../../shared/ocr/types'
 import { visibleBox } from '../page-geometry'
-import { OcrFontCache } from './ocr-font'
-import { appendOcrLayer, type OcrPageSpace } from './ocr-layer'
-import { catalogLang, dropWordsOutside, ocrAllowed } from './ocr-export'
+import { OcrFontCache, OcrFontProgram } from './ocr-font'
+import {
+  appendOcrLayer,
+  dropOcrLayers,
+  existingOcrLayer,
+  ocrLayerEngines,
+  type OcrPageSpace
+} from './ocr-layer'
+import { catalogLang, dropWordsOutside, ocrAllowed, type OcrPassthrough } from './ocr-export'
 import { markOcrDocument, readCatalogLang } from './ocr-marking'
 
 /**
@@ -50,23 +56,61 @@ export interface EditLayer {
    * on EditProvider's layer: useExport adds it to a copy (`withOcrLayer`, ocr-export.ts).
    */
   ocr?: Map<string, PackedOcrPage>
+  /**
+   * What to do with a PDFx OCR layer a SOURCE page already carries (ocr-export.ts
+   * `OcrPassthrough`); `withOcrLayer` sets it from the export setting or the Sign box. Absent:
+   * `keep`, which is also what a page that gets no new layer had before OCR existed.
+   */
+  ocrPassthrough?: OcrPassthrough
 }
 
 /**
- * The OCR layer state of ONE output document: its font (finalised once, after the last page and
- * before computeIntegrity/save) and, per output page, what was baked there (for the marking and
- * the catalog /Lang rule).
+ * The OCR layer state of ONE output document: one font PER BAKED PAGE sharing one font program
+ * (all finalised after the last page and before computeIntegrity/save), and what the output's
+ * pages carry (for the marking and the catalog /Lang rule).
  */
 interface OcrBake {
-  fonts: OcrFontCache
-  /** Engine ids of the layers written. */
+  program: OcrFontProgram
+  /** One per baked page: a page's ToUnicode never holds another page's characters (rule 5). */
+  fonts: OcrFontCache[]
+  /** Engine ids of the layers the output carries: written now, or kept from a source. */
   engines: Set<string>
   /** By output page ordinal: the primary Tesseract language of its layer (unset if none). */
   langs: (string | undefined)[]
 }
 
-const newOcrBake = (doc: PDFDocument, edits: EditLayer | undefined): OcrBake | undefined =>
-  edits?.ocr?.size ? { fonts: new OcrFontCache(doc), engines: new Set(), langs: [] } : undefined
+const newOcrBake = (doc: PDFDocument): OcrBake => ({
+  program: new OcrFontProgram(doc),
+  fonts: [],
+  engines: new Set(),
+  langs: []
+})
+
+/** XMP `pdfx:OCREngine` of a kept source layer whose property list names no engine. */
+const UNKNOWN_OCR_ENGINE = 'unknown'
+
+/**
+ * Apply the passthrough policy to a PDFx OCR layer `page` already carries (a reopened PDFx
+ * export): its tagged streams and their font go when the policy is `drop` or when a NEW layer
+ * replaces it (§3.7.6), and whatever remains is recorded, so the output is marked machine-generated
+ * exactly when it carries machine text (§3.7.1, §3.7.7). A layer whose streams a later rewrite
+ * merged (no tag, the font still bound) cannot be separated from the page content here and is
+ * kept (and marked) whatever the policy; removing it by its marked content is PR3c's fallback.
+ */
+function passExistingOcr(
+  page: PDFPage,
+  policy: OcrPassthrough,
+  replaced: boolean,
+  bake: OcrBake
+): void {
+  const before = existingOcrLayer(page)
+  if (!before.streams.length && !before.font) return
+  if (policy === 'drop' || replaced) dropOcrLayers(page)
+  const after = existingOcrLayer(page)
+  if (!after.streams.length && !after.font) return
+  const engines = ocrLayerEngines(after.streams)
+  for (const e of engines.length ? engines : [UNKNOWN_OCR_ENGINE]) bake.engines.add(e)
+}
 
 /**
  * The recognised page to bake for `key`, or undefined. Re-checks the export gate (ocr-export.ts
@@ -89,7 +133,9 @@ function bakeOcrLayer(
   ordinal: number,
   space: OcrPageSpace
 ): boolean {
-  if (!appendOcrLayer(page, ocr, bake.fonts, { space })) return false
+  const fonts = new OcrFontCache(page.doc, { program: bake.program })
+  bake.fonts.push(fonts)
+  if (!appendOcrLayer(page, ocr, fonts, { space })) return false
   bake.engines.add(ocr.engineId)
   bake.langs[ordinal] = ocr.langs[0]
   return true
@@ -97,21 +143,22 @@ function bakeOcrLayer(
 
 /**
  * Finish the OCR layer of `output`: write the font tables from the CIDs actually baked (redaction
- * rule 5), then the machine-generated marking when any layer was written, and the catalog /Lang
- * (§3.7.5) from the sources' own /Lang and the baked layers. Runs after the last page is baked and
- * before computeIntegrity/save; the Producer is set here, so callers must not overwrite it later.
+ * rule 5), then the machine-generated marking when the output carries any layer (written now or
+ * kept from a source), and the catalog /Lang (§3.7.5) from the sources' own /Lang and the baked
+ * layers. Runs after the last page is baked and before computeIntegrity/save; the Producer is set
+ * here, so callers must not overwrite it later.
  */
 function finishOcr(
   output: PDFDocument,
-  bake: OcrBake | undefined,
+  bake: OcrBake,
   pageCount: number,
   sources: Iterable<PDFDocument>,
   producer: string
 ): void {
-  bake?.fonts.finalize(output)
-  if (bake?.engines.size) markOcrDocument(output, producer, bake.engines)
+  for (const fonts of bake.fonts) fonts.finalize(output)
+  if (bake.engines.size) markOcrDocument(output, producer, bake.engines)
   else output.setProducer(producer)
-  const langs = bake?.langs ?? []
+  const langs = bake.langs
   const lang = catalogLang(
     [...sources].map(readCatalogLang),
     Array.from({ length: pageCount }, (_, i) => langs[i])
@@ -322,9 +369,9 @@ async function bakePage(
   exportPage: ExportPage,
   edits: EditLayer | undefined,
   res: FlattenResources | undefined,
-  ocr?: { bake: OcrBake; ordinal: number }
+  ocr: { bake: OcrBake; ordinal: number }
 ): Promise<void> {
-  if (!edits) return
+  if (!edits) return passExistingOcr(page, 'keep', false, ocr.bake)
   const key = makePageKey(exportPage.sourceKey, exportPage.pageIndex)
   // The source page's intrinsic /Rotate and its original (pre-crop) unrotated view box. Both are
   // captured up front because the editor's overlay/crop coordinates live in pdf.js's
@@ -357,7 +404,7 @@ async function bakePage(
   // The OCR layer (DESIGN.md §3.7.2): words lie in the same overlay frame. On PDF export, words
   // entirely outside the visible box after the edit crop are dropped (§3.7.5), so cropped-away
   // content does not become searchable in other viewers; partly visible words are kept.
-  let ocrPage = ocr ? ocrPageFor(edits, key) : undefined
+  let ocrPage = ocrPageFor(edits, key)
   if (ocrPage) {
     const quarter = intrinsic === 90 || intrinsic === 270
     const visual = quarter
@@ -365,7 +412,11 @@ async function bakePage(
       : { width: view0.width, height: view0.height }
     ocrPage = dropWordsOutside(ocrPage, visibleBox(visual, crop)) ?? undefined
   }
-  const layer = ocr && ocrPage ? { ...ocr, page: ocrPage } : undefined
+  const layer = ocrPage ? { ...ocr, page: ocrPage } : undefined
+  // A layer the source page already carries is kept or dropped by the export's policy, and always
+  // replaced by a new one. (Its words are not re-filtered by the edit crop: like the page's other
+  // native text and the scan pixels outside the CropBox, it is source content the export keeps.)
+  passExistingOcr(page, edits.ocrPassthrough ?? 'keep', !!layer, ocr.bake)
   await withPageSpace(page, intrinsic, view0, {
     prepend: layer
       ? (space) => void bakeOcrLayer(page, layer.page, layer.bake, layer.ordinal, space)
@@ -498,9 +549,9 @@ export async function buildPdf(
 ): Promise<Uint8Array> {
   const output = await PDFDocument.create()
   const res = edits ? createFlattenResources(output, edits.attachments) : undefined
-  // One OCR font per output document (a zip builds one per entry): its tables come only from the
-  // words baked into THIS document (redaction rule 5).
-  const bake = newOcrBake(output, edits)
+  // One OCR font per baked page of THIS output document (a zip builds one document per entry): its
+  // tables come only from the words baked onto that page (redaction rule 5).
+  const bake = newOcrBake(output)
   const { copied, sources } = await copyExportPages(output, pages)
   for (let i = 0; i < pages.length; i++) {
     const page = copied[i]
@@ -512,7 +563,7 @@ export async function buildPdf(
       // Before signing, strip empty/leftover signature fields so the signed PDF has only our
       // signature — not a dangling "sign here" field Adobe would offer to sign.
       if (opts?.stripSignatureFields) removeSignatureWidgets(page)
-      await bakePage(page, pages[i], edits, res, bake && { bake, ordinal: i })
+      await bakePage(page, pages[i], edits, res, { bake, ordinal: i })
     } catch (e) {
       throw pageError(i + 1, pages[i], e)
     }
@@ -546,25 +597,26 @@ export async function buildPdfx(
 
   // The one exception to clean pages: the OCR text layer is BAKED (DESIGN.md §3.7.2), so a
   // reopened .pdfx is searchable without re-recognition, and it is baked BEFORE computeIntegrity
-  // so the pdfx-canon/1 tamper hash covers it. Only those pages are mutated, so only they get
-  // private containers. Rotation and crop stay live mirror edits: words keep the source visual
-  // frame (intrinsic + view-origin matrices only), and every word is kept (no crop drop).
-  const bake = newOcrBake(output, edits)
-  if (bake) {
-    for (let i = 0; i < ordered.length; i++) {
-      const ocrPage = ocrPageFor(edits, makePageKey(ordered[i].sourceKey, ordered[i].pageIndex))
+  // so the pdfx-canon/1 tamper hash covers it. Only those pages get private containers (a dropped
+  // source layer is unlinked by replacing containers, never mutating them). Rotation and crop stay
+  // live mirror edits: words keep the source visual frame (intrinsic + view-origin matrices only),
+  // and every word is kept (no crop drop). A layer a source page already carries follows the
+  // export's passthrough policy, as in buildPdf.
+  const bake = newOcrBake(output)
+  for (let i = 0; i < ordered.length; i++) {
+    const ocrPage = ocrPageFor(edits, makePageKey(ordered[i].sourceKey, ordered[i].pageIndex))
+    const page = copied[i]
+    try {
+      if (ocrPage) isolateMutableContainers(page)
+      passExistingOcr(page, edits?.ocrPassthrough ?? 'keep', !!ocrPage, bake)
       if (!ocrPage) continue
-      const page = copied[i]
-      try {
-        isolateMutableContainers(page)
-        const intrinsic = ((page.getRotation().angle % 360) + 360) % 360
-        const view0 = viewBox(page.getCropBox(), page.getMediaBox())
-        await withPageSpace(page, intrinsic, view0, {
-          prepend: (space) => void bakeOcrLayer(page, ocrPage, bake, i, space)
-        })
-      } catch (e) {
-        throw pageError(i + 1, ordered[i], e)
-      }
+      const intrinsic = ((page.getRotation().angle % 360) + 360) % 360
+      const view0 = viewBox(page.getCropBox(), page.getMediaBox())
+      await withPageSpace(page, intrinsic, view0, {
+        prepend: (space) => void bakeOcrLayer(page, ocrPage, bake, i, space)
+      })
+    } catch (e) {
+      throw pageError(i + 1, ordered[i], e)
     }
   }
 
