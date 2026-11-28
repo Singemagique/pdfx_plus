@@ -259,7 +259,11 @@ function setup(
     },
     init: () => ({
       limits: { onBattery: false, thermal: 'nominal', speedLimit: 100, divisor: 1 },
-      paths: { pdfiumWasm: '/app.asar/node_modules/@embedpdf/pdfium/dist/pdfium.wasm' }
+      paths: {
+        pdfiumWasm: '/app.asar/node_modules/@embedpdf/pdfium/dist/pdfium.wasm',
+        ocrCore: '/resources/ocr',
+        tessdata: { eng: '/resources/ocr/tessdata/eng.traineddata.gz' }
+      }
     }),
     platform: 'win32',
     env: {
@@ -393,7 +397,11 @@ describe('spawning', () => {
       {
         init: {
           limits: { onBattery: false, thermal: 'nominal', speedLimit: 100, divisor: 1 },
-          paths: { pdfiumWasm: '/app.asar/node_modules/@embedpdf/pdfium/dist/pdfium.wasm' }
+          paths: {
+            pdfiumWasm: '/app.asar/node_modules/@embedpdf/pdfium/dist/pdfium.wasm',
+            ocrCore: '/resources/ocr',
+            tessdata: { eng: '/resources/ocr/tessdata/eng.traineddata.gz' }
+          }
         }
       }
     ])

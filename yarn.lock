@@ -1189,6 +1189,26 @@
   dependencies:
     defer-to-connect "^2.0.0"
 
+"@tesseract.js-data/deu@1.0.0":
+  version "1.0.0"
+  resolved "https://registry.yarnpkg.com/@tesseract.js-data/deu/-/deu-1.0.0.tgz#a40d8e00ce3a54781d6ec2c31d833d8b692b1a8f"
+  integrity sha512-3ter1p2gFAiCd5CMC+PodZ9YY2UDomkKj+ytlKeeZqOUmhLx1SDnYPf5zog0g5MBbxYveW+8omI3PUflqHfZ4Q==
+
+"@tesseract.js-data/eng@1.0.0":
+  version "1.0.0"
+  resolved "https://registry.yarnpkg.com/@tesseract.js-data/eng/-/eng-1.0.0.tgz#285a3f1fb419e8e67bdee93ce288b02bb9097f0a"
+  integrity sha512-mbTumm6KQPUHyzTPQaF3ObXYnx0SqqfV2nabqFVQBwD6Kl7PhGSLSzOlfFTWy0P3BjghaSKA2W9GB19Jk+ZcTg==
+
+"@tesseract.js-data/fra@1.0.0":
+  version "1.0.0"
+  resolved "https://registry.yarnpkg.com/@tesseract.js-data/fra/-/fra-1.0.0.tgz#fbcfa9be69141b4c4fced96ea968ce497d28d882"
+  integrity sha512-pp58gMaoyidoBBLd5y5rnf0WW0Y1994QrGqZrYatITqIU/AReUJMykD+YY3JDgvnmgz7uAx1UmhjjuyEmV8JEA==
+
+"@tesseract.js-data/spa@1.0.0":
+  version "1.0.0"
+  resolved "https://registry.yarnpkg.com/@tesseract.js-data/spa/-/spa-1.0.0.tgz#8cd3c04f10519916a6b85101001c4628a1a0a257"
+  integrity sha512-9Ln+QKq/TNu4Hy4aOp5b4nXo9U0C6IqJMzNDpAJZe/fNtz6jXG9G/hQgR/Irxj+RGf0M7Xy1MNx1yl4wQUIfeg==
+
 "@tootallnate/once@2":
   version "2.0.1"
   resolved "https://registry.yarnpkg.com/@tootallnate/once/-/once-2.0.1.tgz#35adc6222e3662fa2222ce123b961476a746b9ea"
@@ -4279,6 +4299,11 @@ temp-file@^3.4.0:
   dependencies:
     async-exit-hook "^2.0.1"
     fs-extra "^10.0.0"
+
+tesseract.js-core@7.0.0:
+  version "7.0.0"
+  resolved "https://registry.yarnpkg.com/tesseract.js-core/-/tesseract.js-core-7.0.0.tgz#596aa1ab5c130adab12f21059e6aa1a1cecc0bab"
+  integrity sha512-WnNH518NzmbSq9zgTPeoF8c+xmilS8rFIl1YKbk/ptuuc7p6cLNELNuPAzcmsYw450ca6bLa8j3t0VAtq435Vw==
 
 tinybench@^2.9.0:
   version "2.9.0"

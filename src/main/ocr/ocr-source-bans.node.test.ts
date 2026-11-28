@@ -10,7 +10,7 @@
 // On top of the module and global bans: the native escape hatches (process.binding,
 // process._linkedBinding, process.dlopen) and a Worker started from a string of code (`eval: true`)
 // reach the network, or a realm without the tripwire, with no import at all. And the third-party
-// code bundled into these threads (the PDFium glue; PR5 adds the Tesseract glue to THIRD_PARTY) is
+// code these threads run (the PDFium glue, bundled; the Tesseract glue, loaded from resources/ocr) is
 // scanned for the same, since our rules do not apply to it at build time.
 //
 // Two robustness rules from PR0b ride along: every thread is started with the V8 heap caps
@@ -53,7 +53,12 @@ const OCR_PROCESS_BANNED_MODULES = [
 ]
 
 /** Bundled third-party code that runs inside the OCR process (repo-relative). */
-const THIRD_PARTY = ['node_modules/@embedpdf/pdfium/dist/index.cjs']
+const THIRD_PARTY = [
+  'node_modules/@embedpdf/pdfium/dist/index.cjs',
+  // Not bundled but require()d by the recognize thread from resources/ocr (the same bytes, checked
+  // against the manifest before the require).
+  'node_modules/tesseract.js-core/tesseract-core-simd-lstm.js'
+]
 
 const ESCAPE_MEMBERS = new Set(['binding', '_linkedBinding', 'dlopen'])
 

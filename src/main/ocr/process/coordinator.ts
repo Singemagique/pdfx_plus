@@ -40,6 +40,7 @@ import {
   type FromOcr,
   type Heartbeat,
   type OcrHostLimits,
+  type OcrPaths,
   type OcrToMain,
   type PageRequest,
   type PageResult,
@@ -54,8 +55,19 @@ import {
   type Budgets,
   type SystemInfo
 } from './budget'
+import { TESS_CORE7_PLACEHOLDER } from '../../../shared/ocr/calibration'
+import { ENGINE_ID, PIPELINE_VERSION } from '../../../shared/ocr/engine/tess-core'
+import { mapRawOcr } from '../../../shared/ocr/map'
+import type { PackedOcrPage } from '../../../shared/ocr/types'
 import { fitRaster } from './raster-core'
-import type { FromRaster, FromRecognize, ToRaster, ToRecognize } from './thread-messages'
+import type { RecognizeOutcome } from './recognize-core'
+import type {
+  EngineAssets,
+  FromRaster,
+  FromRecognize,
+  ToRaster,
+  ToRecognize
+} from './thread-messages'
 import type { TriagePage } from '../../../shared/ocr/triage'
 
 // ---------------------------------------------------------------------------------------------
@@ -91,8 +103,11 @@ export interface CoordinatorDeps {
   spawnRecognize(): WorkerLike
   /** Compile pdfium.wasm (main resolves the path; the renderer never names one). */
   loadPdfium(path: string): Promise<WebAssembly.Module>
-  /** The recognize engine's module. PR4a: a stub module; PR5: the SHA-checked simd-lstm core. */
-  loadEngine(): Promise<WebAssembly.Module>
+  /**
+   * The recognize engine: the SHA-checked simd-lstm core compiled once, and each bundled
+   * language's verified .traineddata.gz (engine-node.ts). Main resolves the paths.
+   */
+  loadEngine(paths: OcrPaths): Promise<LoadedEngine>
   system(): SystemInfo
   /** This realm's tripwire count. */
   tripwire(): number
@@ -107,6 +122,13 @@ export interface CoordinatorDeps {
   /** `process.platform` (PER_WORKER depends on it); tests pass another. */
   platform?: string
   budgets?: Partial<Budgets>
+}
+
+export interface LoadedEngine {
+  /** Posted to every recognize thread's init. */
+  assets: EngineAssets
+  /** SHA-256 of each language's shipped .traineddata.gz (into every OcrPage, §3.5.1). */
+  dataHashes: Record<string, string>
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -242,6 +264,9 @@ const DEFAULT_LIMITS: OcrHostLimits = {
  */
 export function isOomShaped(name: string, message: string): boolean {
   return (
+    // The recognize thread's name for a WASM OOM (Recognize rc ≠ 0, or empty hOCR with a
+    // Leptonica allocation failure on printErr; PR0b §f).
+    name === 'OcrOutOfMemory' ||
     (name === 'RangeError' && !/Maximum call stack size exceeded/i.test(message)) ||
     /out of memory|Cannot enlarge memory|memory access out of bounds|Array buffer allocation failed/i.test(
       message
@@ -267,7 +292,11 @@ export class Coordinator {
   private readonly b: Budgets
   private limits: OcrHostLimits = DEFAULT_LIMITS
   private pdfiumModule: Promise<WebAssembly.Module> | null = null
-  private engineModule: Promise<WebAssembly.Module> | null = null
+  private engineModule: Promise<LoadedEngine> | null = null
+  /** The engine once loaded (the hashes go into every page). */
+  private engine: LoadedEngine | null = null
+  /** Languages main gave paths for (known at init, before the engine has loaded). */
+  private availableLangs = new Set<string>()
   private port: PortLike | null = null
 
   private readonly sources = new Map<string, Source>()
@@ -398,7 +427,14 @@ export class Coordinator {
     if ('init' in msg) {
       this.limits = msg.init.limits
       this.pdfiumModule = this.deps.loadPdfium(msg.init.paths.pdfiumWasm)
-      this.engineModule = this.deps.loadEngine()
+      this.availableLangs = new Set(Object.keys(msg.init.paths.tessdata))
+      this.engineModule = this.deps.loadEngine(msg.init.paths)
+      this.engineModule.then(
+        (e) => {
+          this.engine = e
+        },
+        () => {}
+      )
       const fatal = (e: unknown): void =>
         this.toParent({
           fatal: { code: 'init', message: e instanceof Error ? e.name : 'init failed' }
@@ -729,6 +765,8 @@ export class Coordinator {
       progressDirty: true
     }
     this.jobs.set(job.jobId, job)
+    // A language that is neither bundled nor installed: nothing to recognise with (§3.5.1).
+    const missing = req.opts.langs.some((l) => !this.availableLangs.has(l))
     req.pages.forEach((p, order) => {
       const t: Task = {
         id: ++this.taskSeq,
@@ -746,6 +784,14 @@ export class Coordinator {
       job.tasks.add(t)
       this.tasks.add(t)
     })
+    if (missing)
+      for (const t of [...job.tasks])
+        this.finalize(t, {
+          status: 'needs-language',
+          renderDpi: null,
+          raster: null,
+          recognition: null
+        })
     this.scheduleFlush()
     this.pump()
   }
@@ -1259,7 +1305,8 @@ export class Coordinator {
     worker.on('exit', () => this.guard(() => this.onRecognizeDeath(slot, false)))
     void this.engineModule.then(
       (engine) => {
-        if (!slot.dead) worker.postMessage({ type: 'init', engine } satisfies ToRecognize)
+        if (!slot.dead)
+          worker.postMessage({ type: 'init', engine: engine.assets } satisfies ToRecognize)
       },
       () => {}
     )
@@ -1310,12 +1357,21 @@ export class Coordinator {
     if (m.type === 'result') {
       slot.pages++
       const raster = t.raster!
-      this.finalize(t, {
-        status: 'ok',
-        renderDpi: raster.dpi,
-        raster: { width: raster.width, height: raster.height },
-        recognition: m.result
-      })
+      let page: PackedOcrPage | null = null
+      try {
+        page = this.toPage(t, m.result)
+      } catch {
+        // A mapping bug or an impossible engine result: this page fails, the thread is fine.
+        page = null
+      }
+      if (page)
+        this.finalize(t, {
+          status: page.status,
+          renderDpi: raster.dpi,
+          raster: { width: raster.width, height: raster.height },
+          recognition: page
+        })
+      else this.fail(t, 'failed', 'recognize-crash')
       // The WASM heap never shrinks: recycle after 50 pages, or after any page over 12 MP.
       if (slot.pages >= this.b.recyclePages || slot.big) this.retireRecognizer(slot)
       slot.big = false
@@ -1324,6 +1380,32 @@ export class Coordinator {
       this.recognizeFailure(t, isOomShaped(m.name, m.message))
     }
     this.pump()
+  }
+
+  /**
+   * A thread's RawOcr → the packed OcrPage in the overlay frame (map.ts). The raster covers the
+   * request's page frame exactly (the raster thread checked it against PDFium's), so the frame
+   * and the raster size give the mapping.
+   */
+  private toPage(t: Task, outcome: RecognizeOutcome): PackedOcrPage {
+    const raster = t.raster!
+    const langs = t.job.langs
+    const hashes = this.engine?.dataHashes ?? {}
+    const dataHashes: Record<string, string> = {}
+    for (const l of langs) if (Object.hasOwn(hashes, l)) dataHashes[l] = hashes[l]
+    return mapRawOcr(outcome.raw, {
+      page: { width: t.req.width, height: t.req.height },
+      raster: { width: raster.width, height: raster.height },
+      renderDpi: raster.dpi,
+      engineId: ENGINE_ID,
+      dataHashes,
+      langs,
+      pipelineVersion: PIPELINE_VERSION,
+      // Triage (PR4b) classifies pages; until the renderer sends a class, a page sent for
+      // recognition is treated as a scan.
+      pageClass: 'scanned',
+      calibration: TESS_CORE7_PLACEHOLDER
+    })
   }
 
   private recognizeFailure(t: Task, oom: boolean): void {

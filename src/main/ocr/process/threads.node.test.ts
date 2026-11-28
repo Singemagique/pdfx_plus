@@ -12,6 +12,7 @@ import { Worker } from 'node:worker_threads'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { PDFDocument, degrees, rgb } from 'pdf-lib'
 
+import { ENGINE_ID } from '../../../shared/ocr/engine/tess-core'
 import {
   parseFromOcr,
   type FromOcr,
@@ -21,11 +22,12 @@ import {
 import { THREAD_RESOURCE_LIMITS, threadOptions } from './budget'
 import { Coordinator, isThreadOom } from './coordinator'
 import { DEFAULT_RASTER_LIMITS } from './raster-core'
-import { STUB_ENGINE_WASM } from './stub-engine'
+import { loadEngine } from './engine-node'
 import type { FromRaster, ToRaster } from './thread-messages'
 import { isV8FatalOom } from '../supervisor'
 import { bundleEntry, type Bundled } from '../test-utils/bundle'
 import { FakeParent, FakePort, INIT } from '../test-utils/fake-threads'
+import { nodeModulesEnginePaths } from '../test-utils/engine-harness'
 import { PDFIUM_WASM_PATH } from '../test-utils/pdfium-node'
 
 const here = (p: string): string => fileURLToPath(new URL(p, import.meta.url))
@@ -66,7 +68,7 @@ beforeAll(async () => {
     spawnRaster: () => new Worker(raster.file, threadOptions()),
     spawnRecognize: () => new Worker(recognize.file, threadOptions()),
     loadPdfium: async () => WebAssembly.compile(await readFile(PDFIUM_WASM_PATH)),
-    loadEngine: async () => WebAssembly.compile(STUB_ENGINE_WASM),
+    loadEngine,
     system: () => ({
       totalmem: totalmem(),
       availableMemory: totalmem() / 2,
@@ -79,7 +81,7 @@ beforeAll(async () => {
     rss: () => process.memoryUsage.rss(),
     exit: () => {}
   })
-  parent.send({ init: { ...INIT.init, paths: { pdfiumWasm: PDFIUM_WASM_PATH } } })
+  parent.send({ init: { ...INIT.init, paths: nodeModulesEnginePaths() } })
   port = new FakePort()
   parent.send({ port: {} }, [port])
 }, 60_000)
@@ -91,7 +93,7 @@ afterAll(() => {
 })
 
 describe('real raster and recognize threads', () => {
-  it('opens, renders grey and round-trips the stub recognizer', async () => {
+  it('opens, renders grey and recognises with the real engine', async () => {
     const doc = await PDFDocument.create()
     const p0 = doc.addPage([612, 792])
     // Top tenth of the page solid black: inkFrac ≈ 0.1 whatever the DPI.
@@ -121,10 +123,13 @@ describe('real raster and recognize threads', () => {
       .map((m) => m.result)
       .sort((a, b) => a.index - b.index)
     const [r0, r1] = results.map((r) => r.page) as PageResult[]
-    expect(r0).toMatchObject({ status: 'ok', renderDpi: 100, raster: { width: 850, height: 1100 } })
-    expect(r0.recognition?.inkFrac).toBeCloseTo(0.1, 2)
-    expect(r1).toMatchObject({ status: 'ok', raster: { width: 1100, height: 850 } })
-    expect(r1.recognition?.inkFrac).toBeCloseTo(0.5, 2)
+    // Text-free pages through the real engine: recognised, mapped and packed in the page's frame.
+    expect(r0).toMatchObject({ renderDpi: 100, raster: { width: 850, height: 1100 } })
+    expect(r1).toMatchObject({ raster: { width: 1100, height: 850 } })
+    for (const r of [r0, r1]) {
+      expect(['ok', 'low-confidence', 'no-text']).toContain(r.status)
+      expect(r.recognition).toMatchObject({ engineId: ENGINE_ID, renderDpi: 100, langs: ['eng'] })
+    }
     expect(sent().find((m) => 'jobDone' in m)).toEqual({
       jobDone: { jobId: 'j1', done: 2, failed: 0, cancelled: false }
     })

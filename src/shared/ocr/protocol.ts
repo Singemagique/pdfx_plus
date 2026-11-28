@@ -25,7 +25,7 @@
 // Node all import the same file.
 
 import type { JpxRefusal, NativeWord, TriagePage } from './triage'
-import type { OcrStatus, PageClass } from './types'
+import type { OcrStatus, PackedOcrPage, PageClass } from './types'
 
 export const OCR_PROTOCOL_VERSION = 1
 
@@ -179,21 +179,6 @@ export type ToOcr =
 // ---------------------------------------------------------------------------------------------
 // Coordinator → renderer.
 
-/**
- * PR4a's recognize thread is a skeleton (the Tesseract engine is PR5): it proves the posted
- * `WebAssembly.Module` and the grey bitmap arrive, and reports what it saw. PR5 replaces this with
- * the packed OcrPage (§3.5.1).
- */
-export interface StubRecognition {
-  stub: true
-  width: number
-  height: number
-  /** Mean grey level 0..255 of the bitmap the thread received. */
-  meanGrey: number
-  /** Fraction of pixels darker than 128. */
-  inkFrac: number
-}
-
 export interface PageResult {
   status: OcrStatus
   reason?: PageReason
@@ -201,7 +186,8 @@ export interface PageResult {
   renderDpi: number | null
   /** Raster size in px, or null if it never rendered. */
   raster: { width: number; height: number } | null
-  recognition: StubRecognition | null
+  /** The recognised page, packed (§3.5.1), or null when the page never recognised. */
+  recognition: PackedOcrPage | null
 }
 
 export interface ProgressInfo {
@@ -265,10 +251,18 @@ export interface OcrHostLimits {
   divisor: number
 }
 
+export interface OcrPaths {
+  pdfiumWasm: string
+  /** The directory holding tesseract-core-simd-lstm.{js,wasm} (resources/ocr when packaged). */
+  ocrCore: string
+  /** Each bundled language's `<lang>.traineddata.gz` (resources/ocr/tessdata when packaged). */
+  tessdata: Record<string, string>
+}
+
 export interface OcrInit {
   limits: OcrHostLimits
   /** Absolute paths main resolved (the trusted side; the renderer protocol never carries one). */
-  paths: { pdfiumWasm: string }
+  paths: OcrPaths
 }
 
 export type MainToOcr =
@@ -534,16 +528,122 @@ export function parseToOcr(x: unknown): ToOcr {
   return toOcr(x, 'ToOcr')
 }
 
-const stubRecognition = object<StubRecognition>({
-  stub: (x, path) => {
-    if (x !== true) fail(path, 'expected true')
-    return true
-  },
-  width: int(1, 1_000_000),
-  height: int(1, 1_000_000),
-  meanGrey: num(0, 255),
-  inkFrac: num(0, 1)
-})
+// ---- PackedOcrPage (§3.5.1): the renderer stores it and the layer writer bakes it into PDFs, so
+// every array length, offset and number is checked here, not trusted.
+
+/** Words and characters per page beyond any real page (a dense A4 at 6 pt is ~1,200 words). */
+const MAX_WORDS = 200_000
+const MAX_TEXT = 4_000_000
+
+function typedArray<T>(tag: string): Check<T> {
+  return (x, path) => {
+    if (Object.prototype.toString.call(x) !== `[object ${tag}]`) fail(path, `expected a ${tag}`)
+    return x as T
+  }
+}
+const u32 = typedArray<Uint32Array>('Uint32Array')
+const f32 = typedArray<Float32Array>('Float32Array')
+
+/** Offsets: `n + 1` entries, non-decreasing, from 0 to `end`. */
+function offsets(a: Uint32Array, n: number, end: number, path: string): void {
+  if (a.length !== n + 1) fail(path, 'wrong length')
+  if (a[0] !== 0 || a[n] !== end) fail(path, 'bad bounds')
+  for (let i = 1; i <= n; i++) if (a[i] < a[i - 1]) fail(path, 'not monotone')
+}
+
+const sha256Hex = pattern(/^[0-9a-f]{64}$/, 'a SHA-256')
+
+const packedOcrPage: Check<PackedOcrPage> = (x, path) => {
+  const meta = object<
+    Omit<
+      PackedOcrPage,
+      | 'text'
+      | 'wordOff'
+      | 'wordGeom'
+      | 'wordLine'
+      | 'lineGeom'
+      | 'lineLang'
+      | 'charEdges'
+      | 'charOff'
+    > & {
+      text: string
+      wordOff: Uint32Array
+      wordGeom: Float32Array
+      wordLine: Uint32Array
+      lineGeom: Float32Array
+      lineLang?: (string | null)[]
+      charEdges?: Float32Array
+      charOff?: Uint32Array
+    }
+  >(
+    {
+      v: (v, p) => (v === 1 ? 1 : fail(p, 'expected 1')),
+      engineId: pattern(/^[A-Za-z0-9._/-]{1,128}$/, 'an engine id'),
+      dataHashes: (v, p) => {
+        if (!isPlainObject(v)) fail(p, 'expected an object')
+        const keys = Object.keys(v)
+        if (keys.length > 16) fail(p, 'too many languages')
+        const out: Record<string, string> = {}
+        for (const k of keys) {
+          lang(k, `${p}.key`)
+          out[k] = sha256Hex(v[k], `${p}.${k}`)
+        }
+        return out
+      },
+      langs: array(lang, 16),
+      pipelineVersion: int(0, 1_000_000),
+      pageClass: oneOf(PAGE_CLASSES),
+      renderDpi: num(0, 10_000, { minExclusive: true }),
+      physDpi: num(0, 10_000, { minExclusive: true }),
+      orientation: (v, p) => {
+        if (v !== 0 && v !== 90 && v !== 180 && v !== 270) fail(p, 'expected 0/90/180/270')
+        return v
+      },
+      skewDeg: num(-45, 45),
+      meanConfCal: (v, p) => (v === null ? null : num(0, 1)(v, p)),
+      confSource: oneOf(['word', 'line', 'none'] as const),
+      status: oneOf(OCR_STATUSES),
+      text: text(MAX_TEXT),
+      wordOff: u32,
+      wordGeom: f32,
+      wordLine: u32,
+      lineGeom: f32
+    },
+    {
+      lineLang: array((v, p) => (v === null ? null : lang(v, p)), MAX_WORDS),
+      charEdges: f32,
+      charOff: u32
+    }
+  )(x, path)
+  const nWords = meta.wordOff.length - 1
+  if (nWords < 0 || nWords > MAX_WORDS) fail(`${path}.wordOff`, 'wrong length')
+  offsets(meta.wordOff, nWords, meta.text.length, `${path}.wordOff`)
+  const nLines = meta.wordLine.length - 1
+  if (nLines < 0 || nLines > MAX_WORDS) fail(`${path}.wordLine`, 'wrong length')
+  offsets(meta.wordLine, nLines, nWords, `${path}.wordLine`)
+  if (meta.wordGeom.length !== nWords * 5) fail(`${path}.wordGeom`, 'wrong length')
+  for (let i = 0; i < nWords; i++) {
+    const g = i * 5
+    for (let k = 0; k < 3; k++)
+      if (!Number.isFinite(meta.wordGeom[g + k])) fail(`${path}.wordGeom`, 'non-finite geometry')
+    const conf = meta.wordGeom[g + 3]
+    const cal = meta.wordGeom[g + 4]
+    if (!Number.isNaN(conf) && !(conf >= 0 && conf <= 100)) fail(`${path}.wordGeom`, 'bad conf')
+    if (!Number.isNaN(cal) && !(cal >= 0 && cal <= 1)) fail(`${path}.wordGeom`, 'bad confCal')
+  }
+  if (meta.lineGeom.length !== nLines * 2) fail(`${path}.lineGeom`, 'wrong length')
+  for (let i = 0; i < meta.lineGeom.length; i++)
+    if (!Number.isFinite(meta.lineGeom[i])) fail(`${path}.lineGeom`, 'non-finite geometry')
+  if (meta.lineLang && meta.lineLang.length !== nLines) fail(`${path}.lineLang`, 'wrong length')
+  if ((meta.charEdges === undefined) !== (meta.charOff === undefined))
+    fail(path, 'charEdges and charOff go together')
+  if (meta.charEdges && meta.charOff) {
+    offsets(meta.charOff, nWords, meta.charEdges.length, `${path}.charOff`)
+    for (let i = 0; i < meta.charEdges.length; i++)
+      if (!Number.isFinite(meta.charEdges[i])) fail(`${path}.charEdges`, 'non-finite geometry')
+  }
+  return meta as PackedOcrPage
+}
 
 const pageResult = object<PageResult>(
   {
@@ -556,7 +656,7 @@ const pageResult = object<PageResult>(
             width: int(1, 1_000_000),
             height: int(1, 1_000_000)
           })(x, path),
-    recognition: (x, path) => (x === null ? null : stubRecognition(x, path))
+    recognition: (x, path) => (x === null ? null : packedOcrPage(x, path))
   },
   { reason: oneOf(PAGE_REASONS) }
 )
@@ -679,11 +779,27 @@ const mainToOcr = message<MainToOcr>(
   {
     init: object<OcrInit>({
       limits: hostLimits,
-      paths: object<{ pdfiumWasm: string }>({
+      paths: object<OcrPaths>({
         pdfiumWasm: (x, path) => {
           const p = absolutePath(x, path)
           if (!/[\\/]pdfium\.wasm$/.test(p)) fail(path, 'expected pdfium.wasm')
           return p
+        },
+        ocrCore: absolutePath,
+        tessdata: (x, path) => {
+          if (!isPlainObject(x)) fail(path, 'expected an object')
+          const keys = Object.keys(x)
+          if (keys.length > 64) fail(path, 'too many languages')
+          const out: Record<string, string> = {}
+          for (const k of keys) {
+            lang(k, `${path}.key`)
+            const p = absolutePath(x[k], `${path}.${k}`)
+            // Only the file the manifest names for that language.
+            if (!p.endsWith(`${k}.traineddata.gz`) || !/[\\/]$/.test(p.slice(0, -k.length - 15)))
+              fail(`${path}.${k}`, 'expected <lang>.traineddata.gz')
+            out[k] = p
+          }
+          return out
         }
       })
     }),

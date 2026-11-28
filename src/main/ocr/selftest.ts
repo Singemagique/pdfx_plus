@@ -1,10 +1,13 @@
-// `pdfx --ocr-selftest <out.json>` (DESIGN.md §3.9.3 tier 1c), the PR4a skeleton. Main plays the
-// renderer over a real port into the real utility process: open the embedded page, render it in the
-// raster thread, round-trip the stub recognizer, then check every tripwire counter is 0. PR11 grows
-// this into the `clean300` exact-replay run and the shortcut check.
+// `pdfx --ocr-selftest <out.json>` (DESIGN.md §3.9.3 tier 1c). Main plays the renderer over a real
+// port into the real utility process: open the embedded clean300 scan, render it in the raster
+// thread, recognise it with the real engine from resources/ocr, and require the packed result to
+// match the recorded replay exactly (selftest-fixture.ts), then check every tripwire counter is 0.
+// PR11 adds triage, the shortcut check and the 3-OS CI wiring.
 //
 // This file is the session logic only (no Electron import), so it also runs in vitest against the
 // coordinator; host.ts `runOcrSelftest` wires it to the packaged app and writes the report.
+
+import { createHash } from 'node:crypto'
 
 import {
   OCR_PROTOCOL_VERSION,
@@ -15,7 +18,44 @@ import {
   type ToOcr,
   type TripwireSelfCheck
 } from '../../shared/ocr/protocol'
-import { SELFTEST_BAND_FRACTION, SELFTEST_PAGE, selftestPdf } from './selftest-fixture'
+import { unpack, type PackedOcrPage } from '../../shared/ocr/types'
+import { SELFTEST, selftestPdf } from './selftest-fixture'
+
+/**
+ * SHA-256 over everything a packed page says about its words: status, DPI, text and every array
+ * (little-endian on every platform PDFx ships for), plus the line languages. Two runs agree on it
+ * only if they produced the same words at the same Float32 positions.
+ */
+export function packedDigest(p: PackedOcrPage): string {
+  const h = createHash('sha256')
+  h.update(`${p.status}\n${p.renderDpi}\n${p.engineId}\n${p.text}\n`)
+  for (const a of [p.wordOff, p.wordGeom, p.wordLine, p.lineGeom, p.charOff, p.charEdges]) {
+    h.update(a ? new Uint8Array(a.buffer, a.byteOffset, a.byteLength) : new Uint8Array(0))
+    h.update('|')
+  }
+  h.update(JSON.stringify(p.lineLang ?? null))
+  return h.digest('hex')
+}
+
+/** The copy text of a packed page (words by spaces, lines by newlines). */
+export function packedCopyText(p: PackedOcrPage): string {
+  return unpack(p)
+    .lines.map((l) => l.words.map((w) => w.t).join(' '))
+    .join('\n')
+}
+
+/** What the report carries about the page instead of its arrays. */
+export interface SelftestPageSummary {
+  status: string
+  reason?: string
+  renderDpi: number | null
+  raster: { width: number; height: number } | null
+  words: number
+  digest: string | null
+  digestMatches: boolean
+  textMatches: boolean
+  meanConfCal: number | null
+}
 
 /** The renderer end of the port, as main holds it (a MessagePortMain). */
 export interface SelftestPort {
@@ -31,7 +71,7 @@ export interface SelftestReport {
   protocolVersion: number
   timingsMs: Record<string, number>
   opened: { pageCount: number } | null
-  page: PageResult | null
+  page: SelftestPageSummary | null
   jobDone: { done: number; failed: number; cancelled: boolean } | null
   heartbeat: Heartbeat | null
   /** Every message the "renderer" received passed the protocol validator. */
@@ -39,7 +79,7 @@ export interface SelftestReport {
   messageCount: number
 }
 
-export const SELFTEST_DPI = 150
+export const SELFTEST_DPI = SELFTEST.dpi
 
 /**
  * Escape hatches the utility process's own self-check must have called (and seen trip). Any one
@@ -79,7 +119,24 @@ export function childTripwireFailures(
   }
   return failures
 }
-const STEP_TIMEOUT_MS = 30_000
+const STEP_TIMEOUT_MS = 60_000
+
+function summarise(p: PageResult): SelftestPageSummary {
+  const rec = p.recognition
+  const digest = rec ? packedDigest(rec) : null
+  const s: SelftestPageSummary = {
+    status: p.status,
+    renderDpi: p.renderDpi,
+    raster: p.raster,
+    words: rec ? rec.wordOff.length - 1 : 0,
+    digest,
+    digestMatches: digest === SELFTEST.expected.digest,
+    textMatches: !!rec && packedCopyText(rec) === SELFTEST.expected.text,
+    meanConfCal: rec?.meanConfCal ?? null
+  }
+  if (p.reason) s.reason = p.reason
+  return s
+}
 
 export async function selftestSession(
   port: SelftestPort,
@@ -129,7 +186,7 @@ export async function selftestSession(
   const errorOf = (m: FromOcr): string | null => ('error' in m ? m.error.code : null)
 
   let opened: SelftestReport['opened'] = null
-  let page: PageResult | null = null
+  let page: SelftestPageSummary | null = null
   let jobDone: SelftestReport['jobDone'] = null
   let hb: Heartbeat | null = null
   try {
@@ -146,8 +203,8 @@ export async function selftestSession(
       recognize: {
         jobId: 'selftest-1',
         src: 'selftest',
-        pages: [{ index: 0, userUnit: 1, ...SELFTEST_PAGE }],
-        opts: { langs: ['eng'], renderDpi: SELFTEST_DPI }
+        pages: [{ index: 0, userUnit: 1, ...SELFTEST.page }],
+        opts: { langs: SELFTEST.langs, renderDpi: SELFTEST_DPI }
       }
     })
     const done = await wait('jobDone', (m) => 'jobDone' in m || 'error' in m)
@@ -157,19 +214,22 @@ export async function selftestSession(
       jobDone = { done: d, failed, cancelled }
     } else throw new Error(`recognize failed: ${errorOf(done)}`)
     const r = received.find((m) => 'result' in m)
-    page = r && 'result' in r ? r.result.page : null
+    const result: PageResult | null = r && 'result' in r ? r.result.page : null
+    page = result ? summarise(result) : null
 
-    const w = Math.round((SELFTEST_PAGE.width * SELFTEST_DPI) / 72)
-    const h = Math.round((SELFTEST_PAGE.height * SELFTEST_DPI) / 72)
+    const w = Math.round((SELFTEST.page.width * SELFTEST_DPI) / 72)
+    const h = Math.round((SELFTEST.page.height * SELFTEST_DPI) / 72)
     if (!page) failures.push('no page result')
     else {
-      if (page.status !== 'ok') failures.push(`page status ${page.status} (${page.reason ?? '-'})`)
+      if (page.status !== SELFTEST.expected.status)
+        failures.push(`page status ${page.status} (${page.reason ?? '-'})`)
       if (page.raster?.width !== w || page.raster?.height !== h)
         failures.push(`raster ${JSON.stringify(page.raster)}, expected ${w}x${h}`)
-      const ink = page.recognition?.inkFrac ?? 0
-      // The band alone is 10%; the line of text adds a little. Blank (a silent-blank render) is 0.
-      if (ink < SELFTEST_BAND_FRACTION * 0.95 || ink > SELFTEST_BAND_FRACTION + 0.05)
-        failures.push(`ink fraction ${ink.toFixed(4)} outside the expected band`)
+      if (page.words !== SELFTEST.expected.words)
+        failures.push(`${page.words} words, expected ${SELFTEST.expected.words}`)
+      // The exact replay (§3.9.3 1c): the same words at the same Float32 positions as under Node.
+      if (!page.digestMatches) failures.push('recognised page differs from the recorded replay')
+      if (!page.textMatches) failures.push('recognised text differs from the recorded replay')
     }
 
     t = now()

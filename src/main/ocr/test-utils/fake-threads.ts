@@ -4,7 +4,14 @@
 import { EventEmitter } from 'node:events'
 
 import type { CoordinatorDeps, ParentLike, PortLike, WorkerLike } from '../process/coordinator'
-import type { FromRaster, FromRecognize, ToRaster, ToRecognize } from '../process/thread-messages'
+import type {
+  EngineAssets,
+  FromRaster,
+  FromRecognize,
+  ToRaster,
+  ToRecognize
+} from '../process/thread-messages'
+import type { RawOcr } from '../../../shared/ocr/engine/types'
 import type { Budgets } from '../process/budget'
 
 const later = (fn: () => void): void => {
@@ -158,7 +165,7 @@ export type RecognizeScript = (
 
 export class FakeRecognizer extends FakeWorker<ToRecognize, FromRecognize> {
   readonly jobs: RecognizeMsg[] = []
-  initModule: WebAssembly.Module | null = null
+  initModule: EngineAssets | null = null
   private readyHeld = false
 
   constructor(
@@ -194,11 +201,35 @@ export class FakeRecognizer extends FakeWorker<ToRecognize, FromRecognize> {
   }
 }
 
+/** A recognition of one word, "scanned", in the middle of a width × height raster. */
+export function oneWord(width: number, height: number): RawOcr {
+  const x0 = Math.floor(width / 4)
+  const y0 = Math.floor(height / 2)
+  const h = Math.max(4, Math.floor(height / 40))
+  const bbox = { x0, y0, x1: x0 + 4 * h, y1: y0 + h }
+  return {
+    lines: [
+      {
+        kind: 'ocr_line',
+        bbox,
+        baseline: { slope: 0, intercept: 0 },
+        xHeight: h / 2,
+        size: h,
+        words: [{ text: 'scanned', bbox, conf: 92 }]
+      }
+    ],
+    meanConf: 92,
+    confSource: 'word'
+  }
+}
+
 export function recognized(msg: RecognizeMsg, thread: FakeRecognizer): FromRecognize {
   return {
     type: 'result',
     taskId: msg.taskId,
-    result: { stub: true, width: msg.width, height: msg.height, meanGrey: 230, inkFrac: 0.1 },
+    result: { raw: oneWord(msg.width, msg.height), chosen: 'pass1', passes: [] },
+    heap: 50 * 2 ** 20,
+    stderrLines: 0,
     tripwire: thread.tripwire
   }
 }
@@ -310,7 +341,10 @@ export function harness(opts: HarnessOptions = {}): Harness {
       return r
     },
     loadPdfium: async () => STUB_MODULE,
-    loadEngine: async () => STUB_MODULE,
+    loadEngine: async (paths) => ({
+      assets: { module: STUB_MODULE, coreDir: paths.ocrCore, data: {} },
+      dataHashes: { eng: 'e'.repeat(64) }
+    }),
     // cpus − 2 = threads, plenty of memory: the formula gives `threads` (≤ 4).
     system: () => ({ totalmem: 64 * 2 ** 30, availableMemory: 32 * 2 ** 30, cpus: threads + 2 }),
     tripwire: opts.tripwire ?? (() => 0),
@@ -329,7 +363,18 @@ export const INIT = {
   init: {
     limits: LIMITS,
     paths: {
-      pdfiumWasm: process.platform === 'win32' ? 'C:\\x\\pdfium.wasm' : '/x/pdfium.wasm'
+      pdfiumWasm: process.platform === 'win32' ? 'C:\\x\\pdfium.wasm' : '/x/pdfium.wasm',
+      ocrCore: process.platform === 'win32' ? 'C:\\x\\ocr' : '/x/ocr',
+      tessdata: {
+        eng:
+          process.platform === 'win32'
+            ? 'C:\\x\\ocr\\eng.traineddata.gz'
+            : '/x/ocr/eng.traineddata.gz',
+        deu:
+          process.platform === 'win32'
+            ? 'C:\\x\\ocr\\deu.traineddata.gz'
+            : '/x/ocr/deu.traineddata.gz'
+      }
     }
   }
 }

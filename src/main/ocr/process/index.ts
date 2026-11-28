@@ -18,7 +18,7 @@ import rasterThreadPath from './raster-thread?modulePath'
 import recognizeThreadPath from './recognize-thread?modulePath'
 import { threadOptions } from './budget'
 import { Coordinator, type ParentLike, type WorkerLike } from './coordinator'
-import { STUB_ENGINE_WASM } from './stub-engine'
+import { loadEngine } from './engine-node'
 
 // The only files a worker_thread may be started from in this realm (no-network.ts guards Worker).
 allowThreadEntries([rasterThreadPath, recognizeThreadPath])
@@ -49,7 +49,7 @@ new Coordinator({
   spawnRaster: () => spawn(rasterThreadPath),
   spawnRecognize: () => spawn(recognizeThreadPath),
   loadPdfium: async (path) => WebAssembly.compile(await readFile(path)),
-  loadEngine: async () => WebAssembly.compile(STUB_ENGINE_WASM),
+  loadEngine,
   system: () => ({
     totalmem: totalmem(),
     availableMemory: availableMemory(),
