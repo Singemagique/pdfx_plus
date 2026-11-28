@@ -35,7 +35,11 @@ const passing = (): Fixture => ({
   app: { isPackaged: true, ocrEngineInAsar: false },
   child: { stdio: { bytes: 0, lines: 0 } },
   crashPhase: { ok: true, failures: [] },
-  shortcut: { status: 'pass', message: 'reached the renderer once', sends: 1 }
+  shortcut: {
+    status: 'pass',
+    message: "made main send 'recognize-text' to the renderer once",
+    sends: 1
+  }
 })
 const LO = '1: lo: <LOOPBACK> mtu 65536 qdisc noop state DOWN mode DEFAULT group default qlen 1000'
 const ok = (over: Partial<SelftestRunFacts> = {}): SelftestRunFacts => ({

@@ -2,7 +2,8 @@
 // runs this through scripts/ocr-xos-diff.mjs on the artifacts the build matrix uploads: the
 // per-case records test-utils/xos-dump.ts writes, and vitest's JSON report of the same run. Any
 // difference fails: text, boxes, the engine's hOCR, the input pixels, anything else in a record, a
-// case one OS has and another lacks, or a test that passed on one OS and not on another. The gate
+// case one OS has and another lacks, a test that passed on one OS and not on another, or fewer
+// cases than the caller's floor (`minCases`: the same records lost on every OS). The gate
 // stays strict (R11): a divergence is a bug to root-cause, never a tolerance to add.
 //
 // Pure (no fs, no Electron) and erasable TypeScript only, so Node 24 runs it directly.
@@ -26,6 +27,7 @@ export type XosDiffKind =
   | 'missing-case'
   | 'test-status'
   | 'no-output'
+  | 'too-few-cases'
 
 export interface XosDifference {
   kind: XosDiffKind
@@ -76,17 +78,33 @@ function firstLineDiff(values: Record<string, unknown>): Record<string, string> 
   return Object.fromEntries(oses.map((o) => [o, excerpt(values[o])]))
 }
 
+export interface XosDiffOptions {
+  /**
+   * The fewest cases each OS must have produced. Without a floor, records lost the same way on
+   * every OS (a dump that stopped writing, a suite that stopped running) would compare as
+   * identical; CI passes today's count, lowered only by the change that removes cases.
+   */
+  minCases?: number
+}
+
 /**
  * Compare every OS's run against every other's. `runs` is keyed by OS (e.g. the artifact name's
  * suffix); the report lists every difference, grouped by kind.
  */
-export function diffXos(runs: Record<string, XosRun>): XosDiffReport {
+export function diffXos(runs: Record<string, XosRun>, opts: XosDiffOptions = {}): XosDiffReport {
   const oses = Object.keys(runs).sort()
   const differences: XosDifference[] = []
   const casesByOs = Object.fromEntries(oses.map((o) => [o, Object.keys(runs[o].cases).length]))
+  const minCases = opts.minCases ?? 0
   for (const o of oses)
     if (casesByOs[o] === 0)
       differences.push({ kind: 'no-output', key: o, byOs: { [o]: 'no tier-1 records' } })
+    else if (casesByOs[o] < minCases)
+      differences.push({
+        kind: 'too-few-cases',
+        key: o,
+        byOs: { [o]: `${casesByOs[o]} case(s), expected at least ${minCases}` }
+      })
 
   const keys = [...new Set(oses.flatMap((o) => Object.keys(runs[o].cases)))].sort()
   for (const key of keys) {

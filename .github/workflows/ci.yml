@@ -9,6 +9,11 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Nothing here writes to the repository (builds use --publish never; artifacts go through the
+# Actions runtime, not this token), so the token stays read-only whatever the repo default is.
+permissions:
+  contents: read
+
 jobs:
   check:
     name: Lint, typecheck, test
@@ -37,8 +42,13 @@ jobs:
       - name: Prettier check
         run: yarn format:check
 
+      # `yarn test:run` would also run the ocr project, which the next step runs (strict), so only
+      # the other two projects here. Strict too: the node project checks the replay cache's
+      # recorded engine info (ocr-cache.node.test.ts) only with PDFX_OCR_CACHE_STRICT=1.
       - name: Unit tests
-        run: yarn test:run
+        env:
+          PDFX_OCR_CACHE_STRICT: '1'
+        run: yarn test:run --project node --project jsdom
 
       # OCR tier 1 (DESIGN.md §3.9.3): the real Tesseract core and data on the synth presets,
       # gated against bench/ocr-baseline.json, with every live recognition required to equal its
@@ -238,10 +248,12 @@ jobs:
           pattern: ocr-xos-*
           path: ${{ runner.temp }}/ocr-xos
 
+      # --min-cases: tier 1 writes 53 records per OS today; records lost the same way on every OS
+      # would otherwise compare as identical. Lower it only in the change that removes cases.
       - name: Diff the three OSes' tier-1 outputs
         run: >-
           node scripts/ocr-xos-diff.mjs "$RUNNER_TEMP/ocr-xos" "$RUNNER_TEMP/ocr-xos-diff.json"
-          --expect macos-latest,windows-latest,ubuntu-latest
+          --expect macos-latest,windows-latest,ubuntu-latest --min-cases 53
 
       - name: Upload the diff report
         if: always()

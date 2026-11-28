@@ -8,8 +8,12 @@ name: OCR bench
 #   bench/ocr-real-baseline.json when that file exists (scores only, never data); the calibration
 #   determinism check (the committed table must refit byte for byte) and a refit report over the
 #   sweep's seeds.
-# - timing: the §3.9.4 time row's page (letter10pt) end to end at n = 1 and n = 2 on all three
-#   runners, blocking on Windows only (median ≤ 6 s), plus smallprint6pt (reported).
+# - timing: the §3.9.4 time rows' pages end to end at n = 1 and n = 2 on all three runners,
+#   blocking on Windows only: letter10pt median ≤ 6 s at both n, and a Letter page filled with
+#   6 pt text (smallprint6pt-letter) median ≤ 16 s at n = 1; smallprint6pt itself is reported.
+#
+# Not here yet (§3.9.3 tier 2): the olmOCR-bench and DocLayNet subsets, and the real corpus's
+# Find-recall gate, which waits for bench/ocr-real/ to be committed.
 # - scale: a 1,000-page synthetic scan through the real coordinator and threads (utility RSS
 #   ≤ 2.5 GB, renderer growth estimate ≤ 50 MB), and the 1.5 GiB sparse-file source (over the
 #   ceiling: `too-large`; at it: answered; no crash either way).
@@ -101,7 +105,9 @@ jobs:
           if-no-files-found: error
 
   timing:
-    name: Timing (${{ matrix.os }})
+    # No ${{ matrix.os }} in the name: GitHub appends the matrix values itself, and a skipped
+    # matrix job (an unlabelled PR) would show the expression unexpanded.
+    name: Timing
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ocr')
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60

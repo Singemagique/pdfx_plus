@@ -155,6 +155,18 @@ describe('the cross-OS OCR diff (tier 1b)', () => {
     expect(summaryMarkdown(r)).toContain('| test-status | t | passed | failed |')
   })
 
+  it('fails when every OS lost the same records (fewer cases than the floor)', () => {
+    const same = (): XosRun => run({ 'p/x': rec(), 'p/y': rec() })
+    expect(diffXos({ a: same(), b: same() }).ok).toBe(true)
+    expect(diffXos({ a: same(), b: same() }, { minCases: 2 }).ok).toBe(true)
+    const r = diffXos({ a: same(), b: same() }, { minCases: 3 })
+    expect(r.ok).toBe(false)
+    expect(r.differences).toEqual([
+      { kind: 'too-few-cases', key: 'a', byOs: { a: '2 case(s), expected at least 3' } },
+      { kind: 'too-few-cases', key: 'b', byOs: { b: '2 case(s), expected at least 3' } }
+    ])
+  })
+
   it('a single OS is never "identical"', () => {
     expect(diffXos({ a: run({ 'p/x': rec() }) }).ok).toBe(false)
   })
@@ -217,6 +229,14 @@ describe('the cross-OS OCR diff (tier 1b)', () => {
       expect(cli('--expect', 'ubuntu-latest,windows-latest,macos-latest')).toMatchObject({
         status: 1,
         report: { ok: false, problems: ['macos-latest: no ocr-xos-macos-latest artifact'] }
+      })
+      expect(cli('--expect', 'ubuntu-latest,windows-latest', '--min-cases', '1')).toMatchObject({
+        status: 0,
+        report: { ok: true, minCases: 1 }
+      })
+      expect(cli('--expect', 'ubuntu-latest,windows-latest', '--min-cases', '2')).toMatchObject({
+        status: 1,
+        report: { ok: false }
       })
       put('macos-latest', 'differs')
       expect(cli('--expect', 'ubuntu-latest,windows-latest,macos-latest').status).toBe(1)

@@ -7,10 +7,13 @@ import { describe, expect, it } from 'vitest'
 import type { Heartbeat } from '../../shared/ocr/protocol'
 import { Coordinator } from './process/coordinator'
 import {
+  RECOGNIZE_ACCELERATOR,
   REQUIRED_CHILD_CHECKS,
   childTripwireFailures,
+  hasRecognizeMenuItem,
   selftestSession,
-  shortcutVerdict
+  shortcutVerdict,
+  type MenuItemLike
 } from './selftest'
 import type { FromRaster } from './process/thread-messages'
 import { FakeParent, INIT, harness, settle, triaged } from './test-utils/fake-threads'
@@ -149,5 +152,37 @@ describe('shortcutVerdict (Ctrl/Cmd+Shift+R on a hidden window, §3.8)', () => {
     expect(shortcutVerdict({ ...seen, loaded: false }).status).toBe('fail')
     expect(shortcutVerdict({ ...seen, wrongModifierSends: 1 }).message).toMatch(/darwin/)
     expect(shortcutVerdict({ ...seen, menuItem: false, sends: 2 }).status).toBe('fail')
+  })
+
+  it('says what it proved: main sent the action to the renderer once', () => {
+    expect(shortcutVerdict(seen).message).toMatch(
+      /made main send 'recognize-text' to the renderer once/
+    )
+  })
+})
+
+describe('hasRecognizeMenuItem (the menu half of the shortcut check)', () => {
+  const item = {
+    id: 'recognize-text',
+    label: 'Recognize Text…',
+    accelerator: RECOGNIZE_ACCELERATOR,
+    registerAccelerator: false
+  }
+  const menu = (i: object): MenuItemLike[] => [
+    { label: 'File', submenu: { items: [] } },
+    { label: 'Document', submenu: { items: [{ id: 'other', label: 'Other' }, i] } }
+  ]
+
+  it('finds the Document item showing Ctrl/Cmd+Shift+R, unregistered, in a submenu', () => {
+    expect(hasRecognizeMenuItem(menu(item))).toBe(true)
+  })
+
+  it('rejects a missing or different accelerator, a registered one, or another label', () => {
+    expect(hasRecognizeMenuItem(menu({ ...item, accelerator: undefined }))).toBe(false)
+    expect(hasRecognizeMenuItem(menu({ ...item, accelerator: 'CommandOrControl+R' }))).toBe(false)
+    expect(hasRecognizeMenuItem(menu({ ...item, registerAccelerator: true }))).toBe(false)
+    expect(hasRecognizeMenuItem(menu({ ...item, label: 'Recognize Text' }))).toBe(false)
+    expect(hasRecognizeMenuItem(menu({ ...item, id: 'recognize-all-scanned' }))).toBe(false)
+    expect(hasRecognizeMenuItem(undefined)).toBe(false)
   })
 })

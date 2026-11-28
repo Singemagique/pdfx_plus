@@ -6,8 +6,10 @@
 //              time and the recognize threads' WASM heap; plus the committed real corpus when
 //              bench/ocr-real/manifest.json exists (it does not yet, §3.9.1).
 //   timing     the §3.9.4 time row's page (letter10pt, a full Letter page of 10 pt text at 300 DPI)
-//              end to end at n = 1 and n = 2 concurrent threads, and smallprint6pt (reported).
-//              Blocking on the Windows runner only: median ≤ 6 s at both n.
+//              end to end at n = 1 and n = 2 concurrent threads, the R4 small-print page
+//              (smallprint6pt-letter: a Letter page filled with 6 pt text) and smallprint6pt
+//              (reported). Blocking on the Windows runner only: letter10pt median ≤ 6 s at both n,
+//              smallprint6pt-letter median ≤ 16 s at n = 1.
 //   scale      a 1,000-page synthetic scan (PDFX_OCR_SCALE_PAGES) opened, triaged and recognised in
 //              ONE job through the real coordinator, raster thread and recognize threads; this Node
 //              process plays the utility process (its RSS is the budget: ≤ 2.5 GB) and the receiving
@@ -124,6 +126,12 @@ const SCALE_PAGES = Number(process.env.PDFX_OCR_SCALE_PAGES ?? 1000)
 export const SCALE_BUDGET = { utilityRssBytes: 2.5e9, rendererGrowthBytes: 50e6 } as const
 /** §3.9.4 R3/R4: the time row, blocking on the Windows runner. */
 export const TIME_GATE_MS = 6_000
+/**
+ * §3.9.4 R4: `smallprint6pt` on a full page, end to end including the adaptive pass, blocking on
+ * the Windows runner (reported elsewhere). Timed on smallprint6pt-letter (quality-presets.ts):
+ * smallprint6pt itself is a 1.35 MP strip, not a page.
+ */
+export const SMALLPRINT_GATE_MS = 16_000
 
 const langsOf = (preset: string): string[] =>
   preset === 'latin-diacritics' ? ['deu', 'fra', 'spa'] : ['eng']
@@ -323,7 +331,7 @@ describe.runIf(on('sweep') || on('timing'))('tier 2: sweep and timing', () => {
     'times the §3.9.4 page end to end at n = 1 and n = 2',
     async () => {
       const out: Record<string, unknown> = { platform: process.platform, reps: REPS }
-      for (const preset of ['letter10pt', 'smallprint6pt']) {
+      for (const preset of ['letter10pt', 'smallprint6pt-letter', 'smallprint6pt']) {
         const r = await synthesize({ preset, seed: 1 }, deps)
         const runOnce = (h: PageHarness): Promise<PageRun> =>
           h.run(r.pdfBytes, r.gt.page, { langs: ['eng'] })
@@ -345,17 +353,19 @@ describe.runIf(on('sweep') || on('timing'))('tier 2: sweep and timing', () => {
             recognizeMedian: Math.round(quantile(rec, 0.5)!)
           }
         }
-        out[preset] = { pixels: r.raster.width * r.raster.height, ...byN }
+        out[preset] = { pixels: r.raster.width * r.raster.height, words: r.gt.words.length, ...byN }
       }
       write(`timing-${process.platform}`, out)
-      if (process.platform === 'win32')
+      const median = (preset: string, n: string): number =>
+        (out[preset] as Record<string, { median: number }>)[n].median
+      if (process.platform === 'win32') {
         for (const n of ['n1', 'n2'])
-          expect
-            .soft(
-              (out.letter10pt as Record<string, { median: number }>)[n].median,
-              `letter10pt ${n}`
-            )
-            .toBeLessThanOrEqual(TIME_GATE_MS)
+          expect.soft(median('letter10pt', n), `letter10pt ${n}`).toBeLessThanOrEqual(TIME_GATE_MS)
+        // The R4 row binds a single page (n = 1); n = 2 is reported.
+        expect
+          .soft(median('smallprint6pt-letter', 'n1'), 'smallprint6pt-letter n1')
+          .toBeLessThanOrEqual(SMALLPRINT_GATE_MS)
+      }
     },
     3_600_000
   )

@@ -2,7 +2,8 @@
 // job (DESIGN.md §3.9.3 tier 1b). <artifacts-dir> holds one `ocr-xos-<os>` folder per build-matrix
 // OS (actions/download-artifact with a pattern), each with `out/<suite>/<id>.json` (the tier-1
 // records, src/main/ocr/test-utils/xos-dump.ts) and `vitest.json` (the run's JSON report). Exits 1
-// on any difference, or when an expected OS has no artifact. The comparison itself is
+// on any difference, when an expected OS has no artifact, or when an OS has fewer than
+// `--min-cases` records. The comparison itself is
 // src/main/ocr/ci/xos-diff.ts (erasable TypeScript: Node 24 runs it as is).
 
 import {
@@ -23,9 +24,13 @@ const flag = (name) => {
   return i >= 0 ? args.splice(i, 2)[1] : undefined
 }
 const expect = (flag('expect') ?? '').split(',').filter(Boolean)
+const minCasesArg = flag('min-cases')
+const minCases = minCasesArg === undefined ? 0 : Number(minCasesArg)
 const [root, out] = args
-if (!root || !out) {
-  console.error('usage: ocr-xos-diff.mjs <artifacts-dir> <report.json> [--expect a,b,c]')
+if (!root || !out || !Number.isInteger(minCases) || minCases < 0) {
+  console.error(
+    'usage: ocr-xos-diff.mjs <artifacts-dir> <report.json> [--expect a,b,c] [--min-cases n]'
+  )
   process.exit(2)
 }
 
@@ -61,7 +66,7 @@ for (const d of existsSync(root) ? readdirSync(root) : []) {
 }
 for (const os of expect) if (!runs[os]) problems.push(`${os}: no ocr-xos-${os} artifact`)
 
-const report = { ...diffXos(runs), problems }
+const report = { ...diffXos(runs, { minCases }), minCases, problems }
 report.ok =
   report.ok && problems.length === 0 && (expect.length === 0 || expect.every((o) => runs[o]))
 writeFileSync(out, JSON.stringify(report, null, 2) + '\n')

@@ -385,14 +385,51 @@ export async function selftestSession(
 
 // ---------------------------------------------------------------------------------------------
 // The shortcut check (§3.8, §3.9.3 1c): Ctrl/Cmd+Shift+R sent to a HIDDEN app window with
-// webContents.sendInputEvent must reach the renderer as `pdfx:menu` 'recognize-text' exactly once,
-// through window.ts's own before-input-event handler (the toolkit's watchWindowShortcuts
-// preventDefaults every Ctrl/Cmd+R in packaged builds, and menu accelerators do not fire on a
-// hidden window, PR0/PR0b). selftest-shortcut.ts drives the real window; this is the verdict.
+// webContents.sendInputEvent must make main send `pdfx:menu` 'recognize-text' to the renderer
+// exactly once, through window.ts's own before-input-event handler (the toolkit's
+// watchWindowShortcuts preventDefaults every Ctrl/Cmd+R in packaged builds, and menu accelerators
+// do not fire on a hidden window, PR0/PR0b). The driver counts that send at webContents.send and
+// does not forward it (nothing should start recognising in a hidden window), so what passes is
+// "main sent it once", not "the renderer handled it". selftest-shortcut.ts drives the real window;
+// this is the verdict.
+
+/** The chord menu.ts shows on Recognize Text… (shown only: window.ts delivers the key). */
+export const RECOGNIZE_ACCELERATOR = 'CommandOrControl+Shift+R'
+
+/** The parts of an Electron MenuItem the check reads. */
+export interface MenuItemLike {
+  id?: string
+  label?: string
+  accelerator?: string
+  registerAccelerator?: boolean
+  submenu?: { items: MenuItemLike[] } | null
+}
+
+/**
+ * menu.ts's Document item, anywhere in the menu: id 'recognize-text' (the MenuAction), labelled
+ * "Recognize Text…", SHOWING Ctrl/Cmd+Shift+R and NOT registering it (a registered accelerator
+ * would fire a second Recognize in dev builds, menu.ts).
+ */
+export function hasRecognizeMenuItem(items: readonly MenuItemLike[] | undefined): boolean {
+  for (const i of items ?? []) {
+    if (
+      i.id === 'recognize-text' &&
+      i.label === 'Recognize Text…' &&
+      i.accelerator === RECOGNIZE_ACCELERATOR &&
+      i.registerAccelerator === false
+    )
+      return true
+    if (hasRecognizeMenuItem(i.submenu?.items)) return true
+  }
+  return false
+}
 
 /** What the driver saw on the hidden window. */
 export interface ShortcutObservation {
-  /** The application menu has a Recognize Text item (PR8's Document menu). */
+  /**
+   * The application menu has the Recognize Text… item, showing Ctrl/Cmd+Shift+R without
+   * registering it (`hasRecognizeMenuItem`).
+   */
   menuItem: boolean
   /** `pdfx:menu` 'recognize-text' sends for the platform's chord (meta on darwin, control elsewhere). */
   sends: number
@@ -420,13 +457,21 @@ export function shortcutVerdict(o: ShortcutObservation): ShortcutReport {
   const seen = `the key reached the hidden window ${o.keyDowns} time(s)`
   const fail = (why: string): ShortcutReport => ({ ...o, status: 'fail', message: why })
   if (!o.loaded) return fail(`the hidden window never loaded the renderer; ${seen}`)
-  if (!o.menuItem) return fail(`the application menu has no Recognize Text… item; ${seen}`)
+  if (!o.menuItem)
+    return fail(
+      `the application menu has no Recognize Text… item showing ${RECOGNIZE_ACCELERATOR} ` +
+        `(unregistered); ${seen}`
+    )
   if (o.keyDowns === 0) return fail(`sendInputEvent never reached the hidden window`)
   if (o.sends !== 1)
     return fail(`${chord} sent 'recognize-text' ${o.sends} time(s) for one press, expected 1`)
   if (o.wrongModifierSends)
     return fail(`Ctrl+Shift+R on darwin sent 'recognize-text' ${o.wrongModifierSends} time(s)`)
-  return { ...o, status: 'pass', message: `${chord} reached the renderer once; ${seen}` }
+  return {
+    ...o,
+    status: 'pass',
+    message: `${chord} made main send 'recognize-text' to the renderer once; ${seen}`
+  }
 }
 
 // ---------------------------------------------------------------------------------------------
