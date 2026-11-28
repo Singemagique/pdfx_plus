@@ -108,7 +108,7 @@ jobs:
     # No ${{ matrix.os }} in the name: GitHub appends the matrix values itself, and a skipped
     # matrix job (an unlabelled PR) would show the expression unexpanded.
     name: Timing
-    if: ${{ true }} # TEMPORARY (reverted next): time the R4 gate on this PR's runners
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ocr')
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
