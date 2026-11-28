@@ -22,9 +22,22 @@
 //   and /SeparationInfo;
 // - an annotation whose /IRT, or a popup whose /Parent, names an annotation the page no longer
 //   lists (a second guard behind redact.ts `linkedAnnots`);
+// - XObject residue (xobject-trim.ts `trimXObjects`): an image or form the pass took off the page
+//   that another page's resource dictionary still lists (one /Resources inherited from /Pages, or
+//   one indirect dictionary shared by several pages), unused there, so copyPages would carry the
+//   unredacted original out with that page: every XObject nothing paints leaves every /XObject
+//   dictionary;
 // - font residue (font-trim.ts `trimFonts`): every font's character tables and TrueType outlines
 //   are cut to the codes the document still shows;
-// then deletes the objects that unlinked. (build.ts `pruneDetached` drops what an EXPORT still
+// - pixel-redacted images (DESIGN.md §2 D3; pixel-redact-doc.ts): the interim 8-bit copies PDFium
+//   wrote get their final streams (the source's depth, at most twice its size);
+// then deletes the objects that unlinked.
+//
+// Pixel redaction is on by default (`pixelRedaction`): an in-scope image the box partly covers is
+// blanked under the box on a per-page copy rather than removed, and is then NOT in `removed` (its
+// other pixels are still there, so only the words under the box go: rule 1). It is reported in
+// `modified` instead. Should the pdf-lib pass not find a copy again, the source is redacted once
+// more with whole-image removal. (build.ts `pruneDetached` drops what an EXPORT still
 // does not reach, such as a page dragged in by a link from another copy of the same file.)
 
 import { PDFDict, PDFDocument, PDFName, PDFRef, type PDFObject } from 'pdf-lib'
@@ -36,9 +49,12 @@ import { unrotateCrop, userUnitOf } from './build'
 import { trimFonts } from './font-trim'
 import type { FrameBox } from './ocr-export'
 import { getPdfium } from './pdfium'
+import type { PixelReplacement } from './pixel-redact'
+import { imageCandidates, PixelSwapError, swapPixelImages } from './pixel-redact-doc'
 import { deleteUnreachable, forEachRef } from './reachable'
+import { trimXObjects } from './xobject-trim'
 import {
-  redactPdfReport,
+  redactPdfReportAsync,
   type PageRedaction,
   type PdfBox,
   type PdfiumModule,
@@ -57,6 +73,12 @@ interface SourcePage {
  */
 export interface RedactedSources extends Map<string, Uint8Array> {
   removed?: Map<string, FrameBox[]>
+  /**
+   * With `report`: page key → the bounds, in the overlay frame, of every image redacted pixel by
+   * pixel on that page (pages without one are absent). These images stay, so they are not in
+   * `removed`.
+   */
+  modified?: Map<string, FrameBox[]>
 }
 
 export interface RedactedSourcesOptions {
@@ -64,6 +86,8 @@ export interface RedactedSourcesOptions {
   report?: boolean
   /** The initialised PDFium module (tests); default: the app's shared instance. */
   pdfium?: PdfiumModule
+  /** Blank only the covered pixels of an in-scope image (default true; false removes it whole). */
+  pixelRedaction?: boolean
 }
 
 /** A rect of unknown extent: non-finite, so ocr-export.ts drops the page's whole layer. */
@@ -115,15 +139,22 @@ export const PAGE_SIDE_DATA: readonly string[] = [
 
 /**
  * `bytes` (a PDFium-redacted document) with the redacted pages' side data, orphaned replies and
- * popups, and every font's residue removed (see the header).
+ * popups, and every font's residue removed, and the final streams of its pixel-redacted images
+ * (`pixels`, redact.ts `RedactResult.pixels`) put in (see the header). Throws PixelSwapError when
+ * one of those cannot be found.
  */
 export async function sanitizeRedacted(
   bytes: Uint8Array,
-  pageIndices: Iterable<number>
+  pageIndices: Iterable<number>,
+  pixels?: ReadonlyMap<number, readonly PixelReplacement[]>
 ): Promise<Uint8Array> {
   const doc = await PDFDocument.load(bytes, { updateMetadata: false, ignoreEncryption: true })
   const ctx = doc.context
   const unlinked: PDFRef[] = []
+  if (pixels?.size) {
+    if (doc.isEncrypted) throw new PixelSwapError('pixel redaction: encrypted output')
+    unlinked.push(...swapPixelImages(doc, pixels))
+  }
   const collect = (o: PDFObject | undefined): void => {
     if (o instanceof PDFRef) unlinked.push(o)
     else forEachRef(o, (r) => unlinked.push(r))
@@ -165,8 +196,12 @@ export async function sanitizeRedacted(
     }
     if (keep.length !== annots.size()) node.set(PDFName.of('Annots'), ctx.obj(keep))
   }
-  // An encrypted source's streams cannot be read here, so their fonts cannot be scanned.
-  if (!doc.isEncrypted) unlinked.push(...trimFonts(doc).unlinked)
+  // An encrypted source's streams cannot be read here, so neither its XObjects nor its fonts can
+  // be scanned. XObjects first: a form taken out no longer counts as showing text in a font.
+  if (!doc.isEncrypted) {
+    unlinked.push(...trimXObjects(doc))
+    unlinked.push(...trimFonts(doc).unlinked)
+  }
   deleteUnreachable(ctx, unlinked)
   return doc.save({ useObjectStreams: false, updateFieldAppearances: false })
 }
@@ -183,7 +218,10 @@ export async function buildRedactedSources(
   opts: RedactedSourcesOptions = {}
 ): Promise<RedactedSources> {
   const out: RedactedSources = new Map<string, Uint8Array>()
-  if (opts.report) out.removed = new Map()
+  if (opts.report) {
+    out.removed = new Map()
+    out.modified = new Map()
+  }
   const pageByKey = new Map<string, PageEntry>()
   for (const doc of docs) {
     for (const p of doc.pages) pageByKey.set(makePageKey(p.source.id, p.pageIndex), p)
@@ -246,17 +284,38 @@ export async function buildRedactedSources(
     // the page's /FOcr resource and the no-incremental save writes no orphaned font [measured,
     // tmp probe; pinned by ocr-export.node.test.ts "a reopened OCR'd export": no OCR font is
     // bound on the redacted page and the raw-bytes oracle finds no redacted character].
-    const result = redactPdfReport(pdfium, sourceBytes, pageRedactions, { dropOcrText: true })
-    out.set(sourceKey, await sanitizeRedacted(result.bytes, frames.keys()))
-    if (!out.removed) continue
+    const indices = [...frames.keys()]
+    const pixels =
+      opts.pixelRedaction === false ? undefined : await imageCandidates(sourceBytes, indices)
+    let result = await redactPdfReportAsync(pdfium, sourceBytes, pageRedactions, { dropOcrText: true, pixels }) // prettier-ignore
+    let clean: Uint8Array
+    try {
+      clean = await sanitizeRedacted(result.bytes, indices, result.pixels)
+    } catch (e) {
+      if (!(e instanceof PixelSwapError)) throw e
+      // A copy PDFium wrote could not be found again: redact the source again, removing every
+      // covered image whole (the reports below then come from this pass).
+      result = await redactPdfReportAsync(pdfium, sourceBytes, pageRedactions, {
+        dropOcrText: true
+      })
+      clean = await sanitizeRedacted(result.bytes, indices)
+    }
+    out.set(sourceKey, clean)
+    if (!out.removed || !out.modified) continue
     for (const { pageIndex } of pageRedactions) {
       const frame = frames.get(pageIndex)!
+      const toFrame = (b: PdfBox | null): FrameBox =>
+        pdfBoxToFrame(b, frame.view, frame.rotate, frame.unit)
       const objs = result.removed.get(pageIndex)
       // No entry from the pass for a page it was given: unknown, so the whole layer goes.
-      const rects = objs
-        ? objs.map((o) => pdfBoxToFrame(o.box, frame.view, frame.rotate, frame.unit))
-        : [UNKNOWN]
+      const rects = objs ? objs.map((o) => toFrame(o.box)) : [UNKNOWN]
       out.removed.set(makePageKey(sourceKey, pageIndex), rects)
+      const mod = result.pixels.get(pageIndex)
+      if (mod)
+        out.modified.set(
+          makePageKey(sourceKey, pageIndex),
+          mod.map((p) => toFrame(p.box))
+        )
     }
   }
   return out

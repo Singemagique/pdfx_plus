@@ -207,7 +207,7 @@ function fontKind(font: PDFDict): FontKind {
 }
 
 /** A stream's decoded bytes; null when its filters cannot be decoded here. */
-function streamBytes(s: PDFStream): Uint8Array | null {
+export function streamBytes(s: PDFStream): Uint8Array | null {
   try {
     if (s instanceof PDFRawStream) return decodePDFRawStream(s).decode()
     const u = (s as { getUnencodedContents?: () => Uint8Array }).getUnencodedContents

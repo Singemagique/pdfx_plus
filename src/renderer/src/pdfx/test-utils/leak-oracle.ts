@@ -49,6 +49,29 @@ export interface Secret {
   uniqueCps: readonly number[]
 }
 
+/**
+ * The pixel half of the oracle (pixel redaction, PR12): every stream of `bytes` whose data, inflated
+ * where pdf-lib can (as stored otherwise), contains `needle` (covered pixels of a fixture). Returns
+ * the refs of the streams that hold it.
+ */
+export async function pixelLeaks(bytes: Uint8Array, needle: Uint8Array): Promise<string[]> {
+  const doc = await PDFDocument.load(bytes, { updateMetadata: false, ignoreEncryption: true })
+  const hits: string[] = []
+  const n = Buffer.from(needle)
+  for (const [ref, o] of doc.context.enumerateIndirectObjects()) {
+    if (!(o instanceof PDFRawStream)) continue
+    let data: Uint8Array
+    try {
+      data = decodePDFRawStream(o).decode()
+    } catch {
+      data = o.contents
+    }
+    if (Buffer.from(data.buffer, data.byteOffset, data.byteLength).indexOf(n) >= 0)
+      hits.push(ref.toString())
+  }
+  return hits
+}
+
 /** The code points of `redacted` that occur in none of `kept` (the export's legitimate text). */
 export function uniqueCodePoints(redacted: readonly string[], kept: readonly string[]): number[] {
   const keep = new Set(kept.flatMap((t) => [...t].map((c) => c.codePointAt(0)!)))
